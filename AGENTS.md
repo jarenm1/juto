@@ -24,9 +24,17 @@ application runs belong in a dedicated jj workspace under `~/workspaces/`,
 not in default. `origin` is configured; use `main@origin` as the base for new
 independent tasks after fetching. Do not assume PR or branch-protection policy.
 
-Use Git-aware flake references (`.` / `.#smoke`), not `path:.`: the latter
-copies ignored build outputs into the Nix store and can race active builds.
-Keep new files snapshotted with jj so Nix includes them.
+Use the clean default checkout as the development-flake source. Secondary jj
+workspaces are not Git-colocated; evaluating their `.` flake can copy ignored
+build outputs into the Nix store. Keep Cargo's cwd and target cache in the task
+workspace while reading the default flake:
+
+```sh
+export JUTO_FLAKE="$(dirname "$(jj git root)")"
+```
+
+Use Git-aware references to that checkout, not `path:` references. If a task
+changes the flake itself, evaluate a filtered source snapshot instead.
 
 Before starting a task, inspect `jj root` and create a dedicated workspace from
 the published base:
@@ -49,11 +57,11 @@ writable directory. Long-lived processes use unique names and ephemeral ports.
 Wrap the entire process tree, with the scope outermost:
 
 ```sh
-scripts/agent-scope.sh -- nix develop . -c cargo build -p juto
-scripts/agent-scope.sh -- nix develop . -c cargo test -p <touched-crate>
-scripts/agent-scope.sh -- nix develop . -c cargo clippy --workspace --all-targets -- -D warnings
-scripts/agent-scope.sh --gpu -- nix develop . -c cargo run -p juto
-scripts/agent-scope.sh -- nix develop .#smoke -c <visual-smoke-command>
+scripts/agent-scope.sh -- nix develop "$JUTO_FLAKE" -c cargo build -p juto
+scripts/agent-scope.sh -- nix develop "$JUTO_FLAKE" -c cargo test -p <touched-crate>
+scripts/agent-scope.sh -- nix develop "$JUTO_FLAKE" -c cargo clippy --workspace --all-targets -- -D warnings
+scripts/agent-scope.sh --gpu -- nix develop "$JUTO_FLAKE" -c cargo run -p juto
+scripts/agent-scope.sh -- nix develop "$JUTO_FLAKE#smoke" -c <visual-smoke-command>
 ```
 
 The wrapper inherits jtech's defaults: 400% CPU and 8 GiB memory per scope,
@@ -108,10 +116,11 @@ Cite and retain the upstream license when copying source, prompts, or assets.
 
 ## Environment and verification
 
-Use `nix develop . -c <command>` in unhooked shells, or allow direnv once
-and use `direnv exec <workspace> <command>`. Keep the scope outermost for heavy
-commands. The flake's compiler is authoritative; a second rustup toolchain can
-change artifacts and undo reproducibility.
+Use `nix develop "$JUTO_FLAKE" -c <command>` from the task workspace in
+unhooked shells. For direnv, select the same shared flake source; avoid evaluating
+a non-colocated workspace with a populated target directory. Keep the scope
+outermost for heavy commands. The flake's compiler is authoritative; a second
+rustup toolchain can change artifacts and undo reproducibility.
 
 Optimize for build iteration: preserve unoptimized incremental dev/test
 profiles, reduced debug info, and Clang + mold linking. Do not copy jtech's
