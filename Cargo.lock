@@ -3081,7 +3081,14 @@ dependencies = [
 name = "juto"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "gpui",
+ "juto-agent",
+ "juto-ai",
+ "juto-catalog",
+ "juto-runtime",
+ "tempfile",
+ "tokio",
  "unicode-segmentation",
 ]
 

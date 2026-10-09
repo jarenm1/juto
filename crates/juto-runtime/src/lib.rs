@@ -283,7 +283,7 @@ impl Runtime {
         let mode = if read_only {
             ApprovalMode::ReadOnly
         } else {
-            self.inner.config.approval_mode.clone()
+            self.inner.config.approval_mode
         };
         agent.set_hooks(Arc::new(RuntimeHooks {
             mode,
@@ -297,18 +297,21 @@ impl Runtime {
             tokio::select! {
                 result = &mut future => break result,
                 Some(event) = rx.recv() => {
-                    if let Err(error) = persist_event(session, &event) {
-                        if persistence_error.is_none() {persistence_error = Some(error); control.cancel();}
+                    if let Err(error) = persist_event(session, &event)
+                        && persistence_error.is_none()
+                    {
+                        persistence_error = Some(error);
+                        control.cancel();
                     }
                     let _ = events.send(event);
                 }
             }
         };
         while let Ok(event) = rx.try_recv() {
-            if let Err(error) = persist_event(session, &event) {
-                if persistence_error.is_none() {
-                    persistence_error = Some(error);
-                }
+            if let Err(error) = persist_event(session, &event)
+                && persistence_error.is_none()
+            {
+                persistence_error = Some(error);
             }
             let _ = events.send(event);
         }

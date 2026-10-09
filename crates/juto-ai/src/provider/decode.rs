@@ -307,10 +307,10 @@ impl Decoder {
                     string(item, "name"),
                     events,
                 );
-                if let Some(args) = string(item, "arguments") {
-                    if !args.is_empty() {
-                        self.argument_snapshot(target, args);
-                    }
+                if let Some(args) = string(item, "arguments")
+                    && !args.is_empty()
+                {
+                    self.argument_snapshot(target, args);
                 }
             }
             Some("reasoning") => {

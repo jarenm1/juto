@@ -170,10 +170,10 @@ async fn http_error(response: reqwest::Response, credential: Option<&Credential>
     let mut message = message
         .map(str::to_owned)
         .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-    if let Some(credential) = credential {
-        if !credential.expose_secret().is_empty() {
-            message = message.replace(credential.expose_secret(), "<redacted>");
-        }
+    if let Some(credential) = credential
+        && !credential.expose_secret().is_empty()
+    {
+        message = message.replace(credential.expose_secret(), "<redacted>");
     }
     ProviderError::Http {
         status,

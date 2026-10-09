@@ -213,17 +213,17 @@ impl RuntimeConfig {
                 self.compaction_threshold
             )));
         }
-        if let Some(t) = self.temperature {
-            if !t.is_finite() || t < 0.0 {
-                return Err(ConfigError::Validation(format!(
-                    "temperature must be a non-negative finite number, got {t}"
-                )));
-            }
+        if let Some(t) = self.temperature
+            && (!t.is_finite() || t < 0.0)
+        {
+            return Err(ConfigError::Validation(format!(
+                "temperature must be a non-negative finite number, got {t}"
+            )));
         }
-        if let Some(level) = &self.thinking {
-            if !VALID_EFFORTS.contains(&level.as_str()) {
-                return Err(ConfigError::UnknownEffort(level.clone()));
-            }
+        if let Some(level) = &self.thinking
+            && !VALID_EFFORTS.contains(&level.as_str())
+        {
+            return Err(ConfigError::UnknownEffort(level.clone()));
         }
         // Role selectors must resolve (no cycles) — validate eagerly so a
         // broken config fails at load, not mid-run.
@@ -262,59 +262,55 @@ impl RuntimeConfig {
         let mut effort = inline_effort.map(str::to_string);
         let mut current = base.to_string();
         let mut seen = std::collections::HashSet::new();
-        loop {
-            if let Some(role) = current.strip_prefix('@') {
-                // A role may itself carry an effort suffix; later suffixes win
-                // only when the user did not already specify one.
-                let (role_name, role_effort) = split_effort(role);
-                if effort.is_none() {
-                    effort = role_effort.map(str::to_string);
-                }
-                if !seen.insert(role_name.to_string()) {
-                    return Err(ConfigError::RoleCycle(role_name.to_string()));
-                }
-                match self.model_roles.get(role_name) {
-                    Some(target) => {
-                        let (target_base, target_effort) = split_effort(target);
-                        if effort.is_none() {
-                            effort = target_effort.map(str::to_string);
-                        }
-                        current = target_base.to_string();
+        while let Some(role) = current.strip_prefix('@') {
+            // A role may itself carry an effort suffix; later suffixes win
+            // only when the user did not already specify one.
+            let (role_name, role_effort) = split_effort(role);
+            if effort.is_none() {
+                effort = role_effort.map(str::to_string);
+            }
+            if !seen.insert(role_name.to_string()) {
+                return Err(ConfigError::RoleCycle(role_name.to_string()));
+            }
+            match self.model_roles.get(role_name) {
+                Some(target) => {
+                    let (target_base, target_effort) = split_effort(target);
+                    if effort.is_none() {
+                        effort = target_effort.map(str::to_string);
                     }
-                    None => {
-                        // Source role inheritance: tiny→smol→default,
-                        // memory→tiny. The `default` role without an explicit
-                        // entry is the configured `model` field itself.
-                        let inherited = match role_name {
-                            "tiny" => Some("smol"),
-                            "smol" => Some("default"),
-                            "memory" => Some("tiny"),
-                            _ => None,
-                        };
-                        match inherited {
-                            Some(next) => {
-                                current = format!("@{next}");
-                            }
-                            None if role_name == "default" && !self.model.is_empty() => {
-                                current = self.model.clone();
-                            }
-                            _ => {
-                                // Unknown role or exhausted chain: pass the
-                                // literal selector through so the registry
-                                // lookup reports the real failure.
-                                return Ok((format!("@{role_name}"), effort));
-                            }
+                    current = target_base.to_string();
+                }
+                None => {
+                    // Source role inheritance: tiny→smol→default,
+                    // memory→tiny. The `default` role without an explicit
+                    // entry is the configured `model` field itself.
+                    let inherited = match role_name {
+                        "tiny" => Some("smol"),
+                        "smol" => Some("default"),
+                        "memory" => Some("tiny"),
+                        _ => None,
+                    };
+                    match inherited {
+                        Some(next) => {
+                            current = format!("@{next}");
+                        }
+                        None if role_name == "default" && !self.model.is_empty() => {
+                            current = self.model.clone();
+                        }
+                        _ => {
+                            // Unknown role or exhausted chain: pass the
+                            // literal selector through so the registry
+                            // lookup reports the real failure.
+                            return Ok((format!("@{role_name}"), effort));
                         }
                     }
                 }
-            } else {
-                break;
             }
         }
-        if let Some(level) = &effort {
-            if !VALID_EFFORTS.contains(&level.as_str()) {
-                return Err(ConfigError::UnknownEffort(level.clone()));
-            }
+        if let Some(level) = &effort
+            && !VALID_EFFORTS.contains(&level.as_str())
+        {
+            return Err(ConfigError::UnknownEffort(level.clone()));
         }
         Ok((current, effort))
     }
@@ -487,10 +483,10 @@ mod tests {
         let (model, effort) = cfg.resolve_selector("local/llama:8080").unwrap();
         assert_eq!(model, "local/llama:8080");
         assert_eq!(effort, None);
-        assert!(matches!(
-            cfg.resolve_selector("m:bogus-effort-that-is-not-real"),
-            Ok(_) // non-effort suffix kept, not an error
-        ));
+        assert!(
+            cfg.resolve_selector("m:bogus-effort-that-is-not-real")
+                .is_ok()
+        );
         let (model, _) = cfg.resolve_selector("plain-model").unwrap();
         assert_eq!(model, "plain-model");
         // Unknown roles pass through for the registry to reject, not silently

@@ -7,3 +7,12 @@ license.workspace = true
 [dependencies]
 gpui.workspace = true
 unicode-segmentation.workspace = true
+anyhow.workspace = true
+juto-agent.workspace = true
+juto-ai.workspace = true
+juto-catalog.workspace = true
+juto-runtime.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -6,15 +6,15 @@ capabilities of [oh-my-pi](https://github.com/can1357/oh-my-pi).
 ## Current state
 
 The build includes a pinned Nix development environment, a Cargo workspace,
-and a native GPUI chat view. You can type in a modern composer card with an
-attachment dropdown (**+**), submit with Enter or a circular Send button (**↑**),
-and view plain, left-aligned messages in a scrollable list. Empty or whitespace-only
-submissions are ignored; messages stay in memory until the window closes.
+the modular Rust agent runtime crates, and a native GPUI chat view. You can type
+in a modern composer card with an attachment dropdown (**+**), submit with Enter
+or a circular Send button (**↑**), and view plain, left-aligned messages in a scrollable list.
+Messages and turns are durably journaled to append-only JSONL sessions in the background.
 
-**The UI is not connected to an agent runtime.** It does not generate assistant
-replies, save conversations, connect to providers, or offer login, model
-switching, tools, or subagents.
-
+**The UI is wired into the agent runtime.** User prompts and attachments are submitted
+to the streaming agent runtime on a background Tokio thread, streaming assistant deltas
+into the native UI without blocking GPUI's foreground thread. Existing sessions can be loaded
+with `--session <path>`, and models can be selected with `--model <provider/model>`.
 See [the full OMP runtime inventory and port plan](docs/omp-runtime.md) for the
 capabilities to preserve, primary-source references, and acceptance criteria.
 Agent contributors should read [AGENTS.md](AGENTS.md).
@@ -167,13 +167,15 @@ xdotool key ctrl+q
 Run these commands in the same Xvfb session as the application. Synthetic typing
 can outpace software rendering: wait for the input queue and display to settle
 before capturing or asserting the visible result.
-Observed for the attachment chat view: locked application build; 3 unit tests
-passing; Clippy with warnings denied; native typing, Enter and Send submission,
-empty/whitespace rejection, attachment dropdown (+), native file chooser dialog,
+Observed for the agent-wired chat view: locked application build; 5 unit tests
+passing in `juto` (112 across workspace); Clippy with warnings denied; native typing,
+Enter and Send submission, empty/whitespace rejection, attachment dropdown (+),
 attached file chips, message with attachment submission, attachment-only submission,
 chip removal (×), copy/cut/paste, long-input scrolling, wrapped messages, history
-scrolling, 560×480 resizing, and Ctrl-Q exit status 0 under Xvfb/Mesa software Vulkan.
-Host Wayland, hardware acceleration, provider access, and an actual platform IME
+scrolling, streaming assistant responses, durable append-only JSONL session creation
+and persistence, existing session loading via `--session`, model selection via `--model`,
+560×480 resizing, and Ctrl-Q exit status 0 under Xvfb/Mesa software Vulkan.
+Host Wayland, hardware acceleration, live provider network transport, and an actual platform IME
 were not exercised.
 ## Dependency constraints
 

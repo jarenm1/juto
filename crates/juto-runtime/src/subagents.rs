@@ -517,12 +517,11 @@ pub fn extract_json(text: &str) -> Option<Value> {
     }
     // Fallback: outermost trailing object/array slice.
     for (open, close) in [('{', '}'), ('[', ']')] {
-        if let (Some(start), Some(end)) = (trimmed.find(open), trimmed.rfind(close)) {
-            if start < end {
-                if let Ok(value) = serde_json::from_str::<Value>(&trimmed[start..=end]) {
-                    return Some(value);
-                }
-            }
+        if let (Some(start), Some(end)) = (trimmed.find(open), trimmed.rfind(close))
+            && start < end
+            && let Ok(value) = serde_json::from_str::<Value>(&trimmed[start..=end])
+        {
+            return Some(value);
         }
     }
     None
