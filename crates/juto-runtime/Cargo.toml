@@ -1,0 +1,29 @@
+[package]
+name = "juto-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+juto-ai.workspace = true
+juto-agent.workspace = true
+juto-catalog.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+fs2.workspace = true
+futures.workspace = true
+globset.workspace = true
+ignore.workspace = true
+jsonschema.workspace = true
+libc.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

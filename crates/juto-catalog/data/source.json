@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/can1357/oh-my-pi",
+  "revision": "579da1d661c5cb8d43bc2ddd429ab72e67165ad8",
+  "path": "packages/catalog/src/models.json",
+  "encoding": "gzip -n -9",
+  "uncompressedBytes": 11927901,
+  "uncompressedSha256": "6d26a2d7dc09ceaddac015b44926bf6661b2a526e4b3fbd9c532f4a994727cc5",
+  "license": "../../../licenses/OMP-MIT.txt"
+}
