@@ -1,6 +1,6 @@
 # Agent instructions
 
-Adapted from `~/jtech/AGENTS.md` for Juto: a Rust agent runtime with a native
+Juto: a Rust agent runtime with a native
 GPUI interface. The runtime port is the product goal, not a claim of current
 implementation. Read `README.md` for the current build and launch commands.
 
@@ -19,20 +19,24 @@ implementation. Read `README.md` for the current build and launch commands.
 
 ## Workspace isolation
 
-Run `jj root` before editing. Work in the workspace assigned for this task.
-This repository starts locally: do not assume `main@origin`, a remote, a PR
-workflow, or branch protection exists.
+The default workspace is the human's checkout. Agent edits, builds, tests, and
+application runs belong in a dedicated jj workspace under `~/workspaces/`,
+not in default. `origin` is configured; use `main@origin` as the base for new
+independent tasks after fetching. Do not assume PR or branch-protection policy.
 
 Use Git-aware flake references (`.` / `.#smoke`), not `path:.`: the latter
 copies ignored build outputs into the Nix store and can race active builds.
 Keep new files snapshotted with jj so Nix includes them.
 
-For independent concurrent tasks, create a dedicated workspace based on an
-explicit agreed change:
+Before starting a task, inspect `jj root` and create a dedicated workspace from
+the published base:
 
 ```sh
-jj workspace add ~/workspaces/juto-<slug> -r <base-change-id>
+jj workspace add ~/workspaces/juto-<slug> -r main@origin
 ```
+
+When explicitly moving an existing unfinished change, preserve that change id
+and edit it in the new workspace; leave default on a clean published base.
 
 Use one integration owner. Delegated slices may edit the integration workspace
 only with explicit, nonoverlapping file ownership; the owner alone mutates jj

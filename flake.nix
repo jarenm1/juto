@@ -42,7 +42,7 @@
               pkg-config
               cmake
               ninja
-              jj
+              jujutsu
               git
             ];
             buildInputs = nativeLibraries;

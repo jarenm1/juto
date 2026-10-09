@@ -1,4 +1,7 @@
-/target/
+target/
 /.direnv/
 /result
 /result-*
+
+# The bundled model catalog is tracked as deterministic gzip, not raw JSON.
+/crates/juto-catalog/data/models.json
