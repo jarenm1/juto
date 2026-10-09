@@ -5,12 +5,15 @@ capabilities of [oh-my-pi](https://github.com/can1357/oh-my-pi).
 
 ## Current state
 
-The first step is implemented: a pinned Nix development environment, a Cargo
-workspace, a real GPUI window, and jj-based agent workflow instructions.
-**The agent runtime is not implemented yet.** There are no provider connections,
-login flows, chat messages, model switching, tools, or subagents in this build.
-The window identifies itself as the build-foundation surface rather than
-simulating those features.
+The build includes a pinned Nix development environment, a Cargo workspace,
+and a native GPUI chat view. You can type in a modern composer card with an
+attachment dropdown (**+**), submit with Enter or a circular Send button (**↑**),
+and view plain, left-aligned messages in a scrollable list. Empty or whitespace-only
+submissions are ignored; messages stay in memory until the window closes.
+
+**The UI is not connected to an agent runtime.** It does not generate assistant
+replies, save conversations, connect to providers, or offer login, model
+switching, tools, or subagents.
 
 See [the full OMP runtime inventory and port plan](docs/omp-runtime.md) for the
 capabilities to preserve, primary-source references, and acceptance criteria.
@@ -45,6 +48,47 @@ scripts/agent-scope.sh -- nix develop . -c cargo run -p juto --locked -- --help
 ```
 
 Ctrl-Q exits the window. Closing the last window also requests application exit.
+
+### UI-only iteration
+
+`apps/juto/src/main.rs` launches the native window. `chat.rs` owns the chat view,
+plain message rows, attachment dropdown, and Send control; `chat_input.rs` owns
+native text editing. UI work stays in this application without changing the agent runtime.
+
+The composer features a modern card with an input field and bottom toolbar row:
+a circular **+** button opens a menu to attach **Files…** through the native file
+dialog. Selected attachments appear as removable chips (`×`). Messages can be sent
+with text, attachments, or attachments alone. The composer supports cursor movement,
+selection, Backspace/Delete, clipboard copy/cut/paste, and horizontal scrolling for
+long drafts. Sent messages wrap naturally.
+
+The UI is styled with neutral grays throughout—including backgrounds, borders,
+hover states, focus borders, caret, selection, and active/disabled button states.
+Messages have no bubble backgrounds or borders.
+The input component adapts [GPUI 0.2.2's input example](https://docs.rs/crate/gpui/0.2.2/source/examples/input.rs);
+its upstream Apache-2.0 license is retained in
+`apps/juto/licenses/GPUI-APACHE-2.0.txt`. Unicode grapheme navigation uses
+`unicode-segmentation`, already present in GPUI's dependency graph.
+
+Start UI work in a dedicated jj workspace from the published base:
+
+```sh
+jj workspace add ~/workspaces/juto-ui -r main@origin
+```
+
+From that workspace, use the default checkout's Git-aware flake while keeping
+Cargo's working directory and build cache local to the UI workspace:
+
+```sh
+export JUTO_FLAKE="$(dirname "$(jj git root)")"
+scripts/agent-scope.sh --gpu -- nix develop "$JUTO_FLAKE" -c cargo run -p juto --locked
+# Software Vulkan on a virtual display:
+scripts/agent-scope.sh -- nix develop "$JUTO_FLAKE#smoke" -c xvfb-run -a -s "-screen 0 1280x1024x24" cargo run -p juto --locked
+```
+
+For remote review, put screenshots in the draft PR's description or comments
+using a remotely accessible image URL. Keep capture scripts and screenshots
+outside the project source; a remote `/tmp` path does not render for reviewers.
 
 ### Fast-build choices
 
@@ -87,31 +131,50 @@ nix flake check . --no-build
 nix develop . -c cargo fmt --all --check
 nix fmt .
 scripts/agent-scope.sh -- nix develop . -c cargo build --workspace --locked
+scripts/agent-scope.sh -- nix develop . -c cargo test -p juto --locked
 scripts/agent-scope.sh -- nix develop . -c cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
 `flake check --no-build` verifies flake evaluation, not an application build.
-There is no packaged `nix build`/`nix run` target yet, and no permanent behavior
-tests for this native-window bootstrap.
+There is no packaged `nix build`/`nix run` target yet. Unit tests cover Unicode
+platform text offsets and IME selection positioning; native interaction still
+needs a real-window smoke.
 
 For a headless **native-window** check, `devShells.smoke` supplies Xvfb, xdotool,
 ImageMagick, Python, a DejaVu font configuration, and a pinned Mesa software
 Vulkan driver. It does not require the hardware GPU lock:
 
 ```sh
-scripts/agent-scope.sh -- nix develop .#smoke -c xvfb-run -a cargo run -p juto --locked
+scripts/agent-scope.sh -- nix develop .#smoke -c xvfb-run -a -s "-screen 0 1280x1024x24" cargo run -p juto --locked
 ```
 
 This opens a real window on the virtual display and remains running until
-closed or sent Ctrl-Q. Automations can find it with `xdotool search --sync
---onlyvisible --name '^Juto$'`, capture it with `magick import -window <id>
-/tmp/juto.png`, focus it, and send `xdotool key ctrl+q` from the same Xvfb session.
+closed or sent Ctrl-Q. The explicit display resolution keeps the 960×720
+window fully visible; the smoke shell's default 640×480 display clips it.
+Automations can find the window with `xdotool search --sync --onlyvisible
+--name '^Juto$'`. Focus and resize it to trigger the initial Xvfb redraw:
 
-Observed during setup: successful locked workspace build; a rendered 640×400
-native window under Xvfb/Mesa; Ctrl-Q exit status 0; correct headless version/help
-output and invalid-argument exit status 2; mold 2.42.0 recorded in the binary.
-Host Wayland and hardware acceleration were not exercised.
+```sh
+xdotool windowfocus --sync <id>
+xdotool windowsize --sync <id> 961 721
+sleep 1
+xdotool windowsize --sync <id> 960 720
+sleep 3
+magick import -descend -window <id> /tmp/juto.png
+xdotool key ctrl+q
+```
 
+Run these commands in the same Xvfb session as the application. Synthetic typing
+can outpace software rendering: wait for the input queue and display to settle
+before capturing or asserting the visible result.
+Observed for the attachment chat view: locked application build; 3 unit tests
+passing; Clippy with warnings denied; native typing, Enter and Send submission,
+empty/whitespace rejection, attachment dropdown (+), native file chooser dialog,
+attached file chips, message with attachment submission, attachment-only submission,
+chip removal (×), copy/cut/paste, long-input scrolling, wrapped messages, history
+scrolling, 560×480 resizing, and Ctrl-Q exit status 0 under Xvfb/Mesa software Vulkan.
+Host Wayland, hardware acceleration, provider access, and an actual platform IME
+were not exercised.
 ## Dependency constraints
 
 GPUI 0.2.2's `gpui_http_client → zed-async-tar → xattr 0.2.3` dependency references
