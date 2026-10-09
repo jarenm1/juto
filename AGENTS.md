@@ -79,6 +79,8 @@ jj, source searches) need no scope.
 
 ## Commits
 
+- Keep history linear on every branch: update changes with `jj rebase`, never
+  merge commits. Integrate pull requests with **Rebase and merge** only.
 - Name each logical change with a conventional prefix (`chore:`, `feat:`,
   `fix:`, `refactor:`, `docs:`).
 - `jj describe -m "<type>: <what>"` names the current change;
