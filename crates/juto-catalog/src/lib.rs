@@ -170,13 +170,13 @@ impl Registry {
     /// row matches; a selector naming a known provider is locked to that
     /// provider and never falls back to another provider's same-id model.
     pub fn resolve(&self, selector: &str) -> Result<&Model, CatalogError> {
-        if let Some((provider, id)) = selector.split_once('/') {
-            if let Some(models) = self.models.get(&provider.to_lowercase()) {
-                return models
-                    .iter()
-                    .find(|model| model.id.eq_ignore_ascii_case(id))
-                    .ok_or_else(|| CatalogError::NotFound(selector.to_string()));
-            }
+        if let Some((provider, id)) = selector.split_once('/')
+            && let Some(models) = self.models.get(&provider.to_lowercase())
+        {
+            return models
+                .iter()
+                .find(|model| model.id.eq_ignore_ascii_case(id))
+                .ok_or_else(|| CatalogError::NotFound(selector.to_string()));
         }
         let found: Vec<&Model> = self
             .iter()

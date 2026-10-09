@@ -277,7 +277,7 @@ fn gemini_parts(model: &Model, message: &Message) -> Vec<Value> {
         ContentBlock::Text{text}=>Some(json!({"text":text})),
         ContentBlock::Image{data,mime_type}=>Some(json!({"inlineData":{"mimeType":mime_type,"data":data}})),
         ContentBlock::Thinking{thinking,thinking_signature}=>{
-            let mut part=json!({"text":thinking,"thought":true});if signed{if let Some(signature)=thinking_signature{part["thoughtSignature"]=json!(signature);}}Some(part)
+            let mut part=json!({"text":thinking,"thought":true});if signed&&let Some(signature)=thinking_signature{part["thoughtSignature"]=json!(signature);}Some(part)
         }
         ContentBlock::ToolCall(call)=>{
             let mut part=json!({"functionCall":{"name":call.name,"args":call.arguments,"id":call_id(&call.id)}});
@@ -358,44 +358,43 @@ pub(super) fn build(
         .thinking
         .as_deref()
         .filter(|effort| !matches!(*effort, "off" | "inherit" | "auto"))
+        && model.reasoning
     {
-        if model.reasoning {
-            match api {
-                Api::Chat if flag(model, "supportsReasoningEffort", true) => {
-                    body["reasoning_effort"] = json!(effort)
-                }
-                Api::Responses | Api::Codex | Api::Azure => {
-                    body["reasoning"] = json!({"effort":effort,"summary":"auto"})
-                }
-                Api::Anthropic => {
-                    if flag(model, "supportsAdaptiveThinking", false) {
-                        body["thinking"] = json!({"type":"adaptive"});
-                        body["output_config"] = json!({"effort":effort});
-                    } else {
-                        let budget = match effort {
-                            "minimal" | "low" => 1024,
-                            "medium" => 4096,
-                            _ => 8192,
-                        };
-                        if max_tokens > 1024 {
-                            body["thinking"] =
-                                json!({"type":"enabled","budget_tokens":budget.min(max_tokens-1)});
-                            body.as_object_mut().expect("object").remove("temperature");
-                        }
+        match api {
+            Api::Chat if flag(model, "supportsReasoningEffort", true) => {
+                body["reasoning_effort"] = json!(effort)
+            }
+            Api::Responses | Api::Codex | Api::Azure => {
+                body["reasoning"] = json!({"effort":effort,"summary":"auto"})
+            }
+            Api::Anthropic => {
+                if flag(model, "supportsAdaptiveThinking", false) {
+                    body["thinking"] = json!({"type":"adaptive"});
+                    body["output_config"] = json!({"effort":effort});
+                } else {
+                    let budget = match effort {
+                        "minimal" | "low" => 1024,
+                        "medium" => 4096,
+                        _ => 8192,
+                    };
+                    if max_tokens > 1024 {
+                        body["thinking"] =
+                            json!({"type":"enabled","budget_tokens":budget.min(max_tokens-1)});
+                        body.as_object_mut().expect("object").remove("temperature");
                     }
                 }
-                Api::Gemini => {
-                    body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts":true,"thinkingBudget":match effort{"minimal"|"low"=>1024,"medium"=>4096,_=>8192}})
-                }
-                Api::Ollama => body["think"] = json!(true),
-                _ => {}
             }
+            Api::Gemini => {
+                body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts":true,"thinkingBudget":match effort{"minimal"|"low"=>1024,"medium"=>4096,_=>8192}})
+            }
+            Api::Ollama => body["think"] = json!(true),
+            _ => {}
         }
     }
-    if let Some(tier) = &options.service_tier {
-        if matches!(api, Api::Chat | Api::Responses | Api::Codex) {
-            body["service_tier"] = json!(tier);
-        }
+    if let Some(tier) = &options.service_tier
+        && matches!(api, Api::Chat | Api::Responses | Api::Codex)
+    {
+        body["service_tier"] = json!(tier);
     }
     if model.supports_tools && !context.tools.is_empty() {
         match api {

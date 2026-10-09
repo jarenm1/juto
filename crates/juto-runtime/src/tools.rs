@@ -304,7 +304,7 @@ impl ReadTool {
                     byte_limited = true;
                 }
             }
-            if total_lines % 65536 == 0 {
+            if total_lines.is_multiple_of(65536) {
                 check_cancel(cancel)?;
             }
         }
@@ -634,7 +634,7 @@ impl Tool for GlobTool {
             let mut seen: u64 = 0;
             for entry in walker.build() {
                 seen += 1;
-                if seen % 256 == 0 && cancel.is_cancelled() {
+                if seen.is_multiple_of(256) && cancel.is_cancelled() {
                     return Err("cancelled".to_string());
                 }
                 let entry = match entry {
@@ -1055,10 +1055,10 @@ impl ProcessGroupGuard {
 
 impl Drop for ProcessGroupGuard {
     fn drop(&mut self) {
-        if self.active {
-            if let Some(pid) = self.pid {
-                kill_process_group(pid);
-            }
+        if self.active
+            && let Some(pid) = self.pid
+        {
+            kill_process_group(pid);
         }
     }
 }

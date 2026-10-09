@@ -133,33 +133,33 @@ impl Agent {
             }
 
             turns += 1;
-            if let Some(max) = self.config.max_turns {
-                if turns > max {
-                    let error = AgentError::TurnLimit(max);
-                    emit(
-                        &events,
-                        AgentEvent::Error {
-                            error: error.to_string(),
-                        },
-                    );
-                    self.finish(StopReason::Error, usage, turns, &events);
-                    break Err(error);
-                }
+            if let Some(max) = self.config.max_turns
+                && turns > max
+            {
+                let error = AgentError::TurnLimit(max);
+                emit(
+                    &events,
+                    AgentEvent::Error {
+                        error: error.to_string(),
+                    },
+                );
+                self.finish(StopReason::Error, usage, turns, &events);
+                break Err(error);
             }
             emit(&events, AgentEvent::TurnStart { turn: turns });
 
-            if let Some(hooks) = &self.hooks {
-                if let Err(reason) = hooks.before_model(&self.config.model, &self.context).await {
-                    let error = AgentError::HookRejected(reason);
-                    emit(
-                        &events,
-                        AgentEvent::Error {
-                            error: error.to_string(),
-                        },
-                    );
-                    self.finish(StopReason::Error, usage, turns, &events);
-                    break Err(error);
-                }
+            if let Some(hooks) = &self.hooks
+                && let Err(reason) = hooks.before_model(&self.config.model, &self.context).await
+            {
+                let error = AgentError::HookRejected(reason);
+                emit(
+                    &events,
+                    AgentEvent::Error {
+                        error: error.to_string(),
+                    },
+                );
+                self.finish(StopReason::Error, usage, turns, &events);
+                break Err(error);
             }
 
             let assistant = match self.stream_turn(&events, &control, &token).await {
@@ -537,10 +537,10 @@ impl Agent {
                         .unwrap_or_else(|| ToolOutput::error("Tool execution cancelled.")),
                     _ => ToolOutput::error("Tool execution cancelled."),
                 };
-                if !cancelled_now {
-                    if let (Planned::Immediate(_), Some(hooks)) = (&planned[i], &self.hooks) {
-                        hooks.after_tool(&calls[i], &output).await;
-                    }
+                if !cancelled_now
+                    && let (Planned::Immediate(_), Some(hooks)) = (&planned[i], &self.hooks)
+                {
+                    hooks.after_tool(&calls[i], &output).await;
                 }
                 let result = tool_result_message(&calls[i], &output);
                 emit(
@@ -573,15 +573,12 @@ async fn execute_one(
     ctx: ToolContext,
     cancel: CancellationToken,
 ) -> ToolOutput {
-    if let Some(hooks) = &hooks {
-        match hooks.before_tool(call, tool.tier(), cancel.clone()).await {
-            Err(reason) => {
-                let output = ToolOutput::error(format!("Tool call rejected: {reason}"));
-                hooks.after_tool(call, &output).await;
-                return output;
-            }
-            Ok(()) => {}
-        }
+    if let Some(hooks) = &hooks
+        && let Err(reason) = hooks.before_tool(call, tool.tier(), cancel.clone()).await
+    {
+        let output = ToolOutput::error(format!("Tool call rejected: {reason}"));
+        hooks.after_tool(call, &output).await;
+        return output;
     }
     let mut output = match tool.execute(call.arguments.clone(), ctx).await {
         Ok(output) => output,

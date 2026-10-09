@@ -578,9 +578,7 @@ fn decode_jwt_payload(token: &str) -> Option<Value> {
     let mut parts = token.split('.');
     parts.next()?;
     let payload = parts.next()?;
-    if parts.next().is_none() {
-        return None;
-    }
+    parts.next()?;
     let bytes = B64URL.decode(payload).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -945,6 +943,7 @@ impl CredentialStore {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(true)
                 .open(&lock_path)?;
             file.lock_exclusive()?;
             Ok(file)
@@ -960,6 +959,7 @@ impl CredentialStore {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(true)
             .open(&self.lock_path)?;
         file.lock_exclusive()?;
         Ok(file)
@@ -1151,12 +1151,12 @@ impl CredentialStore {
                 "could not find an authorization code in the pasted input".to_string(),
             )
         })?;
-        if let Some(state) = parsed.state {
-            if state != login.state {
-                return Err(AuthError::Callback(
-                    "State mismatch - possible CSRF attack".to_string(),
-                ));
-            }
+        if let Some(state) = parsed.state
+            && state != login.state
+        {
+            return Err(AuthError::Callback(
+                "State mismatch - possible CSRF attack".to_string(),
+            ));
         }
         // Providers may echo `code#state`; the fragment wins over the callback
         // state, matching the source exchange path.
@@ -1598,6 +1598,7 @@ fn policy_id(provider: &str) -> &'static str {
 
 /// `openai-codex-profile` hook: derive account/org identity from the access or
 /// id token's `https://api.openai.com/*` claims; login requires identity.
+#[allow(clippy::type_complexity)]
 fn apply_codex_profile(
     mapped: &mut MappedCredential,
     body: &Value,
@@ -1686,15 +1687,15 @@ fn parse_callback_input(input: &str) -> ParsedCallback {
     if value.is_empty() {
         return ParsedCallback::default();
     }
-    if value.contains("://") {
-        if let Some(query) = value.split_once('?').map(|(_, q)| q) {
-            let params = query_params(query);
-            if params.contains_key("code") || params.contains_key("state") {
-                return ParsedCallback {
-                    code: params.get("code").cloned(),
-                    state: params.get("state").cloned(),
-                };
-            }
+    if value.contains("://")
+        && let Some(query) = value.split_once('?').map(|(_, q)| q)
+    {
+        let params = query_params(query);
+        if params.contains_key("code") || params.contains_key("state") {
+            return ParsedCallback {
+                code: params.get("code").cloned(),
+                state: params.get("state").cloned(),
+            };
         }
     }
     if value.contains("code=") {
@@ -1750,10 +1751,10 @@ fn write_store_atomic(path: &Path, store: &StoreFile) -> Result<(), AuthError> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
     // Best-effort directory fsync so the rename itself is durable.
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
+    if let Some(parent) = path.parent()
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
     }
     Ok(())
 }
@@ -1856,6 +1857,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn env_api_key_fallback() {
         let _lock = ENV_LOCK.lock().unwrap();
         unsafe { std::env::set_var("ZENMUX_API_KEY", "env-key") };
@@ -1871,6 +1873,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn local_provider_no_env_returns_none() {
         let _lock = ENV_LOCK.lock().unwrap();
         unsafe { std::env::remove_var("OLLAMA_API_KEY") };
@@ -1880,6 +1883,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn anthropic_env_prefers_oauth_token() {
         let _lock = ENV_LOCK.lock().unwrap();
         unsafe {

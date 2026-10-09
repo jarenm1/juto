@@ -1,15 +1,19 @@
-//! In-memory chat UI. No provider, persistence, or agent execution is connected.
+//! Chat UI wired to the agent runtime and session persistence.
 
 use std::path::PathBuf;
-
-use gpui::{
-    App, ClickEvent, Context, Div, Entity, Focusable, KeyBinding, MouseButton, MouseDownEvent,
-    PathPromptOptions, ScrollHandle, SharedString, Subscription, Task, Window, actions, deferred,
-    div, prelude::*, px, rgb,
-};
+use std::sync::Arc;
 
 use crate::Quit;
 use crate::chat_input::{ChatInput, SubmitMessage};
+use gpui::{
+    App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding, MouseButton,
+    MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Subscription, Task,
+    Window, actions, deferred, div, prelude::*, px, rgb,
+};
+use juto_agent::{AgentEvent, RunControl, RunOutcome};
+use juto_ai::{Message as AiMessage, ProviderEvent, StopReason};
+use juto_runtime::{EntryKind, Runtime, Session};
+use tokio::sync::Mutex;
 
 actions!(chat, [CloseAttachmentMenu]);
 
@@ -21,14 +25,20 @@ pub fn init(cx: &mut App) {
     )]);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageRole {
+    User,
+    Assistant,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Attachment {
-    path: PathBuf,
-    label: SharedString,
+pub struct Attachment {
+    pub path: PathBuf,
+    pub label: SharedString,
 }
 
 impl Attachment {
-    fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf) -> Self {
         let label = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -41,7 +51,7 @@ impl Attachment {
 }
 
 /// Appends newly picked paths, keeping the first entry for any path already attached.
-fn add_attachments(attachments: &mut Vec<Attachment>, paths: Vec<PathBuf>) {
+pub fn add_attachments(attachments: &mut Vec<Attachment>, paths: Vec<PathBuf>) {
     for path in paths {
         if !attachments.iter().any(|attachment| attachment.path == path) {
             attachments.push(Attachment::new(path));
@@ -49,9 +59,59 @@ fn add_attachments(attachments: &mut Vec<Attachment>, paths: Vec<PathBuf>) {
     }
 }
 
-struct Message {
-    text: SharedString,
-    attachments: Vec<Attachment>,
+pub fn format_prompt(text: &str, attachments: &[Attachment]) -> String {
+    let mut prompt = String::new();
+    if !attachments.is_empty() {
+        prompt.push_str("Attached files:\n");
+        for attachment in attachments {
+            prompt.push_str(&format!("- {}\n", attachment.path.display()));
+        }
+        if !text.trim().is_empty() {
+            prompt.push('\n');
+        }
+    }
+    if !text.trim().is_empty() {
+        prompt.push_str(text);
+    }
+    prompt
+}
+
+pub fn load_messages(session: &Session) -> Vec<Message> {
+    let mut messages = Vec::new();
+    if let Ok(entries) = session.active_entries() {
+        for entry in entries {
+            if let EntryKind::Message { message } = &entry.kind {
+                match message {
+                    AiMessage::User { .. } => {
+                        messages.push(Message {
+                            role: MessageRole::User,
+                            text: message.text().into(),
+                            attachments: Vec::new(),
+                        });
+                    }
+                    AiMessage::Assistant(assistant) => {
+                        let text = assistant.text();
+                        if !text.is_empty() {
+                            messages.push(Message {
+                                role: MessageRole::Assistant,
+                                text: text.into(),
+                                attachments: Vec::new(),
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    messages
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Message {
+    pub role: MessageRole,
+    pub text: SharedString,
+    pub attachments: Vec<Attachment>,
 }
 
 pub struct ChatView {
@@ -63,11 +123,31 @@ pub struct ChatView {
     attachment_error: Option<SharedString>,
     picker: Option<Task<()>>,
     scroll: ScrollHandle,
+    runtime: Runtime,
+    session: Arc<Mutex<Session>>,
+    tokio_handle: tokio::runtime::Handle,
+    is_running: bool,
+    active_control: Option<RunControl>,
+    run_task: Option<Task<()>>,
     _subscriptions: [Subscription; 2],
 }
 
+impl Drop for ChatView {
+    fn drop(&mut self) {
+        if let Some(control) = self.active_control.take() {
+            control.cancel();
+        }
+    }
+}
+
 impl ChatView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        runtime: Runtime,
+        session: Session,
+        tokio_handle: tokio::runtime::Handle,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let input = cx.new(ChatInput::new);
         input.read(cx).focus_handle(cx).focus(window);
         let submitted =
@@ -75,22 +155,31 @@ impl ChatView {
                 this.send_message(window, cx);
             });
         let changed = cx.observe(&input, |_, _, cx| cx.notify());
+        let messages = load_messages(&session);
         Self {
             input,
-            messages: Vec::new(),
+            messages,
             attachments: Vec::new(),
             attachment_menu_open: false,
             menu_just_dismissed: false,
             attachment_error: None,
             picker: None,
             scroll: ScrollHandle::new(),
+            runtime,
+            session: Arc::new(Mutex::new(session)),
+            tokio_handle,
+            is_running: false,
+            active_control: None,
+            run_task: None,
             _subscriptions: [submitted, changed],
         }
     }
 
     fn can_send(&self, cx: &App) -> bool {
         let input = self.input.read(cx);
-        !input.is_composing() && (input.has_text() || !self.attachments.is_empty())
+        !self.is_running
+            && !input.is_composing()
+            && (input.has_text() || !self.attachments.is_empty())
     }
 
     fn focus_input(&self, window: &mut Window, cx: &App) {
@@ -102,15 +191,184 @@ impl ChatView {
             return;
         }
         let text = self.input.update(cx, |input, cx| input.take_text(cx));
+        let attachments = std::mem::take(&mut self.attachments);
+        let prompt = format_prompt(&text, &attachments);
+
         self.messages.push(Message {
+            role: MessageRole::User,
             text: if text.trim().is_empty() {
                 SharedString::default()
             } else {
                 text
             },
-            attachments: std::mem::take(&mut self.attachments),
+            attachments,
         });
         self.attachment_error = None;
+        self.scroll.scroll_to_bottom();
+        self.focus_input(window, cx);
+        self.is_running = true;
+
+        let control = RunControl::new();
+        self.active_control = Some(control.clone());
+        let runtime = self.runtime.clone();
+        let session = self.session.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let run_future = tokio_handle.spawn(async move {
+            let mut session_guard = session.lock().await;
+            runtime
+                .run(&mut session_guard, prompt, events_tx, control)
+                .await
+        });
+
+        self.run_task = Some(cx.spawn_in(window, async move |this, cx| {
+            while let Some(event) = events_rx.recv().await {
+                let updated = this.update_in(cx, |this, _window, cx| {
+                    this.handle_agent_event(event, cx);
+                });
+                if updated.is_err() {
+                    break;
+                }
+            }
+
+            let outcome = run_future.await;
+            this.update_in(cx, |this, window, cx| {
+                this.finish_run(outcome, window, cx);
+            })
+            .ok();
+        }));
+
+        cx.notify();
+    }
+
+    fn handle_agent_event(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
+        match event {
+            AgentEvent::MessageStart => {
+                self.messages.push(Message {
+                    role: MessageRole::Assistant,
+                    text: SharedString::default(),
+                    attachments: Vec::new(),
+                });
+                self.scroll.scroll_to_bottom();
+                cx.notify();
+            }
+            AgentEvent::MessageUpdate {
+                event: ProviderEvent::TextDelta { delta, .. },
+            } => {
+                if let Some(last) = self.messages.last_mut()
+                    && last.role == MessageRole::Assistant
+                {
+                    let mut text = last.text.to_string();
+                    text.push_str(&delta);
+                    last.text = text.into();
+                    self.scroll.scroll_to_bottom();
+                    cx.notify();
+                }
+            }
+            AgentEvent::MessageEnd { message } => {
+                let text = message.text();
+                if let Some(last) = self.messages.last_mut()
+                    && last.role == MessageRole::Assistant
+                {
+                    last.text = text.into();
+                    self.scroll.scroll_to_bottom();
+                    cx.notify();
+                }
+            }
+            AgentEvent::Error { error } => {
+                let error_text = format!("Error: {error}");
+                if let Some(last) = self.messages.last_mut() {
+                    if last.role == MessageRole::Assistant && last.text.is_empty() {
+                        last.text = error_text.into();
+                    } else if last.role == MessageRole::Assistant {
+                        let mut text = last.text.to_string();
+                        text.push_str(&format!("\n\n{error_text}"));
+                        last.text = text.into();
+                    } else {
+                        self.messages.push(Message {
+                            role: MessageRole::Assistant,
+                            text: error_text.into(),
+                            attachments: Vec::new(),
+                        });
+                    }
+                } else {
+                    self.messages.push(Message {
+                        role: MessageRole::Assistant,
+                        text: error_text.into(),
+                        attachments: Vec::new(),
+                    });
+                }
+                self.scroll.scroll_to_bottom();
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_run(
+        &mut self,
+        outcome: Result<Result<RunOutcome, anyhow::Error>, tokio::task::JoinError>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.is_running = false;
+        self.active_control = None;
+        self.run_task = None;
+        match outcome {
+            Ok(Ok(outcome)) => {
+                if outcome.stop_reason == StopReason::Aborted
+                    && let Some(last) = self.messages.last_mut()
+                    && last.role == MessageRole::Assistant
+                {
+                    let mut text = last.text.to_string();
+                    if !text.is_empty() {
+                        text.push_str("\n\n[Run cancelled]");
+                    } else {
+                        text.push_str("[Run cancelled]");
+                    }
+                    last.text = text.into();
+                } else if outcome.stop_reason == StopReason::Error
+                    && let Some(last) = self.messages.last_mut()
+                    && last.role == MessageRole::Assistant
+                    && last.text.is_empty()
+                {
+                    last.text = "Error: Run failed".into();
+                }
+            }
+            Ok(Err(err)) => {
+                let error_msg = format!("Error: {err}");
+                if let Some(last) = self.messages.last_mut() {
+                    if last.role == MessageRole::Assistant && last.text.is_empty() {
+                        last.text = error_msg.into();
+                    } else if last.role == MessageRole::Assistant {
+                        let mut text = last.text.to_string();
+                        text.push_str(&format!("\n\n{error_msg}"));
+                        last.text = text.into();
+                    } else {
+                        self.messages.push(Message {
+                            role: MessageRole::Assistant,
+                            text: error_msg.into(),
+                            attachments: Vec::new(),
+                        });
+                    }
+                } else {
+                    self.messages.push(Message {
+                        role: MessageRole::Assistant,
+                        text: error_msg.into(),
+                        attachments: Vec::new(),
+                    });
+                }
+            }
+            Err(join_err) => {
+                let error_msg = format!("Error: Task panicked or was cancelled: {join_err}");
+                self.messages.push(Message {
+                    role: MessageRole::Assistant,
+                    text: error_msg.into(),
+                    attachments: Vec::new(),
+                });
+            }
+        }
         self.scroll.scroll_to_bottom();
         self.focus_input(window, cx);
         cx.notify();
@@ -221,7 +479,7 @@ impl ChatView {
                                     div()
                                         .text_xs()
                                         .text_color(rgb(0x808080))
-                                        .child("Agent runtime is not connected."),
+                                        .child("Agent runtime connected."),
                                 ),
                         )
                     })
@@ -465,6 +723,10 @@ fn menu_item(
 }
 
 fn message_row(index: usize, message: &Message) -> impl IntoElement {
+    let author = match message.role {
+        MessageRole::User => "You",
+        MessageRole::Assistant => "Assistant",
+    };
     div()
         .id(("message", index))
         .flex_none()
@@ -475,7 +737,7 @@ fn message_row(index: usize, message: &Message) -> impl IntoElement {
                 .mb_2()
                 .text_xs()
                 .text_color(rgb(0xa0a0a0))
-                .child("You"),
+                .child(author),
         )
         .when(!message.text.is_empty(), |row| {
             row.child(
@@ -541,5 +803,64 @@ mod tests {
             labels(&attachments),
             ["notes.md", "plan.txt", "diagram.png"]
         );
+    }
+
+    #[test]
+    fn prompt_formatting_combines_attachments_and_text() {
+        let attachments = vec![
+            Attachment::new("/tmp/alpha.rs".into()),
+            Attachment::new("/tmp/beta.txt".into()),
+        ];
+        let formatted = format_prompt("Explain this code", &attachments);
+        assert_eq!(
+            formatted,
+            "Attached files:\n- /tmp/alpha.rs\n- /tmp/beta.txt\n\nExplain this code"
+        );
+
+        let attachments_only = format_prompt("", &attachments);
+        assert_eq!(
+            attachments_only,
+            "Attached files:\n- /tmp/alpha.rs\n- /tmp/beta.txt\n"
+        );
+
+        let text_only = format_prompt("Hello world", &[]);
+        assert_eq!(text_only, "Hello world");
+    }
+
+    #[test]
+    fn load_messages_extracts_user_and_assistant_history() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut session = Session::create(temp_dir.path(), &cwd).unwrap();
+        session
+            .append(EntryKind::Message {
+                message: AiMessage::user("Hello from user"),
+            })
+            .unwrap();
+        let assistant = juto_ai::AssistantMessage {
+            content: vec![juto_ai::ContentBlock::Text {
+                text: "Hello from assistant".into(),
+            }],
+            api: "test".into(),
+            provider: "test".into(),
+            model: "test-model".into(),
+            usage: Default::default(),
+            stop_reason: StopReason::Stop,
+            timestamp: 0,
+            response_id: None,
+            error: None,
+        };
+        session
+            .append(EntryKind::Message {
+                message: AiMessage::Assistant(assistant),
+            })
+            .unwrap();
+
+        let messages = load_messages(&session);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[0].text.as_ref(), "Hello from user");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+        assert_eq!(messages[1].text.as_ref(), "Hello from assistant");
     }
 }
