@@ -13,6 +13,6 @@ juto-ai.workspace = true
 juto-catalog.workspace = true
 juto-runtime.workspace = true
 tokio.workspace = true
-
+tokio-util.workspace = true
 [dev-dependencies]
 tempfile.workspace = true

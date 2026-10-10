@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::Quit;
+use crate::auth_modal::{AuthModal, AuthModalEvent};
 use crate::chat_input::{ChatInput, SubmitMessage};
+use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use gpui::{
     App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding, MouseButton,
     MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Subscription, Task,
@@ -15,14 +17,26 @@ use juto_ai::{Message as AiMessage, ProviderEvent, StopReason};
 use juto_runtime::{EntryKind, Runtime, Session};
 use tokio::sync::Mutex;
 
-actions!(chat, [CloseAttachmentMenu]);
+actions!(
+    chat,
+    [CloseAttachmentMenu, ToggleModelPicker, ToggleAuthModal]
+);
 
 pub fn init(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new(
-        "escape",
-        CloseAttachmentMenu,
-        Some("ChatView"),
-    )]);
+    cx.bind_keys([
+        KeyBinding::new("escape", CloseAttachmentMenu, Some("ChatView")),
+        KeyBinding::new("ctrl-m", ToggleModelPicker, None),
+        KeyBinding::new("cmd-m", ToggleModelPicker, None),
+        KeyBinding::new("ctrl-p", ToggleAuthModal, None),
+        KeyBinding::new("cmd-p", ToggleAuthModal, None),
+    ]);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveModal {
+    None,
+    ModelPicker,
+    AuthModal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -116,6 +130,10 @@ pub struct Message {
 
 pub struct ChatView {
     input: Entity<ChatInput>,
+    model_picker: Entity<ModelPicker>,
+    auth_modal: Entity<AuthModal>,
+    active_modal: ActiveModal,
+    active_model: SharedString,
     messages: Vec<Message>,
     attachments: Vec<Attachment>,
     attachment_menu_open: bool,
@@ -129,9 +147,8 @@ pub struct ChatView {
     is_running: bool,
     active_control: Option<RunControl>,
     run_task: Option<Task<()>>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 4],
 }
-
 impl Drop for ChatView {
     fn drop(&mut self) {
         if let Some(control) = self.active_control.take() {
@@ -150,14 +167,53 @@ impl ChatView {
     ) -> Self {
         let input = cx.new(ChatInput::new);
         input.read(cx).focus_handle(cx).focus(window);
+        let initial_model = if runtime.config().model.is_empty() {
+            "anthropic/claude-sonnet-4-5".to_string()
+        } else {
+            runtime.config().model.clone()
+        };
+        let model_picker =
+            cx.new(|cx| ModelPicker::new(&initial_model, runtime.config(), runtime.catalog(), cx));
+        let auth_modal = cx.new(|cx| AuthModal::new(runtime.clone(), tokio_handle.clone(), cx));
+
         let submitted =
             cx.subscribe_in(&input, window, |this, _, _: &SubmitMessage, window, cx| {
                 this.send_message(window, cx);
             });
         let changed = cx.observe(&input, |_, _, cx| cx.notify());
+
+        let model_picker_sub = cx.subscribe_in(
+            &model_picker,
+            window,
+            |this, _, event: &ModelPickerEvent, window, cx| match event {
+                ModelPickerEvent::SelectModel(selector) => {
+                    this.set_model(selector.clone(), window, cx);
+                }
+                ModelPickerEvent::Close => {
+                    this.close_modal(window, cx);
+                }
+            },
+        );
+        let auth_modal_sub = cx.subscribe_in(
+            &auth_modal,
+            window,
+            |this, _, event: &AuthModalEvent, window, cx| match event {
+                AuthModalEvent::Close => {
+                    this.close_modal(window, cx);
+                }
+                AuthModalEvent::CredentialsChanged => {
+                    cx.notify();
+                }
+            },
+        );
+
         let messages = load_messages(&session);
         Self {
             input,
+            model_picker,
+            auth_modal,
+            active_modal: ActiveModal::None,
+            active_model: initial_model.into(),
             messages,
             attachments: Vec::new(),
             attachment_menu_open: false,
@@ -171,8 +227,42 @@ impl ChatView {
             is_running: false,
             active_control: None,
             run_task: None,
-            _subscriptions: [submitted, changed],
+            _subscriptions: [submitted, changed, model_picker_sub, auth_modal_sub],
         }
+    }
+
+    pub fn set_model(&mut self, selector: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_model = selector.clone().into();
+        self.model_picker.update(cx, |picker, cx| {
+            picker.set_active_model(&selector, cx);
+        });
+        let runtime = self.runtime.clone();
+        let session = self.session.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        let sel = selector.clone();
+        tokio_handle.spawn(async move {
+            let mut session_guard = session.lock().await;
+            let _ = runtime.switch_model(&mut session_guard, &sel);
+        });
+        self.close_modal(window, cx);
+    }
+
+    pub fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_modal = ActiveModal::ModelPicker;
+        self.model_picker.read(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    pub fn open_auth_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_modal = ActiveModal::AuthModal;
+        self.auth_modal.read(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    pub fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_modal = ActiveModal::None;
+        self.focus_input(window, cx);
+        cx.notify();
     }
 
     fn can_send(&self, cx: &App) -> bool {
@@ -424,22 +514,85 @@ impl ChatView {
         }));
     }
 
-    fn header(&self) -> impl IntoElement {
+    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .items_center()
+            .justify_between()
             .flex_none()
             .px_6()
-            .py_4()
+            .py_3p5()
             .border_b_1()
             .border_color(rgb(0x333333))
+            .bg(rgb(0x1a1a1a))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_3()
-                    .child(div().text_size(px(21.)).child("Juto"))
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("Juto"),
+                    )
                     .child(div().text_sm().text_color(rgb(0xa0a0a0)).child("Chat")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("header-model-btn")
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .px_3()
+                            .py_1p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(0x3f3f46))
+                            .bg(rgb(0x27272a))
+                            .text_xs()
+                            .text_color(rgb(0xe4e4e7))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x3f3f46)).border_color(rgb(0x52525b)))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                if this.active_modal == ActiveModal::ModelPicker {
+                                    this.close_modal(window, cx);
+                                } else {
+                                    this.open_model_picker(window, cx);
+                                }
+                            }))
+                            .child(format!("🤖 {} ▾", self.active_model)),
+                    )
+                    .child(
+                        div()
+                            .id("header-auth-btn")
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .px_3()
+                            .py_1p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(0x3f3f46))
+                            .bg(rgb(0x27272a))
+                            .text_xs()
+                            .text_color(rgb(0xd4d4d8))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x3f3f46)).text_color(rgb(0xffffff)))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                if this.active_modal == ActiveModal::AuthModal {
+                                    this.close_modal(window, cx);
+                                } else {
+                                    this.open_auth_modal(window, cx);
+                                }
+                            }))
+                            .child("🔑 Providers & Keys"),
+                    ),
             )
     }
 
@@ -771,9 +924,31 @@ impl Render for ChatView {
             .key_context("ChatView")
             .on_action(|_: &Quit, _, cx| cx.quit())
             .on_action(cx.listener(Self::close_attachment_menu))
-            .child(self.header())
-            .child(self.message_list())
-            .child(self.composer(window, cx))
+            .on_action(cx.listener(|this, _: &ToggleModelPicker, window, cx| {
+                if this.active_modal == ActiveModal::ModelPicker {
+                    this.close_modal(window, cx);
+                } else {
+                    this.open_model_picker(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ToggleAuthModal, window, cx| {
+                if this.active_modal == ActiveModal::AuthModal {
+                    this.close_modal(window, cx);
+                } else {
+                    this.open_auth_modal(window, cx);
+                }
+            }))
+            .when(self.active_modal == ActiveModal::ModelPicker, |view| {
+                view.child(self.model_picker.clone())
+            })
+            .when(self.active_modal == ActiveModal::AuthModal, |view| {
+                view.child(self.auth_modal.clone())
+            })
+            .when(self.active_modal == ActiveModal::None, |view| {
+                view.child(self.header(cx))
+                    .child(self.message_list())
+                    .child(self.composer(window, cx))
+            })
     }
 }
 

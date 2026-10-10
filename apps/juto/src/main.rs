@@ -1,8 +1,10 @@
 //! Juto's native chat interface wired to the agent runtime.
 
+mod auth_modal;
 mod chat;
 mod chat_input;
-
+mod model_picker;
+mod text_input;
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -134,6 +136,9 @@ fn run() -> ExitCode {
     Application::new().run(move |cx: &mut App| {
         chat::init(cx);
         chat_input::init(cx);
+        text_input::init(cx);
+        model_picker::init(cx);
+        auth_modal::init(cx);
         cx.bind_keys([
             KeyBinding::new("ctrl-q", Quit, None),
             KeyBinding::new("cmd-q", Quit, None),
