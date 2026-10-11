@@ -37,9 +37,12 @@ pub struct TaskSpec {
     /// Registry selector (`provider/model`) overriding the factory's base model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// When set, the child must answer with JSON validating against this schema.
+    /// Optional JSON Schema used to validate the child's structured result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<Value>,
+    /// Validation policy for `output_schema`; defaults to strict enforcement.
+    #[serde(default)]
+    pub schema_mode: SchemaMode,
     /// Deny Write/Exec-tier tools to the child.
     #[serde(default)]
     pub read_only: bool,
@@ -51,6 +54,17 @@ pub struct TaskSpec {
     pub solution_space: Option<String>,
 }
 
+/// Policy for enforcing a task's declared structured-output schema.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaMode {
+    /// Fail the child when its structured result is absent or invalid.
+    #[default]
+    Strict,
+    /// Preserve the child result even when structured data is absent or invalid.
+    Permissive,
+}
+
 impl TaskSpec {
     pub fn new(task: impl Into<String>) -> Self {
         Self {
@@ -58,6 +72,7 @@ impl TaskSpec {
             task: task.into(),
             model: None,
             output_schema: None,
+            schema_mode: SchemaMode::default(),
             read_only: false,
             isolated_workspace: false,
             solution_space: None,
@@ -764,15 +779,16 @@ async fn run_child(
 
     // Enforce declared output schemas against whatever the factory produced;
     // a completed child still fails when its data is absent or invalid.
-    let outcome = match (validator, outcome) {
-        (Some(validator), Ok(result)) => match &result.data {
+    let outcome = match (validator, child.spec.schema_mode, outcome) {
+        (Some(validator), SchemaMode::Strict, Ok(result)) => match &result.data {
             Some(data) => match validator.validate(data) {
                 Ok(()) => Ok(result),
                 Err(err) => Err(format!("output schema violation: {err}")),
             },
             None => Err("child produced no structured output for output_schema".into()),
         },
-        (_, outcome) => outcome,
+        (_, SchemaMode::Permissive, outcome) | (None, SchemaMode::Strict, outcome) => outcome,
+        (Some(_), SchemaMode::Strict, Err(err)) => Err(err),
     };
 
     let cancelled = control.token().is_cancelled() || inner.parent_cancel.is_cancelled();
@@ -867,6 +883,7 @@ mod tests {
             task: task.to_string(),
             model: None,
             output_schema: None,
+            schema_mode: SchemaMode::default(),
             read_only: false,
             isolated_workspace: false,
             solution_space: None,
@@ -1260,6 +1277,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permissive_output_schema_preserves_invalid_structured_data() {
+        let (gate, gate_rx) = gate();
+        let manager = manager(
+            gate_factory(
+                gate_rx,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                Some(serde_json::json!({"count": "three"})),
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        let mut task = spec("permissive data");
+        task.output_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": {"count": {"type": "integer"}},
+            "required": ["count"]
+        }));
+        task.schema_mode = SchemaMode::Permissive;
+        let id = manager.spawn(task).expect("spawn child");
+        gate.send(true).expect("release child");
+
+        let result = manager.wait(&id).await.expect("permissive result rejected");
+        assert_eq!(result.data, Some(serde_json::json!({"count": "three"})));
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn permissive_output_schema_allows_missing_structured_data() {
+        let (gate, gate_rx) = gate();
+        let manager = manager(
+            gate_factory(
+                gate_rx,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        let mut task = spec("permissive missing data");
+        task.output_schema = Some(serde_json::json!({"type": "object"}));
+        task.schema_mode = SchemaMode::Permissive;
+        let id = manager.spawn(task).expect("spawn child");
+        gate.send(true).expect("release child");
+
+        let result = manager.wait(&id).await.expect("missing data rejected");
+        assert!(result.data.is_none());
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Completed));
+    }
+
+    #[tokio::test]
     async fn factory_failure_is_terminal_and_waitable() {
         let (gate, gate_rx) = gate();
         let manager = manager(
@@ -1385,6 +1456,7 @@ mod tests {
     fn task_spec_round_trips_and_defaults() {
         let parsed: TaskSpec = serde_json::from_str(r#"{"task":"do it"}"#).unwrap();
         assert_eq!(parsed.task, "do it");
+        assert_eq!(parsed.schema_mode, SchemaMode::Strict);
         assert!(parsed.name.is_none() && parsed.model.is_none());
         assert!(parsed.output_schema.is_none() && !parsed.read_only);
         assert!(!parsed.isolated_workspace && parsed.solution_space.is_none());
@@ -1395,12 +1467,14 @@ mod tests {
         full.isolated_workspace = true;
         full.solution_space = Some("exact fix".into());
         full.output_schema = Some(serde_json::json!({"type": "string"}));
+        full.schema_mode = SchemaMode::Permissive;
         let round: TaskSpec = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
         assert!(round.read_only);
         assert!(round.isolated_workspace);
         assert_eq!(round.solution_space.as_deref(), Some("exact fix"));
         assert_eq!(round.name.as_deref(), Some("named"));
         assert!(round.output_schema.is_some());
+        assert_eq!(round.schema_mode, SchemaMode::Permissive);
     }
 
     #[test]
