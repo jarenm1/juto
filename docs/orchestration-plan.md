@@ -180,6 +180,10 @@ Subagents coordinate as specialized coworkers rather than an uncontrolled group 
   * Peer communication uses an internal URI/bus pattern (`agent://<id>`, `history://<id>`).
     A reviewer can directly inspect `history://<builder-id>` to see why a decision was
     made without re-running the builder's analysis.
+  * `agent://<id>` reads status/output and sends steering messages; `agent://all` broadcasts
+    to live children and reports per-child failures.
+  * `history://<id>` reads the active journal entries for a successfully completed child.
+    The URI resolves through the subagent result; it is never treated as a filesystem path.
 
 ---
 
@@ -290,7 +294,7 @@ Traditional PRs lose the reasoning behind changes. Inspired by Zed Delta:
 
 ## 7. Concurrent Workstream Slices for Parallel Agent Execution
 
-To build this rapidly, the architecture is decoupled into five independent slices with
+To build this rapidly, the architecture is decoupled into six independent slices with
 **zero overlapping file ownership**. Each slice has an explicit contract, can be
 implemented by a dedicated subagent concurrently, and validates against its own tests.
 
@@ -396,3 +400,22 @@ implemented by a dedicated subagent concurrently, and validates against its own 
   - Enforces the quality gate before signaling `Completed`.
 * **Acceptance**: End-to-end unit test with mock subagent factories verifying the DAG
   orchestration from initial prompt through peer review to final completion.
+
+### Slice F: Peer Messaging & Session History URIs
+* **File Ownership**: `crates/juto-runtime/src/peers.rs`, `crates/juto-runtime/src/lib.rs`
+* **Interface Contract**:
+  ```rust
+  pub struct PeerBus { /* shared SubagentManager */ }
+  impl PeerBus {
+      pub fn send(&self, uri: &str, message: impl Into<String>)
+          -> Result<PeerSendReport, PeerError>;
+      pub fn read(&self, uri: &str) -> Result<PeerResource, PeerError>;
+  }
+  ```
+* **Implementation Details**:
+  - `agent://<id>` exposes a child status/result snapshot and accepts steering messages.
+  - `agent://all` broadcasts to live children; individual failures do not stop delivery.
+  - `history://<id>` reads a completed child's active session journal via the manager's
+    result path; unsupported, malformed, unknown, and unavailable resources fail explicitly.
+* **Acceptance**: Tests cover completed output and transcript reads, active-child broadcast
+  selection, malformed/read-only URIs, and history availability before completion.
