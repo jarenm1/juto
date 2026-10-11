@@ -46,3 +46,6 @@ Full detailed specification: [`docs/orchestration-plan.md`](docs/orchestration-p
 - [x] **Slice E: End-to-End Orchestrator & Peer Review DAG**
   - *Files*: `crates/juto-runtime/src/orchestrator.rs`
   - *Scope*: Manager DAG pipeline, Jev routing hook, Builder $\to$ Reviewer handoff, verification quality gates.
+- [x] **Slice F: Peer Messaging & Session History URIs**
+  - *Files*: `crates/juto-runtime/src/peers.rs`
+  - *Scope*: `agent://<id>` status/output reads and steering, `agent://all` live-child broadcast, and read-only `history://<id>` session journals.

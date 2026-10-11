@@ -4,6 +4,7 @@
 pub mod config;
 pub mod context;
 pub mod orchestrator;
+pub mod peers;
 pub mod session;
 pub mod subagents;
 pub mod tools;
@@ -37,6 +38,9 @@ pub use orchestrator::{
     OrchestratorConfig, OrchestratorError, OrchestratorEvent, PipelinePhase, QualityGateKind,
     QualityGateRunner, QualityGateSpec, ReviewVerdict, RuleBasedJudge, ScriptedJudge, TaskOutcome,
     VerificationReport,
+};
+pub use peers::{
+    PeerAgentSnapshot, PeerBus, PeerError, PeerResource, PeerSendFailure, PeerSendReport,
 };
 pub use session::{EntryKind, Session};
 pub use subagents::{
