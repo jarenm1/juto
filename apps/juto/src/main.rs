@@ -4,6 +4,8 @@ mod auth_modal;
 mod chat;
 mod chat_input;
 mod model_picker;
+mod sidebar;
+mod task_card;
 mod text_input;
 use std::env;
 use std::path::PathBuf;
@@ -139,6 +141,8 @@ fn run() -> ExitCode {
         text_input::init(cx);
         model_picker::init(cx);
         auth_modal::init(cx);
+        sidebar::init(cx);
+        task_card::init(cx);
         cx.bind_keys([
             KeyBinding::new("ctrl-q", Quit, None),
             KeyBinding::new("cmd-q", Quit, None),

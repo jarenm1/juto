@@ -40,7 +40,7 @@ Full detailed specification: [`docs/orchestration-plan.md`](docs/orchestration-p
 - [x] **Slice C: Subagent State Machine & Blocker Protocol**
   - *Files*: `crates/juto-runtime/src/subagents.rs`
   - *Scope*: Add `Blocked`, `Verifying`, `Reviewing` to `SubagentStatus`, pause/resume escalation channel, `TaskSpec` extensions.
-- [ ] **Slice D: GPUI Sidebar Mission Control & Diff Cards**
+- [x] **Slice D: GPUI Sidebar Mission Control & Diff Cards**
   - *Files*: `apps/juto/src/sidebar.rs`, `apps/juto/src/task_card.rs`
   - *Scope*: Sidebar view, task status badges, expandable duration/token cards, live diff viewer, steering buttons.
 - [ ] **Slice E: End-to-End Orchestrator & Peer Review DAG**
