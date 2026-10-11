@@ -214,16 +214,14 @@ To prevent parallel agents from exhausting host memory, CPU, or lock contention:
    * Automated visual tests use headless software Vulkan (Mesa / Xvfb) to avoid blocking
      the host GPU.
 
-### 4.3 Repository Rule Initialization & Adaptation
-To work seamlessly across diverse repositories:
-* **`juto init` / Auto-Discovery**:
-  On opening a repo, Juto inspects the environment to build an execution profile:
-  - Detects VCS (`jj`, `git`).
-  - Detects resource manager (`systemd-run`, Docker, bare process).
-  - Detects build/test tools (`nix develop`, `cargo`, `pnpm`, `pytest`).
-  - Reads repo instructions (`AGENTS.md`, `CLAUDE.md`, `.cursorrules`).
-* Subagent tool execution transparently wraps shell commands with the appropriate
-  isolation wrappers.
+### 4.3 Repository Setup Skill
+The harness installs the `juto-repo-setup` skill in its global skill directory.
+When onboarding a target repository, the skill directs the agent to inspect repository
+instructions, identify its supported VCS, development environment, and build/test
+commands, and document the Juto workspace, resource-scope, and verification workflow.
+The skill reuses repository conventions and requests approval before changing project
+files or installing dependencies; it does not synthesize an execution profile or
+transparently wrap commands.
 
 ---
 
