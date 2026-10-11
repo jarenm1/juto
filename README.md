@@ -172,9 +172,10 @@ scripts/agent-scope.sh -- nix develop . -c cargo clippy --workspace --all-target
 ```
 
 `flake check --no-build` verifies flake evaluation, not an application build.
-There is no packaged `nix build`/`nix run` target yet. Unit tests cover Unicode
-platform text offsets and IME selection positioning; native interaction still
-needs a real-window smoke.
+Build or run the packaged application with `nix build .#default` or
+`nix run .#default`. For a headless native-window smoke, see the
+`devShells.smoke` instructions below; that exercises the development binary,
+not the packaged artifact.
 
 For a headless **native-window** check, `devShells.smoke` supplies Xvfb, xdotool,
 ImageMagick, Python, a DejaVu font configuration, and a pinned Mesa software
