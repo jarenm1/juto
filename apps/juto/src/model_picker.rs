@@ -346,7 +346,7 @@ impl ModelPicker {
                     .px_2().py_1().border_t_1().border_color(rgb(0x303030)).text_xs()
                     .child(div().w(px(88.)).text_color(rgb(0xd4d4d8)).child(provider_label(&role.role)))
                     .child(div().flex_1().min_w_0().text_color(if target.is_some() { rgb(0xe4e4e7) } else { rgb(0x888888) }).truncate().child(model_name));
-                if let Some(target) = target {
+                if let Some(target) = target.filter(|target| self.data.available.contains(target)) {
                     row.cursor_pointer().hover(|style| style.bg(rgb(0x292929)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.select_model(target.clone(), cx)))
                 } else { row }
@@ -383,7 +383,7 @@ impl Render for ModelPicker {
                         .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.emit(ModelPickerEvent::Close))).child("×")))
                 .child(div().p_3().child(self.search_input.clone()))
                 .child(self.columns_header())
-                .child(div().px_3().pb_2().flex_1().min_h_0()
+                .child(div().pb_2().flex_1().min_h_0()
                      .when(message.is_some(), |list| list.child(div().flex().items_center().justify_center().h_full()
                         .text_sm().text_color(rgb(0xaaaaaa)).child(message.clone().unwrap_or_default())))
                     .when(!self.data.filtered.is_empty(), |list| list.child(uniform_list("model-list", self.data.filtered.len(),
