@@ -43,6 +43,50 @@ pub struct TaskSpec {
     /// Deny Write/Exec-tier tools to the child.
     #[serde(default)]
     pub read_only: bool,
+    /// Dedicated Jujutsu workspace requested.
+    #[serde(default)]
+    pub isolated_workspace: bool,
+    /// Open-endedness / problem-solving guidance for the child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solution_space: Option<String>,
+}
+
+impl TaskSpec {
+    pub fn new(task: impl Into<String>) -> Self {
+        Self {
+            name: None,
+            task: task.into(),
+            model: None,
+            output_schema: None,
+            read_only: false,
+            isolated_workspace: false,
+            solution_space: None,
+        }
+    }
+}
+
+/// Taxonomy of blocker reasons reported by a suspended subagent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockerReason {
+    UserInput,
+    Credential,
+    Environment,
+    Approval,
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl fmt::Display for BlockerReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UserInput => write!(f, "user_input"),
+            Self::Credential => write!(f, "credential"),
+            Self::Environment => write!(f, "environment"),
+            Self::Approval => write!(f, "approval"),
+            Self::Custom(s) => write!(f, "{s}"),
+        }
+    }
 }
 
 /// Terminal result of a finished child run.
@@ -64,19 +108,29 @@ pub struct SubagentResult {
 }
 
 /// Lifecycle status of a spawned child.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubagentStatus {
     Queued,
     Running,
+    Blocked {
+        reason: BlockerReason,
+        prompt: String,
+    },
+    Verifying,
+    Reviewing,
     Completed,
     Failed,
     Cancelled,
 }
 
 impl SubagentStatus {
-    pub fn is_terminal(self) -> bool {
+    pub fn is_terminal(&self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+
+    pub fn is_blocked(&self) -> bool {
+        matches!(self, Self::Blocked { .. })
     }
 }
 
@@ -100,11 +154,11 @@ pub struct SubagentSummary {
 
 /// Errors surfaced by [`SubagentManager`]. Distinct variants preserve the
 /// explicit terminal statuses instead of collapsing them into strings.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubagentError {
     /// No child with this id was ever spawned.
     Unknown(String),
-    /// `send`/`wait` targeted a child that already reached a terminal state.
+    /// `send`/`wait`/`block` targeted a child that already reached a terminal state.
     Terminal(SubagentStatus),
     /// The child run failed; the payload is the child's error.
     Failed(String),
@@ -114,17 +168,34 @@ pub enum SubagentError {
     InvalidSpec(String),
     /// `spawn` was called outside a Tokio runtime.
     NoRuntime,
+    /// Child was not in the blocked state when unblock was attempted.
+    NotBlocked(String),
+    /// Child was already blocked when block was attempted.
+    AlreadyBlocked(String),
+    /// Invalid state transition attempted.
+    InvalidTransition {
+        from: SubagentStatus,
+        to: SubagentStatus,
+    },
+    /// Operation timed out.
+    Timeout(String),
 }
 
 impl fmt::Display for SubagentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Unknown(id) => write!(f, "unknown subagent id: {id}"),
-            Self::Terminal(status) => write!(f, "subagent already {status:?}"),
+            Self::Terminal(status) => write!(f, "subagent already terminal: {status:?}"),
             Self::Failed(err) => write!(f, "subagent failed: {err}"),
             Self::Cancelled => write!(f, "subagent cancelled"),
             Self::InvalidSpec(err) => write!(f, "invalid task spec: {err}"),
             Self::NoRuntime => write!(f, "no Tokio runtime available for spawn"),
+            Self::NotBlocked(id) => write!(f, "subagent {id} is not blocked"),
+            Self::AlreadyBlocked(id) => write!(f, "subagent {id} is already blocked"),
+            Self::InvalidTransition { from, to } => {
+                write!(f, "invalid transition from {from:?} to {to:?}")
+            }
+            Self::Timeout(msg) => write!(f, "subagent operation timed out: {msg}"),
         }
     }
 }
@@ -146,18 +217,21 @@ pub trait SubagentFactory: Send + Sync {
 }
 
 /// Snapshot a child exposes to waiters; the watch channel guarantees every
-/// waiter sees the latest terminal state even if it subscribed late.
+/// waiter sees the latest state even if it subscribed late.
 #[derive(Debug, Clone)]
-struct ChildState {
-    status: SubagentStatus,
+pub struct ChildState {
+    pub status: SubagentStatus,
     /// `Some` once the factory returned, regardless of success.
-    outcome: Option<Result<SubagentResult, String>>,
+    pub outcome: Option<Result<SubagentResult, String>>,
 }
 
 struct Child {
     spec: TaskSpec,
     control: RunControl,
     state: watch::Sender<ChildState>,
+    status_tx: watch::Sender<SubagentStatus>,
+    resolution_tx: Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
+    resolution_rx: Mutex<Option<tokio::sync::oneshot::Receiver<String>>>,
 }
 
 struct Inner {
@@ -212,10 +286,14 @@ impl SubagentManager {
             status: SubagentStatus::Queued,
             outcome: None,
         });
+        let (status_tx, _) = watch::channel(SubagentStatus::Queued);
         let child = Arc::new(Child {
             spec,
             control: control.clone(),
             state,
+            status_tx,
+            resolution_tx: Mutex::new(None),
+            resolution_rx: Mutex::new(None),
         });
         self.inner
             .children
@@ -236,7 +314,11 @@ impl SubagentManager {
         loop {
             let snapshot = rx.borrow().clone();
             match snapshot.status {
-                SubagentStatus::Queued | SubagentStatus::Running => {}
+                SubagentStatus::Queued
+                | SubagentStatus::Running
+                | SubagentStatus::Verifying
+                | SubagentStatus::Reviewing
+                | SubagentStatus::Blocked { .. } => {}
                 SubagentStatus::Completed => match snapshot.outcome {
                     Some(Ok(result)) => return Ok(result),
                     Some(Err(err)) => return Err(SubagentError::Failed(err)),
@@ -273,7 +355,7 @@ impl SubagentManager {
     /// effect on its first turn boundary.
     pub fn send(&self, id: &str, message: String) -> Result<(), SubagentError> {
         let child = self.child(id)?;
-        let status = child.state.borrow().status;
+        let status = child.state.borrow().status.clone();
         if status.is_terminal() {
             return Err(SubagentError::Terminal(status));
         }
@@ -302,7 +384,7 @@ impl SubagentManager {
                     id: id.clone(),
                     name: child.spec.name.clone(),
                     task: child.spec.task.clone(),
-                    status: state.status,
+                    status: state.status.clone(),
                     stop_reason,
                     usage,
                     error,
@@ -342,7 +424,225 @@ impl SubagentManager {
 
     /// Status of one child, `None` for unknown ids.
     pub fn status(&self, id: &str) -> Option<SubagentStatus> {
-        self.child(id).ok().map(|child| child.state.borrow().status)
+        self.child(id)
+            .ok()
+            .map(|child| child.state.borrow().status.clone())
+    }
+
+    /// Transition a child into the Blocked state.
+    ///
+    /// Suspends child progress via [`RunControl::pause`], sets status to
+    /// [`SubagentStatus::Blocked`], and prepares an unblock signaling channel.
+    pub fn block(
+        &self,
+        id: &str,
+        reason: BlockerReason,
+        prompt: impl Into<String>,
+    ) -> Result<(), SubagentError> {
+        let child = self.child(id)?;
+        let prompt = prompt.into();
+        let current = child.state.borrow().status.clone();
+        if current.is_terminal() {
+            return Err(SubagentError::Terminal(current));
+        }
+        if current == SubagentStatus::Queued {
+            return Err(SubagentError::InvalidTransition {
+                from: current,
+                to: SubagentStatus::Blocked { reason, prompt },
+            });
+        }
+        if current.is_blocked() {
+            return Err(SubagentError::AlreadyBlocked(id.to_string()));
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *child.resolution_tx.lock().expect("mutex poisoned") = Some(tx);
+        *child.resolution_rx.lock().expect("mutex poisoned") = Some(rx);
+
+        child.control.pause();
+        let new_status = SubagentStatus::Blocked { reason, prompt };
+        child.state.send_modify(|state| {
+            state.status = new_status.clone();
+        });
+        child.status_tx.send_modify(|s| {
+            *s = new_status;
+        });
+        Ok(())
+    }
+
+    /// Asynchronously wait for resolution to a previously reported blocker.
+    ///
+    /// Respects child cancellation and parent cancellation so waiting never hangs.
+    pub async fn wait_for_resolution(&self, id: &str) -> Result<String, SubagentError> {
+        let child = self.child(id)?;
+        let rx = child
+            .resolution_rx
+            .lock()
+            .expect("mutex poisoned")
+            .take()
+            .ok_or_else(|| SubagentError::NotBlocked(id.to_string()))?;
+        let token = child.control.token();
+        let parent_token = self.inner.parent_cancel.clone();
+
+        tokio::select! {
+            biased;
+            _ = token.cancelled() => Err(SubagentError::Cancelled),
+            _ = parent_token.cancelled() => Err(SubagentError::Cancelled),
+            res = rx => match res {
+                Ok(resolution) => Ok(resolution),
+                Err(_) => {
+                    if token.is_cancelled() || parent_token.is_cancelled() {
+                        Err(SubagentError::Cancelled)
+                    } else {
+                        Err(SubagentError::Failed("resolution channel dropped".into()))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wait for resolution with an explicit timeout.
+    pub async fn wait_for_resolution_timeout(
+        &self,
+        id: &str,
+        duration: std::time::Duration,
+    ) -> Result<String, SubagentError> {
+        match tokio::time::timeout(duration, self.wait_for_resolution(id)).await {
+            Ok(result) => result,
+            Err(_) => Err(SubagentError::Timeout(format!(
+                "timed out waiting for resolution on child {id}"
+            ))),
+        }
+    }
+
+    /// Block and wait for resolution in one step.
+    pub async fn block_and_wait(
+        &self,
+        id: &str,
+        reason: BlockerReason,
+        prompt: impl Into<String>,
+    ) -> Result<String, SubagentError> {
+        self.block(id, reason, prompt)?;
+        self.wait_for_resolution(id).await
+    }
+
+    /// Block and wait for resolution with a timeout.
+    pub async fn block_and_wait_timeout(
+        &self,
+        id: &str,
+        reason: BlockerReason,
+        prompt: impl Into<String>,
+        duration: std::time::Duration,
+    ) -> Result<String, SubagentError> {
+        self.block(id, reason, prompt)?;
+        self.wait_for_resolution_timeout(id, duration).await
+    }
+
+    /// Provide a resolution to a blocked child, transitioning it back to Running.
+    ///
+    /// Resumes the child's [`RunControl`], steers the child with the resolution
+    /// message, and delivers the resolution string to the waiter.
+    pub fn unblock(&self, id: &str, resolution: impl Into<String>) -> Result<(), SubagentError> {
+        let child = self.child(id)?;
+        let resolution = resolution.into();
+        let current = child.state.borrow().status.clone();
+        if !current.is_blocked() {
+            return Err(SubagentError::NotBlocked(id.to_string()));
+        }
+
+        let tx = child
+            .resolution_tx
+            .lock()
+            .expect("mutex poisoned")
+            .take()
+            .ok_or_else(|| SubagentError::NotBlocked(id.to_string()))?;
+        let is_credential = matches!(
+            current,
+            SubagentStatus::Blocked {
+                reason: BlockerReason::Credential,
+                ..
+            }
+        );
+
+        child.state.send_modify(|state| {
+            state.status = SubagentStatus::Running;
+        });
+        child.status_tx.send_modify(|s| {
+            *s = SubagentStatus::Running;
+        });
+
+        child.control.resume();
+        if !is_credential {
+            child.control.steer(Message::user(resolution.clone()));
+        }
+
+        let _ = tx.send(resolution);
+        Ok(())
+    }
+
+    /// Explicitly transition a running child into a new non-terminal status.
+    pub fn transition(&self, id: &str, to: SubagentStatus) -> Result<(), SubagentError> {
+        let child = self.child(id)?;
+        let current = child.state.borrow().status.clone();
+        if current.is_terminal() {
+            return Err(SubagentError::Terminal(current));
+        }
+        if to.is_terminal() || to.is_blocked() || to == SubagentStatus::Queued {
+            return Err(SubagentError::InvalidTransition { from: current, to });
+        }
+        if current == SubagentStatus::Queued || current.is_blocked() {
+            return Err(SubagentError::InvalidTransition { from: current, to });
+        }
+
+        child.state.send_modify(|state| {
+            state.status = to.clone();
+        });
+        child.status_tx.send_modify(|s| {
+            *s = to;
+        });
+        Ok(())
+    }
+
+    /// Mark child as verifying.
+    pub fn set_verifying(&self, id: &str) -> Result<(), SubagentError> {
+        self.transition(id, SubagentStatus::Verifying)
+    }
+
+    /// Mark child as reviewing.
+    pub fn set_reviewing(&self, id: &str) -> Result<(), SubagentError> {
+        self.transition(id, SubagentStatus::Reviewing)
+    }
+
+    /// Mark child as running.
+    pub fn set_running(&self, id: &str) -> Result<(), SubagentError> {
+        self.transition(id, SubagentStatus::Running)
+    }
+
+    /// Subscribe to full child state updates (status + terminal outcome).
+    pub fn subscribe(&self, id: &str) -> Result<watch::Receiver<ChildState>, SubagentError> {
+        Ok(self.child(id)?.state.subscribe())
+    }
+
+    /// Subscribe to status-only updates.
+    pub fn subscribe_status(
+        &self,
+        id: &str,
+    ) -> Result<watch::Receiver<SubagentStatus>, SubagentError> {
+        Ok(self.child(id)?.status_tx.subscribe())
+    }
+
+    /// Wait for terminal result with an explicit timeout.
+    pub async fn wait_timeout(
+        &self,
+        id: &str,
+        duration: std::time::Duration,
+    ) -> Result<SubagentResult, SubagentError> {
+        match tokio::time::timeout(duration, self.wait(id)).await {
+            Ok(result) => result,
+            Err(_) => Err(SubagentError::Timeout(format!(
+                "timed out waiting for child {id}"
+            ))),
+        }
     }
 
     fn child(&self, id: &str) -> Result<Arc<Child>, SubagentError> {
@@ -395,7 +695,9 @@ async fn run_child(
     child.state.send_modify(|state| {
         state.status = SubagentStatus::Running;
     });
-
+    child.status_tx.send_modify(|status| {
+        *status = SubagentStatus::Running;
+    });
     // Propagate parent cancellation into the child's RunControl for the whole
     // run, then release the propagation task when the child finishes.
     let propagation_done = CancellationToken::new();
@@ -468,8 +770,11 @@ async fn run_child(
 fn finish(child: &Child, status: SubagentStatus, outcome: Result<SubagentResult, String>) {
     debug_assert!(status.is_terminal());
     child.state.send_modify(|state| {
-        state.status = status;
+        state.status = status.clone();
         state.outcome = Some(outcome);
+    });
+    child.status_tx.send_modify(|s| {
+        *s = status;
     });
 }
 
@@ -542,6 +847,8 @@ mod tests {
             model: None,
             output_schema: None,
             read_only: false,
+            isolated_workspace: false,
+            solution_space: None,
         }
     }
 
@@ -1059,15 +1366,504 @@ mod tests {
         assert_eq!(parsed.task, "do it");
         assert!(parsed.name.is_none() && parsed.model.is_none());
         assert!(parsed.output_schema.is_none() && !parsed.read_only);
+        assert!(!parsed.isolated_workspace && parsed.solution_space.is_none());
 
         let mut full = spec("x");
         full.name = Some("named".into());
         full.read_only = true;
+        full.isolated_workspace = true;
+        full.solution_space = Some("exact fix".into());
         full.output_schema = Some(serde_json::json!({"type": "string"}));
         let round: TaskSpec = serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
         assert!(round.read_only);
+        assert!(round.isolated_workspace);
+        assert_eq!(round.solution_space.as_deref(), Some("exact fix"));
         assert_eq!(round.name.as_deref(), Some("named"));
         assert!(round.output_schema.is_some());
+    }
+
+    #[test]
+    fn subagent_status_predicates_and_serde() {
+        let queued = SubagentStatus::Queued;
+        assert!(!queued.is_terminal());
+        assert!(!queued.is_blocked());
+        assert_eq!(serde_json::to_string(&queued).unwrap(), "\"queued\"");
+        assert_eq!(
+            serde_json::from_str::<SubagentStatus>("\"queued\"").unwrap(),
+            SubagentStatus::Queued
+        );
+
+        let running = SubagentStatus::Running;
+        assert!(!running.is_terminal());
+        assert!(!running.is_blocked());
+        assert_eq!(serde_json::to_string(&running).unwrap(), "\"running\"");
+
+        let verifying = SubagentStatus::Verifying;
+        assert!(!verifying.is_terminal());
+        assert!(!verifying.is_blocked());
+        assert_eq!(serde_json::to_string(&verifying).unwrap(), "\"verifying\"");
+        assert_eq!(
+            serde_json::from_str::<SubagentStatus>("\"verifying\"").unwrap(),
+            SubagentStatus::Verifying
+        );
+
+        let reviewing = SubagentStatus::Reviewing;
+        assert!(!reviewing.is_terminal());
+        assert!(!reviewing.is_blocked());
+        assert_eq!(serde_json::to_string(&reviewing).unwrap(), "\"reviewing\"");
+        assert_eq!(
+            serde_json::from_str::<SubagentStatus>("\"reviewing\"").unwrap(),
+            SubagentStatus::Reviewing
+        );
+
+        let blocked = SubagentStatus::Blocked {
+            reason: BlockerReason::UserInput,
+            prompt: "choose A or B".into(),
+        };
+        assert!(!blocked.is_terminal());
+        assert!(blocked.is_blocked());
+        let json = serde_json::to_string(&blocked).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SubagentStatus>(&json).unwrap(),
+            blocked
+        );
+
+        let custom_blocked = SubagentStatus::Blocked {
+            reason: BlockerReason::Custom("custom_reason".into()),
+            prompt: "escalate".into(),
+        };
+        let custom_json = serde_json::to_string(&custom_blocked).unwrap();
+        assert_eq!(
+            serde_json::from_str::<SubagentStatus>(&custom_json).unwrap(),
+            custom_blocked
+        );
+
+        assert!(SubagentStatus::Completed.is_terminal());
+        assert!(SubagentStatus::Failed.is_terminal());
+        assert!(SubagentStatus::Cancelled.is_terminal());
+    }
+
+    struct BlockingFactory {
+        manager_holder: Arc<Mutex<Option<Arc<SubagentManager>>>>,
+        reason: BlockerReason,
+        prompt: String,
+    }
+
+    #[async_trait]
+    impl SubagentFactory for BlockingFactory {
+        async fn run(
+            &self,
+            id: &str,
+            spec: TaskSpec,
+            _control: RunControl,
+            _events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<SubagentResult, String> {
+            let mgr = self
+                .manager_holder
+                .lock()
+                .unwrap()
+                .as_ref()
+                .cloned()
+                .expect("manager not registered");
+            let resolution = mgr
+                .block_and_wait(id, self.reason.clone(), &self.prompt)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(SubagentResult {
+                id: id.to_string(),
+                output: format!("{}:{resolution}", spec.task),
+                data: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                session_path: PathBuf::from("/tmp/child.jsonl"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn blocker_escalation_and_unblock_resumes_child() {
+        let holder = Arc::new(Mutex::new(None));
+        let factory = Arc::new(BlockingFactory {
+            manager_holder: holder.clone(),
+            reason: BlockerReason::UserInput,
+            prompt: "Which database?".to_string(),
+        });
+        let manager = Arc::new(manager(factory, 1, CancellationToken::new()));
+        *holder.lock().unwrap() = Some(manager.clone());
+
+        let id = manager.spawn(spec("setup-db")).unwrap();
+        let mut status_rx = manager.subscribe_status(&id).unwrap();
+
+        status_rx
+            .wait_for(|s| matches!(s, SubagentStatus::Blocked { .. }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.status(&id),
+            Some(SubagentStatus::Blocked {
+                reason: BlockerReason::UserInput,
+                prompt: "Which database?".to_string(),
+            })
+        );
+
+        let list = manager.list();
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            list[0].status,
+            SubagentStatus::Blocked {
+                reason: BlockerReason::UserInput,
+                prompt: "Which database?".to_string(),
+            }
+        );
+
+        manager.unblock(&id, "postgres").unwrap();
+
+        let result = timeout(WAIT_TIMEOUT, manager.wait(&id))
+            .await
+            .expect("wait timed out")
+            .expect("wait failed");
+        assert_eq!(result.output, "setup-db:postgres");
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn unblock_on_non_blocked_fails() {
+        let (gate, _gate_rx) = gate();
+        let running = Arc::new(AtomicUsize::new(0));
+        let manager = manager(
+            gate_factory(
+                gate.subscribe(),
+                running,
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("task")).unwrap();
+        let err = manager.unblock(&id, "res").unwrap_err();
+        assert!(matches!(err, SubagentError::NotBlocked(_)));
+    }
+
+    #[tokio::test]
+    async fn block_on_already_blocked_fails() {
+        let holder = Arc::new(Mutex::new(None));
+        let factory = Arc::new(BlockingFactory {
+            manager_holder: holder.clone(),
+            reason: BlockerReason::Credential,
+            prompt: "API key needed".to_string(),
+        });
+        let manager = Arc::new(manager(factory, 1, CancellationToken::new()));
+        *holder.lock().unwrap() = Some(manager.clone());
+
+        let id = manager.spawn(spec("auth")).unwrap();
+        let mut status_rx = manager.subscribe_status(&id).unwrap();
+        status_rx
+            .wait_for(|s| matches!(s, SubagentStatus::Blocked { .. }))
+            .await
+            .unwrap();
+
+        let second_block = manager.block(&id, BlockerReason::UserInput, "another prompt");
+        assert!(matches!(
+            second_block,
+            Err(SubagentError::AlreadyBlocked(_))
+        ));
+
+        manager.unblock(&id, "token123").unwrap();
+        let _ = manager.wait(&id).await;
+    }
+
+    #[tokio::test]
+    async fn block_on_queued_or_terminal_fails() {
+        let (gate, gate_rx) = gate();
+        let running = Arc::new(AtomicUsize::new(0));
+        let manager = manager(
+            gate_factory(
+                gate_rx,
+                running.clone(),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        let first = manager.spawn(spec("first")).unwrap();
+        let queued = manager.spawn(spec("queued")).unwrap();
+
+        until_running(&running, 1).await;
+        let err = manager
+            .block(&queued, BlockerReason::Approval, "approve")
+            .unwrap_err();
+        assert!(matches!(err, SubagentError::InvalidTransition { .. }));
+
+        gate.send(true).unwrap();
+        let _ = manager.wait(&first).await.unwrap();
+
+        let err_terminal = manager
+            .block(&first, BlockerReason::Approval, "approve")
+            .unwrap_err();
+        assert!(matches!(err_terminal, SubagentError::Terminal(_)));
+    }
+
+    #[tokio::test]
+    async fn cancellation_unblocks_waiting_child() {
+        let holder = Arc::new(Mutex::new(None));
+        let factory = Arc::new(BlockingFactory {
+            manager_holder: holder.clone(),
+            reason: BlockerReason::UserInput,
+            prompt: "Blocked forever".to_string(),
+        });
+        let manager = Arc::new(manager(factory, 1, CancellationToken::new()));
+        *holder.lock().unwrap() = Some(manager.clone());
+
+        let id = manager.spawn(spec("cancelled-child")).unwrap();
+        let mut status_rx = manager.subscribe_status(&id).unwrap();
+        status_rx
+            .wait_for(|s| matches!(s, SubagentStatus::Blocked { .. }))
+            .await
+            .unwrap();
+
+        manager.cancel(&id).unwrap();
+        let result = manager.wait(&id).await;
+        assert!(matches!(result, Err(SubagentError::Cancelled)));
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn timeout_on_resolution_returns_timeout_error() {
+        struct TimeoutFactory {
+            manager_holder: Arc<Mutex<Option<Arc<SubagentManager>>>>,
+        }
+
+        #[async_trait]
+        impl SubagentFactory for TimeoutFactory {
+            async fn run(
+                &self,
+                id: &str,
+                _spec: TaskSpec,
+                _control: RunControl,
+                _events: mpsc::UnboundedSender<AgentEvent>,
+            ) -> Result<SubagentResult, String> {
+                let mgr = self
+                    .manager_holder
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .cloned()
+                    .unwrap();
+                match mgr
+                    .block_and_wait_timeout(
+                        id,
+                        BlockerReason::Environment,
+                        "Need env var",
+                        TokioDuration::from_millis(30),
+                    )
+                    .await
+                {
+                    Ok(_) => Ok(SubagentResult {
+                        id: id.to_string(),
+                        output: "got-env".to_string(),
+                        data: None,
+                        usage: Usage::default(),
+                        stop_reason: StopReason::Stop,
+                        session_path: PathBuf::from("/tmp/child.jsonl"),
+                    }),
+                    Err(SubagentError::Timeout(msg)) => Err(format!("timeout: {msg}")),
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+        }
+
+        let holder = Arc::new(Mutex::new(None));
+        let manager = Arc::new(manager(
+            Arc::new(TimeoutFactory {
+                manager_holder: holder.clone(),
+            }),
+            1,
+            CancellationToken::new(),
+        ));
+        *holder.lock().unwrap() = Some(manager.clone());
+
+        let id = manager.spawn(spec("timeout-test")).unwrap();
+        let res = manager.wait(&id).await;
+        assert!(matches!(res, Err(SubagentError::Failed(msg)) if msg.contains("timeout")));
+    }
+
+    #[tokio::test]
+    async fn state_transitions_verifying_and_reviewing() {
+        let (gate, gate_rx) = gate();
+        let running = Arc::new(AtomicUsize::new(0));
+        let manager = manager(
+            gate_factory(
+                gate_rx,
+                running.clone(),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("transitions")).unwrap();
+        until_running(&running, 1).await;
+
+        let mut status_rx = manager.subscribe_status(&id).unwrap();
+
+        manager.set_verifying(&id).unwrap();
+        status_rx
+            .wait_for(|s| *s == SubagentStatus::Verifying)
+            .await
+            .unwrap();
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Verifying));
+
+        manager.set_reviewing(&id).unwrap();
+        status_rx
+            .wait_for(|s| *s == SubagentStatus::Reviewing)
+            .await
+            .unwrap();
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Reviewing));
+
+        manager.set_running(&id).unwrap();
+        status_rx
+            .wait_for(|s| *s == SubagentStatus::Running)
+            .await
+            .unwrap();
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Running));
+
+        gate.send(true).unwrap();
+        let res = manager.wait(&id).await.unwrap();
+        assert_eq!(res.output, "done:transitions");
+    }
+
+    #[tokio::test]
+    async fn wait_survives_non_terminal_transitions_until_completion() {
+        let holder = Arc::new(Mutex::new(None));
+        let factory = Arc::new(BlockingFactory {
+            manager_holder: holder.clone(),
+            reason: BlockerReason::Approval,
+            prompt: "Need file delete approval".to_string(),
+        });
+        let manager = Arc::new(manager(factory, 1, CancellationToken::new()));
+        *holder.lock().unwrap() = Some(manager.clone());
+
+        let id = manager.spawn(spec("delete-files")).unwrap();
+
+        let mgr = manager.clone();
+        let child_id = id.clone();
+        let waiter = tokio::spawn(async move { mgr.wait(&child_id).await });
+
+        let mut status_rx = manager.subscribe_status(&id).unwrap();
+        status_rx
+            .wait_for(|s| matches!(s, SubagentStatus::Blocked { .. }))
+            .await
+            .unwrap();
+
+        manager.unblock(&id, "approved").unwrap();
+
+        let result = timeout(WAIT_TIMEOUT, waiter)
+            .await
+            .expect("waiter timed out")
+            .expect("waiter task panicked")
+            .expect("waiter failed");
+        assert_eq!(result.output, "delete-files:approved");
+    }
+    #[tokio::test]
+    async fn transition_rejects_blocked_and_queued() {
+        let (gate, gate_rx) = gate();
+        let running = Arc::new(AtomicUsize::new(0));
+        let manager = manager(
+            gate_factory(
+                gate_rx,
+                running.clone(),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("transition-guard")).unwrap();
+        until_running(&running, 1).await;
+
+        let err_blocked = manager.transition(
+            &id,
+            SubagentStatus::Blocked {
+                reason: BlockerReason::UserInput,
+                prompt: "bypass".into(),
+            },
+        );
+        assert!(matches!(
+            err_blocked,
+            Err(SubagentError::InvalidTransition { .. })
+        ));
+
+        let err_queued = manager.transition(&id, SubagentStatus::Queued);
+        assert!(matches!(
+            err_queued,
+            Err(SubagentError::InvalidTransition { .. })
+        ));
+
+        gate.send(true).unwrap();
+        let _ = manager.wait(&id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_unblock_skips_steering_plaintext() {
+        struct SecretSteeringInspector {
+            manager_holder: Arc<Mutex<Option<Arc<SubagentManager>>>>,
+        }
+
+        #[async_trait]
+        impl SubagentFactory for SecretSteeringInspector {
+            async fn run(
+                &self,
+                id: &str,
+                _spec: TaskSpec,
+                _control: RunControl,
+                _events: mpsc::UnboundedSender<AgentEvent>,
+            ) -> Result<SubagentResult, String> {
+                let mgr = self
+                    .manager_holder
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .cloned()
+                    .unwrap();
+                let secret = mgr
+                    .block_and_wait(id, BlockerReason::Credential, "API token needed")
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(SubagentResult {
+                    id: id.to_string(),
+                    output: format!("authed-with-len:{}", secret.len()),
+                    data: None,
+                    usage: Usage::default(),
+                    session_path: PathBuf::from("/tmp/test"),
+                    stop_reason: StopReason::Stop,
+                })
+            }
+        }
+
+        let holder = Arc::new(Mutex::new(None));
+        let factory = Arc::new(SecretSteeringInspector {
+            manager_holder: holder.clone(),
+        });
+        let manager = Arc::new(manager(factory, 1, CancellationToken::new()));
+        *holder.lock().unwrap() = Some(manager.clone());
+
+        let id = manager.spawn(spec("secret-subagent")).unwrap();
+        let mut status_rx = manager.subscribe_status(&id).unwrap();
+        status_rx
+            .wait_for(|s| matches!(s, SubagentStatus::Blocked { .. }))
+            .await
+            .unwrap();
+
+        manager.unblock(&id, "sk-secret-token-12345").unwrap();
+        let res = manager.wait(&id).await.unwrap();
+        assert_eq!(res.output, "authed-with-len:21");
     }
 
     #[test]
