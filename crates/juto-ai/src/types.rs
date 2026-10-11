@@ -319,3 +319,66 @@ pub trait Provider: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<ProviderStream, ProviderError>;
 }
+
+/// A candidate option for discrete classification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Choice {
+    pub key: String,
+    pub description: String,
+}
+
+impl Choice {
+    pub fn new(key: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            description: description.into(),
+        }
+    }
+}
+
+/// The result of a discrete classification by a [`Judge`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Decision {
+    /// The chosen candidate key matching one of the candidate [`Choice::key`]s.
+    pub key: String,
+    /// Calibrated confidence score (0.0 .. 1.0) if returned by the classifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    /// Rationale or explanation provided by the classifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    /// Token usage and cost metrics.
+    #[serde(default)]
+    pub usage: Usage,
+    /// Measured execution latency in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<u64>,
+}
+
+/// Errors surfaced during discrete option classification.
+#[derive(Debug, thiserror::Error)]
+pub enum JudgeError {
+    #[error("invalid options: {0}")]
+    InvalidOptions(String),
+    #[error("judge HTTP {status}: {message}")]
+    Http { status: u16, message: String },
+    #[error("authentication: {0}")]
+    Authentication(String),
+    #[error("transport: {0}")]
+    Transport(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
+    #[error("request aborted")]
+    Aborted,
+    #[error("no matching candidate: {0}")]
+    NoMatch(String),
+}
+
+/// Trait for discrete option classification and semantic routing.
+#[async_trait]
+pub trait Judge: Send + Sync + std::fmt::Debug {
+    /// Classifies an input prompt or turn context into one of N discrete options.
+    async fn choose(&self, context: &str, options: &[Choice]) -> Result<Decision, JudgeError>;
+}

@@ -1030,7 +1030,14 @@ impl CredentialStore {
     /// durably committing rotated refresh tokens), then the provider's env
     /// vars, then `None` for local/auth-none providers.
     pub async fn resolve(&self, model: &Model) -> Result<Option<Credential>, AuthError> {
-        let provider = model.provider.as_str();
+        self.resolve_provider(model.provider.as_str()).await
+    }
+
+    /// Resolve a usable credential for `provider` name: explicit stored
+    /// credential first (refreshing OAuth under the cross-process lock and
+    /// durably committing rotated refresh tokens), then the provider's env
+    /// vars, then `None` for local/auth-none providers.
+    pub async fn resolve_provider(&self, provider: &str) -> Result<Option<Credential>, AuthError> {
         // Cheap unlocked read first; the refresh path re-checks under lock.
         let stored = self.read_store()?.credentials.get(provider).cloned();
         match stored {
