@@ -410,16 +410,19 @@ impl SubagentManager {
         summaries
     }
 
-    /// Completed child result, `None` while pending/failed/cancelled.
+    /// Successful result for a completed child; pending, failed, and cancelled children have none.
     pub fn output(&self, id: &str) -> Result<Option<SubagentResult>, SubagentError> {
         let child = self.child(id)?;
-        Ok(child
-            .state
-            .borrow()
-            .outcome
-            .as_ref()
-            .and_then(|outcome| outcome.as_ref().ok())
-            .cloned())
+        let state = child.state.borrow();
+        Ok((state.status == SubagentStatus::Completed)
+            .then(|| {
+                state
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.as_ref().ok())
+                    .cloned()
+            })
+            .flatten())
     }
 
     /// Cancel every child that has not reached a terminal state.
