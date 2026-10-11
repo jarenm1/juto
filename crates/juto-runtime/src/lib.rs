@@ -32,7 +32,10 @@ use tokio_util::sync::CancellationToken;
 
 pub use config::{ApprovalMode, RuntimeConfig};
 pub use session::{EntryKind, Session};
-pub use subagents::{SubagentManager, SubagentResult, TaskSpec};
+pub use subagents::{
+    BlockerReason, ChildState, SubagentError, SubagentManager, SubagentResult, SubagentStatus,
+    SubagentSummary, TaskSpec,
+};
 pub use workspace::{GpuLockGuard, ResourceLimits, SubagentWorkspace, WorkspaceError};
 
 #[async_trait]
@@ -509,7 +512,7 @@ struct TaskTool {
 #[async_trait]
 impl Tool for TaskTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {name: "task".into(), description: "Run child agents concurrently. Each child gets an independent durable transcript; optional output_schema validates its JSON result. This call waits for all children. Use read_only for research-only children.".into(), parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"read_only":{"type":"boolean"}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false})}
+        ToolDefinition {name: "task".into(), description: "Run child agents concurrently. Each child gets an independent durable transcript; optional output_schema validates its JSON result. This call waits for all children. Use read_only for research-only children.".into(), parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"read_only":{"type":"boolean"},"isolated_workspace":{"type":"boolean"},"solution_space":{"type":"string"}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false})}
     }
     fn tier(&self) -> ToolTier {
         ToolTier::Exec
@@ -545,6 +548,14 @@ impl Tool for TaskTool {
                     .get("read_only")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                isolated_workspace: value
+                    .get("isolated_workspace")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                solution_space: value
+                    .get("solution_space")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             };
             match self.manager.spawn(spec) {
                 Ok(id) => ids.push(id),
