@@ -154,7 +154,11 @@ impl PeerBus {
         &self,
         summary: SubagentSummary,
     ) -> Result<PeerAgentSnapshot, PeerError> {
-        let result = self.subagents.output(&summary.id)?;
+        let result = if summary.status == SubagentStatus::Completed {
+            self.subagents.output(&summary.id)?
+        } else {
+            None
+        };
         Ok(PeerAgentSnapshot { summary, result })
     }
 }
@@ -210,6 +214,9 @@ mod tests {
             if spec.task == "wait" {
                 control.token().cancelled().await;
                 return Err("cancelled".into());
+            }
+            if spec.task == "cancel-with-success" {
+                control.token().cancelled().await;
             }
 
             let mut session = Session::create(&self.sessions, PathBuf::from("/work").as_path())
@@ -303,7 +310,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let manager = manager(temp.path());
         let id = manager
-            .spawn(crate::subagents::TaskSpec::new("wait"))
+            .spawn(crate::subagents::TaskSpec::new("cancel-with-success"))
             .unwrap();
         let mut status = manager.subscribe_status(&id).unwrap();
         while *status.borrow() == SubagentStatus::Queued {
@@ -323,8 +330,42 @@ mod tests {
             manager.wait(&id).await,
             Err(SubagentError::Cancelled)
         ));
+        assert!(manager.output(&id).unwrap().is_none());
+        assert!(matches!(
+            bus.read(&format!("history://{id}")),
+            Err(PeerError::HistoryUnavailable {
+                status: SubagentStatus::Cancelled,
+                ..
+            })
+        ));
+        let PeerResource::Agent(snapshot) = bus.read(&format!("agent://{id}")).unwrap() else {
+            panic!("agent URI did not return an agent snapshot");
+        };
+        assert_eq!(snapshot.summary.status, SubagentStatus::Cancelled);
+        assert!(snapshot.result.is_none());
     }
 
+    #[tokio::test]
+    async fn peer_snapshot_does_not_pair_running_status_with_completed_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(temp.path());
+        let id = manager
+            .spawn(crate::subagents::TaskSpec::new("review parser"))
+            .unwrap();
+        manager.wait(&id).await.unwrap();
+        let mut summary = manager
+            .list()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .unwrap();
+        summary.status = SubagentStatus::Running;
+        let snapshot = PeerBus::new(manager)
+            .snapshot_from_summary(summary)
+            .unwrap();
+
+        assert_eq!(snapshot.summary.status, SubagentStatus::Running);
+        assert!(snapshot.result.is_none());
+    }
     #[tokio::test]
     async fn agent_uri_exposes_current_status_and_completed_output() {
         let temp = tempfile::tempdir().unwrap();
