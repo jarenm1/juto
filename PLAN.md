@@ -34,7 +34,7 @@ Full detailed specification: [`docs/orchestration-plan.md`](docs/orchestration-p
 - [ ] **Slice A: Discrete Decision Layer (TypeSafe Jev & Judge Trait)**
   - *Files*: `crates/juto-ai/src/judge.rs`, `crates/juto-ai/src/types.rs`
   - *Scope*: `Judge` trait, `TypeSafeJudge` (`/v1/systemone` / OpenRouter decisions), `Choice`/`Decision` types, mock tests.
-- [ ] **Slice B: Workspace Isolation & Resource Scopes (`jj` + systemd)**
+- [x] **Slice B: Workspace Isolation & Resource Scopes (`jj` + systemd)**
   - *Files*: `crates/juto-runtime/src/workspace.rs`
   - *Scope*: `SubagentWorkspace` (`jj workspace add/forget`), `systemd-run` user scope wrapper (`agents.slice`), flock GPU lock.
 - [ ] **Slice C: Subagent State Machine & Blocker Protocol**

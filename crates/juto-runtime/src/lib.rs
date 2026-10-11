@@ -6,6 +6,7 @@ pub mod context;
 pub mod session;
 pub mod subagents;
 pub mod tools;
+pub mod workspace;
 
 use std::{
     path::{Path, PathBuf},
@@ -32,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 pub use config::{ApprovalMode, RuntimeConfig};
 pub use session::{EntryKind, Session};
 pub use subagents::{SubagentManager, SubagentResult, TaskSpec};
+pub use workspace::{GpuLockGuard, ResourceLimits, SubagentWorkspace, WorkspaceError};
 
 #[async_trait]
 pub trait ApprovalHandler: Send + Sync {
