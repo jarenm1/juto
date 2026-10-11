@@ -43,6 +43,6 @@ Full detailed specification: [`docs/orchestration-plan.md`](docs/orchestration-p
 - [x] **Slice D: GPUI Sidebar Mission Control & Diff Cards**
   - *Files*: `apps/juto/src/sidebar.rs`, `apps/juto/src/task_card.rs`
   - *Scope*: Sidebar view, task status badges, expandable duration/token cards, live diff viewer, steering buttons.
-- [ ] **Slice E: End-to-End Orchestrator & Peer Review DAG**
+- [x] **Slice E: End-to-End Orchestrator & Peer Review DAG**
   - *Files*: `crates/juto-runtime/src/orchestrator.rs`
   - *Scope*: Manager DAG pipeline, Jev routing hook, Builder $\to$ Reviewer handoff, verification quality gates.

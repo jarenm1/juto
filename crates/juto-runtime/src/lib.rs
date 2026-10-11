@@ -3,6 +3,7 @@
 
 pub mod config;
 pub mod context;
+pub mod orchestrator;
 pub mod session;
 pub mod subagents;
 pub mod tools;
@@ -31,6 +32,12 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub use config::{ApprovalMode, RuntimeConfig};
+pub use orchestrator::{
+    CommandGateRunner, GateResult, IntentRoute, MockGateRunner, Orchestrator, OrchestratorBuilder,
+    OrchestratorConfig, OrchestratorError, OrchestratorEvent, PipelinePhase, QualityGateKind,
+    QualityGateRunner, QualityGateSpec, ReviewVerdict, RuleBasedJudge, ScriptedJudge, TaskOutcome,
+    VerificationReport,
+};
 pub use session::{EntryKind, Session};
 pub use subagents::{
     BlockerReason, ChildState, SubagentError, SubagentManager, SubagentResult, SubagentStatus,
