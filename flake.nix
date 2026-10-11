@@ -26,8 +26,56 @@
             libxcb
             vulkan-loader
           ];
+          juto = pkgs.rustPlatform.buildRustPackage {
+            pname = "juto";
+            version = "0.1.0";
+            src = pkgs.lib.cleanSourceWith {
+              src = ./.;
+              filter =
+                path: type:
+                let
+                  name = pkgs.lib.baseNameOf path;
+                in
+                name != ".git" && name != ".jj" && name != "target";
+            };
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = [
+              "-p"
+              "juto"
+              "--bin"
+              "juto"
+            ];
+            cargoInstallFlags = [
+              "-p"
+              "juto"
+              "--bin"
+              "juto"
+            ];
+            nativeBuildInputs = [
+              pkgs.clang
+              pkgs.mold
+              pkgs.makeWrapper
+              pkgs.pkg-config
+            ];
+            buildInputs = nativeLibraries;
+            doCheck = false;
+            postFixup = ''
+              wrapProgram $out/bin/juto \
+                --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath nativeLibraries}"
+            '';
+            meta = {
+              description = "Native GPUI agent runtime";
+              homepage = "https://github.com/jarenm1/juto";
+              license = pkgs.lib.licenses.mit;
+              mainProgram = "juto";
+              platforms = [ "x86_64-linux" ];
+            };
+          };
         in
         {
+          packages.default = juto;
+          packages.juto = juto;
+
           formatter = pkgs.nixfmt-tree;
 
           devShells.default = pkgs.mkShell {

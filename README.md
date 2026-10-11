@@ -51,10 +51,30 @@ scripts/agent-scope.sh -- nix develop . -c cargo build --workspace --locked
 scripts/agent-scope.sh --gpu -- nix develop . -c cargo run -p juto --locked
 ```
 
-The window uses Vulkan and either X11 or Wayland; graphical launch needs a
-working display and GPU driver. The default shell adds `/run/opengl-driver/lib`
-and the native libraries to `LD_LIBRARY_PATH`. The binary is not yet packaged
-for standalone installation: run it inside the development shell.
+The flake also packages the GUI app for `x86_64-linux`. Install the latest
+published GitHub revision into your user profile:
+
+```sh
+nix profile install github:jarenm1/juto
+juto
+```
+
+For a flake-based NixOS system configuration, add the flake as an input and
+include its package:
+
+```nix
+{
+  inputs.juto.url = "github:jarenm1/juto";
+
+  # In the host's configuration:
+  environment.systemPackages = [ inputs.juto.packages.${pkgs.system}.default ];
+}
+```
+
+The same package can be added to `home.packages` in a Home Manager
+configuration. The app needs a graphical session and working Vulkan driver;
+the package supplies Juto's native libraries and uses `/run/opengl-driver/lib`
+for the host GPU driver.
 
 Headless informational commands do not initialize GPUI:
 
