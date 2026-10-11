@@ -7,6 +7,7 @@ use crate::Quit;
 use crate::auth_modal::{AuthModal, AuthModalEvent};
 use crate::chat_input::{ChatInput, SubmitMessage};
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
+use crate::sidebar::{Sidebar, SidebarEvent};
 use gpui::{
     App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding, MouseButton,
     MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Subscription, Task,
@@ -19,9 +20,13 @@ use tokio::sync::Mutex;
 
 actions!(
     chat,
-    [CloseAttachmentMenu, ToggleModelPicker, ToggleAuthModal]
+    [
+        CloseAttachmentMenu,
+        ToggleModelPicker,
+        ToggleAuthModal,
+        ToggleSidebar
+    ]
 );
-
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("escape", CloseAttachmentMenu, Some("ChatView")),
@@ -29,6 +34,8 @@ pub fn init(cx: &mut App) {
         KeyBinding::new("cmd-m", ToggleModelPicker, None),
         KeyBinding::new("ctrl-p", ToggleAuthModal, None),
         KeyBinding::new("cmd-p", ToggleAuthModal, None),
+        KeyBinding::new("ctrl-b", ToggleSidebar, None),
+        KeyBinding::new("cmd-b", ToggleSidebar, None),
     ]);
 }
 
@@ -132,6 +139,9 @@ pub struct ChatView {
     input: Entity<ChatInput>,
     model_picker: Entity<ModelPicker>,
     auth_modal: Entity<AuthModal>,
+    sidebar: Entity<Sidebar>,
+    subagents: Arc<juto_runtime::subagents::SubagentManager>,
+    show_sidebar: bool,
     active_modal: ActiveModal,
     active_model: SharedString,
     messages: Vec<Message>,
@@ -147,7 +157,7 @@ pub struct ChatView {
     is_running: bool,
     active_control: Option<RunControl>,
     run_task: Option<Task<()>>,
-    _subscriptions: [Subscription; 4],
+    _subscriptions: Vec<Subscription>,
 }
 impl Drop for ChatView {
     fn drop(&mut self) {
@@ -175,7 +185,13 @@ impl ChatView {
         let model_picker =
             cx.new(|cx| ModelPicker::new(&initial_model, runtime.config(), runtime.catalog(), cx));
         let auth_modal = cx.new(|cx| AuthModal::new(runtime.clone(), tokio_handle.clone(), cx));
-
+        let subagent_control = RunControl::new();
+        let subagents = runtime.subagent_manager(&subagent_control);
+        let sidebar = cx.new(Sidebar::new);
+        let initial_summaries = subagents.list();
+        sidebar.update(cx, |s, cx| {
+            s.sync_from_summaries(&initial_summaries, cx);
+        });
         let submitted =
             cx.subscribe_in(&input, window, |this, _, _: &SubmitMessage, window, cx| {
                 this.send_message(window, cx);
@@ -207,11 +223,60 @@ impl ChatView {
             },
         );
 
+        let sidebar_sub = cx.subscribe(&sidebar, |this, _, event: &SidebarEvent, cx| match event {
+            SidebarEvent::Close => {
+                this.show_sidebar = false;
+                cx.notify();
+            }
+            SidebarEvent::SelectTask(id) => {
+                this.sidebar.update(cx, |s, cx| s.select_task(id, cx));
+            }
+            SidebarEvent::PauseTask(id) => {
+                if let Err(err) = this.subagents.pause(id) {
+                    this.sidebar.update(cx, |s, cx| {
+                        s.set_error(Some(format!("Pause rejected: {err}").into()), cx);
+                    });
+                } else {
+                    this.sync_subagents(cx);
+                }
+            }
+            SidebarEvent::AbortTask(id) => {
+                if let Err(err) = this.subagents.cancel(id) {
+                    this.sidebar.update(cx, |s, cx| {
+                        s.set_error(Some(format!("Abort rejected: {err}").into()), cx);
+                    });
+                } else {
+                    this.sync_subagents(cx);
+                }
+            }
+            SidebarEvent::ResumeTask { id, resolution } => {
+                if let Err(err) = this.subagents.unblock(id, resolution) {
+                    this.sidebar.update(cx, |s, cx| {
+                        s.set_error(Some(format!("Unblock rejected: {err}").into()), cx);
+                    });
+                } else {
+                    this.sync_subagents(cx);
+                }
+            }
+            SidebarEvent::SteerTask { id, guidance } => {
+                if let Err(err) = this.subagents.send(id, guidance.clone()) {
+                    this.sidebar.update(cx, |s, cx| {
+                        s.set_error(Some(format!("Steer rejected: {err}").into()), cx);
+                    });
+                } else {
+                    this.sync_subagents(cx);
+                }
+            }
+        });
+
         let messages = load_messages(&session);
         Self {
             input,
             model_picker,
             auth_modal,
+            sidebar,
+            subagents,
+            show_sidebar: true,
             active_modal: ActiveModal::None,
             active_model: initial_model.into(),
             messages,
@@ -227,7 +292,13 @@ impl ChatView {
             is_running: false,
             active_control: None,
             run_task: None,
-            _subscriptions: [submitted, changed, model_picker_sub, auth_modal_sub],
+            _subscriptions: vec![
+                submitted,
+                changed,
+                model_picker_sub,
+                auth_modal_sub,
+                sidebar_sub,
+            ],
         }
     }
 
@@ -265,6 +336,22 @@ impl ChatView {
         cx.notify();
     }
 
+    pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.show_sidebar = !self.show_sidebar;
+        cx.notify();
+    }
+
+    pub fn sync_subagents(&mut self, cx: &mut Context<Self>) {
+        let summaries = self.subagents.list();
+        self.sidebar.update(cx, |sidebar, cx| {
+            sidebar.sync_from_summaries(&summaries, cx);
+        });
+    }
+
+    #[allow(dead_code)]
+    pub fn subagents(&self) -> &Arc<juto_runtime::subagents::SubagentManager> {
+        &self.subagents
+    }
     fn can_send(&self, cx: &App) -> bool {
         let input = self.input.read(cx);
         !self.is_running
@@ -392,6 +479,9 @@ impl ChatView {
                 self.scroll.scroll_to_bottom();
                 cx.notify();
             }
+            AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. } => {
+                self.sync_subagents(cx);
+            }
             _ => {}
         }
     }
@@ -459,6 +549,7 @@ impl ChatView {
                 });
             }
         }
+        self.sync_subagents(cx);
         self.scroll.scroll_to_bottom();
         self.focus_input(window, cx);
         cx.notify();
@@ -592,6 +683,39 @@ impl ChatView {
                                 }
                             }))
                             .child("🔑 Providers & Keys"),
+                    )
+                    .child(
+                        div()
+                            .id("header-sidebar-btn")
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .px_3()
+                            .py_1p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(if self.show_sidebar {
+                                rgb(0x2563eb)
+                            } else {
+                                rgb(0x3f3f46)
+                            })
+                            .bg(if self.show_sidebar {
+                                rgb(0x1e3a5f)
+                            } else {
+                                rgb(0x27272a)
+                            })
+                            .text_xs()
+                            .text_color(if self.show_sidebar {
+                                rgb(0x60a5fa)
+                            } else {
+                                rgb(0xd4d4d8)
+                            })
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgb(0x3f3f46)).text_color(rgb(0xffffff)))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.toggle_sidebar(cx);
+                            }))
+                            .child("⚡ Mission Control"),
                     ),
             )
     }
@@ -938,6 +1062,9 @@ impl Render for ChatView {
                     this.open_auth_modal(window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.toggle_sidebar(cx);
+            }))
             .when(self.active_modal == ActiveModal::ModelPicker, |view| {
                 view.child(self.model_picker.clone())
             })
@@ -945,9 +1072,34 @@ impl Render for ChatView {
                 view.child(self.auth_modal.clone())
             })
             .when(self.active_modal == ActiveModal::None, |view| {
-                view.child(self.header(cx))
-                    .child(self.message_list())
-                    .child(self.composer(window, cx))
+                view.child(self.header(cx)).child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .child(self.message_list())
+                                .child(self.composer(window, cx)),
+                        )
+                        .when(self.show_sidebar, |row| {
+                            row.child(
+                                div()
+                                    .w(px(380.0))
+                                    .flex_none()
+                                    .h_full()
+                                    .border_l_1()
+                                    .border_color(rgb(0x27272a))
+                                    .child(self.sidebar.clone()),
+                            )
+                        }),
+                )
             })
     }
 }

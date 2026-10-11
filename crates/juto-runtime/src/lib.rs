@@ -61,8 +61,8 @@ struct RuntimeInner {
     credentials: Arc<CredentialStore>,
     provider: Arc<dyn Provider>,
     approval: Option<Arc<dyn ApprovalHandler>>,
+    subagent_manager: std::sync::Mutex<Option<Arc<SubagentManager>>>,
 }
-
 pub fn default_data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("JUTO_DATA_DIR") {
         return Ok(PathBuf::from(path));
@@ -129,6 +129,7 @@ impl Runtime {
                 credentials,
                 provider,
                 approval,
+                subagent_manager: std::sync::Mutex::new(None),
             }),
         };
         if !runtime.inner.config.model.is_empty() {
@@ -186,14 +187,20 @@ impl Runtime {
     }
 
     pub fn subagent_manager(&self, control: &RunControl) -> Arc<SubagentManager> {
-        Arc::new(SubagentManager::new(
+        let mut guard = self.inner.subagent_manager.lock().unwrap();
+        if let Some(mgr) = &*guard {
+            return mgr.clone();
+        }
+        let mgr = Arc::new(SubagentManager::new(
             Arc::new(ChildFactory {
                 runtime: self.clone(),
                 depth: 1,
             }),
             self.inner.config.max_concurrency,
             control.token(),
-        ))
+        ));
+        *guard = Some(mgr.clone());
+        mgr
     }
 
     pub async fn run(
@@ -235,14 +242,18 @@ impl Runtime {
                 compaction_usage = self.compact(session, &control).await?;
             }
         }
-        let manager = Arc::new(SubagentManager::new(
-            Arc::new(ChildFactory {
-                runtime: self.clone(),
-                depth: depth + 1,
-            }),
-            self.inner.config.max_concurrency,
-            control.token(),
-        ));
+        let manager = if depth == 0 {
+            self.subagent_manager(&control)
+        } else {
+            Arc::new(SubagentManager::new(
+                Arc::new(ChildFactory {
+                    runtime: self.clone(),
+                    depth: depth + 1,
+                }),
+                self.inner.config.max_concurrency,
+                control.token(),
+            ))
+        };
         let _children = ChildCancellation(manager.clone());
         let mut registry = tools::builtin_tools(&self.inner.cwd)?;
         if !read_only && depth < self.inner.config.max_recursion_depth {

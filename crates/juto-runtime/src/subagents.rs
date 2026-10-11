@@ -428,6 +428,27 @@ impl SubagentManager {
             .ok()
             .map(|child| child.state.borrow().status.clone())
     }
+    /// Pause execution of a running child agent.
+    pub fn pause(&self, id: &str) -> Result<(), SubagentError> {
+        let child = self.child(id)?;
+        let current = child.state.borrow().status.clone();
+        if current.is_terminal() {
+            return Err(SubagentError::Terminal(current));
+        }
+        child.control.pause();
+        Ok(())
+    }
+
+    /// Resume execution of a paused child agent without resolving a blocker.
+    pub fn resume(&self, id: &str) -> Result<(), SubagentError> {
+        let child = self.child(id)?;
+        let current = child.state.borrow().status.clone();
+        if current.is_terminal() {
+            return Err(SubagentError::Terminal(current));
+        }
+        child.control.resume();
+        Ok(())
+    }
 
     /// Transition a child into the Blocked state.
     ///
