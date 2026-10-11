@@ -40,8 +40,8 @@ pub use orchestrator::{
 };
 pub use session::{EntryKind, Session};
 pub use subagents::{
-    BlockerReason, ChildState, SubagentError, SubagentManager, SubagentResult, SubagentStatus,
-    SubagentSummary, TaskSpec,
+    BlockerReason, ChildState, SchemaMode, SubagentError, SubagentManager, SubagentResult,
+    SubagentStatus, SubagentSummary, TaskSpec,
 };
 pub use workspace::{GpuLockGuard, ResourceLimits, SubagentWorkspace, WorkspaceError};
 
@@ -531,7 +531,7 @@ struct TaskTool {
 #[async_trait]
 impl Tool for TaskTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {name: "task".into(), description: "Run child agents concurrently. Each child gets an independent durable transcript; optional output_schema validates its JSON result. This call waits for all children. Use read_only for research-only children.".into(), parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"read_only":{"type":"boolean"},"isolated_workspace":{"type":"boolean"},"solution_space":{"type":"string"}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false})}
+        ToolDefinition {name: "task".into(), description: "Run child agents concurrently. Each child gets an independent durable transcript; optional output_schema validates its JSON result. Set schema_mode to strict (default) to fail on missing or invalid data, or permissive to preserve the result. This call waits for all children. Use read_only for research-only children.".into(), parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"schema_mode":{"type":"string","enum":["strict","permissive"]},"read_only":{"type":"boolean"},"isolated_workspace":{"type":"boolean"},"solution_space":{"type":"string"}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false})}
     }
     fn tier(&self) -> ToolTier {
         ToolTier::Exec
@@ -563,6 +563,13 @@ impl Tool for TaskTool {
                     .and_then(Value::as_str)
                     .map(str::to_owned),
                 output_schema: value.get("output_schema").cloned(),
+                schema_mode: value
+                    .get("schema_mode")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .map_err(|error| format!("invalid schema_mode: {error}"))?
+                    .unwrap_or_default(),
                 read_only: value
                     .get("read_only")
                     .and_then(Value::as_bool)

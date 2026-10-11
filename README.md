@@ -35,6 +35,11 @@ skill in its data directory on first startup. It guides agents through identifyi
 a target repository's supported development workflow and documenting Juto-specific
 resource, workspace, and verification requirements without overwriting user edits.
 
+Subagent `output_schema` validation is strict by default. Task requests may set
+`schema_mode: "permissive"` to retain a completed result even when its structured
+data is absent or does not match the declared schema; malformed schema definitions
+remain errors in either mode.
+
 ## Development
 
 Requires Nix with flakes enabled. The supported development system is
@@ -82,6 +87,7 @@ Headless informational commands do not initialize GPUI:
 scripts/agent-scope.sh -- nix develop . -c cargo run -p juto --locked -- --version
 scripts/agent-scope.sh -- nix develop . -c cargo run -p juto --locked -- --help
 ```
+
 
 Ctrl-Q exits the window. Closing the last window also requests application exit.
 
