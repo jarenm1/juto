@@ -31,7 +31,7 @@ Full detailed specification: [`docs/orchestration-plan.md`](docs/orchestration-p
 
 ## Concurrent Workstream Splits (Non-Overlapping Ownership)
 
-- [ ] **Slice A: Discrete Decision Layer (TypeSafe Jev & Judge Trait)**
+- [x] **Slice A: Discrete Decision Layer (TypeSafe Jev & Judge Trait)**
   - *Files*: `crates/juto-ai/src/judge.rs`, `crates/juto-ai/src/types.rs`
   - *Scope*: `Judge` trait, `TypeSafeJudge` (`/v1/systemone` / OpenRouter decisions), `Choice`/`Decision` types, mock tests.
 - [x] **Slice B: Workspace Isolation & Resource Scopes (`jj` + systemd)**
