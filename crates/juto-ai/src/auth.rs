@@ -12,7 +12,7 @@
 //! file (not the renamed store file) is the lock target so the guard survives
 //! atomic replacement.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{ErrorKind, Write};
@@ -1025,6 +1025,27 @@ impl CredentialStore {
             .collect())
     }
 
+    /// Providers with a stored or environment credential, without refreshing
+    /// OAuth or contacting a provider. Read the store once, off the UI thread.
+    /// Local/auth-none backends are not implicitly connected.
+    pub fn available_providers<'a>(
+        &self,
+        providers: impl IntoIterator<Item = &'a str>,
+    ) -> Result<BTreeSet<String>, AuthError> {
+        let store = self.read_store()?;
+        Ok(providers
+            .into_iter()
+            .filter(|provider| match store.credentials.get(*provider) {
+                Some(StoredSecret::ApiKey { key, .. }) => !key.is_empty(),
+                Some(StoredSecret::OAuth {
+                    access, refresh, ..
+                }) => !access.is_empty() || !refresh.is_empty(),
+                None => env_api_key(provider).is_some(),
+            })
+            .map(str::to_string)
+            .collect())
+    }
+
     /// Resolve a usable credential for `model`'s provider: explicit stored
     /// credential first (refreshing OAuth under the cross-process lock and
     /// durably committing rotated refresh tokens), then the provider's env
@@ -1821,6 +1842,26 @@ mod tests {
     }
 
     #[test]
+    fn available_providers_follow_saved_and_removed_credentials() {
+        let dir = tempdir();
+        let store = CredentialStore::open(dir.path().join("auth.json")).unwrap();
+        let providers = ["test-connected", "test-disconnected", "local"];
+        assert!(store.available_providers(providers).unwrap().is_empty());
+        store.set_api_key("test-connected", "test-key").unwrap();
+        assert_eq!(
+            store.available_providers(providers).unwrap(),
+            BTreeSet::from(["test-connected".to_string()])
+        );
+        store.remove("test-connected").unwrap();
+        assert!(store.available_providers(providers).unwrap().is_empty());
+        fs::write(dir.path().join("auth.json"), "{broken").unwrap();
+        assert!(matches!(
+            store.available_providers(providers),
+            Err(AuthError::Corrupt(_))
+        ));
+    }
+
+    #[test]
     fn store_file_is_mode_600() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempdir();
@@ -1871,6 +1912,12 @@ mod tests {
         let dir = tempdir();
         let store = CredentialStore::open(dir.path().join("auth.json")).unwrap();
         let cred = store.resolve(&model("zenmux")).await.unwrap().unwrap();
+        assert_eq!(
+            store
+                .available_providers(["zenmux", "test-disconnected"])
+                .unwrap(),
+            BTreeSet::from(["zenmux".to_string()])
+        );
         assert_eq!(cred.expose_secret(), "env-key");
         // Stored beats env.
         store.set_api_key("zenmux", "stored-key").unwrap();

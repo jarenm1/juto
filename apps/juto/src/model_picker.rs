@@ -1,22 +1,18 @@
-//! OMP-style Model and Role picker component for GPUI.
-//!
-//! Features:
-//! - Search bar for real-time filtering across model IDs, names, providers, and roles.
-//! - Pinned "Recent / Latest Used" models at the top.
-//! - OMP model roles section (`@default`, `@smol`, `@fast`, `@reasoning`, `@editor`).
-//! - All catalog models grouped by provider with capability badges (reasoning, tools, context, rates).
-//! - Fast selection and keyboard navigation.
+//! Connected-provider model and role picker. Filtering is cached; only visible
+//! rows are rendered, even when an authenticated gateway has thousands of models.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use gpui::{
-    App, ClickEvent, Context, Entity, FocusHandle, Focusable, KeyBinding, ScrollHandle,
-    Subscription, Window, actions, div, prelude::*, px, rgb,
+    App, ClickEvent, Context, Entity, FocusHandle, Focusable, KeyBinding, ScrollStrategy,
+    SharedString, Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*,
+    px, rgb, uniform_list,
 };
+use juto_ai::HttpProvider;
 use juto_catalog::{Model, Registry};
-use juto_runtime::RuntimeConfig;
+use juto_runtime::{Runtime, RuntimeConfig};
 
-use crate::text_input::TextInput;
+use crate::text_input::{SubmitText, TextInput};
 
 actions!(
     model_picker,
@@ -37,59 +33,144 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// A model entry for the picker.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ModelEntry {
-    pub id: String,
-    pub name: String,
-    pub provider: String,
-    pub api: String,
-    pub context_window: Option<u64>,
-    pub max_tokens: Option<u64>,
-    pub supports_tools: bool,
-    pub reasoning: bool,
-    pub cost_input_per_mtok: f64,
-    pub cost_output_per_mtok: f64,
+struct ModelEntry {
+    selector: String,
+    provider: String,
+    name: SharedString,
+    details: SharedString,
+    search: String,
 }
 
 impl ModelEntry {
-    pub fn from_catalog(model: &Model) -> Self {
+    fn from_catalog(model: &Model) -> Self {
+        let selector = format!("{}/{}", model.provider, model.id);
+        let name = if model.name.is_empty() {
+            model.id.clone()
+        } else {
+            model.name.clone()
+        };
+        let mut badges = Vec::new();
+        if let Some(context) = model.context_window {
+            badges.push(format!("{}k context", context / 1000));
+        }
+        if model.reasoning {
+            badges.push("Reasoning".into());
+        }
+        if model.supports_tools {
+            badges.push("Tools".into());
+        }
+        if model.cost.input > 0.0 || model.cost.output > 0.0 {
+            badges.push(format!(
+                "${:.2} in / ${:.2} out per Mtok",
+                model.cost.input, model.cost.output
+            ));
+        }
+        let search = format!("{selector} {name} {}", model.api).to_lowercase();
         Self {
-            id: model.id.clone(),
-            name: if model.name.is_empty() {
-                model.id.clone()
-            } else {
-                model.name.clone()
-            },
+            selector,
             provider: model.provider.clone(),
-            api: model.api.clone(),
-            context_window: model.context_window,
-            max_tokens: model.max_tokens,
-            supports_tools: model.supports_tools,
-            reasoning: model.reasoning,
-            cost_input_per_mtok: model.cost.input,
-            cost_output_per_mtok: model.cost.output,
+            name: name.into(),
+            details: badges.join(" · ").into(),
+            search,
+        }
+    }
+}
+
+struct RoleEntry {
+    role: String,
+    target: String,
+    resolved: String,
+}
+
+struct PickerData {
+    models: Vec<ModelEntry>,
+    roles: Vec<RoleEntry>,
+    connected: BTreeSet<String>,
+    available: BTreeSet<String>,
+    filtered: Vec<usize>,
+    query: Option<String>,
+}
+
+impl PickerData {
+    fn new(config: &RuntimeConfig, registry: &Registry) -> Self {
+        let models = registry
+            .iter()
+            .filter(|model| {
+                matches!(model.kind.as_str(), "chat" | "tiny")
+                    && HttpProvider::supports_model(model)
+            })
+            .map(ModelEntry::from_catalog)
+            .collect();
+        let mut role_names = BTreeSet::from(["default".to_string()]);
+        role_names.extend(config.model_roles.keys().cloned());
+        let roles = role_names
+            .into_iter()
+            .filter_map(|name| {
+                let role = format!("@{name}");
+                let (target, _) = config.resolve_selector(&role).ok()?;
+                let model = registry.resolve(&target).ok()?;
+                Some(RoleEntry {
+                    role,
+                    target,
+                    resolved: format!("{}/{}", model.provider, model.id),
+                })
+            })
+            .collect();
+        Self {
+            models,
+            roles,
+            connected: BTreeSet::new(),
+            available: BTreeSet::new(),
+            filtered: Vec::new(),
+            query: None,
         }
     }
 
-    pub fn selector(&self) -> String {
-        format!("{}/{}", self.provider, self.id)
+    fn connect(&mut self, providers: BTreeSet<String>, query: &str) {
+        self.connected = providers;
+        self.available = self
+            .models
+            .iter()
+            .filter(|model| self.connected.contains(&model.provider))
+            .map(|model| model.selector.clone())
+            .collect();
+        self.query = None;
+        self.filter(query);
+    }
+
+    fn filter(&mut self, query: &str) -> bool {
+        let query = query.trim().to_lowercase();
+        if self.query.as_ref() == Some(&query) {
+            return false;
+        }
+        self.filtered = self
+            .models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| {
+                self.connected.contains(&model.provider) && model.search.contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        self.query = Some(query);
+        true
+    }
+
+    fn visible_roles<'a>(&'a self, query: &str) -> impl Iterator<Item = &'a RoleEntry> {
+        let query = query.trim().to_lowercase();
+        self.roles.iter().filter(move |role| {
+            self.available.contains(&role.resolved)
+                && (role.role.to_lowercase().contains(&query)
+                    || role.target.to_lowercase().contains(&query))
+        })
     }
 }
 
-/// An OMP role mapping entry.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RoleEntry {
-    pub role: String,
-    pub target: String,
-    pub description: String,
-}
-
-/// Events emitted by ModelPicker.
 #[derive(Clone, Debug)]
 pub enum ModelPickerEvent {
     SelectModel(String),
     Close,
+    ManageProviders,
 }
 
 pub struct ModelPicker {
@@ -97,9 +178,12 @@ pub struct ModelPicker {
     search_input: Entity<TextInput>,
     active_model: String,
     recent_models: Vec<String>,
-    all_models: Vec<ModelEntry>,
-    roles: Vec<RoleEntry>,
-    scroll_handle: ScrollHandle,
+    data: PickerData,
+    selected: usize,
+    scroll_handle: UniformListScrollHandle,
+    loading: bool,
+    error: Option<String>,
+    refresh_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -114,92 +198,75 @@ impl ModelPicker {
     ) -> Self {
         let active_model = active_model.into();
         let search_input = cx.new(|cx| {
-            TextInput::new(cx).with_placeholder(
-                "Filter models or roles (e.g. sonnet, gpt-4o, @default, @reasoning)…",
-            )
+            TextInput::new(cx).with_placeholder("Search connected models or configured roles…")
         });
-
-        let mut all_models: Vec<ModelEntry> =
-            registry.iter().map(ModelEntry::from_catalog).collect();
-        // If catalog is empty for any reason, add common standard fallbacks
-        if all_models.is_empty() {
-            all_models = default_fallback_models();
-        }
-
-        // Build standard + configured OMP roles
-        let mut roles = Vec::new();
-        roles.push(RoleEntry {
-            role: "@default".to_string(),
-            target: if config.model.is_empty() {
-                "anthropic/claude-sonnet-4-5".to_string()
-            } else {
-                config.model.clone()
-            },
-            description: "Primary default model for general tasks".to_string(),
-        });
-        roles.push(RoleEntry {
-            role: "@fast".to_string(),
-            target: config
-                .model_roles
-                .get("fast")
-                .cloned()
-                .unwrap_or_else(|| "anthropic/claude-3-5-haiku".to_string()),
-            description: "Fast, low-latency lightweight model".to_string(),
-        });
-        roles.push(RoleEntry {
-            role: "@smol".to_string(),
-            target: config
-                .model_roles
-                .get("smol")
-                .cloned()
-                .unwrap_or_else(|| "openai/gpt-4o-mini".to_string()),
-            description: "Economical model for high-throughput subtasks".to_string(),
-        });
-        roles.push(RoleEntry {
-            role: "@reasoning".to_string(),
-            target: config
-                .model_roles
-                .get("reasoning")
-                .cloned()
-                .unwrap_or_else(|| "openai/o3-mini".to_string()),
-            description: "High-effort deep reasoning model".to_string(),
-        });
-
-        // Add any additional custom roles from config
-        for (role_name, target) in &config.model_roles {
-            let role_tag = format!("@{role_name}");
-            if !roles.iter().any(|r| r.role == role_tag) {
-                roles.push(RoleEntry {
-                    role: role_tag,
-                    target: target.clone(),
-                    description: format!("Custom role mapping for @{role_name}"),
-                });
+        let subscription = cx.observe(&search_input, |this, input, cx| {
+            if this.data.filter(input.read(cx).text()) {
+                this.selected = 0;
+                this.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+                cx.notify();
             }
-        }
-
-        // Initial recent models list starting with active model
-        let mut recent_models = vec![
-            active_model.clone(),
-            "anthropic/claude-sonnet-4-5".to_string(),
-            "openai/gpt-4o".to_string(),
-            "google/gemini-2.5-pro".to_string(),
-            "ollama/llama3.3".to_string(),
-            "deepseek/deepseek-chat".to_string(),
-        ];
-        recent_models.dedup();
-
-        let obs_search = cx.observe(&search_input, |_, _, cx| cx.notify());
-
+        });
+        let submitted = cx.subscribe(&search_input, |this, _, _: &SubmitText, cx| {
+            this.select_current(cx);
+        });
         Self {
             focus_handle: cx.focus_handle(),
             search_input,
+            recent_models: vec![active_model.clone()],
             active_model,
-            recent_models,
-            all_models,
-            roles,
-            scroll_handle: ScrollHandle::new(),
-            _subscriptions: vec![obs_search],
+            data: PickerData::new(config, registry),
+            selected: 0,
+            scroll_handle: UniformListScrollHandle::new(),
+            loading: true,
+            error: None,
+            refresh_task: None,
+            _subscriptions: vec![subscription, submitted],
         }
+    }
+
+    pub fn refresh_credentials(
+        &mut self,
+        runtime: Runtime,
+        handle: tokio::runtime::Handle,
+        cx: &mut Context<Self>,
+    ) {
+        self.loading = true;
+        self.error = None;
+        // Fail closed while a refresh is pending; removed providers cannot remain selectable.
+        self.data
+            .connect(BTreeSet::new(), self.search_input.read(cx).text());
+        let providers: BTreeSet<String> = self
+            .data
+            .models
+            .iter()
+            .map(|model| model.provider.clone())
+            .collect();
+        let task = handle.spawn_blocking(move || {
+            runtime
+                .credentials()
+                .available_providers(providers.iter().map(String::as_str))
+        });
+        self.refresh_task = Some(cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.loading = false;
+                match result {
+                    Ok(Ok(providers)) => this
+                        .data
+                        .connect(providers, this.search_input.read(cx).text()),
+                    Ok(Err(error)) => {
+                        this.error = Some(format!("Could not read provider credentials: {error}"))
+                    }
+                    Err(error) => this.error = Some(format!("Credential lookup failed: {error}")),
+                }
+                this.selected = 0;
+                this.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
+                this.refresh_task = None;
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     pub fn focus(&self, window: &mut Window, cx: &App) {
@@ -209,12 +276,9 @@ impl ModelPicker {
     pub fn set_active_model(&mut self, model: impl Into<String>, cx: &mut Context<Self>) {
         let model = model.into();
         self.active_model = model.clone();
-        if !self.recent_models.contains(&model) {
-            self.recent_models.insert(0, model);
-            if self.recent_models.len() > 6 {
-                self.recent_models.truncate(6);
-            }
-        }
+        self.recent_models.retain(|recent| recent != &model);
+        self.recent_models.insert(0, model);
+        self.recent_models.truncate(6);
         cx.notify();
     }
 
@@ -228,542 +292,157 @@ impl ModelPicker {
         cx.emit(ModelPickerEvent::Close);
     }
 
-    fn filtered_roles<'a>(&'a self, cx: &App) -> Vec<&'a RoleEntry> {
-        let query = self.search_input.read(cx).text().trim().to_lowercase();
-        if query.is_empty() {
-            return self.roles.iter().collect();
-        }
-        self.roles
-            .iter()
-            .filter(|r| {
-                r.role.to_lowercase().contains(&query)
-                    || r.target.to_lowercase().contains(&query)
-                    || r.description.to_lowercase().contains(&query)
-            })
-            .collect()
+    fn previous(&mut self, _: &SelectPreviousModel, _: &mut Window, cx: &mut Context<Self>) {
+        self.selected = self.selected.saturating_sub(1);
+        self.scroll_handle
+            .scroll_to_item(self.selected, ScrollStrategy::Top);
+        cx.notify();
     }
 
-    fn filtered_models<'a>(&'a self, cx: &App) -> Vec<&'a ModelEntry> {
-        let query = self.search_input.read(cx).text().trim().to_lowercase();
-        if query.is_empty() {
-            return self.all_models.iter().collect();
-        }
-        self.all_models
-            .iter()
-            .filter(|m| {
-                m.id.to_lowercase().contains(&query)
-                    || m.name.to_lowercase().contains(&query)
-                    || m.provider.to_lowercase().contains(&query)
-                    || m.api.to_lowercase().contains(&query)
-            })
-            .collect()
+    fn next(&mut self, _: &SelectNextModel, _: &mut Window, cx: &mut Context<Self>) {
+        self.selected = (self.selected + 1).min(self.data.filtered.len().saturating_sub(1));
+        self.scroll_handle
+            .scroll_to_item(self.selected, ScrollStrategy::Bottom);
+        cx.notify();
     }
 
-    fn models_by_provider<'a>(
-        &'a self,
-        filtered: &[&'a ModelEntry],
-    ) -> BTreeMap<String, Vec<&'a ModelEntry>> {
-        let mut grouped: BTreeMap<String, Vec<&'a ModelEntry>> = BTreeMap::new();
-        for model in filtered {
-            grouped
-                .entry(model.provider.clone())
-                .or_default()
-                .push(model);
-        }
-        grouped
+    fn confirm(&mut self, _: &ConfirmModelSelection, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_current(cx);
     }
 
-    fn provider_display_name(provider: &str) -> &'static str {
-        match provider.to_lowercase().as_str() {
-            "anthropic" => "Anthropic",
-            "openai" => "OpenAI",
-            "openai-codex" => "OpenAI Codex",
-            "google" | "gemini" => "Google Gemini",
-            "ollama" => "Ollama (Local)",
-            "openrouter" => "OpenRouter",
-            "deepseek" => "DeepSeek",
-            "groq" => "Groq",
-            "mistral" => "Mistral AI",
-            "xai" => "xAI",
-            "azure" => "Azure OpenAI",
-            "cohere" => "Cohere",
-            "together" => "Together AI",
-            "perplexity" => "Perplexity",
-            _ => "Other Providers",
+    fn select_current(&mut self, cx: &mut Context<Self>) {
+        if let Some(index) = self.data.filtered.get(self.selected) {
+            self.select_model(self.data.models[*index].selector.clone(), cx);
         }
     }
 
-    // --- RENDER HELPERS ---
-
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn model_row(
+        &self,
+        row: usize,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let model = &self.data.models[index];
+        let selector = model.selector.clone();
+        let active = model.selector == self.active_model;
         div()
+            .id(("model-entry", index))
+            .h(px(72.))
+            .w_full()
+            .px_3()
+            .py_2()
             .flex()
             .items_center()
             .justify_between()
-            .px_4()
-            .py_3()
-            .border_b_1()
-            .border_color(rgb(0x333333))
-            .bg(rgb(0x202020))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_base()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xffffff))
-                            .child("Select Model or Role"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x888888))
-                            .child(format!("{} models in catalog", self.all_models.len())),
-                    ),
-            )
-            .child(
-                div()
-                    .id("close-picker-btn")
-                    .px_2()
-                    .py_1()
-                    .rounded_sm()
-                    .text_xs()
-                    .text_color(rgb(0xaaaaaa))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x303030)).text_color(rgb(0xffffff)))
-                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                        cx.emit(ModelPickerEvent::Close);
-                    }))
-                    .child("✕ Close (Esc)"),
-            )
-    }
-
-    fn search_bar(&self) -> impl IntoElement {
-        div()
-            .p_3()
-            .border_b_1()
-            .border_color(rgb(0x2a2a2a))
-            .bg(rgb(0x1c1c1c))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .p_1p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(0x404040))
-                    .bg(rgb(0x161616))
-                    .child(div().text_sm().text_color(rgb(0x707070)).child("🔍"))
-                    .child(self.search_input.clone()),
-            )
-    }
-
-    fn recent_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let is_searching = !self.search_input.read(cx).text().trim().is_empty();
-        if is_searching || self.recent_models.is_empty() {
-            return div().into_any_element();
-        }
-
-        let recents = self.recent_models.clone();
-        let active = self.active_model.clone();
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .p_3()
-            .border_b_1()
-            .border_color(rgb(0x2a2a2a))
-            .bg(rgb(0x1e1e1e))
-            .child(
-                div().flex().items_center().gap_2().child(
-                    div()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(rgb(0x60a5fa))
-                        .child("⚡ RECENT / LATEST USED"),
-                ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .children(recents.into_iter().enumerate().map(|(index, selector)| {
-                        let is_active = selector == active;
-                        let sel_copy = selector.clone();
-
-                        div()
-                            .id(("recent-model", index))
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .px_2p5()
-                            .py_1p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(if is_active {
-                                rgb(0x2e7d32)
-                            } else {
-                                rgb(0x3a3a3a)
-                            })
-                            .bg(if is_active {
-                                rgb(0x192e1e)
-                            } else {
-                                rgb(0x242424)
-                            })
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x303030)))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.select_model(sel_copy.clone(), cx);
-                            }))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .font_weight(if is_active {
-                                        gpui::FontWeight::SEMIBOLD
-                                    } else {
-                                        gpui::FontWeight::NORMAL
-                                    })
-                                    .text_color(if is_active {
-                                        rgb(0x4ade80)
-                                    } else {
-                                        rgb(0xeeeeee)
-                                    })
-                                    .child(selector),
-                            )
-                            .when(is_active, |pill| {
-                                pill.child(
-                                    div().text_xs().text_color(rgb(0x4ade80)).child("✓ Active"),
-                                )
-                            })
-                    })),
-            )
-            .into_any_element()
-    }
-
-    fn roles_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let filtered = self.filtered_roles(cx);
-        if filtered.is_empty() {
-            return div().into_any_element();
-        }
-
-        let active = self.active_model.clone();
-
-        div()
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .p_3()
-            .border_b_1()
-            .border_color(rgb(0x2a2a2a))
-            .bg(rgb(0x1b1b1b))
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(rgb(0xa78bfa))
-                    .child("🎭 OMP ROLES"),
-            )
+            .gap_3()
+            .rounded_md()
+            .border_1()
+            .border_color(if row == self.selected {
+                rgb(0x606060)
+            } else {
+                rgb(0x272727)
+            })
+            .bg(if active { rgb(0x132717) } else { rgb(0x1f1f1f) })
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x292929)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.select_model(selector.clone(), cx)
+            }))
             .child(
                 div()
                     .flex()
                     .flex_col()
+                    .min_w_0()
                     .gap_1()
-                    .children(filtered.into_iter().enumerate().map(|(index, role)| {
-                        let target = role.target.clone();
-                        let target_copy = target.clone();
-                        let is_active = target == active || role.role == active;
-
+                    .child(
                         div()
-                            .id(("role-row", index))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(if is_active {
-                                rgb(0x4c1d95)
-                            } else {
-                                rgb(0x282828)
-                            })
-                            .bg(if is_active {
-                                rgb(0x261440)
-                            } else {
-                                rgb(0x202020)
-                            })
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x2d2040)))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.select_model(target_copy.clone(), cx);
-                            }))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_3()
-                                    .child(
-                                        div()
-                                            .px_2()
-                                            .py_0p5()
-                                            .rounded_sm()
-                                            .bg(rgb(0x3b1c60))
-                                            .text_xs()
-                                            .font_weight(gpui::FontWeight::BOLD)
-                                            .text_color(rgb(0xc4b5fd))
-                                            .child(role.role.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(0xe0e0e0))
-                                            .child(format!("→ {target}")),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(rgb(0x7c7c7c))
-                                            .child(role.description.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_sm()
-                                    .border_1()
-                                    .border_color(rgb(0x4c1d95))
-                                    .bg(rgb(0x321354))
-                                    .text_xs()
-                                    .text_color(rgb(0xd8b4fe))
-                                    .child(if is_active {
-                                        "✓ Active"
-                                    } else {
-                                        "Select Role"
-                                    }),
-                            )
-                    })),
+                            .text_sm()
+                            .text_color(if active { rgb(0x4ade80) } else { rgb(0xffffff) })
+                            .truncate()
+                            .child(model.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0xaaaaaa))
+                            .truncate()
+                            .child(model.selector.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(0x888888))
+                            .truncate()
+                            .child(model.details.clone()),
+                    ),
             )
-            .into_any_element()
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(rgb(0xaaaaaa))
+                    .child(if active { "✓ Active" } else { "Select" }),
+            )
     }
 
-    fn model_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let filtered = self.filtered_models(cx);
-        let grouped = self.models_by_provider(&filtered);
-        let active = self.active_model.clone();
-
+    fn shortcuts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = self.search_input.read(cx).text();
+        let recents = self
+            .recent_models
+            .iter()
+            .filter(|selector| self.data.available.contains(*selector));
         div()
-            .id("model-list-container")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.scroll_handle)
-            .p_3()
             .flex()
             .flex_col()
-            .gap_4()
-            .when(filtered.is_empty(), |list| {
-                list.child(
+            .gap_2()
+            .px_4()
+            .py_2()
+            .when(query.trim().is_empty(), |view| {
+                view.child(
                     div()
-                        .py_8()
-                        .text_center()
-                        .text_sm()
-                        .text_color(rgb(0x808080))
-                        .child("No models matched your filter."),
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .children(recents.enumerate().map(|(index, selector)| {
+                            let selection = selector.clone();
+                            div()
+                                .id(("recent-model", index))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x242424))
+                                .text_xs()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0x333333)))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.select_model(selection.clone(), cx)
+                                }))
+                                .child(format!("Recent: {selector}"))
+                        })),
                 )
             })
-            .children(
-                grouped
-                    .into_iter()
-                    .enumerate()
-                    .map(|(provider_idx, (provider, models))| {
-                        let display_title = Self::provider_display_name(&provider);
-                        let count = models.len();
-                        let active_sel = active.clone();
-
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_1p5()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .px_2()
-                                    .py_1()
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .font_weight(gpui::FontWeight::BOLD)
-                                            .text_color(rgb(0x94a3b8))
-                                            .child(format!("{display_title} ({count})")),
-                                    ),
-                            )
-                            .child(div().flex().flex_col().gap_1().children(
-                                models.into_iter().enumerate().map(|(model_idx, model)| {
-                                    let selector = model.selector();
-                                    let is_active = selector == active_sel;
-                                    let sel_copy = selector.clone();
-
-                                    div()
-                                        .id(("model-entry", provider_idx * 1000 + model_idx))
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .px_3()
-                                        .py_2()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(if is_active {
-                                            rgb(0x1e5a2e)
-                                        } else {
-                                            rgb(0x272727)
-                                        })
-                                        .bg(if is_active {
-                                            rgb(0x132717)
-                                        } else {
-                                            rgb(0x1f1f1f)
-                                        })
-                                        .cursor_pointer()
-                                        .hover(|s| s.bg(rgb(0x292929)))
-                                        .on_click(cx.listener(
-                                            move |this, _: &ClickEvent, _, cx| {
-                                                this.select_model(sel_copy.clone(), cx);
-                                            },
-                                        ))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_0p5()
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap_2()
-                                                        .child(
-                                                            div()
-                                                                .text_sm()
-                                                                .font_weight(
-                                                                    gpui::FontWeight::MEDIUM,
-                                                                )
-                                                                .text_color(if is_active {
-                                                                    rgb(0x4ade80)
-                                                                } else {
-                                                                    rgb(0xffffff)
-                                                                })
-                                                                .child(model.name.clone()),
-                                                        )
-                                                        .child(
-                                                            div()
-                                                                .text_xs()
-                                                                .text_color(rgb(0x71717a))
-                                                                .child(selector.clone()),
-                                                        ),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap_1p5()
-                                                        .when_some(
-                                                            model.context_window,
-                                                            |row, ctx| {
-                                                                row.child(
-                                                                    div()
-                                                                        .px_1p5()
-                                                                        .py_0p5()
-                                                                        .rounded_sm()
-                                                                        .bg(rgb(0x2a2a2a))
-                                                                        .text_size(px(10.))
-                                                                        .text_color(rgb(0xa1a1aa))
-                                                                        .child(format!(
-                                                                            "{}k ctx",
-                                                                            ctx / 1000
-                                                                        )),
-                                                                )
-                                                            },
-                                                        )
-                                                        .when(model.reasoning, |row| {
-                                                            row.child(
-                                                                div()
-                                                                    .px_1p5()
-                                                                    .py_0p5()
-                                                                    .rounded_sm()
-                                                                    .bg(rgb(0x381e4a))
-                                                                    .text_size(px(10.))
-                                                                    .text_color(rgb(0xd896ff))
-                                                                    .child("🧠 Reasoning"),
-                                                            )
-                                                        })
-                                                        .when(model.supports_tools, |row| {
-                                                            row.child(
-                                                                div()
-                                                                    .px_1p5()
-                                                                    .py_0p5()
-                                                                    .rounded_sm()
-                                                                    .bg(rgb(0x163d23))
-                                                                    .text_size(px(10.))
-                                                                    .text_color(rgb(0x4ade80))
-                                                                    .child("⚡ Tools"),
-                                                            )
-                                                        })
-                                                        .when(
-                                                            model.cost_input_per_mtok > 0.0,
-                                                            |row| {
-                                                                row.child(
-                                                                    div()
-                                                                        .text_size(px(10.))
-                                                                        .text_color(rgb(0x71717a))
-                                                                        .child(format!(
-                                                                    "${:.2} in / ${:.2} out",
-                                                                    model.cost_input_per_mtok,
-                                                                    model.cost_output_per_mtok
-                                                                )),
-                                                                )
-                                                            },
-                                                        ),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .px_2p5()
-                                                .py_1()
-                                                .rounded_sm()
-                                                .border_1()
-                                                .border_color(if is_active {
-                                                    rgb(0x22c55e)
-                                                } else {
-                                                    rgb(0x3f3f46)
-                                                })
-                                                .bg(if is_active {
-                                                    rgb(0x15803d)
-                                                } else {
-                                                    rgb(0x27272a)
-                                                })
-                                                .text_xs()
-                                                .font_weight(gpui::FontWeight::MEDIUM)
-                                                .text_color(if is_active {
-                                                    rgb(0xffffff)
-                                                } else {
-                                                    rgb(0xd4d4d8)
-                                                })
-                                                .child(if is_active {
-                                                    "✓ Active"
-                                                } else {
-                                                    "Select"
-                                                }),
-                                        )
-                                }),
-                            ))
-                    }),
+            .child(
+                div().flex().flex_wrap().gap_2().children(
+                    self.data
+                        .visible_roles(query)
+                        .enumerate()
+                        .map(|(index, role)| {
+                            let selection = role.role.clone();
+                            div()
+                                .id(("role-row", index))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(rgb(0x261440))
+                                .text_xs()
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgb(0x3b1c60)))
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.select_model(selection.clone(), cx)
+                                }))
+                                .child(format!("{} → {}", role.role, role.target))
+                        }),
+                ),
             )
     }
 }
@@ -780,46 +459,118 @@ impl Render for ModelPicker {
             .key_context("ModelPicker")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close))
+            .on_action(cx.listener(Self::previous))
+            .on_action(cx.listener(Self::next))
+            .on_action(cx.listener(Self::confirm))
             .flex()
             .flex_col()
             .size_full()
             .bg(rgb(0x161616))
             .text_color(rgb(0xe4e4e7))
-            .child(self.header(cx))
-            .child(self.search_bar())
-            .child(self.recent_section(cx))
-            .child(self.roles_section(cx))
-            .child(self.model_list(cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(rgb(0x333333))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child("Select Model or Role")
+                            .child(div().text_xs().text_color(rgb(0x888888)).child(format!(
+                                "{} connected models · {} matching",
+                                self.data.available.len(),
+                                self.data.filtered.len()
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .id("close-picker-btn")
+                            .px_2()
+                            .py_1()
+                            .text_xs()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                cx.emit(ModelPickerEvent::Close)
+                            }))
+                            .child("Close (Esc)"),
+                    ),
+            )
+            .child(
+                div()
+                    .p_3()
+                    .border_b_1()
+                    .border_color(rgb(0x2a2a2a))
+                    .child(self.search_input.clone()),
+            )
+            .child(self.shortcuts(cx))
+            .when(
+                self.loading || self.error.is_some() || self.data.filtered.is_empty(),
+                |view| {
+                    let message = if self.loading {
+                        "Loading connected providers…".to_string()
+                    } else if let Some(error) = &self.error {
+                        error.clone()
+                    } else if self.data.available.is_empty() {
+                        "No connected models. Sign in to a provider or add an API key.".into()
+                    } else {
+                        "No connected models match your search.".into()
+                    };
+                    view.child(
+                        div()
+                            .p_4()
+                            .text_sm()
+                            .text_color(rgb(0xaaaaaa))
+                            .child(message),
+                    )
+                },
+            )
+            .child(
+                uniform_list(
+                    "model-list",
+                    self.data.filtered.len(),
+                    cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                        range
+                            .map(|row| this.model_row(row, this.data.filtered[row], cx))
+                            .collect()
+                    }),
+                )
+                .track_scroll(self.scroll_handle.clone())
+                .w_full()
+                .flex_1()
+                .min_h_0(),
+            )
+            .child(
+                div()
+                    .px_4()
+                    .py_3()
+                    .border_t_1()
+                    .border_color(rgb(0x333333))
+                    .flex()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x888888))
+                            .child("↑ ↓ Navigate · Enter Select"),
+                    )
+                    .child(
+                        div()
+                            .id("picker-manage-providers")
+                            .text_xs()
+                            .cursor_pointer()
+                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                cx.emit(ModelPickerEvent::ManageProviders)
+                            }))
+                            .child("Manage providers…"),
+                    ),
+            )
     }
-}
-
-fn default_fallback_models() -> Vec<ModelEntry> {
-    vec![
-        ModelEntry {
-            id: "claude-sonnet-4-5".into(),
-            name: "Claude 3.5 Sonnet".into(),
-            provider: "anthropic".into(),
-            api: "anthropic-messages".into(),
-            context_window: Some(200_000),
-            max_tokens: Some(8_192),
-            supports_tools: true,
-            reasoning: false,
-            cost_input_per_mtok: 3.0,
-            cost_output_per_mtok: 15.0,
-        },
-        ModelEntry {
-            id: "gpt-4o".into(),
-            name: "GPT-4o".into(),
-            provider: "openai".into(),
-            api: "openai-responses".into(),
-            context_window: Some(128_000),
-            max_tokens: Some(4_096),
-            supports_tools: true,
-            reasoning: false,
-            cost_input_per_mtok: 2.5,
-            cost_output_per_mtok: 10.0,
-        },
-    ]
 }
 
 #[cfg(test)]
@@ -827,38 +578,65 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_picker_populates_roles_and_recents() {
-        let registry = Registry::bundled().unwrap_or_else(|_| Registry::empty());
+    fn disconnected_models_and_roles_are_hidden_and_revoked() {
+        let registry = Registry::bundled().unwrap();
         let config = RuntimeConfig {
             model: "anthropic/claude-sonnet-4-5".into(),
+            model_roles: [("fast".into(), "openai/gpt-4o:high".into())].into(),
             ..Default::default()
         };
-        let models: Vec<ModelEntry> = registry.iter().map(ModelEntry::from_catalog).collect();
-        assert!(!models.is_empty(), "Bundled registry should have models");
-
-        let entry = models
-            .iter()
-            .find(|m| m.id == "claude-sonnet-4-5" && m.provider == "anthropic")
-            .unwrap();
-        assert_eq!(entry.selector(), "anthropic/claude-sonnet-4-5");
-        assert!(entry.supports_tools);
-        assert_eq!(config.model, "anthropic/claude-sonnet-4-5");
+        let mut data = PickerData::new(&config, &registry);
+        assert!(data.filtered.is_empty());
+        assert_eq!(data.visible_roles("").count(), 0);
+        data.connect(BTreeSet::from(["openai".into()]), "");
+        assert!(data.available.contains("openai/gpt-4o"));
+        assert!(!data.available.contains("anthropic/claude-sonnet-4-5"));
+        assert!(
+            data.filtered
+                .iter()
+                .all(|index| data.models[*index].provider == "openai")
+        );
+        assert_eq!(
+            data.visible_roles("")
+                .map(|role| role.role.as_str())
+                .collect::<Vec<_>>(),
+            ["@fast"]
+        );
+        data.filter(" GPT-4O ");
+        assert!(
+            data.filtered
+                .iter()
+                .any(|index| data.models[*index].selector == "openai/gpt-4o")
+        );
+        assert!(
+            data.filtered
+                .iter()
+                .all(|index| data.models[*index].search.contains("gpt-4o"))
+        );
+        data.connect(BTreeSet::new(), "");
+        assert!(data.filtered.is_empty());
+        assert_eq!(data.visible_roles("").count(), 0);
     }
 
     #[test]
-    fn model_entry_selector_formatting() {
-        let model = ModelEntry {
-            id: "gpt-4o".into(),
-            name: "GPT-4o".into(),
-            provider: "openai".into(),
-            api: "openai-responses".into(),
-            context_window: Some(128_000),
-            max_tokens: Some(4_096),
-            supports_tools: true,
-            reasoning: false,
-            cost_input_per_mtok: 2.5,
-            cost_output_per_mtok: 10.0,
-        };
-        assert_eq!(model.selector(), "openai/gpt-4o");
+    fn unsupported_transports_and_non_chat_models_are_not_offered() {
+        let mut registry = Registry::empty();
+        let mut model = Registry::bundled()
+            .unwrap()
+            .get("openai", "gpt-4o")
+            .unwrap()
+            .clone();
+        model.id = "chat".into();
+        registry.upsert(model.clone());
+        model.id = "embedding".into();
+        model.kind = "embedding".into();
+        registry.upsert(model.clone());
+        model.id = "unsupported".into();
+        model.kind = "chat".into();
+        model.api = "future-transport".into();
+        registry.upsert(model);
+        let mut data = PickerData::new(&RuntimeConfig::default(), &registry);
+        data.connect(BTreeSet::from(["openai".into()]), "");
+        assert_eq!(data.available, BTreeSet::from(["openai/chat".into()]));
     }
 }

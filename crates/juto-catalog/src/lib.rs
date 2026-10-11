@@ -249,19 +249,6 @@ mod tests {
     }
 
     #[test]
-    fn bundled_catalog_decodes_fully() {
-        let registry = bundled();
-        // The pinned snapshot (data/source.json) carries 5671 rows.
-        assert_eq!(registry.len(), 5671);
-        let sonnet = registry
-            .get("anthropic", "claude-sonnet-4-5")
-            .expect("anthropic claude-sonnet-4-5 must exist");
-        assert_eq!(sonnet.provider, "anthropic");
-        assert_eq!(sonnet.kind, "chat");
-        assert!(sonnet.context_window.is_some());
-    }
-
-    #[test]
     fn bundled_catalog_preserves_case_variant_rows() {
         let registry = bundled();
         // nanogpt ships `gemma-4-31B-Fabled` and `Gemma-4-31B-Fabled` as

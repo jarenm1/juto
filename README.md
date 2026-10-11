@@ -91,6 +91,42 @@ scripts/agent-scope.sh -- nix develop . -c cargo run -p juto --locked -- --help
 
 Ctrl-Q exits the window. Closing the last window also requests application exit.
 
+### Providers and model selection
+
+Open **Providers** (Ctrl-P) to search supported providers and choose a login
+method. OpenAI has one entry with **ChatGPT / Codex OAuth** and **OpenAI API Key**
+tabs: subscription credentials enable `openai-codex` models, while a Platform
+API key enables `openai` models. These credentials can coexist and are removed
+independently. Anthropic offers browser login and API-key entry under one
+provider; those methods replace the same stored Anthropic credential.
+
+API keys are masked by default. Saving/removing credentials and reading
+connection status run in the background, not during GPUI rendering. Browser
+login can be cancelled; leaving the login screen also cancels a pending OAuth
+flow and clears the key input. Removing a stored credential does not unset an
+environment variable, so an environment credential can keep a provider connected.
+The provider list and login details scroll independently in compact windows.
+
+The model picker (Ctrl-M) and `juto-cli models` show only chat models with an
+implemented transport and a stored or nonempty environment credential for their
+provider. Roles and recent selections cannot bypass this filter. Unauthenticated
+local models are not included in this connected-only view; explicit CLI/session
+model selectors remain available. With no connections, the picker offers
+**Manage providers…** rather than fabricated fallback models.
+
+The picker renders only visible rows and caches searchable model metadata.
+“Recent” contains actual selections, not a hardcoded list of older models.
+Credential changes refresh availability immediately; reopening the picker
+also picks up credentials changed outside the window.
+
+The bundled catalog is refreshed from
+[OMP revision `0affc77e`](https://github.com/can1357/oh-my-pi/blob/0affc77e41c357bb33f8bf056c3ea3cf50fd408b/packages/catalog/src/models.json).
+[Snapshot provenance](crates/juto-catalog/data/source.json) records the source,
+encoding, SHA-256, and retained MIT license. Catalog availability is a fast
+configuration check, not network validation or proof of account entitlement:
+an invalid key, expired non-refreshable login, or restricted model can still
+fail at inference.
+
 ### UI-only iteration
 
 `apps/juto/src/main.rs` launches the native window. `chat.rs` owns the chat view,

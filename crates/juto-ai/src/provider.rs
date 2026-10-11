@@ -47,6 +47,11 @@ pub struct HttpProvider {
     client: reqwest::Client,
 }
 impl HttpProvider {
+    /// Whether the HTTP provider implements this model's wire transport.
+    pub fn supports_model(model: &Model) -> bool {
+        Api::for_model(model).is_ok()
+    }
+
     pub fn new(credentials: Arc<CredentialStore>) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())

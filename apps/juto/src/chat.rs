@@ -182,8 +182,12 @@ impl ChatView {
         } else {
             runtime.config().model.clone()
         };
-        let model_picker =
-            cx.new(|cx| ModelPicker::new(&initial_model, runtime.config(), runtime.catalog(), cx));
+        let model_picker = cx.new(|cx| {
+            let mut picker =
+                ModelPicker::new(&initial_model, runtime.config(), runtime.catalog(), cx);
+            picker.refresh_credentials(runtime.clone(), tokio_handle.clone(), cx);
+            picker
+        });
         let auth_modal = cx.new(|cx| AuthModal::new(runtime.clone(), tokio_handle.clone(), cx));
         let subagent_control = RunControl::new();
         let subagents = runtime.subagent_manager(&subagent_control);
@@ -208,6 +212,9 @@ impl ChatView {
                 ModelPickerEvent::Close => {
                     this.close_modal(window, cx);
                 }
+                ModelPickerEvent::ManageProviders => {
+                    this.open_auth_modal(window, cx);
+                }
             },
         );
         let auth_modal_sub = cx.subscribe_in(
@@ -218,6 +225,13 @@ impl ChatView {
                     this.close_modal(window, cx);
                 }
                 AuthModalEvent::CredentialsChanged => {
+                    this.model_picker.update(cx, |picker, cx| {
+                        picker.refresh_credentials(
+                            this.runtime.clone(),
+                            this.tokio_handle.clone(),
+                            cx,
+                        );
+                    });
                     cx.notify();
                 }
             },
@@ -319,18 +333,29 @@ impl ChatView {
     }
 
     pub fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_modal == ActiveModal::AuthModal {
+            self.auth_modal.update(cx, |modal, cx| modal.dismiss(cx));
+        }
         self.active_modal = ActiveModal::ModelPicker;
+        self.model_picker.update(cx, |picker, cx| {
+            picker.refresh_credentials(self.runtime.clone(), self.tokio_handle.clone(), cx);
+        });
         self.model_picker.read(cx).focus(window, cx);
         cx.notify();
     }
 
     pub fn open_auth_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.active_modal = ActiveModal::AuthModal;
+        self.auth_modal
+            .update(cx, |modal, cx| modal.refresh_credentials(cx));
         self.auth_modal.read(cx).focus(window, cx);
         cx.notify();
     }
 
     pub fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_modal == ActiveModal::AuthModal {
+            self.auth_modal.update(cx, |modal, cx| modal.dismiss(cx));
+        }
         self.active_modal = ActiveModal::None;
         self.focus_input(window, cx);
         cx.notify();
@@ -682,7 +707,7 @@ impl ChatView {
                                     this.open_auth_modal(window, cx);
                                 }
                             }))
-                            .child("🔑 Providers & Keys"),
+                            .child("Providers"),
                     )
                     .child(
                         div()
