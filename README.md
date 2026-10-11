@@ -19,6 +19,11 @@ See [the full OMP runtime inventory and port plan](docs/omp-runtime.md) for the
 capabilities to preserve, primary-source references, and acceptance criteria.
 Agent contributors should read [AGENTS.md](AGENTS.md).
 
+**Workspace isolation and resource governance.** `juto-runtime` provides `SubagentWorkspace`
+for provisioning dedicated Jujutsu (`jj`) workspaces per subagent task, executing commands under
+systemd user scopes (`agents.slice`) with configurable CPU, memory, and swap ceilings, serializing
+GPU access with `flock`, and rebasing completed changes back into the repository.
+
 ## Development
 
 Requires Nix with flakes enabled. The supported development system is
