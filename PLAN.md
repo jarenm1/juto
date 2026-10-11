@@ -17,8 +17,8 @@ Full detailed specification: [`docs/orchestration-plan.md`](docs/orchestration-p
    * Isolated Jujutsu workspaces (`jj workspace add ~/workspaces/juto-<subagent-id>`).
    * Process and tool execution inside systemd user scopes (`agents.slice`), bounded
      CPU/RAM quotas, and GPU lock serialization (`scripts/agent-scope.sh` model).
-   * Repo initialization step (`juto init`) to automatically adapt to repository rules
-     and build systems.
+   * Bundled `juto-repo-setup` skill guides agents to inspect and document each
+     target repository's supported development workflow.
 5. **End-to-End Quality Gate & Zed Delta**:
    * E2E completion requires: code edits + formatting + build pass + deterministic test
      pass + observable smoke proof + automated peer review pass.

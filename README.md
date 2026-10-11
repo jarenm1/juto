@@ -30,6 +30,11 @@ routing (`builder`, `reviewer`, `scout`, `sonic`), sequential verification quali
 (`format`, `build`, `test`, `smoke`), adversarial peer review handoff, bounded remediation
 retry loops, cooperative cancellation safety, and real-time lifecycle event broadcasting.
 
+**Repository setup skill.** The runtime installs the bundled `juto-repo-setup`
+skill in its data directory on first startup. It guides agents through identifying
+a target repository's supported development workflow and documenting Juto-specific
+resource, workspace, and verification requirements without overwriting user edits.
+
 ## Development
 
 Requires Nix with flakes enabled. The supported development system is

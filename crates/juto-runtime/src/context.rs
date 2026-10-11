@@ -165,13 +165,10 @@ fn scan_skills_root(root: &Path, out: &mut BTreeMap<String, Skill>) -> Result<()
     Ok(())
 }
 
-/// Discover skills from `.juto/skills/<name>/SKILL.md` in every directory
-/// from the filesystem root down to `cwd`, then `<global_dir>/skills/` and
-/// `<global_dir>/.omp/skills/`. Nearer-to-cwd project skills shadow
-/// same-named outer/global skills; global never overrides a project skill.
+/// Discover project skills first, then user skills from `<global_dir>/skills/`
+/// and `<global_dir>/.omp/skills/`, then bundled harness skills. Nearer-to-cwd
+/// project skills and user-installed global skills shadow same-named defaults.
 pub fn discover_skills(cwd: &Path, global_dir: &Path) -> Result<Vec<Skill>> {
-    // First writer wins, so scan highest precedence first: project skills
-    // from cwd outward, then the global dirs.
     let mut skills = BTreeMap::new();
     for dir in cwd.ancestors() {
         scan_skills_root(&dir.join(".juto/skills"), &mut skills)?;
@@ -179,7 +176,116 @@ pub fn discover_skills(cwd: &Path, global_dir: &Path) -> Result<Vec<Skill>> {
     }
     scan_skills_root(&global_dir.join("skills"), &mut skills)?;
     scan_skills_root(&global_dir.join(".omp/skills"), &mut skills)?;
+    scan_skills_root(&global_dir.join("bundled-skills"), &mut skills)?;
     Ok(skills.into_values().collect())
+}
+
+/// Install Juto's bundled repository-setup skill in the runtime data directory.
+/// The complete file is linked into place atomically; existing user content wins.
+pub fn install_bundled_skills(global_dir: &Path) -> Result<()> {
+    use std::{
+        io::Write as _,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    let directory = global_dir.join("bundled-skills/juto-repo-setup");
+    std::fs::create_dir_all(&directory).map_err(io_err(&directory))?;
+    let path = directory.join("SKILL.md");
+    let (temporary, mut file) = loop {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary =
+            directory.join(format!(".SKILL.md.{}.{}.tmp", std::process::id(), sequence));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(io_err(&temporary)(error)),
+        }
+    };
+    let write_result = file
+        .write_all(include_bytes!("../skills/juto-repo-setup/SKILL.md"))
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(io_err(&temporary)(error));
+    }
+
+    let link_result = std::fs::hard_link(&temporary, &path);
+    let cleanup_result = std::fs::remove_file(&temporary);
+    match link_result {
+        Ok(()) => cleanup_result.map_err(io_err(&temporary))?,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            cleanup_result.map_err(io_err(&temporary))?;
+        }
+        Err(error) => {
+            let _ = cleanup_result;
+            return Err(io_err(&path)(error));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod bundled_skill_tests {
+    use super::*;
+
+    #[test]
+    fn installs_bundled_skill_for_global_discovery_without_overwriting_user_edits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        install_bundled_skills(&global).unwrap();
+
+        let skills = discover_skills(tmp.path(), &global).unwrap();
+        let skill = skills
+            .iter()
+            .find(|skill| skill.name == "juto-repo-setup")
+            .unwrap();
+        assert!(skill.description.contains("target repository"));
+        assert!(
+            std::fs::read_to_string(&skill.path)
+                .unwrap()
+                .contains("## Completion criteria")
+        );
+
+        std::fs::write(&skill.path, "user version").unwrap();
+        install_bundled_skills(&global).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&skill.path).unwrap(),
+            "user version"
+        );
+    }
+
+    #[test]
+    fn global_compatibility_skill_shadows_bundled_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        let custom = global.join(".omp/skills/juto-repo-setup");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(
+            custom.join("SKILL.md"),
+            "---\nname: juto-repo-setup\ndescription: user version\n---\ncustom\n",
+        )
+        .unwrap();
+
+        install_bundled_skills(&global).unwrap();
+
+        let skill = discover_skills(tmp.path(), &global)
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.name == "juto-repo-setup")
+            .unwrap();
+        assert_eq!(skill.description, "user version");
+        assert_eq!(
+            std::fs::read_to_string(skill.path).unwrap().lines().last(),
+            Some("custom")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +379,25 @@ mod tests {
         // No frontmatter at all → skipped, not an error.
         std::fs::write(bad.join("SKILL.md"), "plain markdown\n").unwrap();
         assert!(discover_skills(&cwd, &global).unwrap().is_empty());
+        let _ = tmp;
+    }
+
+    #[test]
+    fn runtime_installs_bundled_skill_before_first_turn() {
+        let (tmp, cwd, global) = tree();
+        crate::Runtime::from_config(&cwd, &global, crate::RuntimeConfig::default()).unwrap();
+
+        let skill = discover_skills(&cwd, &global)
+            .unwrap()
+            .into_iter()
+            .find(|skill| skill.name == "juto-repo-setup")
+            .unwrap();
+        assert!(skill.path.starts_with(global.join("bundled-skills")));
+        assert!(
+            std::fs::read_to_string(skill.path)
+                .unwrap()
+                .contains("## Procedure")
+        );
         let _ = tmp;
     }
 }

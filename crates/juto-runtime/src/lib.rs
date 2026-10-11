@@ -123,6 +123,7 @@ impl Runtime {
         }
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(data_dir.join("sessions"))?;
+        context::install_bundled_skills(&data_dir)?;
         let mut registry = Registry::bundled()?;
         for model in &config.custom_models {
             registry.upsert(model.clone());
