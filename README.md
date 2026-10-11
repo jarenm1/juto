@@ -24,6 +24,12 @@ for provisioning dedicated Jujutsu (`jj`) workspaces per subagent task, executin
 systemd user scopes (`agents.slice`) with configurable CPU, memory, and swap ceilings, serializing
 GPU access with `flock`, and rebasing completed changes back into the repository.
 
+**Multi-agent orchestrator and peer review DAG.** `juto-runtime` provides `Orchestrator`
+for end-to-end task execution: intent triage via discrete classification (`Judge`), persona
+routing (`builder`, `reviewer`, `scout`, `sonic`), sequential verification quality gates
+(`format`, `build`, `test`, `smoke`), adversarial peer review handoff, bounded remediation
+retry loops, cooperative cancellation safety, and real-time lifecycle event broadcasting.
+
 ## Development
 
 Requires Nix with flakes enabled. The supported development system is
