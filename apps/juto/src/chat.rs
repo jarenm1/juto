@@ -15,7 +15,7 @@ use gpui::{
 };
 use juto_agent::{AgentEvent, RunControl, RunOutcome};
 use juto_ai::{Message as AiMessage, ProviderEvent, StopReason};
-use juto_runtime::{EntryKind, Runtime, Session};
+use juto_runtime::{DesktopSessionArtifact, EntryKind, Runtime, Session};
 use tokio::sync::Mutex;
 
 actions!(
@@ -27,6 +27,7 @@ actions!(
         ToggleSidebar
     ]
 );
+
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("escape", CloseAttachmentMenu, Some("ChatView")),
@@ -97,6 +98,33 @@ pub fn format_prompt(text: &str, attachments: &[Attachment]) -> String {
     prompt
 }
 
+pub fn extract_desktop_artifacts(message: &AiMessage) -> Vec<DesktopSessionArtifact> {
+    let mut artifacts = Vec::new();
+    match message {
+        AiMessage::ToolResult { details, .. } => {
+            if details.get("type").and_then(|t| t.as_str()) == Some("desktop_session_artifact")
+                && let Some(art) = details.get("artifact")
+                && let Ok(artifact) = serde_json::from_value::<DesktopSessionArtifact>(art.clone())
+            {
+                artifacts.push(artifact);
+            }
+        }
+        AiMessage::Assistant(assistant) => {
+            // In case artifacts are mirrored in assistant metadata/tool calls
+            for call in assistant.tool_calls() {
+                if call.name == "desktop_artifact"
+                    && let Ok(artifact) =
+                        serde_json::from_value::<DesktopSessionArtifact>(call.arguments.clone())
+                {
+                    artifacts.push(artifact);
+                }
+            }
+        }
+        _ => {}
+    }
+    artifacts
+}
+
 pub fn load_messages(session: &Session) -> Vec<Message> {
     let mut messages = Vec::new();
     if let Ok(entries) = session.active_entries() {
@@ -108,16 +136,36 @@ pub fn load_messages(session: &Session) -> Vec<Message> {
                             role: MessageRole::User,
                             text: message.text().into(),
                             attachments: Vec::new(),
+                            desktop_artifacts: Vec::new(),
                         });
                     }
                     AiMessage::Assistant(assistant) => {
                         let text = assistant.text();
-                        if !text.is_empty() {
+                        let desktop_artifacts = extract_desktop_artifacts(message);
+                        if !text.is_empty() || !desktop_artifacts.is_empty() {
                             messages.push(Message {
                                 role: MessageRole::Assistant,
                                 text: text.into(),
                                 attachments: Vec::new(),
+                                desktop_artifacts,
                             });
+                        }
+                    }
+                    AiMessage::ToolResult { .. } => {
+                        let desktop_artifacts = extract_desktop_artifacts(message);
+                        if !desktop_artifacts.is_empty() {
+                            if let Some(last) = messages.last_mut()
+                                && last.role == MessageRole::Assistant
+                            {
+                                last.desktop_artifacts.extend(desktop_artifacts);
+                            } else {
+                                messages.push(Message {
+                                    role: MessageRole::Assistant,
+                                    text: SharedString::default(),
+                                    attachments: Vec::new(),
+                                    desktop_artifacts,
+                                });
+                            }
                         }
                     }
                     _ => {}
@@ -133,6 +181,7 @@ pub struct Message {
     pub role: MessageRole,
     pub text: SharedString,
     pub attachments: Vec<Attachment>,
+    pub desktop_artifacts: Vec<DesktopSessionArtifact>,
 }
 
 pub struct ChatView {
@@ -157,6 +206,7 @@ pub struct ChatView {
     is_running: bool,
     active_control: Option<RunControl>,
     run_task: Option<Task<()>>,
+    artifact_notice: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
 }
 impl Drop for ChatView {
@@ -298,6 +348,7 @@ impl ChatView {
             attachment_menu_open: false,
             menu_just_dismissed: false,
             attachment_error: None,
+            artifact_notice: None,
             picker: None,
             scroll: ScrollHandle::new(),
             runtime,
@@ -404,8 +455,10 @@ impl ChatView {
                 text
             },
             attachments,
+            desktop_artifacts: Vec::new(),
         });
         self.attachment_error = None;
+        self.artifact_notice = None;
         self.scroll.scroll_to_bottom();
         self.focus_input(window, cx);
         self.is_running = true;
@@ -451,6 +504,7 @@ impl ChatView {
                     role: MessageRole::Assistant,
                     text: SharedString::default(),
                     attachments: Vec::new(),
+                    desktop_artifacts: Vec::new(),
                 });
                 self.scroll.scroll_to_bottom();
                 cx.notify();
@@ -492,6 +546,7 @@ impl ChatView {
                             role: MessageRole::Assistant,
                             text: error_text.into(),
                             attachments: Vec::new(),
+                            desktop_artifacts: Vec::new(),
                         });
                     }
                 } else {
@@ -499,12 +554,33 @@ impl ChatView {
                         role: MessageRole::Assistant,
                         text: error_text.into(),
                         attachments: Vec::new(),
+                        desktop_artifacts: Vec::new(),
                     });
                 }
                 self.scroll.scroll_to_bottom();
                 cx.notify();
             }
-            AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. } => {
+            AgentEvent::ToolExecutionStart { .. } => {
+                self.sync_subagents(cx);
+            }
+            AgentEvent::ToolExecutionEnd { result, .. } => {
+                let artifacts = extract_desktop_artifacts(&result);
+                if !artifacts.is_empty() {
+                    if let Some(last) = self.messages.last_mut()
+                        && last.role == MessageRole::Assistant
+                    {
+                        last.desktop_artifacts.extend(artifacts);
+                    } else {
+                        self.messages.push(Message {
+                            role: MessageRole::Assistant,
+                            text: SharedString::default(),
+                            attachments: Vec::new(),
+                            desktop_artifacts: artifacts,
+                        });
+                    }
+                    self.scroll.scroll_to_bottom();
+                    cx.notify();
+                }
                 self.sync_subagents(cx);
             }
             _ => {}
@@ -555,6 +631,7 @@ impl ChatView {
                             role: MessageRole::Assistant,
                             text: error_msg.into(),
                             attachments: Vec::new(),
+                            desktop_artifacts: Vec::new(),
                         });
                     }
                 } else {
@@ -562,6 +639,7 @@ impl ChatView {
                         role: MessageRole::Assistant,
                         text: error_msg.into(),
                         attachments: Vec::new(),
+                        desktop_artifacts: Vec::new(),
                     });
                 }
             }
@@ -571,6 +649,7 @@ impl ChatView {
                     role: MessageRole::Assistant,
                     text: error_msg.into(),
                     attachments: Vec::new(),
+                    desktop_artifacts: Vec::new(),
                 });
             }
         }
@@ -745,7 +824,8 @@ impl ChatView {
             )
     }
 
-    fn message_list(&self) -> impl IntoElement {
+    fn message_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let messages = self.messages.clone();
         div()
             .id("messages")
             .flex_1()
@@ -762,7 +842,7 @@ impl ChatView {
                     .w_full()
                     .max_w(px(800.))
                     .mx_auto()
-                    .when(self.messages.is_empty(), |view| {
+                    .when(messages.is_empty(), |view| {
                         view.child(
                             div()
                                 .py_12()
@@ -786,10 +866,82 @@ impl ChatView {
                         )
                     })
                     .children(
-                        self.messages
+                        messages
                             .iter()
                             .enumerate()
-                            .map(|(index, message)| message_row(index, message)),
+                            .map(|(index, message)| {
+                                let author = match message.role {
+                                    MessageRole::User => "You",
+                                    MessageRole::Assistant => "Assistant",
+                                };
+                                let artifacts = message.desktop_artifacts.clone();
+                                div()
+                                    .id(("message", index))
+                                    .flex_none()
+                                    .w_full()
+                                    .min_w_0()
+                                    .child(
+                                        div()
+                                            .mb_2()
+                                            .text_xs()
+                                            .text_color(rgb(0xa0a0a0))
+                                            .child(author),
+                                    )
+                                    .when(!message.text.is_empty(), |row| {
+                                        row.child(
+                                            div()
+                                                .w_full()
+                                                .text_size(px(15.))
+                                                .child(message.text.clone()),
+                                        )
+                                    })
+                                    .when(!message.attachments.is_empty(), |row| {
+                                        row.child(
+                                            div().mt_2().flex().flex_wrap().gap_2().children(
+                                                message
+                                                    .attachments
+                                                    .iter()
+                                                    .map(|attachment| attachment_chip(attachment.label.clone()).pr_2()),
+                                            ),
+                                        )
+                                    })
+                                    .when(!artifacts.is_empty(), |row| {
+                                        row.child(
+                                            div().mt_3().flex().flex_col().gap_2().children(
+                                                artifacts
+                                                    .into_iter()
+                                                    .enumerate()
+                                                    .map(|(art_idx, artifact)| {
+                                                        let env_id = artifact.environment_id.clone();
+                                                        let art_id = artifact.artifact_id.clone();
+                                                        let btn = div()
+                                                            .id(("open-desktop-btn", (index * 1000 + art_idx) as u32))
+                                                            .px_2p5()
+                                                            .py_1()
+                                                            .rounded_md()
+                                                            .bg(rgb(0x2563eb))
+                                                            .hover(|s| s.bg(rgb(0x1d4ed8)))
+                                                            .text_xs()
+                                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                                            .text_color(rgb(0xffffff))
+                                                            .cursor_pointer()
+                                                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                                                this.artifact_notice = Some(
+                                                                    format!(
+                                                                        "Desktop streaming backend is unavailable for environment '{}' (artifact '{}'). No active video/WebRTC adapter configured.",
+                                                                        env_id, art_id
+                                                                    )
+                                                                    .into(),
+                                                                );
+                                                                cx.notify();
+                                                            }))
+                                                            .child("Open Desktop ↗");
+                                                        desktop_artifact_card(&artifact, btn)
+                                                    }),
+                                            ),
+                                        )
+                                    })
+                            }),
                     ),
             )
     }
@@ -883,6 +1035,45 @@ impl ChatView {
                 .mx_auto()
                 .when_some(self.attachment_error.clone(), |column, error| {
                     column.child(div().text_xs().text_color(rgb(0xb0b0b0)).child(error))
+                })
+                .when_some(self.artifact_notice.clone(), |column, notice| {
+                    column.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(0x3b82f6))
+                            .bg(rgb(0x1e293b))
+                            .text_xs()
+                            .text_color(rgb(0x93c5fd))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child("ℹ️")
+                                    .child(notice),
+                            )
+                            .child(
+                                div()
+                                    .id("dismiss-artifact-notice")
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(0x334155)))
+                                    .text_color(rgb(0xe2e8f0))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.artifact_notice = None;
+                                        cx.notify();
+                                    }))
+                                    .child("×"),
+                            ),
+                    )
                 })
                 .child(
                     div()
@@ -1024,41 +1215,75 @@ fn menu_item(
         .child(div().text_xs().text_color(rgb(0x909090)).child(detail))
 }
 
-fn message_row(index: usize, message: &Message) -> impl IntoElement {
-    let author = match message.role {
-        MessageRole::User => "You",
-        MessageRole::Assistant => "Assistant",
-    };
+fn desktop_artifact_card(artifact: &DesktopSessionArtifact, open_button: impl IntoElement) -> Div {
     div()
-        .id(("message", index))
-        .flex_none()
-        .w_full()
-        .min_w_0()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_3()
+        .max_w(px(460.))
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(0x3b82f6))
+        .bg(rgb(0x1e293b))
         .child(
             div()
-                .mb_2()
-                .text_xs()
-                .text_color(rgb(0xa0a0a0))
-                .child(author),
-        )
-        .when(!message.text.is_empty(), |row| {
-            row.child(
-                div()
-                    .w_full()
-                    .text_size(px(15.))
-                    .child(message.text.clone()),
-            )
-        })
-        .when(!message.attachments.is_empty(), |row| {
-            row.child(
-                div().mt_2().flex().flex_wrap().gap_2().children(
-                    message
-                        .attachments
-                        .iter()
-                        .map(|attachment| attachment_chip(attachment.label.clone()).pr_2()),
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xf1f5f9))
+                        .child("🖥️")
+                        .child(artifact.title.clone()),
+                )
+                .child(
+                    div()
+                        .px_2()
+                        .py_0p5()
+                        .rounded_sm()
+                        .bg(rgb(0x0f172a))
+                        .border_1()
+                        .border_color(rgb(0x334155))
+                        .text_xs()
+                        .text_color(rgb(0x94a3b8))
+                        .child(format!("v{}", artifact.version)),
                 ),
-            )
-        })
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .text_xs()
+                .text_color(rgb(0xcbd5e1))
+                .child(div().child(format!("Artifact ID: {}", artifact.artifact_id)))
+                .child(div().child(format!("Environment ID: {}", artifact.environment_id)))
+                .child(div().child(format!("Host ID: {}", artifact.host_id)))
+                .child(div().child(format!("Grant ID: {}", artifact.grant_id))),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .pt_1()
+                .border_t_1()
+                .border_color(rgb(0x334155))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0x94a3b8))
+                        .child("Remote Sharing Session (IDs-only)"),
+                )
+                .child(open_button),
+        )
 }
 
 impl Render for ChatView {
@@ -1110,7 +1335,7 @@ impl Render for ChatView {
                                 .flex_1()
                                 .min_w_0()
                                 .h_full()
-                                .child(self.message_list())
+                                .child(self.message_list(cx))
                                 .child(self.composer(window, cx)),
                         )
                         .when(self.show_sidebar, |row| {
@@ -1214,5 +1439,47 @@ mod tests {
         assert_eq!(messages[0].text.as_ref(), "Hello from user");
         assert_eq!(messages[1].role, MessageRole::Assistant);
         assert_eq!(messages[1].text.as_ref(), "Hello from assistant");
+    }
+
+    #[test]
+    fn load_messages_extracts_and_mounts_desktop_artifacts_from_tool_results() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut session = Session::create(temp_dir.path(), &cwd).unwrap();
+
+        let artifact = DesktopSessionArtifact {
+            version: 1,
+            artifact_id: "desk-test-01".into(),
+            title: "Simulated Game Desktop".into(),
+            host_id: "host-west-01".into(),
+            environment_id: "env-sandbox-42".into(),
+            grant_id: "grant-view-99".into(),
+        };
+
+        let tool_result = AiMessage::ToolResult {
+            tool_call_id: "call-1".into(),
+            tool_name: "desktop_artifact".into(),
+            content: vec![juto_ai::ContentBlock::Text {
+                text: "Desktop sharing artifact mounted".into(),
+            }],
+            is_error: false,
+            details: serde_json::json!({
+                "type": "desktop_session_artifact",
+                "artifact": artifact.clone()
+            }),
+            timestamp: 0,
+        };
+
+        session
+            .append(EntryKind::Message {
+                message: tool_result,
+            })
+            .unwrap();
+
+        let messages = load_messages(&session);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert_eq!(messages[0].desktop_artifacts.len(), 1);
+        assert_eq!(messages[0].desktop_artifacts[0], artifact);
     }
 }

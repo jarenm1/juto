@@ -3087,6 +3087,7 @@ dependencies = [
  "juto-ai",
  "juto-catalog",
  "juto-runtime",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
