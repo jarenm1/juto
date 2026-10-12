@@ -1805,7 +1805,7 @@ fn run_desktop_action(
     }
 }
 
-fn host_identifier() -> String {
+pub(crate) fn host_identifier() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .filter(|h| !h.trim().is_empty())
@@ -3586,6 +3586,106 @@ mod tests {
             "generated: {}",
             art2.artifact_id
         );
+    }
+
+    #[tokio::test]
+    async fn desktop_artifact_resolver_validates_host_environment_and_grant() {
+        use crate::desktop_artifact::{DesktopArtifactResolver, ResolveError, ViewerRoute};
+
+        let supervisor = Arc::new(juto_desktop::DesktopSupervisor::new());
+        let signaling = Arc::new(crate::SignalingHandle::new(supervisor.clone()));
+        let data_dir = tempfile::tempdir().unwrap();
+        let tool = DesktopTool {
+            supervisor: supervisor.clone(),
+            signaling: signaling.clone(),
+            data_dir: data_dir.path().to_path_buf(),
+        };
+        let ctx = ctx(data_dir.path());
+
+        let created = tool
+            .execute(
+                json!({"action": "create", "title": "artifact"}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        let env_id = created.details["envId"].as_str().unwrap().to_string();
+        let grant_id = created.details["grantId"].as_str().unwrap().to_string();
+        let host_id = created.details["hostId"].as_str().unwrap().to_string();
+
+        let resolver =
+            DesktopArtifactResolver::new(supervisor.clone(), signaling.clone(), host_id.clone());
+        let artifact = DesktopSessionArtifact {
+            version: DESKTOP_SESSION_ARTIFACT_VERSION,
+            artifact_id: "art-1".to_string(),
+            title: "artifact".to_string(),
+            host_id: host_id.clone(),
+            environment_id: env_id.clone(),
+            grant_id: grant_id.clone(),
+        };
+
+        // A valid descriptor resolves to the same-host route.
+        let route = resolver.resolve("agent:session", &artifact).unwrap();
+        assert!(matches!(route, ViewerRoute::Local { .. }), "{route:?}");
+
+        // The remote route issues a one-time token.
+        let route = resolver.resolve_remote("agent:session", &artifact).unwrap();
+        match route {
+            ViewerRoute::Remote { url, token, .. } => {
+                assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+                assert!(token.starts_with("attach-"), "{token}");
+            }
+            other => panic!("expected a remote route, got {other:?}"),
+        }
+
+        // Wrong host, environment, grant, and principal are distinguished.
+        let mut wrong_host = artifact.clone();
+        wrong_host.host_id = "other-host".to_string();
+        assert!(matches!(
+            resolver.resolve("agent:session", &wrong_host),
+            Err(ResolveError::Unsupported(_))
+        ));
+
+        let mut wrong_env = artifact.clone();
+        wrong_env.environment_id = "missing".to_string();
+        assert!(matches!(
+            resolver.resolve("agent:session", &wrong_env),
+            Err(ResolveError::Unavailable(_))
+        ));
+
+        let mut wrong_grant = artifact.clone();
+        wrong_grant.grant_id = "missing".to_string();
+        assert!(matches!(
+            resolver.resolve("agent:session", &wrong_grant),
+            Err(ResolveError::Unauthorized(_))
+        ));
+
+        assert!(matches!(
+            resolver.resolve("human:other", &artifact),
+            Err(ResolveError::Unauthorized(_))
+        ));
+
+        // An expired grant is reported as expired, not unauthorized.
+        let env = supervisor.get_environment(&env_id).unwrap();
+        let expired = env.issue_grant(
+            "agent:session".to_string(),
+            vec![juto_desktop::protocol::GrantRole::View],
+            "session".to_string(),
+            0,
+        );
+        let mut expired_artifact = artifact.clone();
+        expired_artifact.grant_id = expired.grant_id.clone();
+        assert!(matches!(
+            resolver.resolve("agent:session", &expired_artifact),
+            Err(ResolveError::Expired(_))
+        ));
+
+        // A destroyed environment is reported as stopped.
+        env.destroy();
+        assert!(matches!(
+            resolver.resolve("agent:session", &artifact),
+            Err(ResolveError::Stopped(_))
+        ));
     }
 
     #[tokio::test]

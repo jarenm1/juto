@@ -199,6 +199,14 @@ reports connection state and errors instead of showing a stale frame as live.
 `juto --desktop <command> [args...]` opens the same viewer directly for
 development.
 
+**Artifact resolution.** Opening a `desktop_artifact` card resolves the
+descriptor through the runtime: the host must be this host, the environment must
+exist here, and the grant must be issued to the requesting principal and
+unexpired. The resolver returns a same-host viewer route or a one-time remote
+attach token, and otherwise reports `Unsupported`, `Unauthorized`, `Expired`,
+`Stopped`, or `Unavailable` explicitly. A resolved route is not proof of a live
+stream — only received frames establish that.
+
 **Aggregate environment cgroup.** Each environment owns a transient
 `juto-desktop-<env>.slice` carrying the configured `CPUQuota`, `MemoryMax`,
 `MemorySwapMax`, and `TasksMax`; applications run as scopes inside that slice, so

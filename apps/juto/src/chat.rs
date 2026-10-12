@@ -449,10 +449,44 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Opens the embedded viewer for an existing desktop environment.
+    /// Resolves a desktop artifact and opens the viewer it authorizes.
     ///
-    /// Resolution is explicit: an unknown or stopped environment reports
-    /// `Unavailable` rather than fabricating a live stream.
+    /// Resolution is explicit: an unknown host, environment, or grant reports
+    /// `Unsupported`, `Unavailable`, `Unauthorized`, `Expired`, or `Stopped`
+    /// rather than fabricating a live stream.
+    pub fn open_desktop_artifact(
+        &mut self,
+        artifact: &DesktopSessionArtifact,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let resolver = self.runtime.desktop_artifact_resolver();
+        let principal = artifact.grant_id.clone();
+        let _ = principal;
+        match resolver.resolve("agent:session", artifact) {
+            Ok(juto_runtime::ViewerRoute::Local { env_id, .. }) => {
+                self.open_desktop_viewer(&env_id, window, cx);
+            }
+            Ok(juto_runtime::ViewerRoute::Remote { url, .. }) => {
+                self.artifact_notice = Some(
+                    format!(
+                        "Desktop '{}' is available remotely at {url} (one-time token, 60s). \
+                         External-browser play is not inline GPUI interaction.",
+                        artifact.title
+                    )
+                    .into(),
+                );
+                cx.notify();
+            }
+            Err(err) => {
+                self.artifact_notice =
+                    Some(format!("Desktop '{}' cannot be opened: {err}", artifact.title).into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Opens the embedded viewer for an existing desktop environment.
     pub fn open_desktop_viewer(
         &mut self,
         env_id: &str,
@@ -1025,7 +1059,8 @@ impl ChatView {
                                     div().mt_3().flex().flex_col().gap_2().children(
                                         artifacts.into_iter().enumerate().map(
                                             |(art_idx, artifact)| {
-                                                let env_id = artifact.environment_id.clone();
+                                                let card_artifact = artifact.clone();
+                                                let click_artifact = artifact.clone();
                                                 let btn = div()
                                                     .id((
                                                         "open-desktop-btn",
@@ -1042,13 +1077,15 @@ impl ChatView {
                                                     .cursor_pointer()
                                                     .on_click(cx.listener(
                                                         move |this, _: &ClickEvent, window, cx| {
-                                                            this.open_desktop_viewer(
-                                                                &env_id, window, cx,
+                                                            this.open_desktop_artifact(
+                                                                &click_artifact,
+                                                                window,
+                                                                cx,
                                                             );
                                                         },
                                                     ))
                                                     .child("Open Desktop ↗");
-                                                desktop_artifact_card(&artifact, btn)
+                                                desktop_artifact_card(&card_artifact, btn)
                                             },
                                         ),
                                     ),

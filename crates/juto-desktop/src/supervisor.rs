@@ -364,6 +364,11 @@ impl DesktopEnvironment {
         grant
     }
 
+    /// Looks up a grant by id, including one that has expired.
+    pub fn grant(&self, grant_id: &str) -> Option<Grant> {
+        self.inner.grants.lock().get(grant_id).cloned()
+    }
+
     /// Revokes an existing grant and releases control held through it.
     pub fn revoke_grant(&self, grant_id: &str) -> bool {
         let mut grants = self.inner.grants.lock();
