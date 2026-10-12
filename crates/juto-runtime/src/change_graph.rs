@@ -686,7 +686,17 @@ impl ChangeGraph {
         {
             let _lock =
                 crate::vcs::MutationLock::acquire(self.workspace()).map_err(anyhow::Error::msg)?;
-            let current = self.snapshot_tree()?;
+            let baseline = self.capture_baseline()?;
+            let current = self.repository.capture_tree(&baseline)?;
+            // A join materializes the merge over the workspace, so an uncaptured
+            // edit in the merge's delta would be silently discarded. Refuse
+            // instead: the caller captures or discards it, then retries.
+            let dirty = self.repository.changed_paths(&baseline, &current)?;
+            ensure!(
+                dirty.is_empty(),
+                "the workspace has uncaptured edits ({}); capture or discard them before joining",
+                dirty.join(", ")
+            );
             self.repository
                 .restore_tree(&current, &merged_tree, self.workspace())?;
         }
@@ -848,6 +858,21 @@ impl ChangeGraph {
             let _lock =
                 crate::vcs::MutationLock::acquire(self.workspace()).map_err(anyhow::Error::msg)?;
             let baseline = self.capture_baseline()?;
+            let current = self.repository.capture_tree(&baseline)?;
+            // The conflicted paths are the caller's resolutions and are expected
+            // to differ. Any *other* uncaptured edit would be silently discarded
+            // by the materialization below, so refuse instead.
+            let stray: Vec<String> = self
+                .repository
+                .changed_paths(&baseline, &current)?
+                .into_iter()
+                .filter(|path| !merged.conflicts.contains(path))
+                .collect();
+            ensure!(
+                stray.is_empty(),
+                "the workspace has uncaptured edits outside the conflict ({}); capture or discard them first",
+                stray.join(", ")
+            );
             let tree = self.repository.resolve_conflicts(
                 &merged.tree,
                 &merged.conflicts,
@@ -857,7 +882,6 @@ impl ChangeGraph {
             // Materialize the resolved tree so the workspace matches the node.
             // Otherwise the next capture would record the workspace's stale copy
             // of every path the merge changed and silently revert it.
-            let current = self.snapshot_tree()?;
             self.repository
                 .restore_tree(&current, &tree, self.workspace())?;
             tree
