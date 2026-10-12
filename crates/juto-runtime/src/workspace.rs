@@ -19,6 +19,7 @@ use fs2::FileExt;
 use serde::Deserialize;
 use thiserror::Error;
 pub use tokio::process::Command;
+use uuid::Uuid;
 
 use crate::change_graph::ChangeGraph;
 use crate::git_transfer::GitRepository;
@@ -351,6 +352,56 @@ impl Drop for GpuLockGuard {
     }
 }
 
+/// A scoped child whose transient systemd unit is stopped when it is dropped.
+///
+/// A sandboxed command runs as a transient *service*, which outlives its
+/// `systemd-run` client: killing the client alone leaves the payload running, so
+/// a cancelled command would keep working. Dropping this guard stops the unit.
+/// An unsandboxed command runs as a *scope*, which the client owns, so there is
+/// no unit to stop.
+pub struct ScopedChild {
+    child: tokio::process::Child,
+    unit: Option<String>,
+}
+
+impl ScopedChild {
+    /// The underlying child, for reading piped output or signalling it.
+    pub fn child_mut(&mut self) -> &mut tokio::process::Child {
+        &mut self.child
+    }
+
+    /// The child's process id, when it is still running.
+    pub fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    /// The transient unit name, when this child is sandboxed.
+    pub fn unit(&self) -> Option<&str> {
+        self.unit.as_deref()
+    }
+
+    /// Wait for the child to exit.
+    pub async fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        self.child.wait().await
+    }
+}
+
+impl Drop for ScopedChild {
+    fn drop(&mut self) {
+        let Some(unit) = &self.unit else {
+            return;
+        };
+        // Fire-and-forget: `Drop` cannot await, and the stop is best-effort
+        // because the unit may already be gone.
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", unit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+}
+
 /// Stdio configuration applied to a resource-scoped command.
 ///
 /// `std::process::Command` does not expose its configured stdio on stable, so a
@@ -554,20 +605,27 @@ impl SubagentWorkspace {
         cmd: &mut Command,
         limits: ResourceLimits,
         stdio: ScopedStdio,
-    ) -> Result<tokio::process::Child, WorkspaceError> {
-        let mut scoped = self.build_scoped_command(cmd.as_std(), &limits)?;
+    ) -> Result<ScopedChild, WorkspaceError> {
+        // A sandboxed command runs as a transient *service*, which outlives its
+        // `systemd-run` client. Naming the unit is what lets the guard stop it.
+        let unit = limits
+            .sandbox
+            .is_some()
+            .then(|| format!("juto-{}", Uuid::now_v7()));
+        let mut scoped = self.build_scoped_command_named(cmd.as_std(), &limits, unit.as_deref())?;
         scoped
             .stdin(stdio.stdin)
             .stdout(stdio.stdout)
             .stderr(stdio.stderr)
             .kill_on_drop(true);
 
-        scoped
+        let child = scoped
             .spawn()
             .map_err(|source| WorkspaceError::CommandSpawnFailed {
                 command: format!("{:?}", cmd.as_std().get_program()),
                 source,
-            })
+            })?;
+        Ok(ScopedChild { child, unit })
     }
 
     /// Run a synchronous `std::process::Command` inside this workspace under resource governance.
@@ -614,7 +672,17 @@ impl SubagentWorkspace {
         original: &std::process::Command,
         limits: &ResourceLimits,
     ) -> Result<Command, WorkspaceError> {
-        let std_cmd = self.build_scoped_std_command(original, limits)?;
+        self.build_scoped_command_named(original, limits, None)
+    }
+
+    /// Build a resource-scoped `tokio::process::Command`, naming the unit.
+    pub fn build_scoped_command_named(
+        &self,
+        original: &std::process::Command,
+        limits: &ResourceLimits,
+        unit: Option<&str>,
+    ) -> Result<Command, WorkspaceError> {
+        let std_cmd = self.build_scoped_std_command_named(original, limits, unit)?;
         Ok(Command::from(std_cmd))
     }
 
@@ -623,6 +691,20 @@ impl SubagentWorkspace {
         &self,
         original: &std::process::Command,
         limits: &ResourceLimits,
+    ) -> Result<std::process::Command, WorkspaceError> {
+        self.build_scoped_std_command_named(original, limits, None)
+    }
+
+    /// Build a scoped command, naming the transient unit when `unit` is set.
+    ///
+    /// A sandboxed command runs as a transient *service*, which outlives its
+    /// `systemd-run` client: killing the client leaves the payload running.
+    /// Naming the unit is what lets a caller stop it.
+    pub fn build_scoped_std_command_named(
+        &self,
+        original: &std::process::Command,
+        limits: &ResourceLimits,
+        unit: Option<&str>,
     ) -> Result<std::process::Command, WorkspaceError> {
         let program = original.get_program().to_os_string();
         let orig_args: Vec<OsString> = original.get_args().map(|s| s.to_os_string()).collect();
@@ -680,6 +762,9 @@ impl SubagentWorkspace {
                 cmd.arg("systemd-run");
                 cmd.arg("--user");
                 append_systemd_unit_mode(&mut cmd, limits.sandbox.is_some());
+                if let Some(unit) = unit {
+                    cmd.arg(format!("--unit={unit}"));
+                }
                 cmd.arg("--quiet");
                 cmd.arg("-p").arg(format!("CPUQuota={}", limits.cpu_quota));
                 cmd.arg("-p")
@@ -707,6 +792,9 @@ impl SubagentWorkspace {
             cmd = std::process::Command::new("systemd-run");
             cmd.arg("--user");
             append_systemd_unit_mode(&mut cmd, limits.sandbox.is_some());
+            if let Some(unit) = unit {
+                cmd.arg(format!("--unit={unit}"));
+            }
             cmd.arg("--quiet");
             cmd.arg("-p").arg(format!("CPUQuota={}", limits.cpu_quota));
             cmd.arg("-p")
@@ -1784,6 +1872,7 @@ mod tests {
 
         let mut stdout = String::new();
         child
+            .child_mut()
             .stdout
             .take()
             .expect("stdout must be piped")
@@ -1792,6 +1881,7 @@ mod tests {
             .expect("read stdout");
         let mut stderr = String::new();
         child
+            .child_mut()
             .stderr
             .take()
             .expect("stderr must be piped")

@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use juto_runtime::workspace::{
-    ProtectHome, ResourceLimits, Sandbox, SubagentWorkspace, is_systemd_run_available,
+    ProtectHome, ResourceLimits, Sandbox, ScopedStdio, SubagentWorkspace, is_systemd_run_available,
 };
 
 /// Serializes tests that mutate process-global environment variables.
@@ -457,4 +457,81 @@ async fn sandboxed_service_inherits_the_caller_environment() {
         "inherited",
         "a sandboxed service must inherit the caller's environment"
     );
+}
+
+/// Whether the transient unit `unit` is currently active.
+fn unit_is_active(unit: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", unit])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "active")
+        .unwrap_or(false)
+}
+
+/// Live proof that dropping a sandboxed child stops its transient unit.
+///
+/// A transient service outlives its `systemd-run` client, so without the guard a
+/// cancelled command would keep working.
+#[tokio::test]
+async fn dropping_a_sandboxed_child_stops_its_unit() {
+    if !is_systemd_run_available() {
+        eprintln!("skipping sandbox live test: systemd-run unavailable");
+        return;
+    }
+
+    let Some(home) = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+    else {
+        eprintln!("skipping sandbox live test: HOME unset");
+        return;
+    };
+
+    let ws_dir = match tempfile::Builder::new()
+        .prefix("juto-sandbox-stop-")
+        .tempdir_in(&home)
+    {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("skipping sandbox live test: cannot create workspace under HOME: {err}");
+            return;
+        }
+    };
+
+    let ws = workspace_at(ws_dir.path());
+    let limits = ResourceLimits::default().with_sandbox(Sandbox::default());
+
+    let mut command = tokio::process::Command::new("sleep");
+    command.arg("60");
+    let child = ws
+        .spawn_scoped(&mut command, limits, ScopedStdio::default())
+        .await
+        .expect("spawn sandboxed child");
+    let unit = child
+        .unit()
+        .expect("a sandboxed child must name its unit")
+        .to_string();
+    // `systemd-run` starts the unit asynchronously, so it becomes active
+    // shortly after the spawn rather than immediately.
+    let mut active = false;
+    for _ in 0..50 {
+        if unit_is_active(&unit) {
+            active = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(active, "the unit must become active while running");
+
+    drop(child);
+
+    let mut stopped = false;
+    for _ in 0..50 {
+        if !unit_is_active(&unit) {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(stopped, "dropping the child must stop unit {unit}");
 }
