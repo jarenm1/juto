@@ -27,6 +27,10 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   (`LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`, `MESA_LOADER_DRIVER_OVERRIDE`), and
   otherwise composes with pixman. A GLES renderer that resolves to a
   non-software device is discarded before any frame is composed.
+- Request idempotency: a retried `Create` with the same owner and request id
+  returns the existing environment instead of allocating a second one, and a
+  retried `Launch` returns the running application handle instead of starting a
+  second copy (spec section 4).
 - Viewer admission: at most two active viewers per environment (spec section 6).
   A third attach is rejected with `LimitExceeded` before any frame pool
   descriptor is handed out, and the slot is released when the viewer's control

@@ -1594,8 +1594,11 @@ fn run_desktop_action(
                 },
                 owner_heartbeat_timeout_secs: 60,
             };
+            // One request per tool call; the control protocol's request ids are
+            // what make a retried Create/Launch idempotent.
+            let request_id = uuid::Uuid::now_v7().to_string();
             let env = supervisor
-                .create_environment(config)
+                .create_environment(config, &request_id)
                 .map_err(|e| e.to_string())?;
             let grant = env.issue_grant(
                 "agent:session".to_string(),
@@ -1643,8 +1646,9 @@ fn run_desktop_action(
             let cwd = args.cwd.as_ref().map(PathBuf::from);
             let overrides: Vec<(String, String)> =
                 args.env.clone().unwrap_or_default().into_iter().collect();
+            let request_id = uuid::Uuid::now_v7().to_string();
             let handle = env
-                .launch(&app_id, &argv, cwd.as_deref(), &overrides)
+                .launch(&app_id, &argv, cwd.as_deref(), &overrides, &request_id)
                 .map_err(|e| e.to_string())?;
             let summary = format!(
                 "Launched `{}` (pid {}) in environment {}.",

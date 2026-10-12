@@ -46,7 +46,10 @@ fn unique_env_id(prefix: &str) -> String {
 fn environment_lifecycle_admission_and_generation() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor
-        .create_environment(test_config(&unique_env_id("lifecycle")))
+        .create_environment(
+            test_config(&unique_env_id("lifecycle")),
+            &unique_env_id("req"),
+        )
         .expect("create environment");
 
     assert_eq!(env.generation(), 1);
@@ -118,7 +121,7 @@ fn shm_pool_sealing_and_roundtrip() {
 fn control_lease_and_human_preemption() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor
-        .create_environment(test_config(&unique_env_id("lease")))
+        .create_environment(test_config(&unique_env_id("lease")), &unique_env_id("req"))
         .expect("create environment");
 
     let agent = env
@@ -153,7 +156,7 @@ fn control_lease_and_human_preemption() {
 fn input_dispatch_validation() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor
-        .create_environment(test_config(&unique_env_id("input")))
+        .create_environment(test_config(&unique_env_id("input")), &unique_env_id("req"))
         .expect("create environment");
 
     let batch = InputBatch {
@@ -211,7 +214,7 @@ fn input_dispatch_validation() {
 fn compositor_renders_real_client_frame() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor
-        .create_environment(test_config(&unique_env_id("render")))
+        .create_environment(test_config(&unique_env_id("render")), &unique_env_id("req"))
         .expect("create environment");
 
     let socket = env.socket_path().to_string_lossy().to_string();
@@ -251,7 +254,7 @@ fn hardware_profile_renders_and_serializes_on_the_shared_device() {
     let mut config = test_config(&unique_env_id("hardware"));
     config.render_profile = RenderProfile::Hardware;
     let env = supervisor
-        .create_environment(config)
+        .create_environment(config, &unique_env_id("req"))
         .expect("hardware environment");
 
     let socket = env.socket_path().to_string_lossy().to_string();
@@ -279,7 +282,7 @@ fn hardware_profile_renders_and_serializes_on_the_shared_device() {
     let mut second = test_config(&unique_env_id("hardware"));
     second.render_profile = RenderProfile::Hardware;
     assert!(matches!(
-        supervisor.create_environment(second),
+        supervisor.create_environment(second, &unique_env_id("req")),
         Err(DesktopError::GpuBusy)
     ));
 
@@ -290,9 +293,58 @@ fn hardware_profile_renders_and_serializes_on_the_shared_device() {
     let mut third = test_config(&unique_env_id("hardware"));
     third.render_profile = RenderProfile::Hardware;
     let third = supervisor
-        .create_environment(third)
+        .create_environment(third, &unique_env_id("req"))
         .expect("the shared device is released after destroy");
     third.destroy();
+}
+
+#[test]
+fn create_and_launch_are_idempotent_per_request_id() {
+    let supervisor = DesktopSupervisor::new();
+    let first_id = unique_env_id("idem");
+    let first = supervisor
+        .create_environment(test_config(&first_id), "req-1")
+        .expect("create environment");
+
+    // A retried Create with the same owner and request id returns the existing
+    // environment instead of allocating the one named in the retry.
+    let other_id = unique_env_id("idem-other");
+    let repeated = supervisor
+        .create_environment(test_config(&other_id), "req-1")
+        .expect("repeat create");
+    assert_eq!(repeated.env_id(), first_id);
+    assert!(
+        supervisor.get_environment(&other_id).is_err(),
+        "a retried Create must not allocate a second environment"
+    );
+
+    // A retried Launch with the same request id returns the running handle.
+    let handle = first
+        .launch(
+            "sleeper",
+            &["sleep".to_string(), "60".to_string()],
+            None,
+            &[],
+            "launch-1",
+        )
+        .expect("launch");
+    let repeated = first
+        .launch(
+            "sleeper",
+            &["sleep".to_string(), "60".to_string()],
+            None,
+            &[],
+            "launch-1",
+        )
+        .expect("repeat launch");
+    assert_eq!(repeated.pid, handle.pid);
+    assert_eq!(
+        first.apps().len(),
+        1,
+        "a retried Launch must not double-launch"
+    );
+
+    first.destroy();
 }
 
 #[test]
@@ -300,7 +352,7 @@ fn destroy_terminates_apps_and_removes_runtime_dir() {
     let supervisor = DesktopSupervisor::new();
     let env_id = unique_env_id("cleanup");
     let env = supervisor
-        .create_environment(test_config(&env_id))
+        .create_environment(test_config(&env_id), &unique_env_id("req"))
         .expect("create environment");
 
     let handle = env
@@ -309,6 +361,7 @@ fn destroy_terminates_apps_and_removes_runtime_dir() {
             &["sleep".to_string(), "300".to_string()],
             None,
             &[],
+            &unique_env_id("req"),
         )
         .expect("launch sleep");
     assert!(handle.pid > 0);
@@ -342,7 +395,7 @@ fn expired_control_lease_is_released_and_rejected() {
     let mut config = test_config(&unique_env_id("expiry"));
     config.lease_ttl_secs = 1;
     let env = supervisor
-        .create_environment(config)
+        .create_environment(config, &unique_env_id("req"))
         .expect("create environment");
 
     let lease = env
@@ -381,7 +434,7 @@ fn expired_control_lease_is_released_and_rejected() {
 fn expired_grants_are_not_reported() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor
-        .create_environment(test_config(&unique_env_id("grants")))
+        .create_environment(test_config(&unique_env_id("grants")), &unique_env_id("req"))
         .expect("create environment");
 
     let live = env.issue_grant(
@@ -412,7 +465,7 @@ fn reconcile_stops_orphan_scopes_and_removes_stale_directories() {
     let supervisor = DesktopSupervisor::new();
     let env_id = unique_env_id("orphan");
     let env = supervisor
-        .create_environment(test_config(&env_id))
+        .create_environment(test_config(&env_id), &unique_env_id("req"))
         .expect("create environment");
 
     // A live environment is left alone.
@@ -471,7 +524,7 @@ fn reconcile_stops_orphan_scopes_and_removes_stale_directories() {
 fn text_input_v3_receives_committed_text() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor
-        .create_environment(test_config(&unique_env_id("text")))
+        .create_environment(test_config(&unique_env_id("text")), &unique_env_id("req"))
         .expect("create environment");
 
     let text_file = std::env::temp_dir().join(format!("juto-text-{}.txt", uuid::Uuid::now_v7()));
@@ -546,7 +599,7 @@ fn virtual_clock_paces_without_catch_up_bursts() {
         let mut config = test_config(&unique_env_id(&format!("pace{fps}")));
         config.output.fps = fps;
         let env = supervisor
-            .create_environment(config)
+            .create_environment(config, &unique_env_id("req"))
             .expect("create environment");
 
         // Sample the virtual clock every 100 ms for a second, measuring the
@@ -586,7 +639,7 @@ fn environment_slice_aggregates_limits_and_contains_apps() {
     let supervisor = DesktopSupervisor::new();
     let env_id = unique_env_id("slice");
     let env = supervisor
-        .create_environment(test_config(&env_id))
+        .create_environment(test_config(&env_id), &unique_env_id("req"))
         .expect("create environment");
 
     let slice = env.slice().expect("environment slice").to_string();
@@ -623,6 +676,7 @@ fn environment_slice_aggregates_limits_and_contains_apps() {
             &["sleep".to_string(), "60".to_string()],
             None,
             &[],
+            &unique_env_id("req"),
         )
         .expect("launch");
     let unit = handle.unit.clone().expect("scope unit");
@@ -653,7 +707,7 @@ fn memory_pressure_emits_limit_pressure() {
     // OOM-killed before the monitor samples.
     config.limits.memory_max = "256M".to_string();
     let env = supervisor
-        .create_environment(config)
+        .create_environment(config, &unique_env_id("req"))
         .expect("create environment");
     let mut events = env.subscribe();
 
@@ -666,6 +720,7 @@ fn memory_pressure_emits_limit_pressure() {
         ],
         None,
         &[],
+        &unique_env_id("req"),
     )
     .expect("launch memory hog");
 
@@ -693,7 +748,10 @@ fn memory_pressure_emits_limit_pressure() {
 fn input_requires_a_geometry_acknowledgement_after_resize() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor
-        .create_environment(test_config(&unique_env_id("geometry")))
+        .create_environment(
+            test_config(&unique_env_id("geometry")),
+            &unique_env_id("req"),
+        )
         .expect("create environment");
     let lease = env
         .set_control("agent:test", "acquire", false)
@@ -764,7 +822,7 @@ fn compositor_worker_runs_inside_the_environment_slice() {
     let supervisor = DesktopSupervisor::new();
     let env_id = unique_env_id("worker");
     let env = supervisor
-        .create_environment(test_config(&env_id))
+        .create_environment(test_config(&env_id), &unique_env_id("req"))
         .expect("create environment");
     let slice = env.slice().expect("environment slice").to_string();
 
@@ -821,7 +879,7 @@ fn owner_heartbeat_expiry_destroys_an_abandoned_environment() {
     let mut config = test_config(&unique_env_id("abandon"));
     config.owner_heartbeat_timeout_secs = 2;
     let env = supervisor
-        .create_environment(config)
+        .create_environment(config, &unique_env_id("req"))
         .expect("create environment");
     let mut events = env.subscribe();
     let runtime_dir = env.runtime_dir().to_path_buf();
@@ -859,7 +917,7 @@ fn heartbeat_renews_and_retention_keeps_an_environment_alive() {
     let mut config = test_config(&unique_env_id("retain"));
     config.owner_heartbeat_timeout_secs = 2;
     let env = supervisor
-        .create_environment(config)
+        .create_environment(config, &unique_env_id("req"))
         .expect("create environment");
 
     // The owner heartbeat renews the deadline.
@@ -902,7 +960,10 @@ fn heartbeat_renews_and_retention_keeps_an_environment_alive() {
 fn launch_rejects_missing_executable() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor
-        .create_environment(test_config(&unique_env_id("missing")))
+        .create_environment(
+            test_config(&unique_env_id("missing")),
+            &unique_env_id("req"),
+        )
         .expect("create environment");
 
     let err = env
@@ -911,6 +972,7 @@ fn launch_rejects_missing_executable() {
             &["definitely-not-a-real-binary-xyz".to_string()],
             None,
             &[],
+            &unique_env_id("req"),
         )
         .expect_err("missing executable must fail");
     assert!(matches!(
