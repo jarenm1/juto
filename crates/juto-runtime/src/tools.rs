@@ -1583,6 +1583,7 @@ fn run_desktop_action(
                 render_profile: RenderProfile::Software,
                 limits: SystemLimits::default(),
                 workspace_dir: workspace.to_path_buf(),
+                lease_ttl_secs: 6,
             };
             let env = supervisor
                 .create_environment(config)

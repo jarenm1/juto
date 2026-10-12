@@ -209,6 +209,16 @@ keyboard input back over a reliable ordered data channel. A native receiver
 termination and public reachability belong to the deployment gateway; the
 shipped server binds loopback and never creates a world-readable attach URL.
 
+**Hardening.** After launching an application, the supervisor reads the scope's
+effective `CPUQuotaPerSecUSec`, `MemoryMax`, and `TasksMax` and fails closed with
+`IsolationUnavailable` if they do not match the requested limits, so a silently
+uncapped application is never reported as isolated. Control leases and grants
+carry deadlines: a lease held by the same caller is renewed without changing its
+epoch, an expired lease is cleared by a reaper and rejected, and expired grants
+are not reported. `DesktopSupervisor::reconcile` stops orphan
+`juto-desktop-*.scope` units and removes stale runtime directories left by a
+previous process; the daemon and the runtime call it at startup.
+
 **Not yet shipped: audio and the remaining profiles.** Audio (private PipeWire
 sink plus Opus), Xwayland, text-input-v3, the hardware render-node profile,
 DMA-BUF export/import, and TURN relay configuration are not implemented.

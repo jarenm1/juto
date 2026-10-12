@@ -30,6 +30,6 @@ pub use shm::{ShmFrame, ShmFramePool, ShmReader, ShmWriter};
 pub use signaling::{AttachGrant, SignalingServer, ViewerReport};
 pub use supervisor::{
     AppHandle, DesktopEnvironment, DesktopSupervisor, EnvironmentConfig, EnvironmentStatus,
-    OutputConfig, OutputProfile, RenderProfile, SystemLimits,
+    OutputConfig, OutputProfile, ReconcileReport, RenderProfile, SystemLimits,
 };
 pub use viewer::{AttachInfo, ViewerClient};

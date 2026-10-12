@@ -40,6 +40,14 @@ fn main() {
     eprintln!("juto-desktop: listening on {}", socket_path.display());
 
     let supervisor = Arc::new(DesktopSupervisor::new());
+    let report = supervisor.reconcile();
+    if !report.stopped_units.is_empty() || !report.removed_directories.is_empty() {
+        eprintln!(
+            "juto-desktop: reconciled {} orphan scope(s) and {} stale director(ies)",
+            report.stopped_units.len(),
+            report.removed_directories.len()
+        );
+    }
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     {

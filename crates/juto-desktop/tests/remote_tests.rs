@@ -25,6 +25,7 @@ fn test_config(env_id: &str) -> EnvironmentConfig {
         render_profile: RenderProfile::Software,
         limits: SystemLimits::default(),
         workspace_dir: std::env::temp_dir(),
+        lease_ttl_secs: 6,
     }
 }
 

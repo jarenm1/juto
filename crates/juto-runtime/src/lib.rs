@@ -343,6 +343,8 @@ impl Runtime {
             return supervisor.clone();
         }
         let supervisor = Arc::new(DesktopSupervisor::new());
+        // Kill orphan scopes and stale directories from a previous process.
+        let _report = supervisor.reconcile();
         *guard = Some(supervisor.clone());
         supervisor
     }

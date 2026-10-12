@@ -499,6 +499,7 @@ impl ChatView {
             render_profile: juto_runtime::RenderProfile::Software,
             limits: juto_runtime::SystemLimits::default(),
             workspace_dir: self.runtime.cwd().to_path_buf(),
+            lease_ttl_secs: 6,
         };
         let env = match supervisor.create_environment(config) {
             Ok(env) => env,
