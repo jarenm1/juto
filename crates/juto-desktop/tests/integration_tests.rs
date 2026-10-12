@@ -481,6 +481,48 @@ fn text_input_v3_receives_committed_text() {
 }
 
 #[test]
+fn virtual_clock_paces_without_catch_up_bursts() {
+    for fps in [15u32, 30, 60] {
+        let supervisor = DesktopSupervisor::new();
+        let mut config = test_config(&unique_env_id(&format!("pace{fps}")));
+        config.output.fps = fps;
+        let env = supervisor
+            .create_environment(config)
+            .expect("create environment");
+
+        // Sample the virtual clock every 100 ms for a second, measuring the
+        // real elapsed time so the rate is comparable to the cap.
+        let mut samples = Vec::new();
+        let started = Instant::now();
+        for _ in 0..11 {
+            samples.push(env.observe(Duration::from_secs(2)).expect("observe").ticks);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        let deltas: Vec<u64> = samples.windows(2).map(|w| w[1] - w[0]).collect();
+        let total: u64 = deltas.iter().sum();
+        let max = *deltas.iter().max().unwrap();
+        let rate = total as f64 / elapsed;
+
+        // The clock must not run fast, and must not burst to catch up.
+        assert!(
+            rate <= fps as f64 * 1.25,
+            "fps {fps}: measured {rate:.1} ticks/s over {elapsed:.2}s"
+        );
+        assert!(
+            rate >= fps as f64 * 0.5,
+            "fps {fps}: measured only {rate:.1} ticks/s over {elapsed:.2}s"
+        );
+        assert!(
+            max <= (fps as u64 / 10) + 2,
+            "fps {fps}: burst of {max} ticks in 100ms"
+        );
+
+        env.destroy();
+    }
+}
+
+#[test]
 fn launch_rejects_missing_executable() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor

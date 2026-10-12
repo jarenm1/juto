@@ -109,6 +109,14 @@ pub struct SnapshotInfo {
     pub width: u32,
     pub height: u32,
     pub slot: usize,
+    /// Virtual-clock ticks since the compositor started.
+    pub ticks: u64,
+    /// Frames composed since the compositor started.
+    pub frames_composed: u64,
+    /// Frames dropped because every pool slot was held by a reader.
+    pub frames_dropped: u64,
+    /// Duration of the last composition, in microseconds.
+    pub compose_micros: u64,
 }
 
 /// Cloneable handle for sending commands to a running compositor thread.
@@ -267,6 +275,10 @@ struct DesktopState {
     fps: u32,
     generation: u64,
     frame_counter: u64,
+    ticks: u64,
+    frames_composed: u64,
+    frames_dropped: u64,
+    compose_micros: u64,
     dirty: bool,
     start_time: Instant,
 
@@ -427,6 +439,7 @@ impl DesktopState {
 
     /// Compose the desktop into the memory image and copy it into the pool.
     fn render_frame(&mut self) -> Result<SnapshotInfo, DesktopError> {
+        let started = Instant::now();
         let physical = Size::<i32, Physical>::from((self.width as i32, self.height as i32));
         let logical = Rectangle::from_size(self.logical_size());
         let damage = [Rectangle::from_size(physical)];
@@ -456,6 +469,7 @@ impl DesktopState {
             .map_err(|e| DesktopError::Compositor(format!("finish failed: {e}")))?;
         drop(target);
 
+        let composed_micros = started.elapsed().as_micros() as u64;
         let stride = self.image.stride();
         let row_bytes = self.width as usize * 4;
         let mut pixels = vec![0u8; row_bytes * self.height as usize];
@@ -478,14 +492,24 @@ impl DesktopState {
         self.frame_counter = self.frame_counter.wrapping_add(1);
         let frame_id = self.frame_counter;
         let timestamp_us = Self::now_us();
-        let frame = self.pool.write_frame(
+        let frame = match self.pool.write_frame(
             frame_id,
             self.generation,
             timestamp_us,
             self.width,
             self.height,
             &pixels,
-        )?;
+        ) {
+            Ok(frame) => frame,
+            Err(err) => {
+                // Every slot is held by a slow reader: drop this frame rather
+                // than blocking the seat or growing the pool.
+                self.frames_dropped = self.frames_dropped.wrapping_add(1);
+                return Err(err);
+            }
+        };
+        self.frames_composed = self.frames_composed.wrapping_add(1);
+        self.compose_micros = composed_micros;
 
         Ok(SnapshotInfo {
             frame_id,
@@ -494,6 +518,10 @@ impl DesktopState {
             width: self.width,
             height: self.height,
             slot: frame.slot,
+            ticks: self.ticks,
+            frames_composed: self.frames_composed,
+            frames_dropped: self.frames_dropped,
+            compose_micros: self.compose_micros,
         })
     }
 
@@ -521,6 +549,7 @@ impl DesktopState {
     }
 
     fn tick(&mut self) {
+        self.ticks = self.ticks.wrapping_add(1);
         if self.dirty {
             if let Err(err) = self.render_frame() {
                 tracing::warn!(error = %err, "composition failed");
@@ -1070,6 +1099,10 @@ fn run_compositor(
         fps: config.fps.max(1),
         generation: 1,
         frame_counter: 0,
+        ticks: 0,
+        frames_composed: 0,
+        frames_dropped: 0,
+        compose_micros: 0,
         dirty: true,
         start_time: Instant::now(),
         windows: HashMap::new(),

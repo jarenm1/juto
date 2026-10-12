@@ -199,6 +199,12 @@ reports connection state and errors instead of showing a stale frame as live.
 `juto --desktop <command> [args...]` opens the same viewer directly for
 development.
 
+**Pacing and statistics.** The compositor runs a virtual clock at the effective
+FPS and never renders twice inside one interval or bursts to catch up. `Observe`
+reports the tick count, frames composed, frames dropped because every pool slot
+was held by a slow reader, and the last composition duration, so a caller can
+measure pacing and backpressure instead of inferring them.
+
 **Text input.** The compositor advertises `zwp_text_input_manager_v3` and acts as
 the input method for its own clients: focus changes send `enter`/`leave`, and
 `TextCommit`/`TextPreedit` input events are delivered as `commit_string` /

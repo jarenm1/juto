@@ -48,6 +48,9 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Text input: `zwp_text_input_manager_v3` is advertised and the compositor acts
   as the input method for its own clients, delivering committed and pre-edit
   text to enabled instances for the focused surface.
+- Pacing: a virtual clock at the effective FPS with no catch-up bursts, and
+  observation statistics (ticks, frames composed, frames dropped, composition
+  duration) reported with every snapshot.
 
 Not implemented: audio (private PipeWire sink plus Opus), Xwayland, the hardware
 render-node profile, DMA-BUF export/import, TURN relay configuration, running the

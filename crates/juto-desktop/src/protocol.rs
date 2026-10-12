@@ -172,6 +172,11 @@ pub enum DesktopResponse {
         height: u32,
         shm_pool_id: String,
         shm_slot: u32,
+        /// Virtual-clock ticks since the compositor started.
+        ticks: u64,
+        frames_composed: u64,
+        frames_dropped: u64,
+        compose_micros: u64,
     },
     Attached {
         viewer_id: String,
