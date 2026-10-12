@@ -33,7 +33,7 @@
 use std::{
     io::{Read as _, Write as _},
     os::unix::ffi::OsStrExt,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -187,7 +187,20 @@ pub fn mutate(
     // was requested in the meantime; we report the applied change rather than
     // claiming a clean cancellation.
 
-    let after_tree = graph.snapshot_tree().map_err(|e| {
+    // This mutation changed exactly one path, so apply a one-entry delta to the
+    // before-tree instead of re-hashing the whole workspace. The result is
+    // identical to a full snapshot because nothing else changed, and it keeps an
+    // edit's cost proportional to the edit rather than to the repository.
+    let after_tree = (|| -> anyhow::Result<String> {
+        let metadata = std::fs::metadata(&target)?;
+        let executable = metadata.permissions().mode() & 0o111 != 0;
+        let mode = if executable { "100755" } else { "100644" };
+        let blob = graph.repository().hash_bytes(new_text.as_bytes())?;
+        graph
+            .repository()
+            .update_tree_entry(&before_tree, &rel_bytes, mode, &blob)
+    })()
+    .map_err(|e| {
         format!(
             "{display}: file applied but the workspace snapshot failed (before_tree={before_tree}, after_tree=unavailable): {e:#}"
         )
