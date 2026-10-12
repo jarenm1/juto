@@ -205,10 +205,12 @@ Juto establishes strict workspace isolation:
    depend on `jj` being installed.
 2. **Execution**: The subagent executes all filesystem mutations, formatting, builds,
    and tests strictly inside that directory.
-3. **Integration**: Once verification and review pass, the work is folded back with
-   `join`/`reconcile`, which merge trees into a two-parent node rather than rebasing. On
-   failure or abandonment, `SubagentWorkspace::cleanup` removes the fork directory and `gc`
-   reclaims the nodes only that workspace kept alive.
+3. **Integration**: Once verification and review pass, the builder's thread head is frozen
+   as a verified checkpoint and folded back into the parent thread with `join`, which merges
+   trees into a two-parent node rather than rebasing. The parent's own uncaptured edits are
+   captured first, so the merge cannot overwrite them, and a conflicting merge is reported
+   rather than forced. On failure or abandonment, `SubagentWorkspace::cleanup` removes the
+   fork directory and `gc` reclaims the nodes only that workspace kept alive.
 
 ### 4.2 Resource Governance (`agent-scope.sh` Model)
 To prevent parallel agents from exhausting host memory, CPU, or lock contention:
@@ -273,7 +275,7 @@ Traditional PRs lose the reasoning behind changes. Inspired by Zed Delta:
    and `juto-cli changes export/push` projects only named points onto Git feature branches
    using compare-and-swap ref updates and raw byte tree capture.
 
-### 5.3 Cross-Machine Replication
+### 5.3 Cross-Machine Replication *(shipped)*
 
 Agents may run locally or on different machines at the same time. The DAG
 replicates over ordinary Git transport — no custom server — as a grow-only set of
@@ -307,6 +309,14 @@ rejected push therefore means a real conflict, never a lost update.
 * **Join** (`join`): merge base from the DAG (falling back to the graph base tree
   when two threads share no node ancestor), then `git merge-tree --write-tree
   --merge-base`, producing a two-parent node. A conflicted merge creates no node.
+* **Resolve** (`resolve`): record a conflict resolved by hand. The node's tree is
+  the merge result with the *conflicted* paths taken from the workspace, so a
+  sparse workspace or a stale copy cannot revert the other side's changes; the
+  resolved tree is then materialized and the folded-in remote head retired, so
+  `needs_reconcile` clears rather than staying true after the agent acted on it.
+* **Dirty** (`dirty`) and **Capture** (`capture`): the edit tools capture
+  automatically, but a `bash` command does not, so `dirty` lists the paths where
+  the workspace differs from its head and `capture` records them as a new point.
 * **Rewind** (`rewind`): materialize a tree delta into the workspace and append a
   *forward* node whose tree equals the target, so history stays append-only.
 * **Reclaim** (`gc`): mark-sweep from heads, workspace heads, and checkpoints;
