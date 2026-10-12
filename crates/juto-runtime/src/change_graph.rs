@@ -791,20 +791,28 @@ impl ChangeGraph {
             self.repository
                 .restore_tree(&current, &target_tree, self.workspace())?;
         }
-        let node = self.capture(
-            thread,
-            EditProvenance {
-                session_id: String::new(),
-                tool: "rewind".into(),
-                selection_mode: None,
-                path: None,
-            },
-            current_head.map(|head| vec![head]),
-        )?;
-        ensure!(
-            node.tree == target_tree,
-            "rewound node tree does not match the target tree"
-        );
+        let provenance = EditProvenance {
+            session_id: String::new(),
+            tool: "rewind".into(),
+            selection_mode: None,
+            path: None,
+        };
+        let node = match current_head {
+            // A sparse workspace cannot reproduce the target tree: capture would
+            // keep the baseline's version of every path outside the spec. Record
+            // the target tree directly instead.
+            Some(head) if self.repository.sparse().is_some() => {
+                self.append_explicit_tree(thread, target_tree.clone(), vec![head], provenance)?
+            }
+            other => {
+                let node = self.capture(thread, provenance, other.map(|head| vec![head]))?;
+                ensure!(
+                    node.tree == target_tree,
+                    "rewound node tree does not match the target tree"
+                );
+                node
+            }
+        };
         Ok(node)
     }
 
