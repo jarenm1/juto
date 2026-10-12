@@ -382,6 +382,39 @@ impl ChangeGraph {
         Ok(node)
     }
 
+    /// Append a node for an explicit tree, without snapshotting the workspace.
+    ///
+    /// Used by [`ChangeGraph::join`] when the workspace is sparse: the merged
+    /// tree contains paths the workspace never materialized, so snapshotting it
+    /// would record the baseline's version of those paths instead of the merge
+    /// result. The node still records the complete merged tree, and the heads
+    /// advance exactly as a capture would.
+    fn append_explicit_tree(
+        &self,
+        thread: &str,
+        tree: String,
+        parents: Vec<String>,
+        provenance: EditProvenance,
+    ) -> Result<ChangeNode> {
+        validate_thread_name(thread)?;
+        if let Some(assigned) = self.repository.thread() {
+            ensure!(
+                thread == assigned,
+                "workspace belongs to thread {assigned:?}"
+            );
+        }
+        let _lock = self.lock()?;
+        let mut state = self.load()?;
+        validate_parents(&state, &parents)?;
+        let node = self.append(&mut state, thread, tree, parents, provenance)?;
+        state.heads.insert(thread.into(), node.id.clone());
+        state
+            .workspace_heads
+            .insert(self.workspace_key(), node.id.clone());
+        self.save_header(&state)?;
+        Ok(node)
+    }
+
     /// Fork an independent native workspace from an immutable live point.
     /// No Git branch/worktree/commit is created; its edits share only the object store.
     pub fn fork(&self, thread: &str, from: &str, destination: &Path) -> Result<GraphState> {
@@ -600,20 +633,30 @@ impl ChangeGraph {
             self.repository
                 .restore_tree(&current, &merged_tree, self.workspace())?;
         }
-        let node = self.capture(
-            thread,
-            EditProvenance {
-                session_id: String::new(),
-                tool: "join".into(),
-                selection_mode: None,
-                path: None,
-            },
-            Some(vec![left_id, right_id]),
-        )?;
-        ensure!(
-            node.tree == merged_tree,
-            "joined node tree does not match the merged tree"
-        );
+        let provenance = EditProvenance {
+            session_id: String::new(),
+            tool: "join".into(),
+            selection_mode: None,
+            path: None,
+        };
+        let node = if self.repository.sparse().is_some() {
+            // A sparse workspace cannot reproduce the merged tree: capture would
+            // keep the baseline's version of every path outside the spec. Record
+            // the merged tree directly instead.
+            self.append_explicit_tree(
+                thread,
+                merged_tree.clone(),
+                vec![left_id, right_id],
+                provenance,
+            )?
+        } else {
+            let node = self.capture(thread, provenance, Some(vec![left_id, right_id]))?;
+            ensure!(
+                node.tree == merged_tree,
+                "joined node tree does not match the merged tree"
+            );
+            node
+        };
         Ok(JoinOutcome::Joined {
             node,
             base: base_id,
