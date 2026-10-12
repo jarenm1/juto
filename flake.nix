@@ -55,6 +55,11 @@
               ]
             )
           );
+          # Xwayland is spawned per environment; xeyes exercises the X11 path.
+          xwaylandTools = with pkgs; [
+            xwayland
+            xorg.xeyes
+          ];
           juto = pkgs.rustPlatform.buildRustPackage {
             pname = "juto";
             version = "0.1.0";
@@ -122,7 +127,7 @@
               ninja
               jujutsu
               git
-            ];
+            ] ++ xwaylandTools;
             buildInputs = nativeLibraries;
 
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
@@ -145,7 +150,7 @@
               xdotool
               imagemagick
               python3
-            ];
+            ] ++ xwaylandTools;
             LIBGL_ALWAYS_SOFTWARE = "1";
             VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json";
             FONTCONFIG_FILE = pkgs.makeFontsConf {

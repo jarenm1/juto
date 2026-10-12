@@ -51,6 +51,7 @@ smithay = { version = "0.7.0", default-features = false, features = [
     "renderer_gl",
     "backend_egl",
     "desktop",
+    "xwayland",
 ] }
 juto-catalog = { path = "crates/juto-catalog" }
 juto-desktop = { path = "crates/juto-desktop" }

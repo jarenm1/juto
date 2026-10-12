@@ -299,6 +299,66 @@ fn hardware_profile_renders_and_serializes_on_the_shared_device() {
 }
 
 #[test]
+fn xwayland_maps_an_x11_client_into_the_desktop() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("x11")), &unique_env_id("req"))
+        .expect("create environment");
+
+    // Xwayland is spawned per environment; wait for it to report its display.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while env.x11_display().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let display = env.x11_display().expect("Xwayland must become ready");
+    assert!(display > 0, "Xwayland must allocate a display number");
+
+    env.launch(
+        "xeyes",
+        &[
+            "xeyes".to_string(),
+            "-geometry".to_string(),
+            "200x150".to_string(),
+        ],
+        None,
+        &[],
+        &unique_env_id("req"),
+    )
+    .expect("launch xeyes");
+
+    // The X11 client's window must appear in the composed desktop.
+    let pool = env.frame_pool();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut mapped = false;
+    let mut painted = false;
+    while Instant::now() < deadline {
+        let info = env.observe(Duration::from_secs(2)).expect("observe");
+        if env
+            .get_status()
+            .mapped_windows
+            .iter()
+            .any(|w| w.app_id.contains("xeyes") || w.title.contains("xeyes"))
+        {
+            mapped = true;
+        }
+        // xeyes paints a light window over the dark compositor background.
+        let sample = read_pixel(&pool, info.slot, 40, 40, info.width);
+        if mapped && sample != [13, 15, 23, 255] {
+            painted = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(mapped, "the X11 client's window was never mapped");
+    assert!(
+        painted,
+        "the composed desktop never showed the X11 client's pixels"
+    );
+
+    env.destroy();
+}
+
+#[test]
 fn create_and_launch_are_idempotent_per_request_id() {
     let supervisor = DesktopSupervisor::new();
     let first_id = unique_env_id("idem");
@@ -702,21 +762,35 @@ fn environment_slice_aggregates_limits_and_contains_apps() {
 #[test]
 fn memory_pressure_emits_limit_pressure() {
     let supervisor = DesktopSupervisor::new();
-    let mut config = test_config(&unique_env_id("pressure"));
-    // Above the 90% threshold but below the limit, so the process is not
-    // OOM-killed before the monitor samples.
+    let env_id = unique_env_id("pressure");
+    let mut config = test_config(&env_id);
     config.limits.memory_max = "256M".to_string();
     let env = supervisor
         .create_environment(config, &unique_env_id("req"))
         .expect("create environment");
     let mut events = env.subscribe();
 
+    // The environment slice already holds the compositor worker and Xwayland,
+    // so size the hog from the slice's current usage: above the 90% threshold
+    // but below the limit, so the process is not OOM-killed before the monitor
+    // samples.
+    let limit: u64 = 256 * 1024 * 1024;
+    let slice = format!("juto-desktop-{}.slice", env_id.replace('-', "_"));
+    let baseline = systemctl_show(&slice, &["MemoryCurrent"])
+        .lines()
+        .find_map(|line| line.strip_prefix("MemoryCurrent="))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let hog_bytes = ((limit as f64 * 0.95) as u64)
+        .saturating_sub(baseline)
+        .max(32 * 1024 * 1024);
+
     env.launch(
         "hog",
         &[
             "perl".to_string(),
             "-e".to_string(),
-            "my $x = 'a' x (240 * 1024 * 1024); sleep 20;".to_string(),
+            format!("my $x = 'a' x ({hog_bytes}); sleep 20;"),
         ],
         None,
         &[],
