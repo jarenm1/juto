@@ -63,6 +63,13 @@ pub enum ChangesCommand {
         #[arg(long, default_value = "origin")]
         remote: String,
     },
+    /// Fetch an exported Git feature branch into a local branch.
+    FetchBranch {
+        #[arg(long)]
+        branch: String,
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
     /// Publish the whole live-change DAG to a remote as `refs/juto/*`.
     PushGraph {
         #[arg(long, default_value = "origin")]
@@ -166,6 +173,10 @@ pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
         ChangesCommand::Push { branch, remote } => {
             graph.push(branch, remote)?;
             serde_json::json!({"branch":branch, "remote":remote, "pushed":true})
+        }
+        ChangesCommand::FetchBranch { branch, remote } => {
+            graph.fetch_branch(branch, remote)?;
+            serde_json::json!({"branch":branch, "remote":remote, "fetched":true})
         }
         ChangesCommand::PushGraph { remote } => serde_json::to_value(graph.push_graph(remote)?)?,
         ChangesCommand::Fetch { remote } => serde_json::to_value(graph.fetch_graph(remote)?)?,

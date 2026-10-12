@@ -1677,6 +1677,66 @@ fn update_refs_applies_a_batch_and_enforces_compare_and_swap() {
 }
 
 #[test]
+fn fetch_branch_mirrors_push() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote.git");
+    run(
+        "git",
+        &[
+            "init",
+            "--bare",
+            "-q",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ],
+        temp.path(),
+    );
+
+    // One repository exports a marked point and pushes the branch.
+    let a = repo(&temp, "a");
+    write_file(&a.join("f.txt"), b"base\n");
+    let base = commit(&a, "base");
+    let repository_a = GitRepository::open(&a).unwrap();
+    let base_tree = repository_a.snapshot_tree(&base).unwrap();
+    write_file(&a.join("f.txt"), b"changed\n");
+    let marked_tree = repository_a.capture_tree(&base_tree).unwrap();
+    let plan = ExportPlan {
+        base_commit: base.clone(),
+        points: vec![ExportPoint {
+            id: "marked".into(),
+            tree: marked_tree,
+            parents: Vec::new(),
+            message: "marked".into(),
+            signature: test_signature(),
+        }],
+        tip: "marked".into(),
+    };
+    let result = repository_a.export(&plan, "feature").unwrap();
+    repository_a
+        .push("feature", remote.to_str().unwrap())
+        .unwrap();
+
+    // A second repository fetches it into a local branch of the same name.
+    let b = repo(&temp, "b");
+    let repository_b = GitRepository::open(&b).unwrap();
+    let git_dir_b = repository_b.git_dir().to_path_buf();
+    repository_b
+        .fetch_branch("feature", remote.to_str().unwrap())
+        .unwrap();
+    assert_eq!(
+        git_at(&git_dir_b, &["rev-parse", "refs/heads/feature"]),
+        result.tip
+    );
+    assert_eq!(git_at(&git_dir_b, &["show", "feature:f.txt"]), "changed");
+
+    // Fetching an already-current branch is a no-op, not an error.
+    repository_b
+        .fetch_branch("feature", remote.to_str().unwrap())
+        .unwrap();
+}
+
+#[test]
 fn refs_transport_blobs_and_trees_over_a_bare_remote() {
     let temp = tempfile::tempdir().unwrap();
     let dir = repo(&temp, "repo");

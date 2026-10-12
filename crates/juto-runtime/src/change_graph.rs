@@ -587,6 +587,14 @@ impl ChangeGraph {
         self.repository.push(branch, remote)
     }
 
+    /// Fetch an exported Git branch from `remote` into a local branch.
+    ///
+    /// The mirror of [`ChangeGraph::push`], for a machine that wants another
+    /// machine's exported branch rather than its change graph.
+    pub fn fetch_branch(&self, branch: &str, remote: &str) -> Result<()> {
+        self.repository.fetch_branch(branch, remote)
+    }
+
     /// This repository's stable replication identity.
     ///
     /// A UUIDv7 stored in `<git-dir>/juto/machine-id`, created on first use
