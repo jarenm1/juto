@@ -348,7 +348,9 @@ impl GitRepository {
     /// marker. `destination` must not exist: it is created atomically with
     /// `create_dir` (which fails if anything is already there), so a
     /// preexisting directory is never touched or removed. A gitlink (submodule)
-    /// entry is refused rather than faked.
+    /// entry is skipped rather than faked: the workspace simply lacks the
+    /// submodule directory, and the capture path preserves a baseline gitlink
+    /// exactly, so the fork still captures a tree identical to the base.
     ///
     /// The fork is registered under `<git-dir>/juto/forks` before the
     /// destination is created and the registry entry is held under an exclusive
@@ -1357,10 +1359,15 @@ impl GitRepository {
                 std::os::unix::fs::symlink(OsStr::from_bytes(&bytes), &target)
                     .with_context(|| format!("failed to create symlink {}", target.display()))?;
             }
-            "160000" => bail!(
-                "cannot materialize gitlink {oid} at {}: submodules are not supported",
-                relative.display()
-            ),
+            // A submodule is a gitlink: a commit id with no tree of its own in
+            // this repository. It is deliberately not materialized — the
+            // workspace simply lacks the submodule directory — because the
+            // capture path preserves a baseline gitlink exactly (it is skipped
+            // before the worktree stat), so a fork that omits it still captures
+            // a tree identical to the base. Materializing an empty directory
+            // instead would let a write inside it add an untracked path that
+            // conflicts with the gitlink in the index.
+            "160000" => {}
             other => bail!(
                 "unsupported tree entry mode {other} at {}",
                 relative.display()
