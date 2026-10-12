@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::error::DesktopError;
-use crate::protocol::{DesktopCommand, DesktopResponse, InputBatch, InputEvent};
+use crate::protocol::{DesktopCommand, DesktopRequest, DesktopResponse, InputBatch, InputEvent};
 use crate::scm;
 use crate::shm::{ShmReader, ShmSlotHeader};
 
@@ -62,7 +62,7 @@ impl ViewerClient {
             transport: "shm".to_string(),
             capabilities: vec!["shm".to_string()],
         };
-        let payload = serde_json::to_vec(&command)
+        let payload = serde_json::to_vec(&DesktopRequest::new(command))
             .map_err(|e| DesktopError::Protocol(format!("encode attach: {e}")))?;
         write_frame(&stream, &payload)?;
 
@@ -148,7 +148,7 @@ impl ViewerClient {
             after_frame: None,
             timeout_ms: timeout.as_millis() as u64,
         };
-        let payload = serde_json::to_vec(&command)
+        let payload = serde_json::to_vec(&DesktopRequest::new(command))
             .map_err(|e| DesktopError::Protocol(format!("encode observe: {e}")))?;
         write_frame(&self.stream, &payload)?;
         let response = self.read_response()?;
@@ -174,7 +174,7 @@ impl ViewerClient {
             action: "acquire".to_string(),
             is_human: true,
         };
-        let payload = serde_json::to_vec(&command)
+        let payload = serde_json::to_vec(&DesktopRequest::new(command))
             .map_err(|e| DesktopError::Protocol(format!("encode control: {e}")))?;
         write_frame(&self.stream, &payload)?;
         match self.read_response()? {
@@ -218,7 +218,7 @@ impl ViewerClient {
                 events,
             },
         };
-        let payload = serde_json::to_vec(&command)
+        let payload = serde_json::to_vec(&DesktopRequest::new(command))
             .map_err(|e| DesktopError::Protocol(format!("encode input: {e}")))?;
         write_frame(&self.stream, &payload)?;
         match self.read_response()? {

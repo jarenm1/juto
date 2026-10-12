@@ -27,6 +27,9 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   (`LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`, `MESA_LOADER_DRIVER_OVERRIDE`), and
   otherwise composes with pixman. A GLES renderer that resolves to a
   non-software device is discarded before any frame is composed.
+- Protocol versioning: control requests carry a protocol version
+  (`PROTOCOL_VERSION = 1`); a request with any other version is rejected with a
+  `Protocol` error before dispatch.
 - Remote transport limits: every configured ICE server is applied to
   `webrtcbin` (STUN through the property, TURN through `add-turn-server`, with
   credentials embedded when supplied), and the requested stream bitrate is

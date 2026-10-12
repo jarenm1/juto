@@ -44,6 +44,28 @@ pub struct AutomationBarrier {
     pub drained_at: u64,
 }
 
+/// Control protocol version. A request carrying any other version is rejected
+/// before it is dispatched (spec section 4).
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Versioned control request envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopRequest {
+    pub version: u32,
+    pub command: DesktopCommand,
+}
+
+impl DesktopRequest {
+    /// Wraps a command in the current protocol version.
+    pub fn new(command: DesktopCommand) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            command,
+        }
+    }
+}
+
 /// Top-level command dispatched to the desktop supervisor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(

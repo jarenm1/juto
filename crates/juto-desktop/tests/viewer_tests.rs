@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use juto_desktop::protocol::{DesktopCommand, DesktopResponse};
+use juto_desktop::protocol::{DesktopCommand, DesktopRequest, DesktopResponse};
 use juto_desktop::viewer::ViewerClient;
 
 struct Daemon {
@@ -50,7 +50,7 @@ impl Daemon {
 
     fn call(&self, command: DesktopCommand) -> DesktopResponse {
         let mut stream = UnixStream::connect(&self.socket).expect("connect to the daemon");
-        let payload = serde_json::to_vec(&command).unwrap();
+        let payload = serde_json::to_vec(&DesktopRequest::new(command)).unwrap();
         stream
             .write_all(&(payload.len() as u32).to_be_bytes())
             .unwrap();
@@ -92,6 +92,40 @@ fn environment_config(env_id: &str) -> serde_json::Value {
         "workspaceDir": std::env::temp_dir(),
         "leaseTtlSecs": 6,
     })
+}
+
+#[test]
+fn an_unsupported_protocol_version_is_rejected() {
+    let daemon = Daemon::start();
+    let mut stream = UnixStream::connect(&daemon.socket).expect("connect");
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "version": 99,
+        "command": {
+            "command": "describe",
+            "payload": {"envId": "whatever", "afterEventSeq": null},
+        },
+    }))
+    .unwrap();
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(&payload).unwrap();
+    stream.flush().unwrap();
+
+    let mut length = [0u8; 4];
+    stream.read_exact(&mut length).expect("response");
+    let mut body = vec![0u8; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut body).unwrap();
+    match serde_json::from_slice::<DesktopResponse>(&body).unwrap() {
+        DesktopResponse::Error { code, message } => {
+            assert_eq!(code, "Protocol");
+            assert!(
+                message.contains("unsupported protocol version"),
+                "unexpected message: {message}"
+            );
+        }
+        other => panic!("expected a protocol error, got {other:?}"),
+    }
 }
 
 #[test]
@@ -147,9 +181,9 @@ fn a_lagging_event_subscriber_is_told_to_resync() {
     // Subscribe and then stop reading while the environment emits far more
     // events than the 256-event replay ring holds.
     let mut stream = UnixStream::connect(&daemon.socket).expect("connect");
-    let subscribe = serde_json::to_vec(&DesktopCommand::Subscribe {
+    let subscribe = serde_json::to_vec(&DesktopRequest::new(DesktopCommand::Subscribe {
         env_id: env_id.clone(),
-    })
+    }))
     .unwrap();
     stream
         .write_all(&(subscribe.len() as u32).to_be_bytes())
