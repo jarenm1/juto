@@ -9,6 +9,7 @@
 //! Architectural reference: `docs/orchestration-plan.md` §4 and `scripts/agent-scope.sh`.
 
 use std::{
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::OsString,
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
@@ -808,9 +809,19 @@ impl SubagentWorkspace {
                 if let Some(sandbox) = &limits.sandbox {
                     emit_sandbox_properties(&mut cmd, sandbox, &self.path);
                 }
-                emit_service_environment(&mut cmd, original, limits.sandbox.is_some());
+                let unsets = emit_service_environment(&mut cmd, original, limits.sandbox.is_some());
 
                 cmd.arg("--");
+                // A variable the original command explicitly removes is applied
+                // with `env -u` in front of the program: `--setenv` can only set
+                // (or set-to-empty), never unset, and the forwarded process
+                // environment would otherwise resurrect it.
+                if !unsets.is_empty() {
+                    cmd.arg("env");
+                    for key in &unsets {
+                        cmd.arg("-u").arg(key);
+                    }
+                }
                 cmd.arg(&program);
                 cmd.args(&orig_args);
             } else {
@@ -838,9 +849,15 @@ impl SubagentWorkspace {
             if let Some(sandbox) = &limits.sandbox {
                 emit_sandbox_properties(&mut cmd, sandbox, &self.path);
             }
-            emit_service_environment(&mut cmd, original, limits.sandbox.is_some());
+            let unsets = emit_service_environment(&mut cmd, original, limits.sandbox.is_some());
 
             cmd.arg("--");
+            if !unsets.is_empty() {
+                cmd.arg("env");
+                for key in &unsets {
+                    cmd.arg("-u").arg(key);
+                }
+            }
             cmd.arg(&program);
             cmd.args(&orig_args);
         } else {
@@ -913,31 +930,60 @@ fn append_systemd_unit_mode(cmd: &mut std::process::Command, sandboxed: bool) {
     }
 }
 
-/// Forward the caller's environment to a transient *service*.
+/// Forward the caller's *effective* environment to a transient *service*.
 ///
 /// A scope wraps the calling process and inherits its environment, but a
 /// service runs in the user manager's environment: without this a sandboxed
 /// command loses `PATH` and every build fails with ``linker `clang` not found``.
 /// `--setenv` is the only way to reach a service's environment; setting the
 /// variables on the `systemd-run` process itself does not propagate.
+///
+/// The effective environment is what the unsandboxed command would see: this
+/// process's environment with `original`'s explicit entries applied. A
+/// `None` entry is an unset; `--setenv` cannot unset, so those keys are
+/// returned for the caller to apply with `env -u` after `--` (returned keys
+/// are not emitted as `--setenv`, and inherited copies of them are skipped).
+/// Forwarding the whole environment to a service matches the same command
+/// running as a scope or unsandboxed — it inherits this process's
+/// environment either way — so nothing extra reaches the sandboxed command.
 fn emit_service_environment(
     cmd: &mut std::process::Command,
     original: &std::process::Command,
     sandboxed: bool,
-) {
+) -> Vec<OsString> {
     if !sandboxed {
-        return;
+        return Vec::new();
     }
+    // The last word wins: an explicit entry overrides the inherited value, an
+    // explicit unset suppresses it.
+    let mut unsets: HashSet<OsString> = HashSet::new();
+    let mut overrides: HashMap<OsString, OsString> = HashMap::new();
     for (key, value) in original.get_envs() {
-        let Some(value) = value else {
-            continue;
-        };
+        match value {
+            Some(value) => {
+                unsets.remove(key);
+                overrides.insert(key.to_os_string(), value.to_os_string());
+            }
+            None => {
+                overrides.remove(key);
+                unsets.insert(key.to_os_string());
+            }
+        }
+    }
+    let mut unset_keys: Vec<OsString> = unsets.iter().cloned().collect();
+    unset_keys.sort();
+    let mut forwarded: BTreeMap<OsString, OsString> = std::env::vars_os()
+        .filter(|(key, _)| !unsets.contains(key))
+        .collect();
+    forwarded.extend(overrides);
+    for (key, value) in forwarded {
         let mut arg = OsString::from("--setenv=");
-        arg.push(key);
+        arg.push(&key);
         arg.push("=");
-        arg.push(value);
+        arg.push(&value);
         cmd.arg(arg);
     }
+    unset_keys
 }
 
 /// Emit the `systemd-run` properties that implement `sandbox`.
@@ -1349,6 +1395,77 @@ mod tests {
             assert!(args.contains(&"cargo".to_string()));
             assert!(args.contains(&"build".to_string()));
             assert!(args.contains(&"--release".to_string()));
+        }
+    }
+
+    #[test]
+    fn sandboxed_service_forwards_the_effective_environment() {
+        if !is_systemd_run_available() {
+            eprintln!("skipping: systemd-run unavailable");
+            return;
+        }
+        let _guard = env_lock();
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe {
+            std::env::set_var("JUTO_SVCENV_INHERITED", "inherited-value");
+            std::env::set_var("JUTO_SVCENV_REMOVED", "present");
+        }
+
+        let ws = workspace_at(&PathBuf::from("/tmp/test-ws"));
+        let mut orig = std::process::Command::new("cargo");
+        orig.arg("build");
+        // An explicit override beats the inherited copy; an explicit unset
+        // must reach the service as a removal, not a resurrection.
+        orig.env("JUTO_SVCENV_INHERITED", "overridden-value");
+        orig.env("JUTO_SVCENV_EXPLICIT", "explicit-value");
+        orig.env_remove("JUTO_SVCENV_REMOVED");
+
+        let limits = ResourceLimits::default().with_sandbox(Sandbox::default());
+        let scoped = ws
+            .build_scoped_std_command(&orig, &limits)
+            .expect("build scoped");
+        let args: Vec<String> = scoped
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        // The effective environment is forwarded through --setenv: inherited
+        // variables are preserved with their overrides applied.
+        assert!(
+            args.contains(&"--setenv=JUTO_SVCENV_INHERITED=overridden-value".to_string()),
+            "the override must win over the inherited value: {args:?}"
+        );
+        assert!(
+            !args.contains(&"--setenv=JUTO_SVCENV_INHERITED=inherited-value".to_string()),
+            "the shadowed inherited value must not be forwarded: {args:?}"
+        );
+        assert!(
+            args.contains(&"--setenv=JUTO_SVCENV_EXPLICIT=explicit-value".to_string()),
+            "an explicit entry must be forwarded: {args:?}"
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("--setenv=JUTO_SVCENV_REMOVED")),
+            "an explicitly removed variable must not be set: {args:?}"
+        );
+
+        // The unset is applied in the service by `env -u` before the program.
+        let dashdash = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[dashdash + 1], "env", "{args:?}");
+        let u = args[dashdash + 1..]
+            .iter()
+            .position(|a| a == "-u")
+            .map(|i| dashdash + 1 + i)
+            .expect("`env -u` must precede the program");
+        assert_eq!(args[u + 1], "JUTO_SVCENV_REMOVED", "{args:?}");
+        let program = args.iter().rposition(|a| a == "cargo").unwrap();
+        assert!(program > u, "the program must follow `env -u`: {args:?}");
+
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe {
+            std::env::remove_var("JUTO_SVCENV_INHERITED");
+            std::env::remove_var("JUTO_SVCENV_REMOVED");
         }
     }
 

@@ -1583,6 +1583,156 @@ fn cleanup_orphaned_forks_skips_live_fork() {
 }
 
 #[test]
+fn interleaved_forks_and_cleanup_keep_every_registration() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"a\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let tree = git_at(repository.git_dir(), &["rev-parse", "HEAD^{tree}"]);
+    let forks_dir = repository.git_dir().join("juto/forks");
+
+    // Forks on distinct destinations race the orphan cleanup. Before the
+    // registry was serialized, a cleanup that ran between a pending file's
+    // creation and its lock acquisition unlinked the file, leaving the fork's
+    // lock on an unlinked inode. Afterwards every fork must still succeed and
+    // every completed fork must clear its own record.
+    let mut handles = Vec::new();
+    for index in 0..4 {
+        let repository = repository.clone();
+        let tree = tree.clone();
+        let destination = temp.path().join(format!("fork-{index}"));
+        handles.push(std::thread::spawn(move || {
+            for attempt in 0..5 {
+                repository
+                    .fork_workspace(&tree, &destination, &format!("thread-{index}-{attempt}"))
+                    .unwrap();
+                fs::remove_dir_all(&destination).unwrap();
+            }
+        }));
+    }
+    let cleanup_repository = repository.clone();
+    let cleanup = std::thread::spawn(move || {
+        for _ in 0..20 {
+            let _ = cleanup_repository.cleanup_orphaned_forks();
+        }
+    });
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    cleanup.join().unwrap();
+
+    // Nothing registered may remain: a surviving unlocked record is either a
+    // missed reclaim or, worse, evidence a fork held a lock on an unlinked
+    // inode (its record would be gone while its directory marker is absent).
+    for _ in 0..100 {
+        if repository.cleanup_orphaned_forks().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let leftover: Vec<_> = fs::read_dir(&forks_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("fork-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leftover.is_empty(),
+        "no pending record may survive: {leftover:?}"
+    );
+}
+
+#[test]
+fn cleanup_orphaned_forks_ignores_non_pending_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"a\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let tree = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    // A real fork creates the registry lock file alongside its pending record.
+    let destination = temp.path().join("fork");
+    repository
+        .fork_workspace(&tree, &destination, "thread-1")
+        .unwrap();
+    let registry_lock = git_dir.join("juto/forks/.fork-registry.lock");
+    assert!(registry_lock.exists(), "the registry lock must exist");
+
+    // The lock file — and any other non-pending file — is never opened,
+    // parsed, or unlinked by the cleanup.
+    repository.cleanup_orphaned_forks().unwrap();
+    assert!(
+        registry_lock.exists(),
+        "the registry lock must survive the cleanup"
+    );
+}
+
+#[test]
+fn restore_tree_refuses_a_symlinked_parent_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("dir/inner.txt"), b"inner\n");
+    write_file(&dir.join("dir/gone.txt"), b"gone\n");
+    write_file(&dir.join("keep.txt"), b"keep\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let base = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    // The target deletes dir/gone.txt and modifies dir/inner.txt: the delete
+    // replay runs first (paths sort before the modify), so both sides of the
+    // guard are exercised.
+    fs::remove_file(dir.join("dir/gone.txt")).unwrap();
+    write_file(&dir.join("dir/inner.txt"), b"inner edited\n");
+    commit(&dir, "target");
+    let target = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    let work = temp.path().join("work");
+    repository.fork_workspace(&base, &work, "thread-1").unwrap();
+
+    // A symlink in place of a parent directory would redirect the delete and
+    // the write outside the workspace.
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    write_file(&outside.join("inner.txt"), b"outside inner\n");
+    write_file(&outside.join("gone.txt"), b"outside gone\n");
+    fs::remove_dir_all(work.join("dir")).unwrap();
+    symlink(&outside, work.join("dir")).unwrap();
+
+    let error = repository.restore_tree(&base, &target, &work).unwrap_err();
+    assert!(error.to_string().contains("symlink"), "{error}");
+    assert_eq!(
+        fs::read(outside.join("inner.txt")).unwrap(),
+        b"outside inner\n",
+        "the restore must not write through the symlink"
+    );
+    assert_eq!(
+        fs::read(outside.join("gone.txt")).unwrap(),
+        b"outside gone\n",
+        "the restore must not delete through the symlink"
+    );
+
+    // Once the real directory is back, the same restore succeeds.
+    fs::remove_file(work.join("dir")).unwrap();
+    fs::create_dir(work.join("dir")).unwrap();
+    repository.restore_tree(&base, &target, &work).unwrap();
+    assert_eq!(
+        fs::read(work.join("dir/inner.txt")).unwrap(),
+        b"inner edited\n"
+    );
+    assert!(!work.join("dir/gone.txt").exists());
+}
+
+#[test]
 fn update_tree_entry_matches_a_full_capture() {
     let temp = tempfile::tempdir().unwrap();
     let dir = repo(&temp, "repo");

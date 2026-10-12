@@ -651,3 +651,41 @@ fn reconcile_in_a_sparse_workspace_records_the_full_merged_tree() {
         "reconcile must record the complete merged tree, got:\n{listing}"
     );
 }
+
+#[test]
+fn publish_repairs_a_canonical_node_ref_with_stale_content() {
+    let fixture = SharedRemote::new();
+    let a = ChangeGraph::open(&fixture.a).unwrap();
+
+    fs::write(fixture.a.join("one"), "one\n").unwrap();
+    let node = a.capture("main", provenance("one"), None).unwrap();
+
+    // Point refs/juto/nodes/<id> at a blob that does not encode this node —
+    // the stale state a crashed or older publish leaves behind.
+    let repository = GitRepository::open(&fixture.a).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let stale = repository.write_blob(b"{\"bogus\":true}").unwrap();
+    repository
+        .update_ref(&format!("refs/juto/nodes/{}", node.id), &stale, None)
+        .unwrap();
+
+    // A publish must verify the pinned payload against the authoritative
+    // encoding (the object id is the content hash) and repair the ref by
+    // compare-and-swap, not trust whatever object the ref already names.
+    a.push_graph(fixture.remote()).unwrap();
+    let pinned = git_at(
+        &git_dir,
+        &["rev-parse", &format!("refs/juto/nodes/{}", node.id)],
+    );
+    assert_ne!(pinned, stale, "the stale ref must be repointed");
+    let bytes = repository.read_blob(&pinned).unwrap();
+    let decoded: ChangeNode = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(decoded, node, "the ref must carry the authoritative node");
+
+    // The remote receives the same payload, so a fetch converges on it.
+    let remote_oid = git_at(
+        &fixture.remote,
+        &["rev-parse", &format!("refs/juto/nodes/{}", node.id)],
+    );
+    assert_eq!(remote_oid, pinned);
+}

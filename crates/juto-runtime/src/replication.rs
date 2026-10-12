@@ -135,12 +135,12 @@ pub(crate) fn publish(graph: &ChangeGraph, remote: &str) -> Result<PublishReport
         let mut updates: Vec<(String, String, Option<String>)> = Vec::new();
         for node in &state.nodes {
             let refname = node_ref(&node.id);
-            // The blob already exists when the ref does, so reuse that object
-            // instead of re-hashing the node.
-            let blob = match existing.get(&refname) {
-                Some(current) => current.clone(),
-                None => repository.write_blob(&encode_node(node)?)?,
-            };
+            // The blob is always re-encoded from the authoritative graph: the
+            // object id IS the content hash, so equality with the existing ref
+            // proves the pinned payload is exactly this node. Reusing the ref's
+            // object without this check would republish a stale or corrupted
+            // blob under the node's id.
+            let blob = repository.write_blob(&encode_node(node)?)?;
             match existing.get(&refname) {
                 Some(current) if current == &blob => {}
                 Some(current) => updates.push((refname, blob, Some(current.clone()))),
