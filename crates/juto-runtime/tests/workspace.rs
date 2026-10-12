@@ -270,7 +270,7 @@ fn sandbox_protect_home_yes_emits_property() {
 }
 
 #[test]
-fn agent_sandbox_env_enables_default_sandbox() {
+fn agent_sandbox_env_enables_the_toolchain_sandbox() {
     let _guard = env_lock();
 
     // SAFETY: serialized by ENV_LOCK.
@@ -284,16 +284,16 @@ fn agent_sandbox_env_enables_default_sandbox() {
     unsafe { std::env::set_var("AGENT_SANDBOX", "1") };
     assert_eq!(
         ResourceLimits::default().sandbox,
-        Some(Sandbox::default()),
-        "AGENT_SANDBOX=1 must enable the default sandbox"
+        Some(Sandbox::for_agent_workspace()),
+        "AGENT_SANDBOX=1 must enable the toolchain sandbox"
     );
 
     // SAFETY: serialized by ENV_LOCK.
     unsafe { std::env::set_var("AGENT_SANDBOX", "true") };
     assert_eq!(
         ResourceLimits::default().sandbox,
-        Some(Sandbox::default()),
-        "AGENT_SANDBOX=true must enable the default sandbox"
+        Some(Sandbox::for_agent_workspace()),
+        "AGENT_SANDBOX=true must enable the toolchain sandbox"
     );
 
     // SAFETY: serialized by ENV_LOCK.
@@ -305,6 +305,33 @@ fn agent_sandbox_env_enables_default_sandbox() {
 
     // SAFETY: serialized by ENV_LOCK.
     unsafe { std::env::remove_var("AGENT_SANDBOX") };
+}
+
+#[test]
+fn toolchain_sandbox_grants_the_build_directories() {
+    let _guard = env_lock();
+    let previous = std::env::var_os("CARGO_HOME");
+
+    // SAFETY: serialized by ENV_LOCK.
+    unsafe { std::env::set_var("CARGO_HOME", "/tmp/juto-cargo-home") };
+    let sandbox = Sandbox::for_agent_workspace();
+    assert!(
+        sandbox
+            .write_paths
+            .contains(&PathBuf::from("/tmp/juto-cargo-home")),
+        "an explicit CARGO_HOME must be granted: {:?}",
+        sandbox.write_paths
+    );
+    // The base defaults are unchanged.
+    assert!(sandbox.protect_system);
+    assert_eq!(sandbox.protect_home, ProtectHome::ReadOnly);
+    assert!(sandbox.private_tmp);
+
+    // SAFETY: serialized by ENV_LOCK.
+    match previous {
+        Some(value) => unsafe { std::env::set_var("CARGO_HOME", value) },
+        None => unsafe { std::env::remove_var("CARGO_HOME") },
+    }
 }
 
 /// Live proof that the sandbox is enforced by the kernel, not just by argv.
@@ -375,4 +402,59 @@ async fn sandbox_allows_workspace_writes_and_denies_home_writes() {
     );
     assert!(!canary.exists(), "canary must not be created");
     let _ = std::fs::remove_file(&canary);
+}
+
+/// Live proof that a sandboxed command keeps the caller's environment.
+///
+/// A transient *service* runs in the user manager's environment, so without
+/// explicit forwarding a sandboxed build loses `PATH` and fails with
+/// ``linker `clang` not found``. A scope inherits the environment; a service
+/// does not.
+#[tokio::test]
+async fn sandboxed_service_inherits_the_caller_environment() {
+    if !is_systemd_run_available() {
+        eprintln!("skipping sandbox live test: systemd-run unavailable");
+        return;
+    }
+
+    let Some(home) = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+    else {
+        eprintln!("skipping sandbox live test: HOME unset");
+        return;
+    };
+
+    let ws_dir = match tempfile::Builder::new()
+        .prefix("juto-sandbox-env-")
+        .tempdir_in(&home)
+    {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("skipping sandbox live test: cannot create workspace under HOME: {err}");
+            return;
+        }
+    };
+
+    let ws = workspace_at(ws_dir.path());
+    let limits = ResourceLimits::default().with_sandbox(Sandbox::default());
+
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg("test -n \"$JUTO_SANDBOX_PROBE\" && printf '%s' \"$JUTO_SANDBOX_PROBE\" > probe.txt");
+    command.env("JUTO_SANDBOX_PROBE", "inherited");
+    let status = ws
+        .run_scoped(&mut command, limits)
+        .await
+        .expect("run scoped env probe");
+    assert!(
+        status.success(),
+        "the probe must see its variable: {status:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws_dir.path().join("probe.txt")).unwrap(),
+        "inherited",
+        "a sandboxed service must inherit the caller's environment"
+    );
 }
