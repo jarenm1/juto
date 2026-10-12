@@ -572,6 +572,7 @@ fn gc_prunes_abandoned_thread_nodes_and_releases_their_snapshot_refs() {
             pruned_nodes: 1,
             retained_nodes: 2,
             released_refs: 1,
+            released_node_refs: 0,
         }
     );
 
@@ -615,6 +616,7 @@ fn gc_is_a_no_op_when_every_node_is_reachable() {
             pruned_nodes: 0,
             retained_nodes: 2,
             released_refs: 0,
+            released_node_refs: 0,
         }
     );
     assert_eq!(

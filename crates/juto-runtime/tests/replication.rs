@@ -294,3 +294,91 @@ fn republishing_advances_the_owner_head_ref() {
         second.id
     );
 }
+
+#[test]
+fn gc_releases_node_refs_for_pruned_nodes() {
+    let fixture = SharedRemote::new();
+    let a = ChangeGraph::open(&fixture.a).unwrap();
+    let root = a.capture("main", provenance("root"), None).unwrap();
+    a.mark(&root.id, "base", "feat: base", true).unwrap();
+
+    // A side thread records a point, then re-bases onto the checkpoint,
+    // abandoning its earlier tip.
+    let workspaces = tempfile::tempdir().unwrap();
+    let side_dir = workspaces.path().join("side");
+    a.fork("side", "base", &side_dir).unwrap();
+    let side = ChangeGraph::open(&side_dir).unwrap();
+    fs::write(side_dir.join("side"), "side\n").unwrap();
+    let abandoned = side.capture("side", provenance("side"), None).unwrap();
+    fs::write(side_dir.join("side"), "side rebased\n").unwrap();
+    side.capture("side", provenance("side"), Some(vec![root.id.clone()]))
+        .unwrap();
+
+    // Publishing pins `refs/juto/nodes/<id>` for every node, including the one
+    // about to be abandoned.
+    a.push_graph(fixture.remote()).unwrap();
+    let git_dir = GitRepository::open(&fixture.a)
+        .unwrap()
+        .git_dir()
+        .to_path_buf();
+    let abandoned_ref = format!("refs/juto/nodes/{}", abandoned.id);
+    assert!(
+        !git_at(
+            &git_dir,
+            &["rev-parse", "--verify", "--quiet", &abandoned_ref]
+        )
+        .is_empty(),
+        "publishing must pin refs/juto/nodes/<id>"
+    );
+
+    let report = a.gc().unwrap();
+    assert_eq!(report.pruned_nodes, 1);
+    assert_eq!(report.released_refs, 1);
+    assert_eq!(report.released_node_refs, 1);
+
+    // The pruned node leaves no replication ref behind.
+    let remaining = git_at(
+        &git_dir,
+        &["for-each-ref", "--format=%(refname)", "refs/juto/nodes/"],
+    );
+    assert!(
+        !remaining.lines().any(|line| line == abandoned_ref),
+        "gc must release the pruned node's refs/juto/nodes ref, got:\n{remaining}"
+    );
+    assert!(remaining.contains(&format!("refs/juto/nodes/{}", root.id)));
+}
+
+#[test]
+fn a_failed_import_leaves_no_staging_refs() {
+    let fixture = SharedRemote::new();
+    let a = ChangeGraph::open(&fixture.a).unwrap();
+    fs::write(fixture.a.join("one"), "one\n").unwrap();
+    a.capture("main", provenance("one"), None).unwrap();
+    a.push_graph(fixture.remote()).unwrap();
+
+    // A repository with an unrelated base cannot import: the base guard aborts.
+    let temp = tempfile::tempdir().unwrap();
+    let c = temp.path().join("c");
+    init_repo(&c);
+    fs::write(c.join("other"), "other\n").unwrap();
+    git(&c, &["add", "-A"]);
+    git(&c, &["commit", "-q", "-m", "other"]);
+    let graph_c = ChangeGraph::open(&c).unwrap();
+
+    let error = graph_c.fetch_graph(fixture.remote()).unwrap_err();
+    assert!(
+        error.to_string().contains("does not match the local base"),
+        "unexpected error: {error}"
+    );
+
+    // The staging namespace must be empty: a failed import may not leak refs.
+    let git_dir = GitRepository::open(&c).unwrap().git_dir().to_path_buf();
+    let staging = git_at(
+        &git_dir,
+        &["for-each-ref", "--format=%(refname)", "refs/juto/incoming/"],
+    );
+    assert!(
+        staging.is_empty(),
+        "a failed import must clean its staging refs, got:\n{staging}"
+    );
+}
