@@ -9,12 +9,13 @@
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 
 use crate::compositor::{Compositor, CompositorCommand, CompositorConfig, SnapshotInfo};
@@ -82,6 +83,20 @@ pub enum RenderProfile {
     Hardware,
 }
 
+impl std::str::FromStr for RenderProfile {
+    type Err = DesktopError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "software" => Ok(RenderProfile::Software),
+            "hardware" => Ok(RenderProfile::Hardware),
+            other => Err(DesktopError::Protocol(format!(
+                "unknown render profile: {other}"
+            ))),
+        }
+    }
+}
+
 /// Profile configurations admitted by the host.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -93,6 +108,14 @@ pub struct OutputProfile {
 }
 
 impl RenderProfile {
+    /// Stable wire/CLI spelling for the profile.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RenderProfile::Software => "software",
+            RenderProfile::Hardware => "hardware",
+        }
+    }
+
     pub fn admitted_profile(&self) -> OutputProfile {
         match self {
             RenderProfile::Software => OutputProfile {
@@ -159,6 +182,48 @@ fn default_owner_timeout() -> u64 {
     60
 }
 
+/// Bounded wait for the shared GPU lock before reporting the device busy.
+const GPU_LOCK_WAIT_SECS: u64 = 5;
+
+/// Path of the repository's shared advisory GPU lock, shared with `jtech`.
+fn gpu_lock_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("AGENT_GPU_LOCK") {
+        return PathBuf::from(path);
+    }
+    let base = std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_else(|| PathBuf::from("/tmp").into());
+    PathBuf::from(base).join("jtech-agent-gpu.lock")
+}
+
+/// Acquires the shared advisory GPU lock, waiting a bounded time for a peer.
+fn acquire_gpu_lock() -> Result<std::fs::File, DesktopError> {
+    let path = gpu_lock_path();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| DesktopError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    let deadline = Instant::now() + Duration::from_secs(GPU_LOCK_WAIT_SECS);
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(file);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(DesktopError::Io { path, source: err });
+        }
+        if Instant::now() >= deadline {
+            return Err(DesktopError::GpuBusy);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// A bounded human acceptance of an environment's lifetime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -222,6 +287,8 @@ struct InnerEnvironment {
     destroyed: AtomicBool,
     use_scope: bool,
     slice: Option<String>,
+    /// Shared advisory GPU lock held for a hardware environment's lifetime.
+    gpu_lock: Mutex<Option<std::fs::File>>,
 }
 
 /// An active, isolated agent desktop environment.
@@ -253,6 +320,14 @@ impl DesktopEnvironment {
                 reason: "width, height, and fps must be non-zero".to_string(),
             });
         }
+
+        // A hardware environment serializes on the repository's shared advisory
+        // GPU lock for its whole lifetime, including its encoder (spec section 6).
+        let gpu_lock = if config.render_profile == RenderProfile::Hardware {
+            Some(acquire_gpu_lock()?)
+        } else {
+            None
+        };
 
         let use_scope = scope_enforced()?;
         let slice = if use_scope {
@@ -288,6 +363,7 @@ impl DesktopEnvironment {
             height: config.output.height,
             scale: config.output.scale,
             fps: config.output.fps,
+            render_profile: config.render_profile,
             socket_path: socket_path.clone(),
         };
         let (compositor, pool) = match config.compositor_mode {
@@ -372,6 +448,7 @@ impl DesktopEnvironment {
             destroyed: AtomicBool::new(false),
             use_scope,
             slice,
+            gpu_lock: Mutex::new(gpu_lock),
         });
 
         spawn_event_forwarder(inner.clone(), comp_rx);
@@ -1048,6 +1125,9 @@ impl DesktopEnvironment {
                 .stderr(Stdio::null())
                 .status();
         }
+
+        // Dropping the lock file releases the shared GPU lock.
+        drop(self.inner.gpu_lock.lock().take());
 
         let _ = std::fs::remove_dir_all(&self.inner.runtime_dir);
         *self.inner.is_ready.lock() = false;

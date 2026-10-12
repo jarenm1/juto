@@ -67,6 +67,12 @@ pub enum DesktopError {
     #[error("isolation unavailable: {0}")]
     IsolationUnavailable(String),
 
+    #[error("renderer unavailable: {0}")]
+    RendererUnavailable(String),
+
+    #[error("GPU busy: the shared device lock is held by another environment")]
+    GpuBusy,
+
     #[error("text input unavailable: {0}")]
     TextUnavailable(String),
 }

@@ -48,6 +48,8 @@ uuid = { version = "1", features = ["v7", "serde"] }
 smithay = { version = "0.7.0", default-features = false, features = [
     "wayland_frontend",
     "renderer_pixman",
+    "renderer_gl",
+    "backend_egl",
     "desktop",
 ] }
 juto-catalog = { path = "crates/juto-catalog" }

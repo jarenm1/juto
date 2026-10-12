@@ -5,6 +5,7 @@ mod common;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use juto_desktop::DesktopError;
 use juto_desktop::protocol::*;
 use juto_desktop::shm::{ShmFramePool, ShmReader};
 use juto_desktop::supervisor::{
@@ -242,6 +243,56 @@ fn compositor_renders_real_client_frame() {
     assert!(frames > 0, "client presented at least one frame");
 
     env.destroy();
+}
+
+#[test]
+fn hardware_profile_renders_and_serializes_on_the_shared_device() {
+    let supervisor = DesktopSupervisor::new();
+    let mut config = test_config(&unique_env_id("hardware"));
+    config.render_profile = RenderProfile::Hardware;
+    let env = supervisor
+        .create_environment(config)
+        .expect("hardware environment");
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    let client = std::thread::spawn(move || common::run(&socket, 10));
+
+    let pool = env.frame_pool();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut verified = None;
+    while Instant::now() < deadline {
+        let info = env.observe(Duration::from_secs(2)).expect("observe");
+        let left = read_pixel(&pool, info.slot, 10, 10, info.width);
+        let right = read_pixel(&pool, info.slot, 300, 10, info.width);
+        if left == common::RED && right == common::BLUE {
+            verified = Some(info);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        verified.is_some(),
+        "the hardware profile never composed the client's two-tone frame"
+    );
+
+    // A second hardware environment cannot share the physical device.
+    let mut second = test_config(&unique_env_id("hardware"));
+    second.render_profile = RenderProfile::Hardware;
+    assert!(matches!(
+        supervisor.create_environment(second),
+        Err(DesktopError::GpuBusy)
+    ));
+
+    env.destroy();
+    let _ = client.join();
+
+    // Destroying the environment releases the shared device.
+    let mut third = test_config(&unique_env_id("hardware"));
+    third.render_profile = RenderProfile::Hardware;
+    let third = supervisor
+        .create_environment(third)
+        .expect("the shared device is released after destroy");
+    third.destroy();
 }
 
 #[test]

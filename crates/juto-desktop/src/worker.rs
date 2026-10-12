@@ -94,6 +94,7 @@ pub struct WorkerArgs {
     pub height: u32,
     pub scale: u32,
     pub fps: u32,
+    pub render_profile: crate::supervisor::RenderProfile,
     pub wayland_socket: PathBuf,
     pub control_socket: PathBuf,
 }
@@ -130,6 +131,7 @@ pub fn run_worker(args: WorkerArgs) -> Result<(), DesktopError> {
         height: args.height,
         scale: args.scale,
         fps: args.fps,
+        render_profile: args.render_profile,
         socket_path: args.wayland_socket.clone(),
     };
     let pool_for_compositor = pool.clone();
@@ -371,6 +373,8 @@ impl WorkerCompositor {
             config.scale.to_string(),
             "--fps".to_string(),
             config.fps.to_string(),
+            "--render-profile".to_string(),
+            config.render_profile.as_str().to_string(),
             "--wayland-socket".to_string(),
             config.socket_path.display().to_string(),
             "--control-socket".to_string(),
@@ -398,6 +402,7 @@ impl WorkerCompositor {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+
         let child = command.spawn().map_err(|e| {
             DesktopError::Compositor(format!("cannot spawn the compositor worker: {e}"))
         })?;

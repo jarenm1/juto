@@ -25,6 +25,10 @@
             libxkbcommon
             libxcb
             pixman
+            libglvnd
+            libgbm
+            libdrm
+            mesa
             vulkan-loader
             glib
             gst_all_1.gstreamer
