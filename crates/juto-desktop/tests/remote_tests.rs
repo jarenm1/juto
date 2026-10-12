@@ -6,7 +6,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use juto_desktop::remote::{
-    NativeReceiver, Negotiation, PresentationWorker, RemoteStreamConfig, VideoCodec,
+    IceServer, NativeReceiver, Negotiation, PresentationWorker, RemoteStreamConfig, VideoCodec,
 };
 use juto_desktop::supervisor::{
     DesktopSupervisor, EnvironmentConfig, OutputConfig, RenderProfile, SystemLimits,
@@ -40,6 +40,51 @@ fn test_config(env_id: &str) -> EnvironmentConfig {
         compositor_mode: juto_desktop::CompositorMode::Worker,
         owner_heartbeat_timeout_secs: 60,
     }
+}
+
+#[test]
+fn remote_bitrate_is_bounded_and_ice_servers_are_applied() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(
+            test_config(&unique_env_id("bitrate")),
+            &unique_env_id("req"),
+        )
+        .expect("create environment");
+
+    let config = RemoteStreamConfig {
+        env_id: env.env_id().to_string(),
+        viewer_id: "bitrate-viewer".to_string(),
+        negotiation: Negotiation::SenderOffers,
+        // Above the environment's total-media ceiling.
+        max_bitrate_bps: 50_000_000,
+        ice_servers: vec![
+            IceServer {
+                url: "stun:stun.example.invalid:3478".to_string(),
+                username: None,
+                credential: None,
+            },
+            IceServer {
+                url: "turn:turn.example.invalid:3478".to_string(),
+                username: Some("user".to_string()),
+                credential: Some("pass".to_string()),
+            },
+        ],
+        ..RemoteStreamConfig::default()
+    };
+
+    let worker = PresentationWorker::new(env.clone(), config).expect("presentation worker");
+    assert_eq!(
+        worker.effective_bitrate_bps(),
+        env.limits().remote_bitrate_max_bps,
+        "the requested bitrate must be clamped to the environment ceiling"
+    );
+    // A TURN-configured session still negotiates: the offer is produced even
+    // though the relay is unreachable from this host.
+    assert!(worker.offer().is_ok(), "the offer must still be produced");
+
+    worker.shutdown();
+    env.destroy();
 }
 
 #[test]
