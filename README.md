@@ -52,6 +52,9 @@ for end-to-end task execution: intent triage via discrete classification (`Judge
 routing (`builder`, `reviewer`, `scout`, `sonic`), sequential verification quality gates
 (`format`, `build`, `test`, `smoke`), adversarial peer review handoff, bounded remediation
 retry loops, cooperative cancellation safety, and real-time lifecycle event broadcasting.
+An approved task's isolated workspace is folded back into the parent thread — the builder's
+head is frozen as a verified checkpoint and joined into the parent, with the parent's own
+uncaptured edits captured first so the merge cannot overwrite them.
 
 **Native live-change DAG and Git transfer.** Juto tracks live agent edits in its own
 version control DAG rather than synthesizing premature Git commits or depending on
@@ -70,8 +73,12 @@ publishes, `fetch_graph` imports into a staging namespace and unions by node id
 with a hard content-equality assertion, and `reconcile` folds another machine's
 head into the local thread (joining cleanly, adopting when the thread has no local
 head, or reporting conflicting paths). `join` merges two threads into a two-parent
-node via `git merge-tree`; `rewind` reverts a thread by materializing a tree delta
-and appending a forward node, so history stays append-only. `gc` mark-sweeps
+node via `git merge-tree`; `resolve` records a conflict resolved by hand, taking
+the conflicted paths from the workspace so a sparse or stale copy cannot revert
+the other side's changes; `rewind` reverts a thread by materializing a tree delta
+and appending a forward node, so history stays append-only. `dirty` lists the
+paths a `bash` command left uncaptured and `capture` records them, since only the
+edit tools capture automatically. `gc` mark-sweeps
 unreachable nodes, releases their refs, and packs the survivors. All of it is
 exposed both as `juto-cli changes` subcommands and as the runtime's `vcs` tool,
 so an agent can run the whole workflow — including handing a verified checkpoint
