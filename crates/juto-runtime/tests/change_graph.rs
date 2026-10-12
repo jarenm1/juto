@@ -2,7 +2,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
 use juto_runtime::{
-    change_graph::{ChangeGraph, EditProvenance, GcReport},
+    change_graph::{ChangeGraph, EditProvenance, GcReport, JoinOutcome},
     git_transfer::GitRepository,
 };
 use tempfile::TempDir;
@@ -652,4 +652,159 @@ fn fork_survives_a_stale_pending_fork_entry() {
     let mut open = fs::metadata(stale.join("locked")).unwrap().permissions();
     open.set_mode(0o700);
     fs::set_permissions(stale.join("locked"), open).unwrap();
+}
+
+#[test]
+fn thread_names_may_not_contain_a_slash() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+
+    assert!(
+        graph
+            .capture("bad/thread", provenance("bad"), None)
+            .is_err()
+    );
+    let workspaces = tempfile::tempdir().unwrap();
+    let destination = workspaces.path().join("bad");
+    assert!(graph.fork("bad/thread", &root.id, &destination).is_err());
+    assert!(
+        !destination.exists(),
+        "a rejected fork must not materialize"
+    );
+
+    fs::write(cwd.join("edit"), "edit\n").unwrap();
+    let after = graph.snapshot_tree().unwrap();
+    assert!(
+        graph
+            .record_edit(&root.tree, &after, provenance("bad/thread"))
+            .is_err()
+    );
+}
+
+#[test]
+fn rewind_materializes_the_target_tree_and_appends_a_forward_node() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    graph.mark(&root.id, "base", "feat: base", true).unwrap();
+
+    let workspaces = tempfile::tempdir().unwrap();
+    let child_dir = workspaces.path().join("child");
+    graph.fork("child", &root.id, &child_dir).unwrap();
+    let child = ChangeGraph::open(&child_dir).unwrap();
+
+    fs::write(child_dir.join("extra"), "extra\n").unwrap();
+    child.capture("child", provenance("extra"), None).unwrap();
+    fs::write(child_dir.join("base"), "changed\n").unwrap();
+    let head = child.capture("child", provenance("change"), None).unwrap();
+    assert_eq!(
+        fs::read_to_string(child_dir.join("base")).unwrap(),
+        "changed\n"
+    );
+
+    // Rewind by checkpoint name: the target tree restores one file and deletes
+    // another, and the rewind itself is recorded as a forward node.
+    let rewound = child.rewind("child", "base").unwrap();
+
+    assert_eq!(rewound.tree, root.tree);
+    assert_eq!(rewound.parents, vec![head.id.clone()]);
+    assert_eq!(rewound.provenance.tool, "rewind");
+    assert_eq!(
+        fs::read_to_string(child_dir.join("base")).unwrap(),
+        "base\n"
+    );
+    assert!(
+        !child_dir.join("extra").exists(),
+        "rewind must delete files the target tree does not contain"
+    );
+    let state = child.state().unwrap();
+    assert_eq!(state.heads["child"], rewound.id);
+    assert_eq!(state.nodes.last().unwrap().id, rewound.id);
+    assert_eq!(state.checkpoints["base"], root.id);
+}
+
+#[test]
+fn join_of_two_diverged_threads_produces_a_two_parent_node() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    graph.mark(&root.id, "base", "feat: base", true).unwrap();
+
+    let workspaces = tempfile::tempdir().unwrap();
+    let left_dir = workspaces.path().join("left");
+    let right_dir = workspaces.path().join("right");
+    graph.fork("left", &root.id, &left_dir).unwrap();
+    graph.fork("right", &root.id, &right_dir).unwrap();
+    let left_graph = ChangeGraph::open(&left_dir).unwrap();
+    let right_graph = ChangeGraph::open(&right_dir).unwrap();
+
+    fs::write(left_dir.join("left"), "left\n").unwrap();
+    let left = left_graph
+        .capture("left", provenance("left"), None)
+        .unwrap();
+    fs::write(right_dir.join("right"), "right\n").unwrap();
+    let right = right_graph
+        .capture("right", provenance("right"), None)
+        .unwrap();
+
+    let outcome = graph.join("integration", &left.id, &right.id).unwrap();
+    let JoinOutcome::Joined { node, base, tree } = outcome else {
+        panic!("expected a clean join, got {outcome:?}");
+    };
+    assert_eq!(base, root.id);
+    assert_eq!(node.parents, vec![left.id.clone(), right.id.clone()]);
+    assert_eq!(node.tree, tree);
+    assert_eq!(node.provenance.tool, "join");
+    assert_eq!(fs::read_to_string(cwd.join("left")).unwrap(), "left\n");
+    assert_eq!(fs::read_to_string(cwd.join("right")).unwrap(), "right\n");
+    assert_eq!(fs::read_to_string(cwd.join("base")).unwrap(), "base\n");
+    assert_eq!(graph.state().unwrap().heads["integration"], node.id);
+}
+
+#[test]
+fn conflicting_join_reports_the_paths_and_creates_no_node() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+
+    let workspaces = tempfile::tempdir().unwrap();
+    let left_dir = workspaces.path().join("left");
+    let right_dir = workspaces.path().join("right");
+    graph.fork("left", &root.id, &left_dir).unwrap();
+    graph.fork("right", &root.id, &right_dir).unwrap();
+    let left_graph = ChangeGraph::open(&left_dir).unwrap();
+    let right_graph = ChangeGraph::open(&right_dir).unwrap();
+
+    fs::write(left_dir.join("shared"), "left\n").unwrap();
+    let left = left_graph
+        .capture("left", provenance("left"), None)
+        .unwrap();
+    fs::write(right_dir.join("shared"), "right\n").unwrap();
+    let right = right_graph
+        .capture("right", provenance("right"), None)
+        .unwrap();
+
+    let before = graph.state().unwrap().nodes.len();
+    let outcome = graph.join("integration", &left.id, &right.id).unwrap();
+    let JoinOutcome::Conflicted { base, conflicts } = outcome else {
+        panic!("expected a conflicted join, got {outcome:?}");
+    };
+    assert_eq!(base, root.id);
+    assert_eq!(conflicts, vec!["shared".to_string()]);
+    let state = graph.state().unwrap();
+    assert_eq!(
+        state.nodes.len(),
+        before,
+        "a conflicted join must not append a node"
+    );
+    assert!(!state.heads.contains_key("integration"));
+    assert!(
+        !cwd.join("shared").exists(),
+        "a conflicted join must not touch the workspace"
+    );
 }

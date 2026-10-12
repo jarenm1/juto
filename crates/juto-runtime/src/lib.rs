@@ -8,6 +8,7 @@ mod contextual;
 pub mod git_transfer;
 pub mod orchestrator;
 pub mod peers;
+pub mod replication;
 pub mod session;
 pub mod subagents;
 pub mod tools;
