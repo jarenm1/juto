@@ -77,6 +77,11 @@ pub struct RemoteStreamConfig {
     pub negotiation: Negotiation,
     #[serde(default)]
     pub ice_servers: Vec<IceServer>,
+    /// GStreamer description of the environment's private audio source, for
+    /// example `pulsesrc device=juto-sink.monitor`. When unset the stream
+    /// carries video only.
+    #[serde(default)]
+    pub audio_source: Option<String>,
 }
 
 fn default_negotiation() -> Negotiation {
@@ -93,9 +98,13 @@ impl Default for RemoteStreamConfig {
             max_fps: 30,
             negotiation: Negotiation::ViewerOffers,
             ice_servers: Vec::new(),
+            audio_source: None,
         }
     }
 }
+
+/// Opus bitrate reserved for the audio track when one is configured.
+const AUDIO_BITRATE_BPS: u64 = 96_000;
 
 /// Session description for WebRTC signaling (SDP offer/answer).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +204,12 @@ impl PresentationWorker {
             config.max_bitrate_bps = ceiling;
         }
         let effective_bitrate_bps = config.max_bitrate_bps;
+        // Audio shares the environment's total-media ceiling with video.
+        let video_bitrate_bps = if config.audio_source.is_some() {
+            effective_bitrate_bps.saturating_sub(AUDIO_BITRATE_BPS)
+        } else {
+            effective_bitrate_bps
+        };
 
         let pipeline = gst::Pipeline::new();
         let appsrc = gst::ElementFactory::make("appsrc")
@@ -221,13 +236,13 @@ impl PresentationWorker {
         let encoder = match config.video_codec {
             VideoCodec::Vp8 => gst::ElementFactory::make("vp8enc")
                 .property("deadline", 1i64)
-                .property("target-bitrate", config.max_bitrate_bps as i32)
+                .property("target-bitrate", video_bitrate_bps as i32)
                 .property("keyframe-max-dist", fps)
                 .property("cpu-used", 8i32)
                 .build()
                 .map_err(|e| DesktopError::TransportUnavailable(format!("vp8enc: {e}")))?,
             VideoCodec::H264 => gst::ElementFactory::make("x264enc")
-                .property("bitrate", (config.max_bitrate_bps / 1000) as u32)
+                .property("bitrate", (video_bitrate_bps / 1000) as u32)
                 .property("tune", 0x00000004u32) // zerolatency
                 .property("speed-preset", 1i32) // ultrafast
                 .property("key-int-max", fps as u32)
@@ -286,7 +301,67 @@ impl PresentationWorker {
         gst::Element::link_many(elements[..5].iter())
             .map_err(|e| DesktopError::TransportUnavailable(format!("pipeline link: {e}")))?;
 
+        // Optional private audio track: the environment's own source, encoded
+        // with Opus and carried on a second WebRTC stream (spec section 7).
+        let mut audio_elements: Vec<gst::Element> = Vec::new();
+        if let Some(source) = config.audio_source.as_deref() {
+            let audio_src = gst::parse::bin_from_description(source, true)
+                .map_err(|e| DesktopError::TransportUnavailable(format!("audio source: {e}")))?;
+            let audio_convert = gst::ElementFactory::make("audioconvert")
+                .build()
+                .map_err(|e| DesktopError::TransportUnavailable(format!("audioconvert: {e}")))?;
+            let audio_resample = gst::ElementFactory::make("audioresample")
+                .build()
+                .map_err(|e| DesktopError::TransportUnavailable(format!("audioresample: {e}")))?;
+            let audio_encoder = gst::ElementFactory::make("opusenc")
+                .property("bitrate", AUDIO_BITRATE_BPS as i32)
+                .build()
+                .map_err(|e| DesktopError::TransportUnavailable(format!("opusenc: {e}")))?;
+            let audio_payloader = gst::ElementFactory::make("rtpopuspay")
+                .property("pt", 97u32)
+                .build()
+                .map_err(|e| DesktopError::TransportUnavailable(format!("rtpopuspay: {e}")))?;
+            let audio_queue = gst::ElementFactory::make("queue")
+                .build()
+                .map_err(|e| DesktopError::TransportUnavailable(format!("audio queue: {e}")))?;
+            audio_elements = vec![
+                audio_src.upcast(),
+                audio_convert,
+                audio_resample,
+                audio_encoder,
+                audio_payloader,
+                audio_queue,
+            ];
+            pipeline
+                .add_many(audio_elements.iter())
+                .map_err(|e| DesktopError::TransportUnavailable(format!("audio add: {e}")))?;
+            gst::Element::link_many(audio_elements.iter())
+                .map_err(|e| DesktopError::TransportUnavailable(format!("audio link: {e}")))?;
+        }
+
         // webrtcbin's sink pad is a request pad; request it before linking.
+        if let Some(audio_queue) = audio_elements.last() {
+            let audio_sink = webrtc
+                .request_pad_simple("sink_%u")
+                .or_else(|| {
+                    webrtc
+                        .pad_template("sink_%u")
+                        .and_then(|template| webrtc.request_pad(&template, None, None))
+                })
+                .ok_or_else(|| {
+                    DesktopError::TransportUnavailable(
+                        "webrtcbin did not provide an audio sink pad".to_string(),
+                    )
+                })?;
+            audio_queue
+                .static_pad("src")
+                .ok_or_else(|| {
+                    DesktopError::TransportUnavailable("audio queue has no src pad".to_string())
+                })?
+                .link(&audio_sink)
+                .map_err(|e| DesktopError::TransportUnavailable(format!("audio sink link: {e}")))?;
+        }
+
         let sink = webrtc
             .request_pad_simple("sink_%u")
             .or_else(|| {

@@ -556,6 +556,7 @@ pub fn default_stream_config(env_id: &str, viewer_id: &str) -> RemoteStreamConfi
         max_fps: 30,
         negotiation: crate::remote::Negotiation::ViewerOffers,
         ice_servers: Vec::new(),
+        audio_source: None,
     }
 }
 

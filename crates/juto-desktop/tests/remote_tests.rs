@@ -12,6 +12,10 @@ use juto_desktop::supervisor::{
     DesktopSupervisor, EnvironmentConfig, OutputConfig, RenderProfile, SystemLimits,
 };
 
+/// GStreamer pipelines share process-global state; these tests build several
+/// pipelines in one process, so they run one at a time.
+static PIPELINE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The worker binary is the daemon; point the supervisor at it.
 fn worker_binary() -> &'static str {
     env!("CARGO_BIN_EXE_juto-desktop")
@@ -44,6 +48,7 @@ fn test_config(env_id: &str) -> EnvironmentConfig {
 
 #[test]
 fn remote_bitrate_is_bounded_and_ice_servers_are_applied() {
+    let _guard = PIPELINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let supervisor = DesktopSupervisor::new();
     let env = supervisor
         .create_environment(
@@ -88,7 +93,42 @@ fn remote_bitrate_is_bounded_and_ice_servers_are_applied() {
 }
 
 #[test]
+fn a_configured_audio_source_adds_an_audio_track() {
+    let _guard = PIPELINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("audio")), &unique_env_id("req"))
+        .expect("create environment");
+
+    let config = RemoteStreamConfig {
+        env_id: env.env_id().to_string(),
+        viewer_id: "audio-viewer".to_string(),
+        negotiation: Negotiation::SenderOffers,
+        // A private audio server is a deployment prerequisite; the track is
+        // wired from whatever source the environment provides.
+        audio_source: Some("audiotestsrc is-live=true".to_string()),
+        ..RemoteStreamConfig::default()
+    };
+    let worker = PresentationWorker::new(env.clone(), config).expect("presentation worker");
+    let offer = worker.offer().expect("worker produced an SDP offer");
+    assert!(
+        offer.contains("m=audio"),
+        "the offer must carry an audio track: {offer}"
+    );
+    assert!(
+        offer.contains("m=video"),
+        "the offer must still carry the video track: {offer}"
+    );
+    // Audio and video share the environment's total-media ceiling.
+    assert_eq!(worker.effective_bitrate_bps(), 4_000_000);
+
+    worker.shutdown();
+    env.destroy();
+}
+
+#[test]
 fn webrtc_streams_composed_frames_to_a_native_receiver() {
+    let _guard = PIPELINE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let supervisor = DesktopSupervisor::new();
     let env_id = format!("remote-{}", uuid::Uuid::now_v7());
     let env = supervisor
@@ -130,6 +170,7 @@ fn webrtc_streams_composed_frames_to_a_native_receiver() {
             max_fps: 30,
             negotiation: Negotiation::SenderOffers,
             ice_servers: Vec::new(),
+            audio_source: None,
         },
     )
     .expect("start presentation worker");

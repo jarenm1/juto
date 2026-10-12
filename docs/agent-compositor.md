@@ -111,10 +111,23 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Resize gating: a new geometry generation clears viewer acknowledgements and
   input is rejected until `GeometryReady` reports the new generation.
 
-Not implemented: audio (private PipeWire sink plus Opus), Xwayland, the hardware
-render-node profile, DMA-BUF export/import, TURN relay configuration, and
-deployment provisioning (TLS termination, public reachability). Sections
-describing those remain design.
+Not implemented: the private audio server itself (a per-environment PipeWire
+sink), DMA-BUF export/import, and deployment provisioning (TLS termination,
+public reachability). Sections describing those remain design.
+
+The remote stream carries an Opus audio track when the environment's audio
+source is configured (`RemoteStreamConfig::audio_source`, for example
+`pulsesrc device=juto-sink.monitor`); audio and video share the environment's
+total-media ceiling.
+
+Xwayland is implemented (one private X11 server per environment, driven by
+Smithay's X11 WM, with an `MIT-MAGIC-COOKIE-1` `XAUTHORITY` file). The hardware
+profile composes with a GLES renderer over surfaceless EGL under the repository's
+shared advisory GPU lock; a render-node/GBM `EGLDisplay` is not reachable through
+Smithay 0.7 on platforms without `EGL_EXT_device_enumeration` /
+`EGL_EXT_device_query`, so the default EGL device is used instead. TURN relay
+configuration is applied to `webrtcbin`, but no relay was reachable from the
+development host, so relay-candidate gathering is not claimed.
 
 ## 1. Decision and scope
 
