@@ -185,6 +185,11 @@ pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
                         "base": base,
                         "tree": tree,
                     }),
+                    ReconcileOutcome::Adopted { remote, node } => serde_json::json!({
+                        "status": "adopted",
+                        "remote": remote,
+                        "node": node,
+                    }),
                     ReconcileOutcome::Conflicted {
                         remote,
                         base,
