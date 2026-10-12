@@ -72,8 +72,10 @@ head into the local thread (joining cleanly, adopting when the thread has no loc
 head, or reporting conflicting paths). `join` merges two threads into a two-parent
 node via `git merge-tree`; `rewind` reverts a thread by materializing a tree delta
 and appending a forward node, so history stays append-only. `gc` mark-sweeps
-unreachable nodes and releases their refs. All of it is exposed as
-`juto-cli changes push-graph|fetch|reconcile|join|rewind`.
+unreachable nodes, releases their refs, and packs the survivors. All of it is
+exposed both as `juto-cli changes` subcommands and as the runtime's `vcs` tool,
+so an agent can run the whole workflow — including handing a verified checkpoint
+to a reviewer as a Git branch — without shelling out.
 
 Fork provisioning materializes a tree with a single `git cat-file --batch` child,
 recovers forks interrupted mid-provision, and skips gitlink (submodule) entries —
@@ -107,31 +109,29 @@ Exact-text selection requires a unique match unless `replace_all: true` is set
 inside `selection`. This replaces the previous top-level
 `old_string` / `new_string` edit contract; there is no legacy alias.
 
-Both `edit` and whole-file `write` now require a path inside the session's jj
+Both `edit` and whole-file `write` now require a path inside the session's
 workspace. A shared per-workspace advisory lock covers before/after snapshots
 and atomic writes, preserving existing file permissions. Receipts contain
-immutable `before_commit` / `after_commit`, stable `change_id`, an operation-only
-Git-format diff (capped at 64 KiB with `diff_truncated`), no-op/application status,
-and session/tool/selection provenance. Edits retain the jj change ID without
-calling `jj new` or `jj commit`; snapshots produce immutable commit identities.
-Existing unrelated working edits are snapshotted before the operation,
+immutable `before_tree` / `after_tree` tree ids, the `graph_node` the edit
+recorded, an operation-only Git-format diff (capped at 64 KiB with
+`diff_truncated`), no-op/application status, and session/tool/selection
+provenance. An edit appends a node to the change graph; it never creates a Git
+commit. Existing unrelated working edits are snapshotted before the operation,
 not included in its diff.
 
-Workspace escapes, metadata paths, symlinks, unresolved conflicts, and existing
-ignored/untracked files are rejected. A newly created ignored file can be applied
-before jj reports it untracked; this returns an explicit applied-but-untracked
+Workspace escapes, metadata paths, symlinks, and existing ignored/untracked files
+are rejected. A newly created ignored file can be applied
+before Git reports it untracked; this returns an explicit applied-but-untracked
 error, not success. Post-write bookkeeping errors report that the file was
 applied; no rollback is claimed. Cancellation before writing leaves the file
 unchanged; once applied, snapshot/diff bookkeeping finishes. The lock coordinates
 Juto callers, not arbitrary external writers; `bash` is not intercepted.
-Live-change DAG recording, marking, and Git export belong to the separately
-stacked DAG/export change, not this edit-tool PR.
 
 Observed verification: runtime tests and a real Agent command/event smoke using
-a deterministic local model driver, actual file tools, and an actual scratch jj
+a deterministic local model driver, actual file tools, and an actual scratch Git
 repository. The smoke exercised write, AST/range/text edits, ambiguous AST
 rejection, paired tool results, revision/provenance receipts, and no-op reporting.
-No live-provider, native-window, or DAG/export behavior was exercised by this PR.
+No live-provider or native-window behavior was exercised by that smoke.
 
 **Repository setup skill.** The runtime installs the bundled `juto-repo-setup`
 skill in its data directory on first startup. It guides agents through identifying
