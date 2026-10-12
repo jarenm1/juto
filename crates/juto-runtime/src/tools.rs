@@ -2842,9 +2842,27 @@ mod tests {
             out.details
         );
 
+        // `resolve` refuses a workspace with uncaptured edits outside the
+        // conflict, rather than materializing over them.
+        std::fs::write(dir.path().join("stray.txt"), "stray\n").expect("write");
+        assert!(
+            tool.execute(
+                json!({
+                    "action": "resolve",
+                    "thread": "integration",
+                    "left": heads["left"],
+                    "right": heads["right"],
+                }),
+                ctx(dir.path()),
+            )
+            .await
+            .is_err(),
+            "resolve must refuse a stray uncaptured edit"
+        );
+        std::fs::remove_file(dir.path().join("stray.txt")).expect("remove");
+
         // `resolve` records the workspace as a two-parent node, the way an
         // agent records a conflict it resolved by hand.
-        std::fs::write(dir.path().join("resolved.txt"), "resolved\n").expect("write");
         let out = tool
             .execute(
                 json!({
