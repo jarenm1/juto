@@ -661,6 +661,58 @@ fn gc_drops_workspace_heads_whose_directory_is_gone() {
 }
 
 #[test]
+fn join_in_a_sparse_workspace_records_the_full_merged_tree() {
+    let directory = fixture();
+    let cwd = directory.path();
+    fs::create_dir_all(cwd.join("crates/foo")).unwrap();
+    fs::write(cwd.join("crates/foo/a.txt"), "a\n").unwrap();
+    fs::create_dir_all(cwd.join("crates/bar")).unwrap();
+    fs::write(cwd.join("crates/bar/b.txt"), "b\n").unwrap();
+    command(cwd, "git", &["add", "-A"]);
+    command(cwd, "git", &["commit", "-m", "layout"]);
+
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+
+    let workspaces = tempfile::tempdir().unwrap();
+    let left_dir = workspaces.path().join("left");
+    let right_dir = workspaces.path().join("right");
+    let sparse = vec!["crates/foo".to_string()];
+    graph
+        .fork_sparse("left", &root.id, &left_dir, &sparse)
+        .unwrap();
+    graph
+        .fork_sparse("right", &root.id, &right_dir, &sparse)
+        .unwrap();
+
+    let left = ChangeGraph::open(&left_dir).unwrap();
+    fs::write(left_dir.join("crates/foo/a.txt"), "a edited\n").unwrap();
+    let left_head = left.capture("left", provenance("left"), None).unwrap();
+
+    let right = ChangeGraph::open(&right_dir).unwrap();
+    fs::write(right_dir.join("crates/foo/c.txt"), "c\n").unwrap();
+    let right_head = right.capture("right", provenance("right"), None).unwrap();
+
+    // Join from the sparse left workspace. The merged tree contains
+    // crates/bar/b.txt, which this workspace never materialized, so the node
+    // must record the merge result rather than a snapshot of the workspace.
+    let outcome = left.join("left", &left_head.id, &right_head.id).unwrap();
+    let JoinOutcome::Joined { node, tree, .. } = outcome else {
+        panic!("expected a clean join, got {outcome:?}");
+    };
+    assert_eq!(node.tree, tree);
+
+    let listing = command(cwd, "git", &["ls-tree", "-r", "--name-only", &tree]);
+    assert!(listing.contains("crates/foo/a.txt"), "{listing}");
+    assert!(listing.contains("crates/foo/c.txt"), "{listing}");
+    assert!(
+        listing.contains("crates/bar/b.txt"),
+        "the join must record the complete merged tree, got:\n{listing}"
+    );
+    assert!(listing.contains("base"), "{listing}");
+}
+
+#[test]
 fn fork_survives_a_stale_pending_fork_entry() {
     let directory = fixture();
     let cwd = directory.path();
