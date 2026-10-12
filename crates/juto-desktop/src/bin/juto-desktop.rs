@@ -405,8 +405,29 @@ fn handle(
             Ok(()) => DesktopResponse::Destroyed,
             Err(err) => error_response(&err),
         },
-        DesktopCommand::Heartbeat { env_id, .. } => match supervisor.get_environment(&env_id) {
-            Ok(_) => DesktopResponse::HeartbeatExtended { expires_at: 0 },
+        DesktopCommand::Heartbeat {
+            env_id,
+            target,
+            epoch,
+        } => match supervisor.get_environment(&env_id) {
+            Ok(env) => match env.heartbeat(&target, epoch) {
+                Ok(expires_at) => DesktopResponse::HeartbeatExtended { expires_at },
+                Err(err) => error_response(&err),
+            },
+            Err(err) => error_response(&err),
+        },
+        DesktopCommand::Retain {
+            env_id,
+            human_owner,
+            deadline_seconds,
+        } => match supervisor.get_environment(&env_id) {
+            Ok(env) => match env.retain(&human_owner, deadline_seconds) {
+                Ok(retention) => DesktopResponse::Retained {
+                    human_owner: retention.human_owner,
+                    expires_at: retention.expires_at,
+                },
+                Err(err) => error_response(&err),
+            },
             Err(err) => error_response(&err),
         },
         DesktopCommand::Attach { env_id, .. } => match supervisor.get_environment(&env_id) {

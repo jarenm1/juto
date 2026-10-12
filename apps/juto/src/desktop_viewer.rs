@@ -160,6 +160,9 @@ impl DesktopViewer {
         self.heartbeat_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(LEASE_HEARTBEAT).await;
+                // The viewer is the human owner while it is open, so the
+                // environment is not retired as abandoned.
+                let _ = env.heartbeat("owner", None);
                 let renewed = env
                     .set_control("human:viewer", "acquire", true)
                     .ok()

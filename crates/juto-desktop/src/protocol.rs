@@ -107,6 +107,11 @@ pub enum DesktopCommand {
         target: String,
         epoch: Option<u64>,
     },
+    Retain {
+        env_id: String,
+        human_owner: String,
+        deadline_seconds: u64,
+    },
     Control {
         env_id: String,
         action: String, // "acquire" or "release"
@@ -195,6 +200,10 @@ pub enum DesktopResponse {
     GrantIssued(Grant),
     Revoked,
     HeartbeatExtended {
+        expires_at: u64,
+    },
+    Retained {
+        human_owner: String,
         expires_at: u64,
     },
     ControlChanged {

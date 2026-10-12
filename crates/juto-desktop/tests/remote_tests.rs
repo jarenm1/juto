@@ -34,6 +34,7 @@ fn test_config(env_id: &str) -> EnvironmentConfig {
         workspace_dir: std::env::temp_dir(),
         lease_ttl_secs: 6,
         compositor_mode: juto_desktop::CompositorMode::Worker,
+        owner_heartbeat_timeout_secs: 60,
     }
 }
 

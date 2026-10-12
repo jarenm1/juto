@@ -57,6 +57,9 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Compositor worker: the compositor runs in its own process inside the slice, owns
   the writable frame-pool mapping, and seals it before handing the descriptor to
   the supervisor; slot reservations travel back over the control socket.
+- Owner lifetime: `Heartbeat` renews the owner deadline or the control lease, a
+  reaper retires an environment whose heartbeat lapsed, and `Retain` transfers
+  lifetime responsibility to a human session with a host-bounded deadline.
 - Artifact resolution: the runtime validates host, environment, grant, principal,
   and expiry before returning a same-host route or a one-time remote token, and
   otherwise reports `Unsupported`, `Unauthorized`, `Expired`, `Stopped`, or

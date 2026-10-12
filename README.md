@@ -212,6 +212,15 @@ attach token, and otherwise reports `Unsupported`, `Unauthorized`, `Expired`,
 `Stopped`, or `Unavailable` explicitly. A resolved route is not proof of a live
 stream — only received frames establish that.
 
+**Owner lifetime and retention.** An environment records an owner heartbeat;
+`Heartbeat` renews either the owner deadline or the control lease (matching the
+current epoch), and input traffic never renews either implicitly. A reaper retires
+an environment whose heartbeat has lapsed, so an abandoned desktop does not
+outlive its task. `Retain` transfers lifetime responsibility to an authenticated
+human session with a host-bounded deadline (default maximum 30 minutes). The
+runtime's `desktop` tool heartbeats on every action, and the embedded viewer
+heartbeats while it is open.
+
 **Compositor worker process.** The compositor runs in its own process inside the
 environment slice (`juto-desktop-<env>-compositor.scope`), so its CPU and memory
 are charged to the environment and a compositor failure cannot take the
