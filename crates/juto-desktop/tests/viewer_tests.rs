@@ -95,6 +95,43 @@ fn environment_config(env_id: &str) -> serde_json::Value {
 }
 
 #[test]
+fn a_destroyed_environment_stays_describable() {
+    let daemon = Daemon::start();
+    let env_id = format!("t-{}", &uuid::Uuid::now_v7().to_string()[24..]);
+    let created = daemon.call(DesktopCommand::Create {
+        spec: serde_json::from_value(environment_config(&env_id)).expect("config"),
+        request_id: "create".to_string(),
+    });
+    assert!(
+        matches!(created, DesktopResponse::Created { .. }),
+        "create failed: {created:?}"
+    );
+    let destroyed = daemon.call(DesktopCommand::Destroy {
+        env_id: env_id.clone(),
+    });
+    assert!(matches!(destroyed, DesktopResponse::Destroyed));
+
+    // The terminal state remains queryable after destroy.
+    match daemon.call(DesktopCommand::Describe {
+        env_id: env_id.clone(),
+        after_event_seq: None,
+    }) {
+        DesktopResponse::Description(status) => assert_eq!(status.env_id, env_id),
+        other => panic!("expected the retained terminal state, got {other:?}"),
+    }
+
+    // An environment that never existed is still unknown.
+    let unknown = daemon.call(DesktopCommand::Describe {
+        env_id: "never-existed".to_string(),
+        after_event_seq: None,
+    });
+    assert!(
+        matches!(unknown, DesktopResponse::Error { .. }),
+        "unknown environments must not be described: {unknown:?}"
+    );
+}
+
+#[test]
 fn a_lagging_event_subscriber_is_told_to_resync() {
     let daemon = Daemon::start();
     let env_id = format!("r-{}", &uuid::Uuid::now_v7().to_string()[24..]);

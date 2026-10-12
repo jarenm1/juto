@@ -1592,7 +1592,19 @@ pub struct DesktopSupervisor {
     environments: Mutex<HashMap<String, DesktopEnvironment>>,
     /// Environment ids keyed by `owner:request_id` for idempotent `Create`.
     create_requests: Mutex<HashMap<String, String>>,
+    /// Terminal state of destroyed environments, retained for a bounded period.
+    retired: Mutex<HashMap<String, RetiredEnvironment>>,
 }
+
+/// Terminal state of a destroyed environment (spec section 4).
+#[derive(Debug, Clone)]
+pub struct RetiredEnvironment {
+    pub status: EnvironmentStatus,
+    pub stopped_at: Instant,
+}
+
+/// How long a destroyed environment's terminal state stays queryable.
+pub const TERMINAL_RETENTION_SECS: u64 = 600;
 
 impl Default for DesktopSupervisor {
     fn default() -> Self {
@@ -1605,6 +1617,7 @@ impl DesktopSupervisor {
         Self {
             environments: Mutex::new(HashMap::new()),
             create_requests: Mutex::new(HashMap::new()),
+            retired: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1645,11 +1658,28 @@ impl DesktopSupervisor {
         let env = self.environments.lock().remove(env_id);
         match env {
             Some(env) => {
+                let status = env.get_status();
                 env.destroy();
+                self.retired.lock().insert(
+                    env_id.to_string(),
+                    RetiredEnvironment {
+                        status,
+                        stopped_at: Instant::now(),
+                    },
+                );
                 Ok(())
             }
             None => Err(DesktopError::EnvironmentNotFound(env_id.to_string())),
         }
+    }
+
+    /// Terminal state of a destroyed environment, while it is still retained.
+    pub fn retired_environment(&self, env_id: &str) -> Option<EnvironmentStatus> {
+        let mut retired = self.retired.lock();
+        retired.retain(|_, entry| {
+            entry.stopped_at.elapsed() < Duration::from_secs(TERMINAL_RETENTION_SECS)
+        });
+        retired.get(env_id).map(|entry| entry.status.clone())
     }
 
     /// Kills orphan environment scopes and removes stale runtime directories
