@@ -89,7 +89,8 @@ pub enum ChangesCommand {
         #[arg(long)]
         right: String,
     },
-    /// Record a resolved merge: capture the workspace as a two-parent node.
+    /// Record a resolved merge: the merge result with the conflicted paths
+    /// taken from the workspace, as a two-parent node.
     ///
     /// Edit the conflicted files first; this records the result.
     Resolve {
@@ -100,6 +101,12 @@ pub enum ChangesCommand {
         #[arg(long)]
         right: String,
     },
+    /// List the paths where the workspace differs from its head.
+    ///
+    /// A `bash` command is not captured automatically, so this is how to notice
+    /// an uncaptured edit before a later capture attributes it to the wrong
+    /// point.
+    Dirty,
     /// Revert a thread to an earlier point by materializing its tree delta.
     Rewind {
         #[arg(long)]
@@ -223,6 +230,10 @@ pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
                 path: None,
             },
         )?)?,
+        ChangesCommand::Dirty => {
+            let changed = graph.dirty_paths()?;
+            serde_json::json!({"dirty": !changed.is_empty(), "changed": changed})
+        }
         ChangesCommand::Rewind { thread, to } => serde_json::to_value(graph.rewind(thread, to)?)?,
         ChangesCommand::Reconcile { thread } => serde_json::Value::Array(
             graph

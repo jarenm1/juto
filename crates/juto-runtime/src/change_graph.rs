@@ -277,6 +277,19 @@ impl ChangeGraph {
         self.repository.capture_tree(&baseline)
     }
 
+    /// The paths where the workspace differs from its head.
+    ///
+    /// A `bash` command is not captured automatically, so this is how an agent
+    /// notices an uncaptured edit before a later capture attributes it to the
+    /// wrong point. An empty result means the workspace matches its head.
+    pub fn dirty_paths(&self) -> Result<Vec<String>> {
+        let _lock =
+            crate::vcs::MutationLock::acquire(self.workspace()).map_err(anyhow::Error::msg)?;
+        let baseline = self.capture_baseline()?;
+        let current = self.repository.capture_tree(&baseline)?;
+        self.repository.changed_paths(&baseline, &current)
+    }
+
     /// The tree a workspace capture is layered on: this workspace's head, the
     /// thread head, or the base tree.
     fn capture_baseline(&self) -> Result<String> {
