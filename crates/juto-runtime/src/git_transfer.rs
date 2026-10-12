@@ -917,6 +917,17 @@ impl GitRepository {
                 .next()
                 .context("malformed `git diff-tree` record: missing path")?;
             let change = parse_raw_change(meta)?;
+            // A partial fork holds only its sparse prefixes. A delta path
+            // outside them is left alone, matching capture, which preserves
+            // those paths from the baseline: writing one here would diverge the
+            // workspace from the tree the next capture records.
+            if let Some(sparse) = &self.sparse
+                && !sparse
+                    .iter()
+                    .any(|prefix| path_under(path, prefix.as_bytes()))
+            {
+                continue;
+            }
             match change.status {
                 b'A' | b'M' | b'T' => {
                     let relative = validate_tree_path(path)?;
