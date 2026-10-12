@@ -360,7 +360,8 @@ impl Drop for GpuLockGuard {
 /// An unsandboxed command runs as a *scope*, which the client owns, so there is
 /// no unit to stop.
 pub struct ScopedChild {
-    child: tokio::process::Child,
+    /// `None` only after [`ScopedChild::wait_with_output`] has taken it.
+    child: Option<tokio::process::Child>,
     unit: Option<String>,
 }
 
@@ -371,17 +372,20 @@ impl ScopedChild {
     /// is nothing to stop on drop. This lets a caller use one type for both
     /// paths.
     pub fn unscoped(child: tokio::process::Child) -> Self {
-        Self { child, unit: None }
+        Self {
+            child: Some(child),
+            unit: None,
+        }
     }
 
     /// The underlying child, for reading piped output or signalling it.
     pub fn child_mut(&mut self) -> &mut tokio::process::Child {
-        &mut self.child
+        self.child.as_mut().expect("child is present")
     }
 
     /// The child's process id, when it is still running.
     pub fn id(&self) -> Option<u32> {
-        self.child.id()
+        self.child.as_ref().and_then(tokio::process::Child::id)
     }
 
     /// The transient unit name, when this child is sandboxed.
@@ -391,7 +395,16 @@ impl ScopedChild {
 
     /// Wait for the child to exit.
     pub async fn wait(&mut self) -> std::io::Result<ExitStatus> {
-        self.child.wait().await
+        self.child_mut().wait().await
+    }
+
+    /// Wait for the child to exit, collecting its piped output.
+    ///
+    /// The guard stays alive until this returns, so a sandboxed command's unit
+    /// is stopped even though the child itself is consumed.
+    pub async fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
+        let child = self.child.take().expect("child is present");
+        child.wait_with_output().await
     }
 }
 
@@ -638,7 +651,10 @@ impl SubagentWorkspace {
                 command: format!("{:?}", cmd.as_std().get_program()),
                 source,
             })?;
-        Ok(ScopedChild { child, unit })
+        Ok(ScopedChild {
+            child: Some(child),
+            unit,
+        })
     }
 
     /// Run a synchronous `std::process::Command` inside this workspace under resource governance.
