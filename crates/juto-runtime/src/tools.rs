@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::workspace::{ResourceLimits, SubagentWorkspace};
+use crate::workspace::{ResourceLimits, ScopedChild, ScopedStdio, SubagentWorkspace};
 
 // ---------------------------------------------------------------------------
 // Bounds (source: streaming-output.ts, glob.ts, grep.ts, tool-timeouts.ts)
@@ -1122,6 +1122,9 @@ impl Tool for BashTool {
         // caps apply to the whole tree. `enforce_scope` is the caller's choice:
         // with it off, a host without `systemd-run` degrades to a bare spawn
         // rather than failing the tool.
+        // The governed path goes through `spawn_scoped`, whose guard stops the
+        // transient unit on drop: a sandboxed command runs as a service that
+        // outlives its client, so killing the child alone would leave it running.
         let mut child = match &self.limits {
             Some(limits) => {
                 let workspace = SubagentWorkspace {
@@ -1131,23 +1134,24 @@ impl Tool for BashTool {
                     repo_root: cwd.clone(),
                     subagent_id: String::new(),
                 };
-                let mut scoped = workspace
-                    .build_scoped_command_named(command.as_std(), limits, None)
-                    .map_err(|e| format!("failed to build a scoped command: {e}"))?;
-                scoped
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .kill_on_drop(true);
-                #[cfg(unix)]
-                scoped.process_group(0);
-                scoped
-                    .spawn()
+                workspace
+                    .spawn_scoped(
+                        &mut command,
+                        limits.clone(),
+                        ScopedStdio {
+                            stdin: std::process::Stdio::null(),
+                            stdout: std::process::Stdio::piped(),
+                            stderr: std::process::Stdio::piped(),
+                        },
+                    )
+                    .await
                     .map_err(|e| format!("failed to spawn `sh`: {e}"))?
             }
-            None => command
-                .spawn()
-                .map_err(|e| format!("failed to spawn `sh`: {e}"))?,
+            None => ScopedChild::unscoped(
+                command
+                    .spawn()
+                    .map_err(|e| format!("failed to spawn `sh`: {e}"))?,
+            ),
         };
         let pid = child.id();
         let mut guard = ProcessGroupGuard::new(pid);
@@ -1155,8 +1159,8 @@ impl Tool for BashTool {
         // Drain both pipes concurrently into a shared rolling tail so slow
         // readers can never deadlock the child on a full pipe.
         let sink = Arc::new(Mutex::new(TailBuffer::new(BASH_OUTPUT_MAX_BYTES)));
-        let stdout = child.stdout.take().expect("stdout piped");
-        let stderr = child.stderr.take().expect("stderr piped");
+        let stdout = child.child_mut().stdout.take().expect("stdout piped");
+        let stderr = child.child_mut().stderr.take().expect("stderr piped");
         let out_task = spawn_drain(stdout, Arc::clone(&sink));
         let err_task = spawn_drain(stderr, Arc::clone(&sink));
 
@@ -2176,6 +2180,71 @@ mod tests {
         assert!(
             body.contains(".scope"),
             "expected a systemd scope cgroup, got: {body}"
+        );
+    }
+
+    /// Live proof that a timed-out sandboxed command leaves no unit behind.
+    ///
+    /// A sandboxed command runs as a transient service that outlives its client,
+    /// so killing the child alone would leave `sleep` running.
+    #[tokio::test]
+    async fn a_timed_out_sandboxed_bash_command_leaves_no_unit() {
+        if !crate::workspace::is_systemd_run_available() {
+            eprintln!("skipping sandboxed-bash test: systemd-run unavailable");
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+        else {
+            eprintln!("skipping sandboxed-bash test: HOME unset");
+            return;
+        };
+        // `PrivateTmp=yes` hides /tmp, so the workspace must live under $HOME.
+        let dir = match tempfile::Builder::new()
+            .prefix("juto-bash-sandbox-")
+            .tempdir_in(&home)
+        {
+            Ok(dir) => dir,
+            Err(err) => {
+                eprintln!("skipping sandboxed-bash test: {err}");
+                return;
+            }
+        };
+
+        let tool = BashTool {
+            cwd: dir.path().to_path_buf(),
+            limits: Some(
+                ResourceLimits::default().with_sandbox(crate::workspace::Sandbox::default()),
+            ),
+        };
+        let out = tool
+            .execute(
+                json!({"command": "sleep 47", "timeout": 1}),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.details["timedOut"], true, "{:?}", out.details);
+
+        // The guard stops the unit on drop; the stop is fire-and-forget, so poll
+        // for the payload itself. Scanning `juto-*` units would also match
+        // unrelated ones such as the desktop subsystem's cleanup slices.
+        let mut leftover = String::new();
+        for _ in 0..50 {
+            let ps = std::process::Command::new("pgrep")
+                .args(["-f", "sleep 47"])
+                .output()
+                .expect("pgrep");
+            leftover = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+            if leftover.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            leftover.is_empty(),
+            "a timed-out sandboxed command must not survive: {leftover}"
         );
     }
 

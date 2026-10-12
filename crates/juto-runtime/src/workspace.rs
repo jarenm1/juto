@@ -365,6 +365,15 @@ pub struct ScopedChild {
 }
 
 impl ScopedChild {
+    /// Wrap a child that has no transient unit to stop.
+    ///
+    /// An unsandboxed command runs as a scope, which its client owns, so there
+    /// is nothing to stop on drop. This lets a caller use one type for both
+    /// paths.
+    pub fn unscoped(child: tokio::process::Child) -> Self {
+        Self { child, unit: None }
+    }
+
     /// The underlying child, for reading piped output or signalling it.
     pub fn child_mut(&mut self) -> &mut tokio::process::Child {
         &mut self.child
@@ -618,6 +627,10 @@ impl SubagentWorkspace {
             .stdout(stdio.stdout)
             .stderr(stdio.stderr)
             .kill_on_drop(true);
+        // Its own process group, so a caller can signal the whole tree without
+        // touching its own group.
+        #[cfg(unix)]
+        scoped.process_group(0);
 
         let child = scoped
             .spawn()
