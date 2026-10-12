@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, ensure};
 use clap::Subcommand;
-use juto_runtime::change_graph::{ChangeGraph, EditProvenance, JoinOutcome};
+use juto_runtime::change_graph::{ChangeGraph, EditProvenance, JoinOutcome, ReconcileOutcome};
 
 #[derive(Subcommand)]
 pub enum ChangesCommand {
@@ -86,6 +86,11 @@ pub enum ChangesCommand {
         #[arg(long)]
         to: String,
     },
+    /// Join every imported remote head back into a thread after a fetch.
+    Reconcile {
+        #[arg(long)]
+        thread: String,
+    },
 }
 
 pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
@@ -163,6 +168,36 @@ pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
             }),
         },
         ChangesCommand::Rewind { thread, to } => serde_json::to_value(graph.rewind(thread, to)?)?,
+        ChangesCommand::Reconcile { thread } => serde_json::Value::Array(
+            graph
+                .reconcile(thread)?
+                .into_iter()
+                .map(|outcome| match outcome {
+                    ReconcileOutcome::Joined {
+                        remote,
+                        node,
+                        base,
+                        tree,
+                    } => serde_json::json!({
+                        "status": "joined",
+                        "remote": remote,
+                        "node": node,
+                        "base": base,
+                        "tree": tree,
+                    }),
+                    ReconcileOutcome::Conflicted {
+                        remote,
+                        base,
+                        conflicts,
+                    } => serde_json::json!({
+                        "status": "conflicted",
+                        "remote": remote,
+                        "base": base,
+                        "conflicts": conflicts,
+                    }),
+                })
+                .collect(),
+        ),
     };
     serde_json::to_writer_pretty(std::io::stdout().lock(), &value)?;
     println!();
