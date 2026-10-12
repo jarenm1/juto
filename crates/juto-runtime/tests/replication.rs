@@ -512,3 +512,93 @@ fn reconcile_adopts_a_remote_head_when_the_thread_has_no_local_head() {
         "a"
     );
 }
+
+#[test]
+fn reconcile_in_a_sparse_workspace_records_the_full_merged_tree() {
+    let temp = tempfile::tempdir().unwrap();
+    let remote = temp.path().join("remote.git");
+    run(
+        "git",
+        &[
+            "init",
+            "--bare",
+            "-q",
+            "-b",
+            "main",
+            remote.to_str().unwrap(),
+        ],
+        temp.path(),
+    );
+
+    let a = temp.path().join("a");
+    init_repo(&a);
+    fs::create_dir_all(a.join("crates/foo")).unwrap();
+    fs::write(a.join("crates/foo/a.txt"), "a\n").unwrap();
+    fs::create_dir_all(a.join("crates/bar")).unwrap();
+    fs::write(a.join("crates/bar/b.txt"), "b\n").unwrap();
+    git(&a, &["add", "-A"]);
+    git(&a, &["commit", "-q", "-m", "base"]);
+    git(&a, &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(&a, &["push", "-q", "origin", "main"]);
+
+    let b = temp.path().join("b");
+    run(
+        "git",
+        &["clone", "-q", remote.to_str().unwrap(), b.to_str().unwrap()],
+        temp.path(),
+    );
+    git(&b, &["config", "user.name", "Juto Test"]);
+    git(&b, &["config", "user.email", "juto@test.local"]);
+
+    let graph_a = ChangeGraph::open(&a).unwrap();
+    let root_a = graph_a.capture("main", provenance("root"), None).unwrap();
+    let graph_b = ChangeGraph::open(&b).unwrap();
+    let root_b = graph_b.capture("main", provenance("root"), None).unwrap();
+
+    // Both machines fork a sparse workspace on the same thread.
+    let sparse = vec!["crates/foo".to_string()];
+    let a_left = temp.path().join("a-left");
+    let b_left = temp.path().join("b-left");
+    graph_a
+        .fork_sparse("left", &root_a.id, &a_left, &sparse)
+        .unwrap();
+    graph_b
+        .fork_sparse("left", &root_b.id, &b_left, &sparse)
+        .unwrap();
+
+    // A edits a.txt on "left" and publishes.
+    let a_ws = ChangeGraph::open(&a_left).unwrap();
+    fs::write(a_left.join("crates/foo/a.txt"), "a edited\n").unwrap();
+    let a_head = a_ws.capture("left", provenance("a"), None).unwrap();
+    a_ws.push_graph(remote.to_str().unwrap()).unwrap();
+
+    // B adds c.txt on "left".
+    let b_ws = ChangeGraph::open(&b_left).unwrap();
+    fs::write(b_left.join("crates/foo/c.txt"), "c\n").unwrap();
+    let b_head = b_ws.capture("left", provenance("b"), None).unwrap();
+
+    // B imports A's head and reconciles from its sparse workspace.
+    b_ws.fetch_graph(remote.to_str().unwrap()).unwrap();
+    let remote_head = format!("{}/left", graph_a.machine_id().unwrap());
+    assert!(b_ws.state().unwrap().heads.contains_key(&remote_head));
+
+    let outcomes = b_ws.reconcile("left").unwrap();
+    assert_eq!(outcomes.len(), 1);
+    let ReconcileOutcome::Joined { node, .. } = &outcomes[0] else {
+        panic!("expected a clean join, got {:?}", outcomes[0]);
+    };
+    assert_eq!(node.parents.len(), 2);
+    assert!(node.parents.contains(&a_head.id));
+    assert!(node.parents.contains(&b_head.id));
+
+    // The recorded tree is the complete merge, including the path this sparse
+    // workspace never materialized.
+    let git_dir = GitRepository::open(&b).unwrap().git_dir().to_path_buf();
+    let listing = git_at(&git_dir, &["ls-tree", "-r", "--name-only", &node.tree]);
+    assert!(listing.contains("crates/foo/a.txt"), "{listing}");
+    assert!(listing.contains("crates/foo/c.txt"), "{listing}");
+    assert!(
+        listing.contains("crates/bar/b.txt"),
+        "reconcile must record the complete merged tree, got:\n{listing}"
+    );
+}
