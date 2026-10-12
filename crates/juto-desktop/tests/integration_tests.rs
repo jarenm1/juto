@@ -364,8 +364,10 @@ fn reconcile_stops_orphan_scopes_and_removes_stale_directories() {
             .any(|unit| unit.contains(&env_id.replace('-', "_")) || unit.contains(&env_id))
     );
 
-    // An orphan scope and a stale directory are cleaned up.
-    let orphan = format!("juto-desktop-orphan-{}.scope", uuid::Uuid::now_v7());
+    // An environment whose owning supervisor is gone is reclaimed: its scope is
+    // stopped and its runtime directory removed.
+    let orphan_env = format!("orphan-{}", &uuid::Uuid::now_v7().to_string()[24..]);
+    let orphan = format!("juto-desktop-{orphan_env}-app.scope");
     let mut orphan_child = std::process::Command::new("systemd-run")
         .args([
             "--user",
@@ -386,8 +388,9 @@ fn reconcile_stops_orphan_scopes_and_removes_stale_directories() {
         "orphan scope never became active"
     );
 
-    let stale = env.runtime_dir().parent().unwrap().join("stale-env-dir");
+    let stale = env.runtime_dir().parent().unwrap().join(&orphan_env);
     std::fs::create_dir_all(&stale).unwrap();
+    std::fs::write(stale.join("owner"), "999999999\n").unwrap();
 
     let report = supervisor.reconcile();
     assert!(
