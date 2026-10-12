@@ -647,6 +647,20 @@ impl GitRepository {
         Ok(true)
     }
 
+    /// Pack every ref into `.git/packed-refs`, removing the loose files.
+    ///
+    /// The change graph pins two refs per node (`refs/juto/nodes/<id>` and
+    /// `refs/juto/snapshots/<id>`), so a long-lived repository accumulates
+    /// thousands of loose ref files that every `for-each-ref` — and therefore
+    /// every publish and import — has to walk. Packing is transparent: refs
+    /// resolve identically, and `update-ref`/`update-ref -d` keep working. It is
+    /// what `git gc` does anyway; this lets the graph's own maintenance trigger
+    /// it without a separate `git gc`.
+    pub fn pack_refs(&self) -> Result<()> {
+        self.run_trimmed(&["pack-refs", "--all"])?;
+        Ok(())
+    }
+
     /// Write `bytes` as a blob and return its object id.
     ///
     /// The blob is written with `git hash-object --no-filters`, so no clean
