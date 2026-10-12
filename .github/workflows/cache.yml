@@ -1,0 +1,46 @@
+name: cache
+
+# Builds packages.default for every main push and uploads it to
+# juto.cachix.org so `github:jarenm1/juto` installs substitute the binary
+# instead of compiling locally.
+#
+# Provisioning (one-time, repo owner):
+#   1. Create a public cache named "juto" at https://app.cachix.org with
+#      Cachix-managed signing; paste its public key into flake.nix nixConfig.
+#   2. Create a personal access token with *write* scope for the cache at
+#      https://app.cachix.org/personal-access-tokens (read-only tokens cannot
+#      push; public caches need no token for downloads) and add it as the
+#      Actions secret CACHIX_AUTH_TOKEN.
+#   3. Set the Actions variable CACHIX_ENABLED = 1 to arm this workflow.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Secrets are unavailable in job-level `if`; a repo variable is the gate.
+    if: vars.CACHIX_ENABLED == '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - uses: cachix/cachix-action@v15
+        with:
+          name: juto
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
+      - name: Build and push packages.default
+        run: |
+          nix build --print-build-logs .#default
+          cachix push juto ./result
