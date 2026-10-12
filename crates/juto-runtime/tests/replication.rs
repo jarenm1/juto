@@ -470,3 +470,35 @@ fn reconcile_reports_a_conflicting_merge_and_changes_nothing() {
         "from b\n"
     );
 }
+
+#[test]
+fn reconcile_adopts_a_remote_head_when_the_thread_has_no_local_head() {
+    let fixture = SharedRemote::new();
+    let a = ChangeGraph::open(&fixture.a).unwrap();
+    let b = ChangeGraph::open(&fixture.b).unwrap();
+
+    fs::write(fixture.a.join("a.txt"), "a\n").unwrap();
+    let a_head = a.capture("main", provenance("a"), None).unwrap();
+    a.push_graph(fixture.remote()).unwrap();
+
+    // B has never captured on "main", so the import lands only under the
+    // owner-qualified key.
+    b.fetch_graph(fixture.remote()).unwrap();
+    let remote_head = format!("{}/main", a.machine_id().unwrap());
+    let state = b.state().unwrap();
+    assert!(state.heads.contains_key(&remote_head));
+    assert!(!state.heads.contains_key("main"));
+
+    let outcomes = b.reconcile("main").unwrap();
+    assert_eq!(outcomes.len(), 1);
+    let ReconcileOutcome::Adopted { remote, node } = &outcomes[0] else {
+        panic!("expected adoption, got {:?}", outcomes[0]);
+    };
+    assert_eq!(remote, &remote_head);
+    assert_eq!(node.id, a_head.id);
+
+    // The thread now owns the history and the owner-qualified key is retired.
+    let state = b.state().unwrap();
+    assert_eq!(state.heads["main"], a_head.id);
+    assert!(!state.heads.contains_key(&remote_head));
+}
