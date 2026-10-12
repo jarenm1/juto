@@ -8,9 +8,11 @@ pub mod error;
 pub mod png;
 pub mod protocol;
 pub mod remote;
+pub mod scm;
 pub mod shm;
 pub mod signaling;
 pub mod supervisor;
+pub mod viewer;
 
 pub use compositor::{
     Compositor, CompositorCommand, CompositorConfig, CompositorSender, SnapshotInfo,
@@ -30,3 +32,4 @@ pub use supervisor::{
     AppHandle, DesktopEnvironment, DesktopSupervisor, EnvironmentConfig, EnvironmentStatus,
     OutputConfig, OutputProfile, RenderProfile, SystemLimits,
 };
+pub use viewer::{AttachInfo, ViewerClient};

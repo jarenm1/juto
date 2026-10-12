@@ -176,6 +176,16 @@ pub enum DesktopResponse {
     Attached {
         viewer_id: String,
         negotiated_transport: String,
+        /// Shared-memory pool metadata; the descriptor itself travels as
+        /// `SCM_RIGHTS` ancillary data on the control socket.
+        pool_id: String,
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: String,
+        slot_count: u32,
+        slot_size: u32,
+        pool_bytes: u64,
     },
     GrantIssued(Grant),
     Revoked,

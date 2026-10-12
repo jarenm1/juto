@@ -302,6 +302,7 @@ impl Drop for ShmFramePool {
 pub struct ShmReader {
     fd: RawFd,
     size: usize,
+    slot_size: usize,
     mmap_ptr: *const u8,
 }
 
@@ -330,8 +331,46 @@ impl ShmReader {
         Ok(Self {
             fd,
             size,
+            slot_size: size / POOL_SLOT_COUNT,
             mmap_ptr: mmap_ptr as *const u8,
         })
+    }
+
+    /// Byte size of one slot in the mapped pool.
+    pub fn slot_size(&self) -> usize {
+        self.slot_size
+    }
+
+    /// The most recently written slot, chosen by the highest frame id.
+    ///
+    /// A reader has no producer state, so it scans the fixed slot set rather
+    /// than trusting a shared cursor.
+    pub fn latest_frame(&self) -> Result<Option<ShmFrame>, DesktopError> {
+        let mut best: Option<ShmFrame> = None;
+        for slot in 0..POOL_SLOT_COUNT {
+            let offset = slot * self.slot_size;
+            if offset + self.slot_size > self.size {
+                break;
+            }
+            let header = unsafe { *(self.mmap_ptr.add(offset) as *const ShmSlotHeader) };
+            if header.size_bytes == 0 {
+                continue;
+            }
+            let candidate = ShmFrame {
+                slot,
+                header,
+                offset,
+                length: self.slot_size,
+            };
+            if best
+                .as_ref()
+                .map(|current| candidate.header.frame_id > current.header.frame_id)
+                .unwrap_or(true)
+            {
+                best = Some(candidate);
+            }
+        }
+        Ok(best)
     }
 
     pub fn read_slot(

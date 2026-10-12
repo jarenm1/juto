@@ -31,6 +31,9 @@
             gst_all_1.gst-plugins-base
             gst_all_1.gst-plugins-bad
             gst_all_1.gst-plugins-good
+            gst_all_1.gst-plugins-ugly
+            gst_all_1.gst-libav
+            libnice
           ];
           # Pin `.out`: default outputs can be `-bin` splits without the plugin .so files
           # (core `queue` lives in `gstreamer`'s main output; `libgstnice.so` in libnice's).
@@ -42,6 +45,8 @@
                 gst_all_1.gst-plugins-base
                 gst_all_1.gst-plugins-good
                 gst_all_1.gst-plugins-bad
+                gst_all_1.gst-plugins-ugly
+                gst_all_1.gst-libav
                 libnice
               ]
             )
