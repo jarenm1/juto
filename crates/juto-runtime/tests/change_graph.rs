@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
 use juto_runtime::{
@@ -62,6 +63,83 @@ fn commit_count(cwd: &Path) -> usize {
     .lines()
     .filter(|line| line.split_whitespace().nth(1) == Some("commit"))
     .count()
+}
+
+#[test]
+fn record_edit_noop_does_not_regress_the_workspace_head() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+
+    // Thread "main" advances the shared workspace head.
+    fs::write(cwd.join("main-edit"), "main\n").unwrap();
+    let main_tree = graph.snapshot_tree().unwrap();
+    let main_node = graph
+        .record_edit(&root.tree, &main_tree, provenance("main"))
+        .unwrap()
+        .unwrap();
+
+    // Thread "other" records an edit on top of the shared workspace head.
+    fs::write(cwd.join("other-edit"), "other\n").unwrap();
+    let other_tree = graph.snapshot_tree().unwrap();
+    let other_node = graph
+        .record_edit(&main_tree, &other_tree, provenance("other"))
+        .unwrap()
+        .unwrap();
+
+    let key = cwd.canonicalize().unwrap().to_string_lossy().into_owned();
+    assert_eq!(graph.state().unwrap().workspace_heads[&key], other_node.id);
+
+    // A no-op edit from "main" creates no node, so it must not move the shared
+    // workspace head back to "main"'s older head.
+    assert!(
+        graph
+            .record_edit(&other_tree, &other_tree, provenance("main"))
+            .unwrap()
+            .is_none()
+    );
+    let state = graph.state().unwrap();
+    assert_eq!(
+        state.workspace_heads[&key], other_node.id,
+        "a no-op edit must not regress the shared workspace head"
+    );
+    assert_eq!(state.heads["main"], main_node.id);
+    assert_eq!(state.heads["other"], other_node.id);
+}
+
+#[test]
+fn fork_removes_materialized_directory_when_bookkeeping_fails() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    let state_dir = GitRepository::open(cwd).unwrap().git_dir().join("juto");
+    let workspaces = tempfile::tempdir().unwrap();
+    let destination = workspaces.path().join("child");
+
+    // Make the native bookkeeping unwritable so `save` fails after the fork
+    // directory has already been materialized.
+    let original = fs::metadata(&state_dir).unwrap().permissions();
+    let mut unwritable = original.clone();
+    unwritable.set_mode(0o500);
+    fs::set_permissions(&state_dir, unwritable).unwrap();
+
+    let failed = graph.fork("child", &root.id, &destination);
+    fs::set_permissions(&state_dir, original).unwrap();
+
+    assert!(failed.is_err(), "fork must report the bookkeeping failure");
+    assert!(
+        !destination.exists(),
+        "a failed fork must not leave a materialized directory behind"
+    );
+    // The same destination must be usable again.
+    graph.fork("child", &root.id, &destination).unwrap();
+    assert!(destination.join(".juto-workspace.json").is_file());
+    assert_eq!(
+        ChangeGraph::open(&destination).unwrap().thread(),
+        Some("child")
+    );
 }
 
 #[test]

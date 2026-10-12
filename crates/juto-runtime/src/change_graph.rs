@@ -146,15 +146,15 @@ impl ChangeGraph {
         self.repository.capture_tree(baseline)
     }
 
-    pub fn path_tracked(&self, tree: &str, path: &str) -> Result<bool> {
+    pub fn path_tracked(&self, tree: &str, path: &[u8]) -> Result<bool> {
         self.repository.path_tracked(tree, path)
     }
 
-    pub fn path_ignored(&self, path: &str) -> Result<bool> {
+    pub fn path_ignored(&self, path: &[u8]) -> Result<bool> {
         self.repository.path_ignored(path)
     }
 
-    pub fn diff_trees(&self, before: &str, after: &str, path: &str) -> Result<String> {
+    pub fn diff_trees(&self, before: &str, after: &str, path: &[u8]) -> Result<String> {
         self.repository.diff_trees(before, after, path)
     }
 
@@ -193,6 +193,11 @@ impl ChangeGraph {
                     .any(|n| &n.id == id && n.tree == before_tree)
             })
         };
+        // Only a node this call actually created may advance a head. Falling
+        // back to `parents.first()` would move the shared workspace head back to
+        // an older thread head in a shared working directory or a cross-thread
+        // fork, dropping later lineage from the projection.
+        let mut created: Option<String> = None;
         let parents = if !before_is_known {
             let external = self.append(
                 &mut state,
@@ -201,6 +206,7 @@ impl ChangeGraph {
                 parents,
                 EditProvenance::external(),
             )?;
+            created = Some(external.id.clone());
             vec![external.id]
         } else {
             parents
@@ -208,20 +214,19 @@ impl ChangeGraph {
         let node = if before_tree == after_tree {
             None
         } else {
-            Some(self.append(
+            let node = self.append(
                 &mut state,
                 &thread,
                 after_tree.into(),
                 parents.clone(),
                 provenance,
-            )?)
+            )?;
+            created = Some(node.id.clone());
+            Some(node)
         };
-        let head = node.as_ref().map(|n| &n.id).or_else(|| parents.first());
-        if let Some(head) = head {
+        if let Some(head) = created {
             state.heads.insert(thread, head.clone());
-            state
-                .workspace_heads
-                .insert(self.workspace_key(), head.clone());
+            state.workspace_heads.insert(self.workspace_key(), head);
         }
         self.save(&state)?;
         Ok(node)
@@ -289,14 +294,31 @@ impl ChangeGraph {
             .context("unknown fork point")?;
         self.repository
             .fork_workspace(&node.tree, destination, thread)?;
-        let destination = destination.canonicalize()?;
-        state.heads.insert(thread.into(), from.clone());
-        state
-            .workspace_heads
-            .insert(destination.to_string_lossy().into_owned(), from);
-        self.save(&state)
-            .context("workspace created but native thread bookkeeping failed")?;
-        Ok(state)
+        let recorded = (|| -> Result<()> {
+            let destination = destination.canonicalize()?;
+            state.heads.insert(thread.into(), from.clone());
+            state
+                .workspace_heads
+                .insert(destination.to_string_lossy().into_owned(), from.clone());
+            self.save(&state)
+        })();
+        match recorded {
+            Ok(()) => Ok(state),
+            Err(error) => {
+                // `fork_workspace` created `destination` atomically in this
+                // call, so it is known-new and safe to remove. `save` is atomic,
+                // so only remove it when the bookkeeping truly did not land;
+                // otherwise the thread would point at a missing directory.
+                let landed = self
+                    .load()
+                    .map(|state| state.heads.contains_key(thread))
+                    .unwrap_or(false);
+                if !landed {
+                    let _ = fs::remove_dir_all(destination);
+                }
+                Err(error.context("workspace created but native thread bookkeeping failed"))
+            }
+        }
     }
 
     /// Freeze a named point, including exact tree, message, identity and timestamp.

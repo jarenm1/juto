@@ -6,8 +6,10 @@
 //! No Jujutsu binary is involved.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -334,6 +336,101 @@ fn capture_tree_leaves_user_index_and_head_untouched() {
 }
 
 #[test]
+fn capture_tree_tolerates_untracked_nested_repository() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"base\n");
+    let head = commit(&dir, "base");
+    let baseline = git(&dir, &["rev-parse", "HEAD^{tree}"]);
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+
+    // `git ls-files --others` enumerates an untracked nested repository as the
+    // directory itself (`sub/`), which can never be a blob. It is not in the
+    // baseline, so it needs no removal record either.
+    let nested = dir.join("sub");
+    fs::create_dir_all(&nested).unwrap();
+    git(&nested, &["init", "-q", "-b", "main"]);
+
+    let captured = repository.capture_tree(&baseline).unwrap();
+    let entries = tree_entries(&git_dir, &captured);
+    assert_eq!(
+        entries.get("a.txt").map(|(mode, _)| mode.as_str()),
+        Some("100644")
+    );
+    assert!(
+        !entries
+            .keys()
+            .any(|path| path == "sub" || path.starts_with("sub/")),
+        "an untracked nested repository must not be captured: {entries:?}"
+    );
+    assert_eq!(git_at(&git_dir, &["rev-parse", "HEAD"]), head);
+}
+
+#[test]
+fn capture_tree_handles_file_replacing_tracked_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a/b.txt"), b"nested\n");
+    commit(&dir, "base");
+    let baseline = git(&dir, &["rev-parse", "HEAD^{tree}"]);
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+
+    // The worktree now has a FILE where the baseline tracked a directory, so
+    // `symlink_metadata(workspace/a/b.txt)` fails with ENOTDIR.
+    fs::remove_dir_all(dir.join("a")).unwrap();
+    write_file(&dir.join("a"), b"now a file\n");
+
+    let captured = repository.capture_tree(&baseline).unwrap();
+    let entries = tree_entries(&git_dir, &captured);
+    assert_eq!(
+        entries.get("a").map(|(mode, _)| mode.as_str()),
+        Some("100644")
+    );
+    assert!(
+        !entries.contains_key("a/b.txt"),
+        "the replaced directory must be removed from the snapshot: {entries:?}"
+    );
+    assert_eq!(
+        git_raw(&git_dir, &["cat-file", "blob", &entries["a"].1]),
+        b"now a file\n"
+    );
+}
+
+#[test]
+fn capture_tree_excludes_atomic_write_temp_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"base\n");
+    commit(&dir, "base");
+    let baseline = git(&dir, &["rev-parse", "HEAD^{tree}"]);
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+
+    // Exactly the shape `vcs::atomic_write_preserving` leaves behind when it
+    // crashes between `create_new` and `rename`.
+    write_file(&dir.join(".a.txt.juto-4242-7.tmp"), b"partial\n");
+    // Files that merely look similar are ordinary user files and must survive.
+    write_file(&dir.join("keep.juto-1-2.tmp"), b"user\n");
+    write_file(&dir.join(".keep.tmp"), b"user\n");
+    write_file(&dir.join(".keep.juto-x.tmp"), b"user\n");
+
+    let captured = repository.capture_tree(&baseline).unwrap();
+    let entries = tree_entries(&git_dir, &captured);
+    assert!(
+        !entries.contains_key(".a.txt.juto-4242-7.tmp"),
+        "an atomic-write temp file must never be captured: {entries:?}"
+    );
+    assert!(entries.contains_key("keep.juto-1-2.tmp"));
+    assert!(entries.contains_key(".keep.tmp"));
+    assert!(entries.contains_key(".keep.juto-x.tmp"));
+}
+
+#[test]
 fn retain_snapshot_pins_object_ref_and_rejects_unsafe_ids() {
     let temp = tempfile::tempdir().unwrap();
     let dir = repo(&temp, "repo");
@@ -389,12 +486,12 @@ fn path_tracked_and_diff_trees() {
     let after = git(&dir, &["rev-parse", "HEAD^{tree}"]);
 
     let repository = GitRepository::open(&dir).unwrap();
-    assert!(repository.path_tracked(&after, "a.txt").unwrap());
-    assert!(repository.path_tracked(&after, "b.txt").unwrap());
-    assert!(!repository.path_tracked(&after, "missing.txt").unwrap());
-    assert!(!repository.path_tracked(&before, "b.txt").unwrap());
+    assert!(repository.path_tracked(&after, b"a.txt").unwrap());
+    assert!(repository.path_tracked(&after, b"b.txt").unwrap());
+    assert!(!repository.path_tracked(&after, b"missing.txt").unwrap());
+    assert!(!repository.path_tracked(&before, b"b.txt").unwrap());
 
-    let patch = repository.diff_trees(&before, &after, "a.txt").unwrap();
+    let patch = repository.diff_trees(&before, &after, b"a.txt").unwrap();
     assert!(patch.contains("changed"), "{patch}");
     assert!(patch.contains("a.txt"), "{patch}");
     assert!(
@@ -420,21 +517,21 @@ fn pathspecs_are_literal() {
     let repository = GitRepository::open(&dir).unwrap();
 
     // A wildcard path is matched literally, never as a glob.
-    let wild = repository.diff_trees(&before, &after, "*.txt").unwrap();
+    let wild = repository.diff_trees(&before, &after, b"*.txt").unwrap();
     assert!(wild.contains("*.txt"), "{wild}");
     assert!(
         !wild.contains("a.txt"),
         "a literal wildcard must not match a.txt: {wild}"
     );
 
-    let exact = repository.diff_trees(&before, &after, "a.txt").unwrap();
+    let exact = repository.diff_trees(&before, &after, b"a.txt").unwrap();
     assert!(exact.contains("a.txt"), "{exact}");
     assert!(!exact.contains("*.txt"), "{exact}");
 
-    assert!(repository.path_tracked(&after, "*.txt").unwrap());
-    assert!(repository.path_tracked(&after, "a.txt").unwrap());
+    assert!(repository.path_tracked(&after, b"*.txt").unwrap());
+    assert!(repository.path_tracked(&after, b"a.txt").unwrap());
     // `a*.txt` is not a file; a glob would have matched `a.txt`.
-    assert!(!repository.path_tracked(&after, "a*.txt").unwrap());
+    assert!(!repository.path_tracked(&after, b"a*.txt").unwrap());
 }
 
 #[test]
@@ -447,15 +544,52 @@ fn path_ignored_reports_ignore_rules() {
     commit(&dir, "base");
 
     let repository = GitRepository::open(&dir).unwrap();
-    assert!(repository.path_ignored("a.log").unwrap());
-    assert!(!repository.path_ignored("b.txt").unwrap());
-    assert!(!repository.path_ignored("missing.txt").unwrap());
-    assert!(repository.path_ignored("").is_err());
+    assert!(repository.path_ignored(b"a.log").unwrap());
+    assert!(!repository.path_ignored(b"b.txt").unwrap());
+    assert!(!repository.path_ignored(b"missing.txt").unwrap());
+    assert!(repository.path_ignored(b"").is_err());
 
     // A tracked file that matches an ignore rule still reports as ignored.
     git(&dir, &["add", "-f", "a.log"]);
     git(&dir, &["commit", "-q", "-m", "force tracked"]);
-    assert!(repository.path_ignored("a.log").unwrap());
+    assert!(repository.path_ignored(b"a.log").unwrap());
+}
+
+#[test]
+fn path_queries_accept_raw_path_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"base\n");
+    commit(&dir, "base");
+    let before = git(&dir, &["rev-parse", "HEAD^{tree}"]);
+
+    // A backslash is an ordinary filename byte, not a directory separator, and
+    // a non-UTF-8 name must round-trip as raw bytes.
+    let backslash = dir.join("a\\b.txt");
+    write_file(&backslash, b"backslash\n");
+    let raw = dir.join(OsStr::from_bytes(b"raw-\xff.txt"));
+    write_file(&raw, b"raw\n");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let after = repository.capture_tree(&before).unwrap();
+
+    assert!(repository.path_tracked(&after, b"a\\b.txt").unwrap());
+    assert!(
+        !repository.path_tracked(&after, b"a/b.txt").unwrap(),
+        "a backslash must not be rewritten into a separator"
+    );
+    assert!(repository.path_tracked(&after, b"raw-\xff.txt").unwrap());
+    assert!(!repository.path_tracked(&after, b"raw-\xfe.txt").unwrap());
+
+    let patch = repository.diff_trees(&before, &after, b"a\\b.txt").unwrap();
+    assert!(patch.contains("backslash"), "{patch}");
+    assert!(
+        !patch.contains("raw-"),
+        "diff must stay path-scoped: {patch}"
+    );
+
+    assert!(!repository.path_ignored(b"a\\b.txt").unwrap());
+    assert!(repository.path_ignored(b"").is_err());
 }
 
 #[test]
