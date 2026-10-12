@@ -150,7 +150,25 @@ pub struct EnvironmentConfig {
     /// Where the compositor runs.
     #[serde(default = "default_compositor_mode")]
     pub compositor_mode: CompositorMode,
+    /// Owner heartbeat timeout in seconds; 0 disables expiry (spec section 3).
+    #[serde(default = "default_owner_timeout")]
+    pub owner_heartbeat_timeout_secs: u64,
 }
+
+fn default_owner_timeout() -> u64 {
+    60
+}
+
+/// A bounded human acceptance of an environment's lifetime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Retention {
+    pub human_owner: String,
+    pub expires_at: u64,
+}
+
+/// Maximum retention a host grants without further approval (spec section 4).
+const MAX_RETENTION_SECS: u64 = 1800;
 
 fn default_lease_ttl() -> u64 {
     6
@@ -197,6 +215,10 @@ struct InnerEnvironment {
     last_automation_barrier: Mutex<Option<AutomationBarrier>>,
     /// Viewers that have presented a frame of the current geometry generation.
     geometry_ready: Mutex<HashMap<String, GeometryGeneration>>,
+    /// Last owner heartbeat, in seconds since the epoch.
+    owner_heartbeat: Mutex<u64>,
+    /// Explicit human retention of the environment's lifetime.
+    retention: Mutex<Option<Retention>>,
     destroyed: AtomicBool,
     use_scope: bool,
     slice: Option<String>,
@@ -345,6 +367,8 @@ impl DesktopEnvironment {
             events: events.clone(),
             last_automation_barrier: Mutex::new(None),
             geometry_ready: Mutex::new(HashMap::new()),
+            owner_heartbeat: Mutex::new(now_secs()),
+            retention: Mutex::new(None),
             destroyed: AtomicBool::new(false),
             use_scope,
             slice,
@@ -768,6 +792,77 @@ impl DesktopEnvironment {
         Ok(batch.seq)
     }
 
+    /// Renews the owner lifetime or the control lease.
+    ///
+    /// Returns the renewed deadline. A lease heartbeat must match the current
+    /// holder and epoch; input traffic never renews either deadline implicitly.
+    pub fn heartbeat(&self, target: &str, epoch: Option<u64>) -> Result<u64, DesktopError> {
+        match target {
+            "owner" => {
+                let now = now_secs();
+                *self.inner.owner_heartbeat.lock() = now;
+                Ok(now + self.inner.config.owner_heartbeat_timeout_secs)
+            }
+            "lease" => {
+                let mut lease = self.inner.lease.lock();
+                let current = lease.as_ref().ok_or_else(|| DesktopError::Unauthorized {
+                    caller: "heartbeat".to_string(),
+                    role: "Control".to_string(),
+                    environment: self.env_id().to_string(),
+                })?;
+                if let Some(epoch) = epoch
+                    && epoch != current.epoch
+                {
+                    return Err(DesktopError::StaleLease {
+                        expected: current.epoch,
+                        received: epoch,
+                    });
+                }
+                let renewed = ControlLease {
+                    expires_at: now_secs() + self.inner.config.lease_ttl_secs.max(1),
+                    ..current.clone()
+                };
+                *lease = Some(renewed.clone());
+                Ok(renewed.expires_at)
+            }
+            other => Err(DesktopError::Protocol(format!(
+                "unknown heartbeat target `{other}`"
+            ))),
+        }
+    }
+
+    /// Transfers lifetime responsibility to an authenticated human session.
+    ///
+    /// The deadline is host-bounded; an owner cannot nominate an unbounded
+    /// retention.
+    pub fn retain(
+        &self,
+        human_owner: &str,
+        deadline_seconds: u64,
+    ) -> Result<Retention, DesktopError> {
+        if human_owner.trim().is_empty() {
+            return Err(DesktopError::Protocol(
+                "retention requires a human owner".to_string(),
+            ));
+        }
+        let bounded = deadline_seconds.clamp(1, MAX_RETENTION_SECS);
+        let retention = Retention {
+            human_owner: human_owner.to_string(),
+            expires_at: now_secs() + bounded,
+        };
+        *self.inner.retention.lock() = Some(retention.clone());
+        Ok(retention)
+    }
+
+    /// The active retention, if any.
+    pub fn retention(&self) -> Option<Retention> {
+        self.inner
+            .retention
+            .lock()
+            .clone()
+            .filter(|retention| retention.expires_at > now_secs())
+    }
+
     /// Records that a viewer has presented a frame of `generation`.
     ///
     /// Input from that viewer resumes only after this acknowledgement, so a
@@ -888,6 +983,27 @@ impl DesktopEnvironment {
             .filter(|(_, generation)| **generation == current)
             .map(|(viewer, _)| viewer.clone())
             .collect()
+    }
+
+    /// Destroys the environment when its owner heartbeat and retention have both
+    /// lapsed, so an abandoned desktop does not outlive its task.
+    fn expire_owner_if_abandoned(&self) {
+        let timeout = self.inner.config.owner_heartbeat_timeout_secs;
+        if timeout == 0 {
+            return;
+        }
+        if self.retention().is_some() {
+            return;
+        }
+        let last = *self.inner.owner_heartbeat.lock();
+        if now_secs().saturating_sub(last) <= timeout {
+            return;
+        }
+        let _ = self.inner.events.send(DesktopEvent::Failed {
+            env_id: self.env_id().to_string(),
+            reason: format!("owner heartbeat expired after {timeout}s"),
+        });
+        self.destroy();
     }
 
     /// Clears an expired control lease and reports the change.
@@ -1085,6 +1201,7 @@ fn spawn_lease_reaper(inner: std::sync::Weak<InnerEnvironment>) {
                 }
                 let env = DesktopEnvironment { inner };
                 env.expire_lease_if_stale();
+                env.expire_owner_if_abandoned();
             }
         });
 }

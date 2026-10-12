@@ -1592,6 +1592,7 @@ fn run_desktop_action(
                 } else {
                     juto_desktop::supervisor::CompositorMode::InProcess
                 },
+                owner_heartbeat_timeout_secs: 60,
             };
             let env = supervisor
                 .create_environment(config)

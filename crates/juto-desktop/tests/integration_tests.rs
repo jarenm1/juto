@@ -33,6 +33,7 @@ fn test_config(env_id: &str) -> EnvironmentConfig {
         workspace_dir: std::env::temp_dir(),
         lease_ttl_secs: 6,
         compositor_mode: juto_desktop::CompositorMode::Worker,
+        owner_heartbeat_timeout_secs: 60,
     }
 }
 
@@ -761,6 +762,89 @@ fn compositor_worker_runs_inside_the_environment_slice() {
         !unit_is_active(&unit),
         "compositor scope must stop on destroy"
     );
+}
+
+#[test]
+fn owner_heartbeat_expiry_destroys_an_abandoned_environment() {
+    let supervisor = DesktopSupervisor::new();
+    let mut config = test_config(&unique_env_id("abandon"));
+    config.owner_heartbeat_timeout_secs = 2;
+    let env = supervisor
+        .create_environment(config)
+        .expect("create environment");
+    let mut events = env.subscribe();
+    let runtime_dir = env.runtime_dir().to_path_buf();
+
+    // No heartbeat arrives, so the reaper retires the environment.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut failed = false;
+    while Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(DesktopEvent::Failed { reason, .. }) => {
+                assert!(reason.contains("heartbeat"), "{reason}");
+                failed = true;
+                break;
+            }
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    assert!(failed, "no heartbeat-expiry failure was emitted");
+    assert!(env.is_destroyed());
+    // Teardown follows the failure event.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && runtime_dir.exists() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(!runtime_dir.exists(), "runtime directory must be removed");
+}
+
+#[test]
+fn heartbeat_renews_and_retention_keeps_an_environment_alive() {
+    let supervisor = DesktopSupervisor::new();
+    let mut config = test_config(&unique_env_id("retain"));
+    config.owner_heartbeat_timeout_secs = 2;
+    let env = supervisor
+        .create_environment(config)
+        .expect("create environment");
+
+    // The owner heartbeat renews the deadline.
+    let deadline = env.heartbeat("owner", None).expect("owner heartbeat");
+    assert!(deadline > 0);
+
+    // The lease heartbeat must match the current epoch.
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
+    assert!(env.heartbeat("lease", Some(lease.epoch)).is_ok());
+    assert!(matches!(
+        env.heartbeat("lease", Some(lease.epoch + 7)),
+        Err(juto_desktop::DesktopError::StaleLease { .. })
+    ));
+
+    // Retention outlives the heartbeat timeout.
+    let retention = env.retain("human:test", 60).expect("retain");
+    assert_eq!(retention.human_owner, "human:test");
+    std::thread::sleep(Duration::from_millis(3500));
+    assert!(
+        !env.is_destroyed(),
+        "retention must keep the environment alive"
+    );
+    assert!(env.retention().is_some());
+
+    // Retention is host-bounded.
+    let bounded = env.retain("human:test", 999_999).expect("retain");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(bounded.expires_at <= now + 1801, "{}", bounded.expires_at);
+
+    env.destroy();
 }
 
 #[test]
