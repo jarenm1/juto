@@ -2064,7 +2064,7 @@ fn entry_path(entry: &[u8]) -> Result<&[u8]> {
 /// Used to decide whether a baseline path belongs to a partial fork's sparse
 /// prefixes. The comparison is byte-exact on whole path components, so `src`
 /// does not match `srcx`.
-fn path_under(path: &[u8], prefix: &[u8]) -> bool {
+pub(crate) fn path_under(path: &[u8], prefix: &[u8]) -> bool {
     path == prefix
         || (path.len() > prefix.len() && path.starts_with(prefix) && path[prefix.len()] == b'/')
 }
