@@ -176,6 +176,8 @@ struct InnerEnvironment {
     apps: Mutex<HashMap<String, AppHandle>>,
     events: broadcast::Sender<DesktopEvent>,
     last_automation_barrier: Mutex<Option<AutomationBarrier>>,
+    /// Viewers that have presented a frame of the current geometry generation.
+    geometry_ready: Mutex<HashMap<String, GeometryGeneration>>,
     destroyed: AtomicBool,
     use_scope: bool,
     slice: Option<String>,
@@ -282,6 +284,7 @@ impl DesktopEnvironment {
             apps: Mutex::new(HashMap::new()),
             events: events.clone(),
             last_automation_barrier: Mutex::new(None),
+            geometry_ready: Mutex::new(HashMap::new()),
             destroyed: AtomicBool::new(false),
             use_scope,
             slice,
@@ -682,6 +685,16 @@ impl DesktopEnvironment {
                 received: generation,
             });
         }
+        // After a resize, pointer input resumes only once a viewer has presented
+        // a frame of the new generation (spec section 6). There is exactly one
+        // active control lease, so the acknowledging viewer is the one whose
+        // input is gated; the acknowledgement is tracked per environment.
+        if current_gen > 1 && self.inner.geometry_ready.lock().is_empty() {
+            return Err(DesktopError::StaleGeneration {
+                expected: current_gen,
+                received: generation,
+            });
+        }
         drop(lease);
 
         let compositor = self.compositor()?;
@@ -689,6 +702,29 @@ impl DesktopEnvironment {
             compositor.send(CompositorCommand::Input(event))?;
         }
         Ok(batch.seq)
+    }
+
+    /// Records that a viewer has presented a frame of `generation`.
+    ///
+    /// Input from that viewer resumes only after this acknowledgement, so a
+    /// click cannot land on a stale frame at the same encoded size.
+    pub fn acknowledge_geometry(
+        &self,
+        viewer: &str,
+        generation: GeometryGeneration,
+    ) -> Result<(), DesktopError> {
+        let current = self.generation();
+        if generation != current {
+            return Err(DesktopError::StaleGeneration {
+                expected: current,
+                received: generation,
+            });
+        }
+        self.inner
+            .geometry_ready
+            .lock()
+            .insert(viewer.to_string(), generation);
+        Ok(())
     }
 
     /// Forces a fresh composition and returns the resulting frame metadata.
@@ -774,6 +810,8 @@ impl DesktopEnvironment {
         }
         *self.inner.output.lock() = new_mode;
         self.inner.generation.store(new_gen, Ordering::SeqCst);
+        // Every viewer must present a new-generation frame before input resumes.
+        self.inner.geometry_ready.lock().clear();
         Ok(new_gen)
     }
 
@@ -803,6 +841,18 @@ impl DesktopEnvironment {
             mapped_windows: self.inner.windows.lock().values().cloned().collect(),
             active_grants: grants,
         }
+    }
+
+    /// Viewers that have acknowledged the current geometry generation.
+    pub fn geometry_ready_viewers(&self) -> Vec<String> {
+        let current = self.generation();
+        self.inner
+            .geometry_ready
+            .lock()
+            .iter()
+            .filter(|(_, generation)| **generation == current)
+            .map(|(viewer, _)| viewer.clone())
+            .collect()
     }
 
     /// Clears an expired control lease and reports the change.

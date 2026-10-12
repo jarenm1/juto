@@ -58,6 +58,8 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   and expiry before returning a same-host route or a one-time remote token, and
   otherwise reports `Unsupported`, `Unauthorized`, `Expired`, `Stopped`, or
   `Unavailable`.
+- Resize gating: a new geometry generation clears viewer acknowledgements and
+  input is rejected until `GeometryReady` reports the new generation.
 
 Not implemented: audio (private PipeWire sink plus Opus), Xwayland, the hardware
 render-node profile, DMA-BUF export/import, TURN relay configuration, running the
