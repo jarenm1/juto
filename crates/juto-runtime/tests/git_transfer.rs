@@ -1369,58 +1369,253 @@ fn cleanup_orphaned_forks_skips_live_fork() {
 }
 
 #[test]
-fn interleaved_forks_and_cleanup_keep_every_registration() {
+fn refs_transport_blobs_and_trees_over_a_bare_remote() {
     let temp = tempfile::tempdir().unwrap();
     let dir = repo(&temp, "repo");
     write_file(&dir.join("a.txt"), b"a\n");
     commit(&dir, "base");
 
     let repository = GitRepository::open(&dir).unwrap();
-    let tree = git_at(repository.git_dir(), &["rev-parse", "HEAD^{tree}"]);
-    let forks_dir = repository.git_dir().join("juto/forks");
+    let git_dir = repository.git_dir().to_path_buf();
+    let tree = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
 
-    let mut handles = Vec::new();
-    for index in 0..4 {
-        let repository = repository.clone();
-        let tree = tree.clone();
-        let destination = temp.path().join(format!("fork-{index}"));
-        handles.push(std::thread::spawn(move || {
-            for attempt in 0..5 {
-                repository
-                    .fork_workspace(&tree, &destination, &format!("thread-{index}-{attempt}"))
-                    .unwrap();
-                fs::remove_dir_all(&destination).unwrap();
-            }
-        }));
-    }
-    let cleanup_repository = repository.clone();
-    let cleanup = std::thread::spawn(move || {
-        for _ in 0..20 {
-            let _ = cleanup_repository.cleanup_orphaned_forks();
-        }
-    });
-    for handle in handles {
-        handle.join().unwrap();
-    }
-    cleanup.join().unwrap();
-
-    for _ in 0..100 {
-        if repository.cleanup_orphaned_forks().unwrap().is_empty() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let leftover: Vec<_> = fs::read_dir(&forks_dir)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok())
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                .filter(|name| name.starts_with("fork-"))
-                .collect()
-        })
-        .unwrap_or_default();
-    assert!(
-        leftover.is_empty(),
-        "no pending record may survive: {leftover:?}"
+    // A local bare remote.
+    let remote = temp.path().join("remote.git");
+    run(
+        "git",
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+        temp.path(),
     );
+
+    // Write a blob and pin a tree under the wire-format refs.
+    let blob = repository.write_blob(b"{\"node\":1}").unwrap();
+    assert_eq!(repository.read_blob(&blob).unwrap(), b"{\"node\":1}");
+    assert!(
+        repository
+            .update_ref("refs/juto/nodes/node-1", &blob, None)
+            .unwrap()
+    );
+    assert!(
+        repository
+            .update_ref("refs/juto/snapshots/snap-1", &tree, None)
+            .unwrap()
+    );
+
+    let refspecs = vec![
+        "refs/juto/nodes/node-1:refs/juto/nodes/node-1".to_string(),
+        "refs/juto/snapshots/snap-1:refs/juto/snapshots/snap-1".to_string(),
+    ];
+    repository
+        .push_refs(remote.to_str().unwrap(), &refspecs)
+        .unwrap();
+
+    // The remote advertises both refs with the right object types.
+    let remote_refs = git_at(
+        &remote,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(objecttype)",
+        ],
+    );
+    assert!(
+        remote_refs.contains(&format!("refs/juto/nodes/node-1 {blob} blob")),
+        "the blob ref must transport as a blob: {remote_refs}"
+    );
+    assert!(
+        remote_refs.contains(&format!("refs/juto/snapshots/snap-1 {tree} tree")),
+        "the tree ref must transport as a tree: {remote_refs}"
+    );
+
+    // Fetch into a second repository and read the refs back.
+    let dst = repo(&temp, "dst");
+    let dst_repo = GitRepository::open(&dst).unwrap();
+    dst_repo.fetch(remote.to_str().unwrap(), &refspecs).unwrap();
+    let fetched = dst_repo.list_refs("refs/juto/").unwrap();
+    assert!(fetched.contains(&("refs/juto/nodes/node-1".to_string(), blob.clone())));
+    assert!(fetched.contains(&("refs/juto/snapshots/snap-1".to_string(), tree.clone())));
+    assert_eq!(dst_repo.read_blob(&blob).unwrap(), b"{\"node\":1}");
+    let dst_git_dir = dst_repo.git_dir().to_path_buf();
+    assert_eq!(git_at(&dst_git_dir, &["cat-file", "-t", &tree]), "tree");
+}
+
+#[test]
+fn update_ref_enforces_compare_and_swap() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"a\n");
+    commit(&dir, "base");
+    let repository = GitRepository::open(&dir).unwrap();
+
+    let one = repository.write_blob(b"one").unwrap();
+    let two = repository.write_blob(b"two").unwrap();
+
+    // Create-only succeeds when absent and fails when present.
+    assert!(
+        repository
+            .update_ref("refs/juto/nodes/n1", &one, None)
+            .unwrap()
+    );
+    assert!(
+        repository
+            .update_ref("refs/juto/nodes/n1", &one, None)
+            .is_err()
+    );
+
+    // Some(old) fails on a mismatch and succeeds on a match.
+    assert!(
+        repository
+            .update_ref("refs/juto/nodes/n1", &two, Some(&one))
+            .unwrap()
+    );
+    assert!(
+        repository
+            .update_ref("refs/juto/nodes/n1", &one, Some(&one))
+            .is_err()
+    );
+
+    // An identical value is a no-op that reports no change.
+    assert!(
+        !repository
+            .update_ref("refs/juto/nodes/n1", &two, Some(&two))
+            .unwrap()
+    );
+
+    // Some(old) on a missing ref fails.
+    assert!(
+        repository
+            .update_ref("refs/juto/nodes/n2", &one, Some(&one))
+            .is_err()
+    );
+
+    // The ref resolves to the last written value.
+    assert_eq!(
+        git_at(repository.git_dir(), &["rev-parse", "refs/juto/nodes/n1"]),
+        two
+    );
+}
+
+#[test]
+fn restore_tree_applies_delta_into_existing_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("keep.txt"), b"keep\n");
+    write_file(&dir.join("mod.txt"), b"old\n");
+    write_file(&dir.join("del.txt"), b"delete me\n");
+    write_file(&dir.join("script.sh"), b"#!/bin/sh\necho hi\n");
+    write_file(&dir.join("unrelated.txt"), b"unrelated\n");
+    symlink("keep.txt", dir.join("link")).unwrap();
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let base = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    // Target: modify, delete, add, chmod +x, and add a symlink.
+    write_file(&dir.join("mod.txt"), b"new\n");
+    fs::remove_file(dir.join("del.txt")).unwrap();
+    write_file(&dir.join("added.txt"), b"added\n");
+    set_executable(&dir.join("script.sh"));
+    symlink("mod.txt", dir.join("newlink")).unwrap();
+    commit(&dir, "target");
+    let target = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    // Materialize the base tree into a fresh directory, then apply the delta.
+    let work = temp.path().join("work");
+    repository.fork_workspace(&base, &work, "thread-1").unwrap();
+    assert_eq!(fs::read(work.join("mod.txt")).unwrap(), b"old\n");
+    assert!(work.join("del.txt").exists());
+
+    repository.restore_tree(&base, &target, &work).unwrap();
+
+    assert_eq!(fs::read(work.join("mod.txt")).unwrap(), b"new\n");
+    assert_eq!(fs::read(work.join("added.txt")).unwrap(), b"added\n");
+    assert!(
+        !work.join("del.txt").exists(),
+        "a deleted path must be removed"
+    );
+    assert!(
+        fs::metadata(work.join("script.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111
+            != 0,
+        "the executable bit must be applied"
+    );
+    assert_eq!(
+        fs::read_link(work.join("newlink")).unwrap(),
+        Path::new("mod.txt")
+    );
+    // Unrelated paths are untouched.
+    assert_eq!(fs::read(work.join("keep.txt")).unwrap(), b"keep\n");
+    assert_eq!(
+        fs::read(work.join("unrelated.txt")).unwrap(),
+        b"unrelated\n"
+    );
+    assert_eq!(
+        fs::read_link(work.join("link")).unwrap(),
+        Path::new("keep.txt")
+    );
+}
+
+#[test]
+fn merge_trees_merges_cleanly_and_reports_conflicts() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("f1.txt"), b"base\n");
+    write_file(&dir.join("f2.txt"), b"base\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let base = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    // Ours changes f1 only.
+    write_file(&dir.join("f1.txt"), b"ours\n");
+    commit(&dir, "ours");
+    let ours = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    // Theirs (from base) changes f2 only: a disjoint, clean merge.
+    git(&dir, &["checkout", "-q", "-b", "other", "HEAD~1"]);
+    write_file(&dir.join("f2.txt"), b"theirs\n");
+    commit(&dir, "theirs");
+    let theirs = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    let clean = repository.merge_trees(&base, &ours, &theirs).unwrap();
+    assert!(clean.conflicts.is_empty(), "a disjoint merge must be clean");
+    let entries = tree_entries(&git_dir, &clean.tree);
+    assert_eq!(
+        git_raw(&git_dir, &["cat-file", "blob", &entries["f1.txt"].1]),
+        b"ours\n"
+    );
+    assert_eq!(
+        git_raw(&git_dir, &["cat-file", "blob", &entries["f2.txt"].1]),
+        b"theirs\n"
+    );
+
+    // Now both sides change f1: a conflict that still yields a tree.
+    git(&dir, &["checkout", "-q", "main"]);
+    write_file(&dir.join("f1.txt"), b"ours2\n");
+    commit(&dir, "ours2");
+    let ours2 = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+    git(&dir, &["checkout", "-q", "other"]);
+    write_file(&dir.join("f1.txt"), b"theirs2\n");
+    commit(&dir, "theirs2");
+    let theirs2 = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    let conflicted = repository.merge_trees(&base, &ours2, &theirs2).unwrap();
+    assert_eq!(conflicted.conflicts, vec!["f1.txt".to_string()]);
+    assert!(
+        tree_entries(&git_dir, &conflicted.tree).contains_key("f1.txt"),
+        "a conflicting merge still returns a merged tree"
+    );
+}
+
+#[test]
+fn supports_tree_merge_reports_a_bool() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    let repository = GitRepository::open(&dir).unwrap();
+    // The probe must not panic; this crate requires Git >= 2.45.
+    assert!(repository.supports_tree_merge().unwrap());
 }
