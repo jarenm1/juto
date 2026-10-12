@@ -167,6 +167,9 @@ pub struct GcReport {
     /// `refs/juto/nodes/<id>` refs actually deleted by the sweep, so a pruned
     /// node leaves no replication ref behind.
     pub released_node_refs: usize,
+    /// Workspace-head entries dropped because their directory no longer exists.
+    /// A stale entry would otherwise pin that thread's nodes forever.
+    pub dropped_workspace_heads: usize,
 }
 
 pub struct ChangeGraph {
@@ -815,7 +818,22 @@ impl ChangeGraph {
     /// node (the `base` and `base-tree` anchors) are never touched.
     pub fn gc(&self) -> Result<GcReport> {
         let _lock = self.lock()?;
-        let state = self.load()?;
+        let mut state = self.load()?;
+        // A workspace head is keyed by absolute path. Once the fork directory is
+        // gone — a cleaned-up subagent workspace — that head can never advance
+        // again, so keeping it would pin the thread's nodes forever. Drop the
+        // stale entries before computing the keep-set. Losing one is safe: a
+        // capture falls back to the thread head when no workspace head matches.
+        let stale: Vec<String> = state
+            .workspace_heads
+            .keys()
+            .filter(|path| !Path::new(path).is_dir())
+            .cloned()
+            .collect();
+        let dropped_workspace_heads = stale.len();
+        for path in &stale {
+            state.workspace_heads.remove(path);
+        }
         let by_id: BTreeMap<&str, &ChangeNode> =
             state.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
         let mut keep: BTreeSet<&str> = BTreeSet::new();
@@ -839,12 +857,13 @@ impl ChangeGraph {
             .iter()
             .cloned()
             .partition(|node| keep.contains(node.id.as_str()));
-        if pruned.is_empty() {
+        if pruned.is_empty() && dropped_workspace_heads == 0 {
             return Ok(GcReport {
                 pruned_nodes: 0,
                 retained_nodes: retained.len(),
                 released_refs: 0,
                 released_node_refs: 0,
+                dropped_workspace_heads: 0,
             });
         }
         let mut released_refs = 0;
@@ -869,6 +888,7 @@ impl ChangeGraph {
             retained_nodes: retained.len(),
             released_refs,
             released_node_refs,
+            dropped_workspace_heads,
         })
     }
 
