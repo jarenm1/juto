@@ -1,0 +1,263 @@
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Monotonic geometry generation counter. Incremented on every desktop resize/scale change.
+pub type GeometryGeneration = u64;
+
+/// Roles granted to a caller principal on an environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GrantRole {
+    Owner,
+    View,
+    Control,
+}
+
+/// An authenticated capability grant issued by the environment owner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Grant {
+    pub grant_id: String,
+    pub principal: String,
+    pub roles: Vec<GrantRole>,
+    pub audience: String,
+    pub expires_at: u64,
+}
+
+/// Exclusive interactive control lease state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ControlLease {
+    pub holder: String,
+    pub epoch: u64,
+    pub expires_at: u64,
+    pub is_human: bool,
+}
+
+/// A barrier acknowledging quiescence of alternate automation (application RPCs)
+/// before human interactive takeover.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationBarrier {
+    pub barrier_id: String,
+    pub old_epoch: u64,
+    pub drained_at: u64,
+}
+
+/// Top-level command dispatched to the desktop supervisor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", content = "payload", rename_all = "camelCase")]
+pub enum DesktopCommand {
+    Create {
+        spec: crate::supervisor::EnvironmentConfig,
+        request_id: String,
+    },
+    Launch {
+        env_id: String,
+        argv: Vec<String>,
+        cwd: PathBuf,
+        grants: Vec<String>,
+        request_id: String,
+    },
+    Terminate {
+        env_id: String,
+        app_id: String,
+    },
+    Describe {
+        env_id: String,
+        after_event_seq: Option<u64>,
+    },
+    ConfigureOutput {
+        env_id: String,
+        expected_generation: GeometryGeneration,
+        mode: crate::supervisor::OutputConfig,
+    },
+    Observe {
+        env_id: String,
+        generation: GeometryGeneration,
+        after_frame: Option<u64>,
+        timeout_ms: u64,
+    },
+    Attach {
+        env_id: String,
+        transport: String,
+        capabilities: Vec<String>,
+    },
+    Grant {
+        env_id: String,
+        principal: String,
+        roles: Vec<GrantRole>,
+        audience: String,
+        expiry_seconds: u64,
+    },
+    Revoke {
+        env_id: String,
+        grant_id: String,
+    },
+    Heartbeat {
+        env_id: String,
+        target: String,
+        epoch: Option<u64>,
+    },
+    Control {
+        env_id: String,
+        action: String, // "acquire" or "release"
+        is_human: bool,
+    },
+    Input {
+        env_id: String,
+        epoch: u64,
+        generation: GeometryGeneration,
+        events: InputBatch,
+    },
+    GeometryReady {
+        env_id: String,
+        viewer_id: String,
+        generation: GeometryGeneration,
+        track_or_pool_id: String,
+    },
+    AutomationQuiesced {
+        env_id: String,
+        old_epoch: u64,
+        barrier_id: String,
+    },
+    Destroy {
+        env_id: String,
+    },
+}
+
+/// Responses to synchronous desktop commands.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", content = "data", rename_all = "camelCase")]
+pub enum DesktopResponse {
+    Created {
+        env_id: String,
+        effective_output: crate::supervisor::OutputConfig,
+        effective_limits: crate::supervisor::SystemLimits,
+    },
+    Launched {
+        app_id: String,
+        pid: u32,
+    },
+    Terminated {
+        app_id: String,
+    },
+    Description(Box<crate::supervisor::EnvironmentStatus>),
+    OutputConfigured {
+        generation: GeometryGeneration,
+        effective_output: crate::supervisor::OutputConfig,
+    },
+    Observation {
+        frame_id: u64,
+        generation: GeometryGeneration,
+        timestamp_us: u64,
+        width: u32,
+        height: u32,
+        shm_pool_id: String,
+        shm_slot: u32,
+    },
+    Attached {
+        viewer_id: String,
+        negotiated_transport: String,
+    },
+    GrantIssued(Grant),
+    Revoked,
+    HeartbeatExtended {
+        expires_at: u64,
+    },
+    ControlChanged {
+        lease: Option<ControlLease>,
+    },
+    InputAccepted {
+        applied_watermark: u64,
+    },
+    Destroyed,
+    Error {
+        code: String,
+        message: String,
+    },
+}
+
+/// Batch of user or agent input events.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputBatch {
+    pub seq: u64,
+    pub client_timestamp_us: u64,
+    pub events: Vec<InputEvent>,
+}
+
+/// Discrete input event targeting the virtual seat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum InputEvent {
+    PointerMoveAbs { x: u32, y: u32 },
+    PointerDelta { dx: i32, dy: i32 },
+    PointerButton { button: u32, pressed: bool },
+    PointerScroll { axis: u32, value: i32 },
+    Key { keycode: u32, pressed: bool },
+    TextCommit { text: String, focus_epoch: u64 },
+}
+
+/// Metadata about a window mapped inside the compositor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowInfo {
+    pub window_id: u32,
+    pub title: String,
+    pub app_id: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub is_focused: bool,
+}
+
+/// Real-time asynchronous lifecycle event broadcast by the desktop supervisor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", content = "payload", rename_all = "camelCase")]
+pub enum DesktopEvent {
+    Ready {
+        env_id: String,
+    },
+    ApplicationExited {
+        env_id: String,
+        app_id: String,
+        exit_code: Option<i32>,
+    },
+    WindowMapped {
+        env_id: String,
+        window: WindowInfo,
+    },
+    WindowUnmapped {
+        env_id: String,
+        window_id: u32,
+    },
+    OutputChanged {
+        env_id: String,
+        generation: GeometryGeneration,
+        output: crate::supervisor::OutputConfig,
+    },
+    ControlChanged {
+        env_id: String,
+        lease: Option<ControlLease>,
+    },
+    ViewerStateChanged {
+        env_id: String,
+        viewer_id: String,
+        state: String,
+    },
+    LimitPressure {
+        env_id: String,
+        metric: String,
+        current_value: u64,
+        threshold: u64,
+    },
+    Failed {
+        env_id: String,
+        reason: String,
+    },
+    Stopped {
+        env_id: String,
+    },
+}

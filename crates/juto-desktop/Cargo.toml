@@ -1,0 +1,24 @@
+[package]
+name = "juto-desktop"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Headless agent-first desktop environment compositor and supervisor for Juto"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = "0.12"
+bytes = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -3161,6 +3161,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "juto-desktop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "clap",
+ "libc",
+ "parking_lot",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "juto-runtime"
 version = "0.1.0"
 dependencies = [

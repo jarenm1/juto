@@ -40,6 +40,14 @@ Subagent `output_schema` validation is strict by default. Task requests may set
 data is absent or does not match the declared schema; malformed schema definitions
 remain errors in either mode.
 
+### Proposed agent desktop
+
+The [agent-owned headless compositor design](docs/agent-compositor.md) specifies
+isolated application environments, configurable output/FPS/resource limits,
+computer-use control, and live human interaction with running games. Same-host
+viewing uses shared memory or negotiated DMA-BUF; remote laptop/phone viewing
+uses WebRTC. This is a design proposal, **not a shipped compositor or viewer**.
+
 ## Development
 
 Requires Nix with flakes enabled. The supported development system is
