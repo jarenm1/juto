@@ -443,7 +443,8 @@ impl Tool for EditTool {
                 for supported Rust, Python, JavaScript and TypeScript files; use inclusive line \
                 ranges or exact text otherwise. AST query must uniquely capture @edit (or the \
                 supplied capture). Replacement is verbatim, including newlines. Returns snapshot \
-                trees and the operation's diff; never silently falls back between modes."
+                trees and the operation's diff; records a durable change-graph node; never \
+                silently falls back between modes."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -1454,10 +1455,16 @@ impl Tool for VcsTool {
         juto_ai::ToolDefinition {
             name: "vcs".to_string(),
             description: "Inspect and synchronize Juto's native change graph. `status` reports \
-                counts, heads, and whether an imported head still needs reconciling; `fetch` \
-                imports another machine's graph; `reconcile` folds imported heads into the local \
-                thread; `push` publishes the local graph; `verify` checks that every node's \
-                snapshot ref is present and correct."
+                counts, heads, and whether an imported head still needs reconciling; `dirty` \
+                lists paths edited outside the capture tools, since a `bash` command is not \
+                captured automatically; `fetch` imports another machine's graph; `reconcile` \
+                folds imported heads into the local thread; `push` publishes the local graph; \
+                `verify` checks that every node's snapshot ref is present and correct; `mark` \
+                freezes a point as a named checkpoint; `rewind` reverts a thread to an earlier \
+                point; `export` projects marked points into Git commits on a branch; `publish` \
+                and `fetch_branch` move that branch to and from a remote; `join` merges two \
+                threads into a two-parent node; `resolve` records a conflict resolved by hand \
+                the same way, taking the conflicted paths from the workspace."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -2620,6 +2627,34 @@ mod tests {
             leftover.is_empty(),
             "a timed-out sandboxed command must not survive: {leftover}"
         );
+    }
+
+    #[test]
+    fn vcs_tool_description_covers_every_action() {
+        let tool = VcsTool {
+            cwd: PathBuf::from("."),
+        };
+        let description = tool.definition().description;
+        for action in [
+            "status",
+            "fetch",
+            "reconcile",
+            "push",
+            "verify",
+            "mark",
+            "rewind",
+            "export",
+            "publish",
+            "fetch_branch",
+            "join",
+            "resolve",
+            "dirty",
+        ] {
+            assert!(
+                description.contains(action),
+                "the vcs tool description must mention `{action}`: {description}"
+            );
+        }
     }
 
     #[tokio::test]
