@@ -67,16 +67,33 @@ struct Snapshot {
 
 struct Reader {
     repository: GitRepository,
-    fingerprint: Option<Option<(SystemTime, u64)>>,
+    fingerprint: Option<Option<GraphFingerprint>>,
+}
+
+/// Combined modification fingerprint of the version 3 graph state: the header
+/// (`graph.json`) and the append-only node journal (`nodes.jsonl`). Either
+/// changing means the rendered graph may differ.
+type GraphFingerprint = ((SystemTime, u64), (SystemTime, u64));
+
+/// Modification fingerprint of a state file, or `None` when it does not exist.
+fn file_fingerprint(path: &std::path::Path) -> anyhow::Result<Option<(SystemTime, u64)>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some((metadata.modified()?, metadata.len()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 impl Reader {
     fn read(&mut self) -> anyhow::Result<Option<Snapshot>> {
-        let path = self.repository.git_dir().join("juto/change-graph.json");
-        let fingerprint = match std::fs::metadata(path) {
-            Ok(metadata) => Some((metadata.modified()?, metadata.len())),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
+        let directory = self.repository.git_dir().join("juto");
+        let fingerprint = match file_fingerprint(&directory.join("graph.json"))? {
+            Some(header) => {
+                let nodes = file_fingerprint(&directory.join("nodes.jsonl"))?
+                    .unwrap_or((SystemTime::UNIX_EPOCH, 0));
+                Some((header, nodes))
+            }
+            None => None,
         };
         if self.fingerprint == Some(fingerprint) {
             return Ok(None);

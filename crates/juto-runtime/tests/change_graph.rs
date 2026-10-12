@@ -2,7 +2,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::{collections::BTreeSet, fs, path::Path, process::Command};
 
 use juto_runtime::{
-    change_graph::{ChangeGraph, EditProvenance},
+    change_graph::{ChangeGraph, EditProvenance, GcReport},
     git_transfer::GitRepository,
 };
 use tempfile::TempDir;
@@ -63,6 +63,23 @@ fn commit_count(cwd: &Path) -> usize {
     .lines()
     .filter(|line| line.split_whitespace().nth(1) == Some("commit"))
     .count()
+}
+
+/// The native graph directory inside the repository's Git directory.
+fn graph_dir(cwd: &Path) -> std::path::PathBuf {
+    GitRepository::open(cwd).unwrap().git_dir().join("juto")
+}
+
+/// Every `refs/juto/snapshots/<id>` ref currently pinned in the repository.
+fn snapshot_refs(cwd: &Path) -> BTreeSet<String> {
+    command(
+        cwd,
+        "git",
+        &["for-each-ref", "--format=%(refname)", "refs/juto/snapshots"],
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect()
 }
 
 #[test]
@@ -424,4 +441,215 @@ fn native_snapshot_refs_survive_git_gc_without_creating_commits() {
         "retained snapshot"
     );
     assert_eq!(commit_count(cwd), 1);
+}
+
+#[test]
+fn version_three_journal_roundtrips_edits_marks_and_forks() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    fs::write(cwd.join("file"), "one\n").unwrap();
+    let after = graph.snapshot_tree().unwrap();
+    let node = graph
+        .record_edit(&root.tree, &after, provenance("main"))
+        .unwrap()
+        .unwrap();
+    graph.mark(&node.id, "first", "feat: first", true).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    let child = workspaces.path().join("child");
+    graph.fork("child", "first", &child).unwrap();
+
+    let state_dir = graph_dir(cwd);
+    assert!(state_dir.join("graph.json").is_file());
+    assert!(state_dir.join("nodes.jsonl").is_file());
+    assert!(
+        !state_dir.join("change-graph.json").exists(),
+        "a version 3 graph must not keep the legacy single-file state"
+    );
+
+    // The journal is one JSON object per line, in append (topological) order.
+    let journal = fs::read_to_string(state_dir.join("nodes.jsonl")).unwrap();
+    let lines: Vec<&str> = journal
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), 2);
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.starts_with('{') && line.ends_with('}'))
+    );
+
+    drop(graph);
+    let reopened = ChangeGraph::open(cwd).unwrap();
+    let state = reopened.state().unwrap();
+    assert_eq!(state.version, 3);
+    assert_eq!(state.nodes.len(), 2);
+    assert_eq!(state.nodes[0].id, root.id);
+    assert_eq!(state.nodes[1].id, node.id);
+    assert_eq!(state.nodes[1].mark.as_ref().unwrap().name, "first");
+    assert_eq!(state.heads["main"], node.id);
+    assert_eq!(state.heads["child"], node.id);
+    assert_eq!(state.checkpoints["first"], node.id);
+    assert_eq!(ChangeGraph::open(&child).unwrap().thread(), Some("child"));
+}
+
+#[test]
+fn version_two_state_migrates_to_the_journal_layout() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    graph.mark(&root.id, "base", "feat: base", true).unwrap();
+    let mut legacy = graph.state().unwrap();
+    drop(graph);
+
+    // Downgrade the on-disk graph to the version 2 single-file layout.
+    let state_dir = graph_dir(cwd);
+    fs::remove_file(state_dir.join("graph.json")).unwrap();
+    fs::remove_file(state_dir.join("nodes.jsonl")).unwrap();
+    legacy.version = 2;
+    fs::write(
+        state_dir.join("change-graph.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+
+    let migrated = ChangeGraph::open(cwd).unwrap();
+    let state = migrated.state().unwrap();
+    assert_eq!(state.version, 3);
+    assert_eq!(state.nodes.len(), 1);
+    assert_eq!(state.nodes[0].id, root.id);
+    assert_eq!(state.nodes[0].mark.as_ref().unwrap().name, "base");
+    assert_eq!(state.heads["main"], root.id);
+    assert_eq!(state.checkpoints["base"], root.id);
+    assert!(state_dir.join("graph.json").is_file());
+    assert!(state_dir.join("nodes.jsonl").is_file());
+    assert!(
+        !state_dir.join("change-graph.json").exists(),
+        "migration must retire the legacy file once version 3 is durable"
+    );
+
+    // The migrated graph keeps working end to end.
+    fs::write(cwd.join("after"), "after\n").unwrap();
+    let next = migrated.capture("main", provenance("next"), None).unwrap();
+    assert_eq!(next.parents, vec![root.id.clone()]);
+    assert_eq!(migrated.state().unwrap().nodes.len(), 2);
+}
+
+#[test]
+fn gc_prunes_abandoned_thread_nodes_and_releases_their_snapshot_refs() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    graph.mark(&root.id, "base", "feat: base", true).unwrap();
+
+    // A side thread forks from the checkpoint and records a live point.
+    let workspaces = tempfile::tempdir().unwrap();
+    let side_dir = workspaces.path().join("side");
+    graph.fork("side", "base", &side_dir).unwrap();
+    let side = ChangeGraph::open(&side_dir).unwrap();
+    fs::write(side_dir.join("side"), "side\n").unwrap();
+    let abandoned = side.capture("side", provenance("side"), None).unwrap();
+
+    // Re-basing the side thread onto the checkpoint abandons its earlier tip.
+    fs::write(side_dir.join("side"), "side rebased\n").unwrap();
+    let rebased = side
+        .capture("side", provenance("side"), Some(vec![root.id.clone()]))
+        .unwrap();
+    assert_eq!(rebased.parents, vec![root.id.clone()]);
+
+    let refs = snapshot_refs(cwd);
+    assert!(refs.contains(&format!("refs/juto/snapshots/{}", abandoned.id)));
+    assert!(refs.contains(&format!("refs/juto/snapshots/{}", root.id)));
+
+    let report = graph.gc().unwrap();
+    assert_eq!(
+        report,
+        GcReport {
+            pruned_nodes: 1,
+            retained_nodes: 2,
+            released_refs: 1,
+        }
+    );
+
+    let refs = snapshot_refs(cwd);
+    assert!(!refs.contains(&format!("refs/juto/snapshots/{}", abandoned.id)));
+    assert!(refs.contains(&format!("refs/juto/snapshots/{}", root.id)));
+    assert!(refs.contains(&format!("refs/juto/snapshots/{}", rebased.id)));
+    // The baseline anchors are not nodes and must never be released.
+    assert!(refs.contains("refs/juto/snapshots/base"));
+    assert!(refs.contains("refs/juto/snapshots/base-tree"));
+
+    let state = graph.state().unwrap();
+    assert_eq!(state.nodes.len(), 2);
+    assert!(state.nodes.iter().all(|node| node.id != abandoned.id));
+    assert_eq!(state.heads["main"], root.id);
+    assert_eq!(state.heads["side"], rebased.id);
+    assert_eq!(state.checkpoints["base"], root.id);
+
+    // The surviving graph still exports and reloads.
+    let reopened = ChangeGraph::open(cwd).unwrap();
+    assert_eq!(reopened.state().unwrap().nodes.len(), 2);
+    assert!(reopened.export("base", "feature/base").is_ok());
+}
+
+#[test]
+fn gc_is_a_no_op_when_every_node_is_reachable() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    graph.mark(&root.id, "base", "feat: base", true).unwrap();
+    fs::write(cwd.join("next"), "next\n").unwrap();
+    let next = graph.capture("main", provenance("next"), None).unwrap();
+
+    let state_dir = graph_dir(cwd);
+    let before = fs::read(state_dir.join("nodes.jsonl")).unwrap();
+    let report = graph.gc().unwrap();
+    assert_eq!(
+        report,
+        GcReport {
+            pruned_nodes: 0,
+            retained_nodes: 2,
+            released_refs: 0,
+        }
+    );
+    assert_eq!(
+        fs::read(state_dir.join("nodes.jsonl")).unwrap(),
+        before,
+        "a no-op sweep must not rewrite the journal"
+    );
+    assert_eq!(graph.state().unwrap().nodes.len(), 2);
+    assert!(snapshot_refs(cwd).contains(&format!("refs/juto/snapshots/{}", next.id)));
+}
+
+#[test]
+fn fork_survives_a_stale_pending_fork_entry() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+
+    // A crashed provision left a directory behind that cannot be reclaimed.
+    let stale = graph_dir(cwd).join("forks").join("pending-crashed");
+    fs::create_dir_all(stale.join("locked")).unwrap();
+    fs::write(stale.join("locked").join("file"), "x").unwrap();
+    let mut locked = fs::metadata(stale.join("locked")).unwrap().permissions();
+    locked.set_mode(0o500);
+    fs::set_permissions(stale.join("locked"), locked).unwrap();
+
+    let workspaces = tempfile::tempdir().unwrap();
+    let child = workspaces.path().join("child");
+    graph.fork("child", &root.id, &child).unwrap();
+    assert!(child.join(".juto-workspace.json").is_file());
+    assert_eq!(ChangeGraph::open(&child).unwrap().thread(), Some("child"));
+    assert_eq!(graph.state().unwrap().heads["child"], root.id);
+
+    // Restore permissions so the temporary directory can be cleaned up.
+    let mut open = fs::metadata(stale.join("locked")).unwrap().permissions();
+    open.set_mode(0o700);
+    fs::set_permissions(stale.join("locked"), open).unwrap();
 }
