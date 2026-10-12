@@ -1083,3 +1083,287 @@ fn export_leaves_head_index_and_worktree_untouched() {
         "worktree contents must not change"
     );
 }
+
+/// Mirror of the pending-file naming in `git_transfer` so a test can plant a
+/// crashed creator's registry entry at the exact path the implementation uses.
+fn pending_name(destination: &Path) -> String {
+    let name: String = destination
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let absolute = std::path::absolute(destination).unwrap();
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in absolute.as_os_str().as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("fork-{name}-{hash:016x}")
+}
+
+/// Write a pending-fork registry entry the way a crashed creator would.
+fn plant_pending(git_dir: &Path, destination: &Path, thread: &str) -> PathBuf {
+    let forks = git_dir.join("juto/forks");
+    fs::create_dir_all(&forks).unwrap();
+    let pending = forks.join(pending_name(destination));
+    fs::write(
+        &pending,
+        format!(
+            "{{\"destination\":\"{}\",\"thread\":\"{thread}\"}}",
+            destination.display()
+        ),
+    )
+    .unwrap();
+    pending
+}
+
+#[test]
+fn fork_workspace_streams_regular_exec_and_symlink_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+
+    // A large blob exercises the streaming path: content must round-trip
+    // byte-for-byte without ever being buffered whole.
+    let large: Vec<u8> = (0..2 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    write_file(&dir.join("large.bin"), &large);
+    write_file(&dir.join("plain.txt"), b"plain\n");
+    write_file(&dir.join("script.sh"), b"#!/bin/sh\nexit 0\n");
+    set_executable(&dir.join("script.sh"));
+    symlink("plain.txt", dir.join("alias")).unwrap();
+    for i in 0..64 {
+        write_file(
+            &dir.join(format!("many/f{i}.txt")),
+            format!("file {i}\n").as_bytes(),
+        );
+    }
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let tree = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    let destination = temp.path().join("fork");
+    repository
+        .fork_workspace(&tree, &destination, "thread-1")
+        .unwrap();
+
+    assert_eq!(fs::read(destination.join("large.bin")).unwrap(), large);
+    assert_eq!(fs::read(destination.join("plain.txt")).unwrap(), b"plain\n");
+    assert_eq!(
+        fs::read(destination.join("script.sh")).unwrap(),
+        b"#!/bin/sh\nexit 0\n"
+    );
+    assert_eq!(
+        fs::metadata(destination.join("script.sh"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::read_link(destination.join("alias")).unwrap(),
+        PathBuf::from("plain.txt")
+    );
+    for i in 0..64 {
+        assert_eq!(
+            fs::read(destination.join(format!("many/f{i}.txt"))).unwrap(),
+            format!("file {i}\n").as_bytes()
+        );
+    }
+}
+
+#[test]
+fn release_snapshot_removes_ref_and_reports_absence() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"a\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let tree = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    repository.retain_snapshot("keep", &tree).unwrap();
+    assert_eq!(
+        git_at(&git_dir, &["rev-parse", "refs/juto/snapshots/keep"]),
+        tree
+    );
+
+    assert!(repository.release_snapshot("keep").unwrap());
+    assert_eq!(
+        git_status(
+            &git_dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                "refs/juto/snapshots/keep"
+            ]
+        )
+        .code(),
+        Some(1),
+        "the snapshot ref must be gone"
+    );
+    // Releasing again reports that nothing was there.
+    assert!(!repository.release_snapshot("keep").unwrap());
+
+    // The id is validated exactly like `retain_snapshot`.
+    assert!(repository.release_snapshot("").is_err());
+    assert!(repository.release_snapshot("nested/id").is_err());
+    assert!(repository.release_snapshot("../escape").is_err());
+}
+
+#[test]
+fn cleanup_orphaned_forks_reclaims_crashed_fork_and_allows_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"a\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let tree = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    // Simulate a crash between `create_dir` and the marker write: a partial
+    // directory plus a registry entry, no marker.
+    let destination = temp.path().join("fork");
+    fs::create_dir_all(destination.join("partial")).unwrap();
+    write_file(&destination.join("partial/left.txt"), b"left\n");
+    let pending = plant_pending(&git_dir, &destination, "thread-1");
+
+    let reclaimed = repository.cleanup_orphaned_forks().unwrap();
+    assert_eq!(reclaimed, vec![destination.clone()]);
+    assert!(
+        !destination.exists(),
+        "the orphaned directory must be removed"
+    );
+    assert!(!pending.exists(), "the pending record must be removed");
+
+    // A fresh fork at the reclaimed destination now succeeds.
+    repository
+        .fork_workspace(&tree, &destination, "thread-1")
+        .unwrap();
+    assert_eq!(fs::read(destination.join("a.txt")).unwrap(), b"a\n");
+
+    // A repository with no registry directory has nothing to reclaim.
+    let fresh = repo(&temp, "fresh");
+    let fresh_repository = GitRepository::open(&fresh).unwrap();
+    assert!(
+        fresh_repository
+            .cleanup_orphaned_forks()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn fork_workspace_reclaims_registered_orphan() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"a\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let tree = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    // A crashed creator left a partial directory and its registry entry.
+    let destination = temp.path().join("fork");
+    fs::create_dir_all(destination.join("partial")).unwrap();
+    write_file(&destination.join("partial/left.txt"), b"left\n");
+    let pending = plant_pending(&git_dir, &destination, "thread-1");
+
+    // The retry reclaims the orphan in place and materializes the tree.
+    repository
+        .fork_workspace(&tree, &destination, "thread-1")
+        .unwrap();
+    assert_eq!(fs::read(destination.join("a.txt")).unwrap(), b"a\n");
+    assert!(
+        !destination.join("partial").exists(),
+        "the orphaned contents must be gone"
+    );
+    assert!(destination.join(".juto-workspace.json").exists());
+    assert!(
+        !pending.exists(),
+        "the pending record must be cleared on success"
+    );
+}
+
+#[test]
+fn cleanup_orphaned_forks_preserves_completed_fork() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"a\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let tree = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    // A completed fork whose pending delete was lost: the marker is present.
+    let destination = temp.path().join("fork");
+    repository
+        .fork_workspace(&tree, &destination, "thread-1")
+        .unwrap();
+    let pending = plant_pending(&git_dir, &destination, "thread-1");
+
+    let reclaimed = repository.cleanup_orphaned_forks().unwrap();
+    assert!(reclaimed.is_empty(), "a completed fork is not reclaimed");
+    assert!(destination.exists(), "a completed fork must be preserved");
+    assert!(
+        !pending.exists(),
+        "the stale pending record must still be cleared"
+    );
+}
+
+#[test]
+fn cleanup_orphaned_forks_skips_live_fork() {
+    use fs2::FileExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"a\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+
+    let destination = temp.path().join("fork");
+    fs::create_dir_all(&destination).unwrap();
+    let pending = plant_pending(&git_dir, &destination, "thread-1");
+
+    // Hold the exclusive lock the way a live fork would.
+    let live = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pending)
+        .unwrap();
+    live.lock_exclusive().unwrap();
+
+    let reclaimed = repository.cleanup_orphaned_forks().unwrap();
+    assert!(reclaimed.is_empty(), "a live fork must not be reclaimed");
+    assert!(
+        destination.exists(),
+        "a live fork's directory must be preserved"
+    );
+    assert!(
+        pending.exists(),
+        "a live fork's pending record must be preserved"
+    );
+
+    // Once the creator is gone, the same record is reclaimed.
+    drop(live);
+    let reclaimed = repository.cleanup_orphaned_forks().unwrap();
+    assert_eq!(reclaimed, vec![destination.clone()]);
+    assert!(!destination.exists());
+    assert!(!pending.exists());
+}

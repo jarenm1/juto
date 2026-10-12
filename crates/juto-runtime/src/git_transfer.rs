@@ -18,15 +18,16 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsStr;
-use std::fs;
-use std::io::Write;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -114,6 +115,18 @@ pub struct ExportResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceLink {
     git_dir: PathBuf,
+    thread: String,
+}
+
+/// The on-disk contents of a pending-fork registry entry.
+///
+/// One file per in-flight [`GitRepository::fork_workspace`] call lives under
+/// `<git-dir>/juto/forks`. The file is held under an exclusive `flock` for the
+/// whole materialization, so a crashed creator leaves an unlocked file that
+/// [`GitRepository::cleanup_orphaned_forks`] can reclaim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingFork {
+    destination: PathBuf,
     thread: String,
 }
 
@@ -317,14 +330,21 @@ impl GitRepository {
     /// Materialize `tree` into a brand-new independent workspace at
     /// `destination` and link it back to this repository.
     ///
-    /// The tree is walked with `git ls-tree -r -z` and every blob is written
-    /// directly with `git cat-file`, preserving binary contents, executable
-    /// bits, and symlinks. No checkout, index, or branch is created; the fork
-    /// shares this repository's object store through the marker. `destination`
-    /// must not exist: it is created atomically with `create_dir` (which fails
-    /// if anything is already there), so a preexisting directory is never
-    /// touched or removed. A gitlink (submodule) entry is refused rather than
-    /// faked.
+    /// The tree is walked with `git ls-tree -r -z` and every blob is streamed
+    /// out of a single `git cat-file --batch` child, preserving binary
+    /// contents, executable bits, and symlinks. No checkout, index, or branch
+    /// is created; the fork shares this repository's object store through the
+    /// marker. `destination` must not exist: it is created atomically with
+    /// `create_dir` (which fails if anything is already there), so a
+    /// preexisting directory is never touched or removed. A gitlink (submodule)
+    /// entry is refused rather than faked.
+    ///
+    /// The fork is registered under `<git-dir>/juto/forks` before the
+    /// destination is created and the registry entry is held under an exclusive
+    /// lock for the whole materialization. A crash between `create_dir` and the
+    /// marker write therefore leaves a reclaimable record instead of an
+    /// orphaned directory that blocks every retry; see
+    /// [`GitRepository::cleanup_orphaned_forks`].
     pub fn fork_workspace(&self, tree: &str, destination: &Path, thread: &str) -> Result<()> {
         if thread.is_empty() {
             bail!("fork thread name is empty");
@@ -344,30 +364,114 @@ impl GitRepository {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
-        // Atomic: fails with `AlreadyExists` instead of racing an `exists` check.
-        fs::create_dir(destination).with_context(|| {
-            format!(
-                "failed to create the fork directory {} (it must not already exist)",
+
+        let forks = self.forks_directory();
+        fs::create_dir_all(&forks)
+            .with_context(|| format!("failed to create {}", forks.display()))?;
+        let pending_path = forks.join(pending_fork_name(destination));
+        // Whether a crashed creator already registered this destination. Only a
+        // pre-existing record may be reclaimed; an unregistered directory is
+        // never touched.
+        let pending_existed = pending_path.exists();
+        let pending = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&pending_path)
+            .with_context(|| format!("failed to open {}", pending_path.display()))?;
+        // The exclusive lock is the liveness signal: a free lock means any
+        // leftover directory belongs to a dead creator and may be reclaimed; a
+        // held lock means another fork is still materializing here.
+        if pending.try_lock_exclusive().is_err() {
+            bail!(
+                "fork destination {} is already being created",
                 destination.display()
-            )
-        })?;
-        let materialized = self.materialize_tree(&listing.stdout, destination, thread);
-        if materialized.is_err() {
-            // Only ever removes the directory this call just created.
-            let _ = fs::remove_dir_all(destination);
+            );
         }
-        materialized
+        write_pending(
+            &pending,
+            &PendingFork {
+                destination: absolute_destination(destination),
+                thread: thread.to_string(),
+            },
+        )?;
+
+        // Atomic: fails with `AlreadyExists` instead of racing an `exists` check.
+        match fs::create_dir(destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // We hold the lock, so no live fork owns this path. A leftover
+                // directory is reclaimed only when it is a genuine orphan: it
+                // was registered by a crashed creator and carries no success
+                // marker. Anything else is refused untouched.
+                if pending_existed
+                    && destination.is_dir()
+                    && !destination.join(WORKSPACE_MARKER).exists()
+                {
+                    fs::remove_dir_all(destination).with_context(|| {
+                        format!(
+                            "failed to remove the orphaned fork {}",
+                            destination.display()
+                        )
+                    })?;
+                    fs::create_dir(destination).with_context(|| {
+                        format!(
+                            "failed to create the fork directory {} (it must not already exist)",
+                            destination.display()
+                        )
+                    })?;
+                } else {
+                    let _ = fs::remove_file(&pending_path);
+                    bail!(
+                        "failed to create the fork directory {} (it must not already exist)",
+                        destination.display()
+                    );
+                }
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&pending_path);
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create the fork directory {} (it must not already exist)",
+                        destination.display()
+                    )
+                });
+            }
+        }
+
+        let materialized = self.materialize_tree(&listing.stdout, destination, thread);
+        match materialized {
+            Ok(()) => {
+                // The marker is the durable record; the pending file is done.
+                let _ = fs::remove_file(&pending_path);
+                Ok(())
+            }
+            Err(error) => {
+                // Only ever removes the directory this call just created.
+                let _ = fs::remove_dir_all(destination);
+                let _ = fs::remove_file(&pending_path);
+                Err(error)
+            }
+        }
+    }
+
+    /// The pending-fork registry directory, alongside the change graph's state.
+    fn forks_directory(&self) -> PathBuf {
+        self.git_dir.join("juto").join("forks")
     }
 
     /// Write every `git ls-tree -r -z` entry into `destination` and add the
     /// workspace marker.
     fn materialize_tree(&self, listing: &[u8], destination: &Path, thread: &str) -> Result<()> {
+        let mut batch = BatchCatFile::spawn(self)?;
         for entry in listing.split(|byte| *byte == 0) {
             if entry.is_empty() {
                 continue;
             }
-            self.materialize_entry(entry, destination)?;
+            self.materialize_entry(entry, destination, &mut batch)?;
         }
+        drop(batch);
         let link = WorkspaceLink {
             git_dir: self.git_dir.clone(),
             thread: thread.to_string(),
@@ -415,6 +519,86 @@ impl GitRepository {
         let full = self.resolve_object(object)?;
         self.run_trimmed(&["update-ref", refname.as_str(), full.as_str()])?;
         Ok(())
+    }
+
+    /// Release a snapshot pinned by [`GitRepository::retain_snapshot`].
+    ///
+    /// Deletes `refs/juto/snapshots/<id>` so Git garbage collection may prune
+    /// the object once nothing else references it. The id is validated exactly
+    /// like [`GitRepository::retain_snapshot`]. Returns `true` when the ref
+    /// existed and was removed, `false` when it was already absent.
+    pub fn release_snapshot(&self, id: &str) -> Result<bool> {
+        if id.is_empty() {
+            bail!("snapshot id is empty");
+        }
+        if id.contains('/') {
+            bail!("snapshot id must be a single ref component: {id:?}");
+        }
+        let refname = format!("refs/juto/snapshots/{id}");
+        self.validate_ref(&refname)?;
+        if self
+            .run_opt(&["rev-parse", "--verify", "--quiet", refname.as_str()])?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        self.run_trimmed(&["update-ref", "-d", refname.as_str()])?;
+        Ok(true)
+    }
+
+    /// Reclaim fork directories left behind by a crashed
+    /// [`GitRepository::fork_workspace`].
+    ///
+    /// Every in-flight fork holds an exclusive lock on its pending file under
+    /// `<git-dir>/juto/forks`. A pending file whose lock is free belongs to a
+    /// dead creator: its destination directory is removed (unless the success
+    /// marker is present, meaning the fork completed and only the pending
+    /// delete was lost) and the pending file is deleted. Returns the reclaimed
+    /// destination paths. A missing registry directory is not an error.
+    pub fn cleanup_orphaned_forks(&self) -> Result<Vec<PathBuf>> {
+        let forks = self.forks_directory();
+        let entries = match fs::read_dir(&forks) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", forks.display()));
+            }
+        };
+        let mut reclaimed = Vec::new();
+        for entry in entries {
+            let path = entry
+                .with_context(|| format!("failed to read {}", forks.display()))?
+                .path();
+            if !path.is_file() {
+                continue;
+            }
+            let file = match OpenOptions::new().read(true).write(true).open(&path) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            // A held lock means the creator is still running: leave it alone.
+            if file.try_lock_exclusive().is_err() {
+                continue;
+            }
+            let raw = match fs::read(&path) {
+                Ok(raw) => raw,
+                Err(_) => continue,
+            };
+            let Ok(record) = serde_json::from_slice::<PendingFork>(&raw) else {
+                continue;
+            };
+            if !record.destination.join(WORKSPACE_MARKER).exists() && record.destination.exists() {
+                fs::remove_dir_all(&record.destination).with_context(|| {
+                    format!(
+                        "failed to remove the orphaned fork {}",
+                        record.destination.display()
+                    )
+                })?;
+                reclaimed.push(record.destination);
+            }
+            let _ = fs::remove_file(&path);
+        }
+        Ok(reclaimed)
     }
 
     /// Materialize `plan` as Git commits and move `branch` to the plan tip.
@@ -734,8 +918,14 @@ impl GitRepository {
         Ok(())
     }
 
-    /// Write one `git ls-tree -r -z` entry into `destination`.
-    fn materialize_entry(&self, entry: &[u8], destination: &Path) -> Result<()> {
+    /// Write one `git ls-tree -r -z` entry into `destination`, streaming blob
+    /// content out of the shared `batch` child.
+    fn materialize_entry(
+        &self,
+        entry: &[u8],
+        destination: &Path,
+        batch: &mut BatchCatFile,
+    ) -> Result<()> {
         let tab = entry
             .iter()
             .position(|byte| *byte == b'\t')
@@ -772,9 +962,16 @@ impl GitRepository {
                         relative.display()
                     );
                 }
-                let bytes = self.read_blob(oid)?;
-                fs::write(&target, &bytes)
+                // Stream straight into the file: a large blob is never buffered
+                // whole in memory.
+                let file = fs::File::create(&target)
+                    .with_context(|| format!("failed to create {}", target.display()))?;
+                let mut writer = std::io::BufWriter::new(file);
+                batch.stream_blob(oid, &mut writer)?;
+                writer
+                    .flush()
                     .with_context(|| format!("failed to write {}", target.display()))?;
+                drop(writer);
                 let permissions = if mode == "100755" { 0o755 } else { 0o644 };
                 fs::set_permissions(&target, fs::Permissions::from_mode(permissions))
                     .with_context(|| format!("failed to chmod {}", target.display()))?;
@@ -786,7 +983,8 @@ impl GitRepository {
                         relative.display()
                     );
                 }
-                let bytes = self.read_blob(oid)?;
+                // Symlink targets are small, so reading the blob is fine.
+                let bytes = batch.read_blob(oid)?;
                 std::os::unix::fs::symlink(OsStr::from_bytes(&bytes), &target)
                     .with_context(|| format!("failed to create symlink {}", target.display()))?;
             }
@@ -800,20 +998,6 @@ impl GitRepository {
             ),
         }
         Ok(())
-    }
-
-    fn read_blob(&self, oid: &str) -> Result<Vec<u8>> {
-        let output = self
-            .git(&["cat-file", "blob", oid])
-            .output()
-            .context("failed to run `git cat-file`")?;
-        if !output.status.success() {
-            bail!(
-                "`git cat-file blob {oid}` failed: {}",
-                describe_failure(&output)
-            );
-        }
-        Ok(output.stdout)
     }
 
     /// Build a Git command addressed at this repository with a sanitized
@@ -1168,6 +1352,178 @@ fn sanitize(command: &mut Command) {
     for name in SANITIZED_ENV {
         command.env_remove(name);
     }
+}
+
+/// A single long-lived `git cat-file --batch` child used to stream every blob
+/// in a tree listing.
+///
+/// One process serves the whole fork instead of one `git cat-file` per file,
+/// and content is streamed straight into the destination file so a large blob
+/// is never buffered whole in memory. The child is killed on drop.
+struct BatchCatFile {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl BatchCatFile {
+    /// Spawn `git cat-file --batch` against `repository`.
+    fn spawn(repository: &GitRepository) -> Result<Self> {
+        let mut child = repository
+            .git(&["cat-file", "--batch"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("failed to spawn `git cat-file --batch`")?;
+        let stdin = child
+            .stdin
+            .take()
+            .context("`git cat-file --batch` stdin was not piped")?;
+        let stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .context("`git cat-file --batch` stdout was not piped")?,
+        );
+        Ok(Self {
+            child,
+            stdin,
+            stdout,
+        })
+    }
+
+    /// Request `oid` and return the blob's size, leaving the reader positioned
+    /// at the first content byte.
+    fn request(&mut self, oid: &str) -> Result<u64> {
+        self.stdin
+            .write_all(oid.as_bytes())
+            .and_then(|()| self.stdin.write_all(b"\n"))
+            .and_then(|()| self.stdin.flush())
+            .context("failed to write to `git cat-file --batch` stdin")?;
+        let mut header = String::new();
+        let read = self
+            .stdout
+            .read_line(&mut header)
+            .context("failed to read from `git cat-file --batch` stdout")?;
+        if read == 0 {
+            bail!("`git cat-file --batch` closed its output unexpectedly");
+        }
+        let header = header.trim_end_matches(['\n', '\r']);
+        let mut fields = header.split(' ');
+        let echoed = fields.next().unwrap_or_default();
+        let kind = fields.next().unwrap_or_default();
+        if kind == "missing" {
+            bail!("object {oid} is missing from the object store");
+        }
+        if echoed != oid {
+            bail!("`git cat-file --batch` returned {echoed:?} for {oid:?}");
+        }
+        if kind != "blob" {
+            bail!("object {oid} is a {kind}, not a blob");
+        }
+        fields
+            .next()
+            .context("`git cat-file --batch` header is missing a size")?
+            .parse::<u64>()
+            .with_context(|| format!("invalid `git cat-file --batch` size for {oid}"))
+    }
+
+    /// Stream the blob `oid` into `sink` without buffering it whole.
+    fn stream_blob(&mut self, oid: &str, sink: &mut impl Write) -> Result<()> {
+        let size = self.request(oid)?;
+        let mut limited = self.stdout.by_ref().take(size);
+        let copied = std::io::copy(&mut limited, sink)
+            .with_context(|| format!("failed to stream blob {oid}"))?;
+        if copied != size {
+            bail!("blob {oid} ended after {copied} of {size} bytes");
+        }
+        self.consume_trailer(oid)
+    }
+
+    /// Read the blob `oid` into memory (used for small symlink targets).
+    fn read_blob(&mut self, oid: &str) -> Result<Vec<u8>> {
+        let size = self.request(oid)?;
+        let mut bytes = vec![0u8; size as usize];
+        self.stdout
+            .read_exact(&mut bytes)
+            .with_context(|| format!("failed to read blob {oid}"))?;
+        self.consume_trailer(oid)?;
+        Ok(bytes)
+    }
+
+    /// Consume the trailing newline `--batch` writes after each object.
+    fn consume_trailer(&mut self, oid: &str) -> Result<()> {
+        let mut newline = [0u8; 1];
+        self.stdout
+            .read_exact(&mut newline)
+            .with_context(|| format!("failed to read the trailer for blob {oid}"))?;
+        if newline[0] != b'\n' {
+            bail!("`git cat-file --batch` did not terminate blob {oid} with a newline");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BatchCatFile {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// The absolute form of `destination`, used for the pending record and hash.
+fn absolute_destination(destination: &Path) -> PathBuf {
+    std::path::absolute(destination).unwrap_or_else(|_| destination.to_path_buf())
+}
+
+/// Deterministic pending-file name for `destination`: a sanitized file name
+/// plus a 64-bit FNV-1a hash of the absolute destination path.
+fn pending_fork_name(destination: &Path) -> String {
+    let name = destination
+        .file_name()
+        .map(|name| {
+            name.to_string_lossy()
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "fork".to_string());
+    let hash = fnv64(absolute_destination(destination).as_os_str().as_bytes());
+    format!("fork-{name}-{hash:016x}")
+}
+
+/// FNV-1a 64-bit hash, used only to disambiguate pending-file names.
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Truncate and rewrite a pending-fork registry file.
+fn write_pending(file: &fs::File, record: &PendingFork) -> Result<()> {
+    let bytes = serde_json::to_vec(record).context("failed to encode the pending fork record")?;
+    let mut handle = file;
+    handle
+        .set_len(0)
+        .context("failed to truncate the pending fork record")?;
+    handle
+        .write_all(&bytes)
+        .context("failed to write the pending fork record")?;
+    handle
+        .flush()
+        .context("failed to flush the pending fork record")?;
+    Ok(())
 }
 
 /// Discover an ordinary Git worktree with `git rev-parse`.
