@@ -109,13 +109,26 @@ The provider list and login details scroll independently in compact windows.
 
 The model picker (Ctrl-M) and `juto-cli models` show only chat models with an
 implemented transport and a stored or nonempty environment credential for their
-provider. Roles and recent selections cannot bypass this filter. Unauthenticated
+provider. Role selections cannot bypass this filter. Unauthenticated
 local models are not included in this connected-only view; explicit CLI/session
 model selectors remain available. With no connections, the picker offers
 **Manage providers…** rather than fabricated fallback models.
 
+The picker groups models by provider and shows context windows, role badges,
+and tok/s and DeepSWE columns (`n/a` when data is unavailable). Its role
+assignment summary includes unassigned roles; only connected targets are
+selectable. Use search, Up/Down and Enter, or click a model or assigned role.
+Escape and the close button return to chat; **Manage providers…** opens login.
+
+The centered dialog fits the window up to 900×660. In narrow windows it hides
+secondary model IDs and stacks role badges, keeping the metrics, role summary,
+and controls visible. Native-window screenshots at
+[960×720](docs/screenshots/model-picker-960x720.png) and
+[560×480](docs/screenshots/model-picker-560x480.png) were captured under
+Xvfb/Mesa software Vulkan with isolated placeholder credentials for list
+rendering, not live provider authentication.
+
 The picker renders only visible rows and caches searchable model metadata.
-“Recent” contains actual selections, not a hardcoded list of older models.
 Credential changes refresh availability immediately; reopening the picker
 also picks up credentials changed outside the window.
 
