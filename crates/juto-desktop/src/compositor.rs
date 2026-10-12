@@ -14,10 +14,13 @@ use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::text_input::{TextInputManagerState, TextInputUserData};
+use smithay::backend::egl::native::EGLSurfacelessDisplay;
+use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::{Axis, ButtonState, KeyState};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::pixman::PixmanRenderer;
 use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_handler};
-use smithay::backend::renderer::{Bind, Color32F, Frame, Renderer};
+use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer};
 use smithay::desktop::Window;
 use smithay::desktop::space::Space;
 use smithay::input::keyboard::{FilterResult, KeyboardHandle, Keycode, XkbConfig};
@@ -44,7 +47,7 @@ use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, Display, GlobalDispatch, ListeningSocket, New, Resource,
 };
 use smithay::utils::{
-    Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform,
+    Buffer, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform,
 };
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -75,6 +78,8 @@ pub struct CompositorConfig {
     pub height: u32,
     pub scale: u32,
     pub fps: u32,
+    /// Renderer profile requested by the environment configuration.
+    pub render_profile: crate::supervisor::RenderProfile,
     /// Absolute path of the Wayland listening socket.
     pub socket_path: PathBuf,
 }
@@ -229,6 +234,285 @@ impl Drop for Compositor {
     }
 }
 
+/// True when the host exposes at least one DRM render node.
+fn has_render_node() -> bool {
+    std::fs::read_dir("/dev/dri")
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("renderD"))
+        })
+        .unwrap_or(false)
+}
+
+/// True when the deployment declares that EGL must use Mesa software GL.
+fn software_gl_declared() -> bool {
+    [
+        "LIBGL_ALWAYS_SOFTWARE",
+        "GALLIUM_DRIVER",
+        "MESA_LOADER_DRIVER_OVERRIDE",
+    ]
+    .iter()
+    .any(|key| std::env::var_os(key).is_some())
+}
+
+/// The renderer backing the virtual output.
+///
+/// The software profile uses surfaceless EGL with Mesa software GL, falling back
+/// to pixman when EGL is unavailable; the hardware profile requires a render-node
+/// EGL device and fails explicitly rather than silently rendering on the CPU.
+#[allow(clippy::large_enum_variant)]
+enum FrameRenderer {
+    Pixman {
+        renderer: PixmanRenderer,
+        image: smithay::reexports::pixman::Image<'static, 'static>,
+    },
+    Gl {
+        renderer: GlesRenderer,
+        texture: GlesTexture,
+        buffer_size: Size<i32, Buffer>,
+    },
+}
+
+impl FrameRenderer {
+    fn new(
+        profile: crate::supervisor::RenderProfile,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, DesktopError> {
+        use crate::supervisor::RenderProfile;
+        match profile {
+            RenderProfile::Hardware => {
+                // The supervisor holds the shared advisory GPU lock for this
+                // environment's lifetime, so the default EGL device may be used
+                // directly. A render-node/GBM display is not reachable through
+                // Smithay's `EGLDisplay` on platforms without
+                // `EGL_EXT_device_enumeration`/`EGL_EXT_device_query`.
+                let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }.map_err(|e| {
+                    DesktopError::RendererUnavailable(format!("hardware EGL display: {e}"))
+                })?;
+                Self::gl(display, width, height)
+            }
+            RenderProfile::Software => {
+                // The software profile must never touch the host GPU. When a
+                // render node exists and the deployment has not declared
+                // software GL, render with pixman instead of probing the device.
+                if has_render_node() && !software_gl_declared() {
+                    tracing::info!(
+                        "a render node is present and software GL is not declared; \
+                         the software profile renders with pixman"
+                    );
+                    return Self::pixman(width, height);
+                }
+                match unsafe { EGLDisplay::new(EGLSurfacelessDisplay) } {
+                    Ok(display) => match Self::gl(display, width, height) {
+                        Ok(renderer) if renderer.is_software_gl() => Ok(renderer),
+                        Ok(renderer) => {
+                            tracing::info!(
+                                "default EGL device is not a software rasterizer; \
+                                 the software profile renders with pixman"
+                            );
+                            drop(renderer);
+                            Self::pixman(width, height)
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "software GL unavailable; falling back to the pixman renderer"
+                            );
+                            Self::pixman(width, height)
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %err,
+                            "surfaceless EGL unavailable; falling back to the pixman renderer"
+                        );
+                        Self::pixman(width, height)
+                    }
+                }
+            }
+        }
+    }
+
+    fn gl(display: EGLDisplay, width: u32, height: u32) -> Result<Self, DesktopError> {
+        let context = EGLContext::new(&display)
+            .map_err(|e| DesktopError::RendererUnavailable(format!("EGL context: {e}")))?;
+        let mut renderer = unsafe { GlesRenderer::new(context) }
+            .map_err(|e| DesktopError::RendererUnavailable(format!("GL renderer: {e}")))?;
+        let buffer_size: Size<i32, Buffer> = Size::from((width as i32, height as i32));
+        let texture: GlesTexture = renderer
+            .create_buffer(smithay::backend::allocator::Fourcc::Argb8888, buffer_size)
+            .map_err(|e| DesktopError::RendererUnavailable(format!("GL target: {e}")))?;
+        tracing::info!(width, height, "compositor using the GL renderer");
+        Ok(Self::Gl {
+            renderer,
+            texture,
+            buffer_size,
+        })
+    }
+
+    fn pixman(width: u32, height: u32) -> Result<Self, DesktopError> {
+        let renderer = PixmanRenderer::new()
+            .map_err(|e| DesktopError::Compositor(format!("pixman renderer: {e}")))?;
+        let image = smithay::reexports::pixman::Image::new(
+            smithay::reexports::pixman::FormatCode::A8R8G8B8,
+            width as usize,
+            height as usize,
+            false,
+        )
+        .map_err(|_| DesktopError::Compositor("failed to allocate render image".to_string()))?;
+        tracing::info!(width, height, "compositor using the pixman renderer");
+        Ok(Self::Pixman { renderer, image })
+    }
+
+    /// True when the active EGL device is a software rasterizer.
+    fn is_software_gl(&self) -> bool {
+        let Self::Gl { renderer, .. } = self else {
+            return false;
+        };
+        use smithay::backend::renderer::gles::ffi;
+        unsafe {
+            if renderer.egl_context().make_current().is_err() {
+                return false;
+            }
+            let gl = ffi::Gles2::load_with(|symbol| {
+                smithay::backend::egl::get_proc_address(symbol) as *const std::os::raw::c_void
+            });
+            let ptr = gl.GetString(ffi::RENDERER);
+            if ptr.is_null() {
+                return false;
+            }
+            let name = std::ffi::CStr::from_ptr(ptr as *const std::os::raw::c_char)
+                .to_string_lossy()
+                .to_lowercase();
+            ["llvmpipe", "softpipe", "swrast", "software rasterizer"]
+                .iter()
+                .any(|needle| name.contains(needle))
+        }
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<(), DesktopError> {
+        match self {
+            Self::Pixman { image, .. } => {
+                *image = smithay::reexports::pixman::Image::new(
+                    smithay::reexports::pixman::FormatCode::A8R8G8B8,
+                    width as usize,
+                    height as usize,
+                    false,
+                )
+                .map_err(|_| {
+                    DesktopError::Compositor("failed to allocate render image".to_string())
+                })?;
+                Ok(())
+            }
+            Self::Gl {
+                renderer,
+                texture,
+                buffer_size,
+            } => {
+                let size: Size<i32, Buffer> = Size::from((width as i32, height as i32));
+                *texture = renderer
+                    .create_buffer(smithay::backend::allocator::Fourcc::Argb8888, size)
+                    .map_err(|e| DesktopError::Compositor(format!("GL target: {e}")))?;
+                *buffer_size = size;
+                Ok(())
+            }
+        }
+    }
+
+    /// Composes the space and returns tightly packed ARGB8888 pixels.
+    fn compose(
+        &mut self,
+        space: &Space<Window>,
+        logical: &Rectangle<i32, Logical>,
+        physical: Size<i32, Physical>,
+        scale: u32,
+    ) -> Result<Vec<u8>, DesktopError> {
+        let damage = [Rectangle::from_size(physical)];
+        let clear = Color32F::new(0.05, 0.06, 0.09, 1.0);
+        match self {
+            Self::Pixman { renderer, image } => {
+                let elements =
+                    space.render_elements_for_region(renderer, logical, scale as f64, 1.0);
+                let mut target = renderer
+                    .bind(image)
+                    .map_err(|e| DesktopError::Compositor(format!("bind target: {e}")))?;
+                let mut frame = renderer
+                    .render(&mut target, physical, Transform::Normal)
+                    .map_err(|e| DesktopError::Compositor(format!("render: {e}")))?;
+                frame
+                    .clear(clear, &damage)
+                    .map_err(|e| DesktopError::Compositor(format!("clear: {e}")))?;
+                draw_render_elements(&mut frame, 1.0, &elements, &damage)
+                    .map_err(|e| DesktopError::Compositor(format!("draw: {e}")))?;
+                let _ = frame
+                    .finish()
+                    .map_err(|e| DesktopError::Compositor(format!("finish: {e}")))?;
+                drop(target);
+
+                let stride = image.stride();
+                let row_bytes = physical.w as usize * 4;
+                let mut pixels = vec![0u8; row_bytes * physical.h as usize];
+                let base = unsafe { image.data() };
+                if base.is_null() {
+                    return Err(DesktopError::Compositor(
+                        "pixman image has no backing store".to_string(),
+                    ));
+                }
+                for y in 0..physical.h as usize {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (base as *const u8).add(y * stride),
+                            pixels.as_mut_ptr().add(y * row_bytes),
+                            row_bytes,
+                        );
+                    }
+                }
+                Ok(pixels)
+            }
+            Self::Gl {
+                renderer,
+                texture,
+                buffer_size,
+            } => {
+                let elements =
+                    space.render_elements_for_region(renderer, logical, scale as f64, 1.0);
+                {
+                    let mut target = renderer
+                        .bind(texture)
+                        .map_err(|e| DesktopError::Compositor(format!("bind target: {e}")))?;
+                    let mut frame = renderer
+                        .render(&mut target, physical, Transform::Normal)
+                        .map_err(|e| DesktopError::Compositor(format!("render: {e}")))?;
+                    frame
+                        .clear(clear, &damage)
+                        .map_err(|e| DesktopError::Compositor(format!("clear: {e}")))?;
+                    draw_render_elements(&mut frame, 1.0, &elements, &damage)
+                        .map_err(|e| DesktopError::Compositor(format!("draw: {e}")))?;
+                    let _ = frame
+                        .finish()
+                        .map_err(|e| DesktopError::Compositor(format!("finish: {e}")))?;
+                }
+                let target = renderer
+                    .bind(texture)
+                    .map_err(|e| DesktopError::Compositor(format!("bind target: {e}")))?;
+                let mapping = renderer
+                    .copy_framebuffer(
+                        &target,
+                        Rectangle::from_size(*buffer_size),
+                        smithay::backend::allocator::Fourcc::Argb8888,
+                    )
+                    .map_err(|e| DesktopError::Compositor(format!("readback: {e}")))?;
+                let bytes = renderer
+                    .map_texture(&mapping)
+                    .map_err(|e| DesktopError::Compositor(format!("map readback: {e}")))?;
+                Ok(bytes.to_vec())
+            }
+        }
+    }
+}
+
 /// Per-client Wayland state.
 #[derive(Default)]
 struct ClientState {
@@ -267,8 +551,7 @@ struct DesktopState {
     keyboard: KeyboardHandle<Self>,
     pointer: PointerHandle<Self>,
 
-    renderer: PixmanRenderer,
-    image: smithay::reexports::pixman::Image<'static, 'static>,
+    renderer: FrameRenderer,
     pool: Arc<ShmFramePool>,
     events: std_mpsc::Sender<DesktopEvent>,
 
@@ -446,52 +729,11 @@ impl DesktopState {
         let started = Instant::now();
         let physical = Size::<i32, Physical>::from((self.width as i32, self.height as i32));
         let logical = Rectangle::from_size(self.logical_size());
-        let damage = [Rectangle::from_size(physical)];
 
-        let elements = self.space.render_elements_for_region(
-            &mut self.renderer,
-            &logical,
-            self.scale as f64,
-            1.0,
-        );
-
-        let mut target = self
+        let pixels = self
             .renderer
-            .bind(&mut self.image)
-            .map_err(|e| DesktopError::Compositor(format!("bind render target failed: {e}")))?;
-        let mut frame = self
-            .renderer
-            .render(&mut target, physical, Transform::Normal)
-            .map_err(|e| DesktopError::Compositor(format!("renderer failed: {e}")))?;
-        frame
-            .clear(Color32F::new(0.05, 0.06, 0.09, 1.0), &damage)
-            .map_err(|e| DesktopError::Compositor(format!("clear failed: {e}")))?;
-        draw_render_elements(&mut frame, 1.0, &elements, &damage)
-            .map_err(|e| DesktopError::Compositor(format!("draw failed: {e}")))?;
-        let _ = frame
-            .finish()
-            .map_err(|e| DesktopError::Compositor(format!("finish failed: {e}")))?;
-        drop(target);
-
+            .compose(&self.space, &logical, physical, self.scale)?;
         let composed_micros = started.elapsed().as_micros() as u64;
-        let stride = self.image.stride();
-        let row_bytes = self.width as usize * 4;
-        let mut pixels = vec![0u8; row_bytes * self.height as usize];
-        let base = unsafe { self.image.data() };
-        if base.is_null() {
-            return Err(DesktopError::Compositor(
-                "pixman image has no backing store".to_string(),
-            ));
-        }
-        for y in 0..self.height as usize {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    (base as *const u8).add(y * stride),
-                    pixels.as_mut_ptr().add(y * row_bytes),
-                    row_bytes,
-                );
-            }
-        }
 
         self.frame_counter = self.frame_counter.wrapping_add(1);
         let frame_id = self.frame_counter;
@@ -1060,15 +1302,7 @@ pub(crate) fn run_compositor(
     let mut space = Space::<Window>::default();
     space.map_output(&output, Point::from((0, 0)));
 
-    let renderer = PixmanRenderer::new()
-        .map_err(|e| DesktopError::Compositor(format!("failed to create pixman renderer: {e}")))?;
-    let image = smithay::reexports::pixman::Image::new(
-        smithay::reexports::pixman::FormatCode::A8R8G8B8,
-        config.width as usize,
-        config.height as usize,
-        false,
-    )
-    .map_err(|_| DesktopError::Compositor("failed to allocate render image".to_string()))?;
+    let renderer = FrameRenderer::new(config.render_profile, config.width, config.height)?;
 
     let listener = ListeningSocket::bind_absolute(config.socket_path.clone())
         .map_err(|e| DesktopError::Compositor(format!("failed to bind wayland socket: {e}")))?;
@@ -1093,7 +1327,6 @@ pub(crate) fn run_compositor(
         keyboard,
         pointer,
         renderer,
-        image,
         pool,
         events,
         env_id: config.env_id.clone(),
@@ -1241,15 +1474,7 @@ fn reconfigure(
     generation: u64,
 ) -> Result<(), DesktopError> {
     let scale = scale.max(1);
-    let image = smithay::reexports::pixman::Image::new(
-        smithay::reexports::pixman::FormatCode::A8R8G8B8,
-        width as usize,
-        height as usize,
-        false,
-    )
-    .map_err(|_| DesktopError::Compositor("failed to allocate render image".to_string()))?;
-
-    state.image = image;
+    state.renderer.resize(width, height)?;
     state.width = width;
     state.height = height;
     state.scale = scale;

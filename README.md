@@ -164,8 +164,11 @@ runtime tool, and embedded viewer.**
 virtual seat per environment — no host display, no physical input. An environment
 owns a private `XDG_RUNTIME_DIR` and Wayland socket, launches applications by
 argv into a per-environment systemd scope (`CPUQuota`, `MemoryMax`,
-`MemorySwapMax`, `TasksMax`), composes toplevels with Smithay's software (pixman)
-renderer into a sealed shared-memory frame pool, injects authorized pointer and
+`MemorySwapMax`, `TasksMax`), composes toplevels into a sealed shared-memory
+frame pool with a GLES renderer over surfaceless EGL (the `hardware` profile,
+which holds the shared advisory GPU lock for the environment lifetime) or with
+Smithay's software pixman renderer (the `software` profile, which never touches
+the host GPU), injects authorized pointer and
 keyboard input into the virtual seat, and reports mapped windows, geometry
 generations, grants, and control leases. `Destroy` terminates the application
 tree, stops the compositor, and removes the private runtime directory; it is

@@ -100,6 +100,7 @@ fn run_worker_command(args: &[String]) -> Result<(), juto_desktop::DesktopError>
     let mut height = 720u32;
     let mut scale = 1u32;
     let mut fps = 30u32;
+    let mut render_profile = juto_desktop::RenderProfile::Software;
     let mut wayland_socket = None;
     let mut control_socket = None;
     let mut index = 0;
@@ -111,6 +112,9 @@ fn run_worker_command(args: &[String]) -> Result<(), juto_desktop::DesktopError>
             "--height" => height = value.parse().unwrap_or(height),
             "--scale" => scale = value.parse().unwrap_or(scale),
             "--fps" => fps = value.parse().unwrap_or(fps),
+            "--render-profile" => {
+                render_profile = value.parse().unwrap_or(render_profile);
+            }
             "--wayland-socket" => wayland_socket = Some(PathBuf::from(value)),
             "--control-socket" => control_socket = Some(PathBuf::from(value)),
             _ => {}
@@ -130,6 +134,7 @@ fn run_worker_command(args: &[String]) -> Result<(), juto_desktop::DesktopError>
         height,
         scale,
         fps,
+        render_profile,
         wayland_socket,
         control_socket,
     })
@@ -508,6 +513,8 @@ fn error_code(err: &juto_desktop::DesktopError) -> String {
         TransportUnavailable(_) => "TransportUnavailable",
         EnvironmentFailed(_, _) => "EnvironmentFailed",
         IsolationUnavailable(_) => "IsolationUnavailable",
+        RendererUnavailable(_) => "RendererUnavailable",
+        GpuBusy => "GpuBusy",
         TextUnavailable(_) => "TextUnavailable",
         Io { .. } => "Io",
         Protocol(_) => "Protocol",

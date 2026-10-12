@@ -14,9 +14,19 @@ Implemented (verified by `cargo test -p juto-desktop`, `cargo test -p
 juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 
 - Headless Smithay compositor: one virtual output, one virtual seat, xdg-shell
-  toplevels, `wl_shm` buffers, software (pixman) composition, frame callbacks on
-  a virtual clock, and programmatic pointer/keyboard injection. No host display,
-  KMS, libinput, or physical vblank.
+  toplevels, `wl_shm` buffers, frame callbacks on a virtual clock, and
+  programmatic pointer/keyboard injection. No host display, KMS, libinput, or
+  physical vblank.
+- Renderer profiles: the `hardware` profile composes with a GLES renderer over
+  surfaceless EGL and holds the repository's shared advisory GPU lock
+  (`AGENT_GPU_LOCK`, default `$XDG_RUNTIME_DIR/jtech-agent-gpu.lock`) for the
+  environment lifetime; a second hardware environment waits a bounded 5s and is
+  rejected with `GpuBusy` rather than sharing the device. The `software` profile
+  never touches the host GPU: it uses surfaceless EGL only when the host exposes
+  no DRM render node or the deployment declares Mesa software GL
+  (`LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`, `MESA_LOADER_DRIVER_OVERRIDE`), and
+  otherwise composes with pixman. A GLES renderer that resolves to a
+  non-software device is discarded before any frame is composed.
 - Environment supervisor: admission checks, private `XDG_RUNTIME_DIR` and Wayland
   socket, argv application launch inside a per-environment systemd scope
   (`CPUQuota`, `MemoryMax`, `MemorySwapMax`, `TasksMax`), an approved environment
