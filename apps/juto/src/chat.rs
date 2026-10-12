@@ -11,7 +11,7 @@ use crate::sidebar::{Sidebar, SidebarEvent};
 use gpui::{
     App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding, MouseButton,
     MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Subscription, Task,
-    Window, actions, deferred, div, prelude::*, px, rgb,
+    Window, actions, deferred, div, prelude::*, px, rgb, rgba,
 };
 use juto_agent::{AgentEvent, RunControl, RunOutcome};
 use juto_ai::{Message as AiMessage, ProviderEvent, StopReason};
@@ -234,7 +234,7 @@ impl ChatView {
         };
         let model_picker = cx.new(|cx| {
             let mut picker =
-                ModelPicker::new(&initial_model, runtime.config(), runtime.catalog(), cx);
+                ModelPicker::new(&initial_model, &runtime.config(), runtime.catalog(), cx);
             picker.refresh_credentials(runtime.clone(), tokio_handle.clone(), cx);
             picker
         });
@@ -256,8 +256,8 @@ impl ChatView {
             &model_picker,
             window,
             |this, _, event: &ModelPickerEvent, window, cx| match event {
-                ModelPickerEvent::SelectModel(selector) => {
-                    this.set_model(selector.clone(), window, cx);
+                ModelPickerEvent::AssignRole { role, selector } => {
+                    this.assign_role(role.clone(), selector.clone(), window, cx);
                 }
                 ModelPickerEvent::Close => {
                     this.close_modal(window, cx);
@@ -367,10 +367,40 @@ impl ChatView {
         }
     }
 
+    /// Persist `selector` to `role` (`modelRoles` in the global config layer,
+    /// `model` for `default`) and update the picker. Assigning `default` also
+    /// switches the session model and closes the picker, matching the OMP
+    /// model hub; other roles keep the picker open so several roles can be
+    /// assigned in one pass.
+    fn assign_role(
+        &mut self,
+        role: String,
+        selector: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = self.runtime.set_model_role(&role, &selector) {
+            self.model_picker.update(cx, |picker, cx| {
+                picker.set_error(Some(format!("Could not assign @{role}: {error}")), cx);
+            });
+            return;
+        }
+        if role == "default" {
+            self.set_model(selector, window, cx);
+        } else {
+            self.model_picker.update(cx, |picker, cx| {
+                picker.set_error(None, cx);
+                picker.apply_assignment(&role, &selector, cx);
+            });
+            cx.notify();
+        }
+    }
+
     pub fn set_model(&mut self, selector: String, window: &mut Window, cx: &mut Context<Self>) {
         self.active_model = selector.clone().into();
         self.model_picker.update(cx, |picker, cx| {
-            picker.set_active_model(&selector, cx);
+            picker.set_error(None, cx);
+            picker.apply_assignment("default", &selector, cx);
         });
         let runtime = self.runtime.clone();
         let session = self.session.clone();
@@ -1168,6 +1198,49 @@ impl ChatView {
                 ),
         )
     }
+
+    /// The active modal's content, if any. Rendered by `modal_overlay` as a
+    /// deferred layer so the chat view stays visible behind it.
+    fn modal_content(&self) -> Option<gpui::AnyView> {
+        match self.active_modal {
+            ActiveModal::ModelPicker => Some(self.model_picker.clone().into()),
+            ActiveModal::AuthModal => Some(self.auth_modal.clone().into()),
+            ActiveModal::None => None,
+        }
+    }
+
+    /// Translucent scrim covering the chat view (gpui has no backdrop blur);
+    /// clicks outside the centered panel close the modal.
+    fn modal_overlay(&self, content: gpui::AnyView, cx: &mut Context<Self>) -> impl IntoElement {
+        deferred(
+            div()
+                .id("modal-scrim")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0x00000080))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.close_modal(window, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_, _: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .child(content),
+                ),
+        )
+        .with_priority(10)
+    }
 }
 
 fn attachment_chip(label: SharedString) -> Div {
@@ -1315,41 +1388,37 @@ impl Render for ChatView {
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.toggle_sidebar(cx);
             }))
-            .when(self.active_modal == ActiveModal::ModelPicker, |view| {
-                view.child(self.model_picker.clone())
-            })
-            .when(self.active_modal == ActiveModal::AuthModal, |view| {
-                view.child(self.auth_modal.clone())
-            })
-            .when(self.active_modal == ActiveModal::None, |view| {
-                view.child(self.header(cx)).child(
-                    div()
-                        .flex()
-                        .flex_1()
-                        .min_h_0()
-                        .w_full()
-                        .child(
+            .child(self.header(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .child(self.message_list(cx))
+                            .child(self.composer(window, cx)),
+                    )
+                    .when(self.show_sidebar, |row| {
+                        row.child(
                             div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w_0()
+                                .w(px(380.0))
+                                .flex_none()
                                 .h_full()
-                                .child(self.message_list(cx))
-                                .child(self.composer(window, cx)),
+                                .border_l_1()
+                                .border_color(rgb(0x27272a))
+                                .child(self.sidebar.clone()),
                         )
-                        .when(self.show_sidebar, |row| {
-                            row.child(
-                                div()
-                                    .w(px(380.0))
-                                    .flex_none()
-                                    .h_full()
-                                    .border_l_1()
-                                    .border_color(rgb(0x27272a))
-                                    .child(self.sidebar.clone()),
-                            )
-                        }),
-                )
+                    }),
+            )
+            .when_some(self.modal_content(), |view, content| {
+                view.child(self.modal_overlay(content, cx))
             })
     }
 }

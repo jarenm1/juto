@@ -1547,15 +1547,24 @@ impl Focusable for AuthModal {
 }
 
 impl Render for AuthModal {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .key_context("AuthModal")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::close))
             .flex()
             .flex_col()
-            .size_full()
+            .w(px(860.))
+            .max_w(window.viewport_size().width - px(48.))
+            .h(px(600.))
+            .max_h(window.viewport_size().height - px(48.))
+            .min_w_0()
+            .min_h_0()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(0x4a4a4a))
             .bg(rgb(0x141414))
+            .shadow_xl()
             .text_color(rgb(0xe4e4e7))
             .child(self.header(cx))
             .child(

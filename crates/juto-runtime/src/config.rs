@@ -332,7 +332,7 @@ fn split_effort(selector: &str) -> (&str, Option<&str>) {
 
 /// Deep merge `overlay` into `base`: mappings merge recursively, every other
 /// value (including arrays and `null` tombstones) replaces.
-fn merge_value(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
+pub(crate) fn merge_value(base: &mut serde_yaml::Value, overlay: serde_yaml::Value) {
     use serde_yaml::Value;
     match (base, overlay) {
         (Value::Mapping(base_map), Value::Mapping(overlay_map)) => {

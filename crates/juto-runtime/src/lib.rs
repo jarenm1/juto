@@ -20,6 +20,8 @@ use std::{
     time::Duration,
 };
 
+use parking_lot::{Mutex, RwLock};
+
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -74,12 +76,12 @@ pub struct Runtime {
 struct RuntimeInner {
     cwd: PathBuf,
     data_dir: PathBuf,
-    config: RuntimeConfig,
+    config: RwLock<RuntimeConfig>,
     registry: Registry,
     credentials: Arc<CredentialStore>,
     provider: Arc<dyn Provider>,
     approval: Option<Arc<dyn ApprovalHandler>>,
-    subagent_manager: std::sync::Mutex<Option<Arc<SubagentManager>>>,
+    subagent_manager: Mutex<Option<Arc<SubagentManager>>>,
 }
 pub fn default_data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("JUTO_DATA_DIR") {
@@ -143,22 +145,26 @@ impl Runtime {
             inner: Arc::new(RuntimeInner {
                 cwd,
                 data_dir,
-                config,
+                config: RwLock::new(config),
                 registry,
                 credentials,
                 provider,
                 approval,
-                subagent_manager: std::sync::Mutex::new(None),
+                subagent_manager: Mutex::new(None),
             }),
         };
-        if !runtime.inner.config.model.is_empty() {
-            runtime.resolve_model(&runtime.inner.config.model)?;
+        if !runtime.inner.config.read().model.is_empty() {
+            let model = runtime.inner.config.read().model.clone();
+            runtime.resolve_model(&model)?;
         }
         Ok(runtime)
     }
 
-    pub fn config(&self) -> &RuntimeConfig {
-        &self.inner.config
+    /// Snapshot of the layered runtime settings. Role assignments mutate the
+    /// live config through `set_model_role`; callers needing the latest values
+    /// re-read rather than holding this copy.
+    pub fn config(&self) -> RuntimeConfig {
+        self.inner.config.read().clone()
     }
     pub fn catalog(&self) -> &Registry {
         &self.inner.registry
@@ -174,26 +180,26 @@ impl Runtime {
         if selector.is_empty() {
             bail!("select a model with --model provider/model or set model in config.yml");
         }
-        let (selector, thinking) = self.inner.config.resolve_selector(selector)?;
+        let config = self.config();
+        let (selector, thinking) = config.resolve_selector(selector)?;
         let model = self.inner.registry.resolve(&selector)?.clone();
         if model.kind != "chat" && model.kind != "tiny" {
             bail!("{} is a {} model, not a chat model", model.id, model.kind);
         }
         let options = StreamOptions {
-            temperature: self.inner.config.temperature,
-            max_tokens: self.inner.config.max_tokens,
-            thinking: thinking.or_else(|| self.inner.config.thinking.clone()),
+            temperature: config.temperature,
+            max_tokens: config.max_tokens,
+            thinking: thinking.or(config.thinking),
             ..StreamOptions::default()
         };
         Ok((model, options))
     }
 
     pub fn new_session(&self) -> Result<Session> {
-        self.resolve_model(&self.inner.config.model)?;
+        let model = self.config().model;
+        self.resolve_model(&model)?;
         let mut session = Session::create(&self.inner.data_dir.join("sessions"), &self.inner.cwd)?;
-        session.append(EntryKind::ModelChange {
-            model: self.inner.config.model.clone(),
-        })?;
+        session.append(EntryKind::ModelChange { model })?;
         Ok(session)
     }
 
@@ -205,8 +211,88 @@ impl Runtime {
         Ok(())
     }
 
+    /// Assign `selector` (e.g. `provider/model`, optionally `:effort`) to a
+    /// model role: validates against the merged config, persists into the
+    /// global `data_dir/config.yml` (`modelRoles.<role>`; assigning `default`
+    /// also sets the top-level `model`, and `modelRoles.default` only when an
+    /// entry already exists), then commits the live config so later
+    /// `resolve_selector("@role")` calls honor it.
+    ///
+    /// Mirrors oh-my-pi's `/models` role assignment semantics (`modelRoles` in
+    /// the global layer). Selecting a model for `default` is the caller's cue
+    /// to also `switch_model` the session.
+    pub fn set_model_role(&self, role: &str, selector: &str) -> Result<()> {
+        let role = role.trim_start_matches('@');
+        if role.is_empty() {
+            bail!("model role name is empty");
+        }
+        let mut updated = self.config();
+        if role == "default" {
+            updated.model = selector.to_string();
+        } else {
+            updated
+                .model_roles
+                .insert(role.to_string(), selector.to_string());
+        }
+        updated
+            .validate()
+            .context("role assignment rejected by config validation")?;
+        // Reject selectors that cannot resolve to a usable chat/tiny model
+        // under the would-be config so a bad binding never hits disk.
+        let (resolved, _) = updated.resolve_selector(selector)?;
+        let model = self.inner.registry.resolve(&resolved)?.clone();
+        if model.kind != "chat" && model.kind != "tiny" {
+            bail!("{} is a {} model, not a chat model", model.id, model.kind);
+        }
+        self.persist_model_role(role, selector)?;
+        *self.inner.config.write() = updated;
+        Ok(())
+    }
+
+    /// Merge one role binding into `data_dir/config.yml` without disturbing
+    /// other layers: the project `.juto/config.yml` still overrides at load.
+    fn persist_model_role(&self, role: &str, selector: &str) -> Result<()> {
+        use serde_yaml::{Mapping, Value};
+        let path = self.inner.data_dir.join("config.yml");
+        let mut root = match std::fs::read_to_string(&path) {
+            Ok(text) if !text.trim().is_empty() => serde_yaml::from_str(&text)
+                .with_context(|| format!("parsing {}", path.display()))?,
+            Ok(_) => Value::Mapping(Mapping::new()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Value::Mapping(Mapping::new())
+            }
+            Err(source) => {
+                return Err(source).with_context(|| format!("reading {}", path.display()));
+            }
+        };
+        if !root.is_mapping() {
+            bail!("{}: top level is not a mapping", path.display());
+        }
+        let has_default_role_entry = root
+            .get("modelRoles")
+            .and_then(Value::as_mapping)
+            .is_some_and(|roles| roles.contains_key("default"));
+        let mut overlay = Mapping::new();
+        let mut roles = Mapping::new();
+        if role == "default" {
+            overlay.insert("model".into(), selector.into());
+            if has_default_role_entry {
+                roles.insert("default".into(), selector.into());
+            }
+        } else {
+            roles.insert(role.into(), selector.into());
+        }
+        if !roles.is_empty() {
+            overlay.insert("modelRoles".into(), Value::Mapping(roles));
+        }
+        config::merge_value(&mut root, Value::Mapping(overlay));
+        let text = serde_yaml::to_string(&root)
+            .with_context(|| format!("serializing {}", path.display()))?;
+        std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
+    }
+
     pub fn subagent_manager(&self, control: &RunControl) -> Arc<SubagentManager> {
-        let mut guard = self.inner.subagent_manager.lock().unwrap();
+        let mut guard = self.inner.subagent_manager.lock();
         if let Some(mgr) = &*guard {
             return mgr.clone();
         }
@@ -215,7 +301,7 @@ impl Runtime {
                 runtime: self.clone(),
                 depth: 1,
             }),
-            self.inner.config.max_concurrency,
+            self.config().max_concurrency,
             control.token(),
         ));
         *guard = Some(mgr.clone());
@@ -245,19 +331,19 @@ impl Runtime {
         if session.header().cwd != self.inner.cwd {
             bail!("session belongs to a different working directory");
         }
-        let read_only =
-            read_only || matches!(self.inner.config.approval_mode, ApprovalMode::ReadOnly);
+        let settings = self.config();
+        let read_only = read_only || matches!(settings.approval_mode, ApprovalMode::ReadOnly);
         let selector = session
             .current_model()
-            .unwrap_or_else(|| self.inner.config.model.clone());
+            .unwrap_or_else(|| settings.model.clone());
         let (model, stream_options) = self.resolve_model(&selector)?;
         let mut compaction_usage = Usage::default();
-        if self.inner.config.auto_compact {
+        if settings.auto_compact {
             let history = session.messages()?;
             let estimated = estimate_tokens(&history) + (prompt.len() as u64).div_ceil(3);
             let threshold = (model.context_window.unwrap_or(128_000) as f64
-                * self.inner.config.compaction_threshold) as u64;
-            if history.len() > self.inner.config.keep_recent_messages && estimated > threshold {
+                * settings.compaction_threshold) as u64;
+            if history.len() > settings.keep_recent_messages && estimated > threshold {
                 compaction_usage = self.compact(session, &control).await?;
             }
         }
@@ -269,21 +355,21 @@ impl Runtime {
                     runtime: self.clone(),
                     depth: depth + 1,
                 }),
-                self.inner.config.max_concurrency,
+                settings.max_concurrency,
                 control.token(),
             ))
         };
         let _children = ChildCancellation(manager.clone());
         let mut registry = tools::builtin_tools(&self.inner.cwd)?;
-        if !read_only && depth < self.inner.config.max_recursion_depth {
+        if !read_only && depth < settings.max_recursion_depth {
             register_agent_tools(&mut registry, manager)?;
         }
-        if !self.inner.config.tools.is_empty() {
-            registry.retain_names(&self.inner.config.tools);
+        if !settings.tools.is_empty() {
+            registry.retain_names(&settings.tools);
         }
         let mut system_prompt = context::load_instructions(&self.inner.cwd, &self.inner.data_dir)?;
-        if !self.inner.config.system_prompt.is_empty() {
-            system_prompt.push(self.inner.config.system_prompt.clone());
+        if !settings.system_prompt.is_empty() {
+            system_prompt.push(settings.system_prompt.clone());
         }
         let skills = context::discover_skills(&self.inner.cwd, &self.inner.data_dir)?;
         if !skills.is_empty() {
@@ -310,7 +396,7 @@ impl Runtime {
             stream_options,
             cwd: self.inner.cwd.clone(),
             session_id: session.header().id.clone(),
-            max_turns: self.inner.config.max_turns,
+            max_turns: settings.max_turns,
             max_retries: 2,
             retry_delay: Duration::from_millis(500),
         };
@@ -318,7 +404,7 @@ impl Runtime {
         let mode = if read_only {
             ApprovalMode::ReadOnly
         } else {
-            self.inner.config.approval_mode
+            settings.approval_mode
         };
         agent.set_hooks(Arc::new(RuntimeHooks {
             mode,
@@ -365,7 +451,7 @@ impl Runtime {
         }
         let selector = session
             .current_model()
-            .unwrap_or_else(|| self.inner.config.model.clone());
+            .unwrap_or_else(|| self.config().model);
         let (model, mut options) = self.resolve_model(&selector)?;
         options.max_tokens = Some(options.max_tokens.unwrap_or(4096).min(4096));
         let context = Context {
@@ -395,7 +481,7 @@ impl Runtime {
         if summary.trim().is_empty() {
             bail!("compaction returned an empty summary");
         }
-        session.compact(summary, self.inner.config.keep_recent_messages)?;
+        session.compact(summary, self.config().keep_recent_messages)?;
         Ok(completed.usage)
     }
 }
@@ -525,7 +611,7 @@ impl ChildFactory {
         let workspace =
             SubagentWorkspace::provision_in(&parent_cwd, &child_path, &source, id).await?;
         let cwd = workspace.path.clone();
-        let config = self.runtime.inner.config.clone();
+        let config = self.runtime.config();
         let credentials = self.runtime.inner.credentials.clone();
         let provider = self.runtime.inner.provider.clone();
         let approval = self.runtime.inner.approval.clone();
@@ -553,8 +639,13 @@ impl subagents::SubagentFactory for ChildFactory {
                 self.runtime.clone()
             };
             let mut session = Session::create(&runtime.inner.data_dir.join("sessions/subagents"), &runtime.inner.cwd)?;
-            let selector = spec.model.as_deref().or_else(|| runtime.inner.config.model_roles.get("task").map(String::as_str)).unwrap_or(&runtime.inner.config.model);
-            runtime.switch_model(&mut session, selector)?;
+            let settings = runtime.config();
+            let selector = spec
+                .model
+                .clone()
+                .or_else(|| settings.model_roles.get("task").cloned())
+                .unwrap_or(settings.model);
+            runtime.switch_model(&mut session, &selector)?;
             let mut prompt = spec.task;
             if let Some(schema) = spec.output_schema {
                 prompt.push_str("\n\nReturn a single JSON value validating against this JSON Schema, without surrounding prose:\n");

@@ -185,15 +185,20 @@ local models are not included in this connected-only view; explicit CLI/session
 model selectors remain available. With no connections, the picker offers
 **Manage providers…** rather than fabricated fallback models.
 
-The picker groups models by provider and shows context windows, role badges,
-and tok/s and DeepSWE columns (`n/a` when data is unavailable). Its role
-assignment summary includes unassigned roles; only connected targets are
-selectable. Use search, Up/Down and Enter, or click a model or assigned role.
-Escape and the close button return to chat; **Manage providers…** opens login.
+The picker opens as a centered dialog over a dimmed chat view and groups
+models by provider, showing context windows, role badges, and tok/s and
+DeepSWE columns (`n/a` when data is unavailable). The role assignment panel
+lists every configured or built-in role; click a role to choose the
+assignment target, then pick a model (or press Enter on a filtered row) to
+persist `modelRoles.<role>` into the global `config.yml`. Assigning `default`
+also switches the session model and closes the dialog; other roles stay open
+so several bindings can be set in one pass. Clicking the scrim, Escape, or
+the close button returns to chat; **Manage providers…** opens login.
 
-The centered dialog fits the window up to 900×660. In narrow windows it hides
-secondary model IDs and stacks role badges, keeping the metrics, role summary,
-and controls visible. Native-window screenshots at
+The centered dialog fits the window up to 900×660 over the translucent scrim.
+In narrow windows it hides secondary model IDs and stacks role badges,
+keeping the metrics, role summary, and controls visible. Native-window
+screenshots at
 [960×720](docs/screenshots/model-picker-960x720.png) and
 [560×480](docs/screenshots/model-picker-560x480.png) were captured under
 Xvfb/Mesa software Vulkan with isolated placeholder credentials for list
