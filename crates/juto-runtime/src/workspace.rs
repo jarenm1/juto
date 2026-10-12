@@ -112,6 +112,77 @@ pub enum WorkspaceError {
     Other(String),
 }
 
+/// How `$HOME` (and `/root`, `/run/user`) is exposed inside a sandboxed command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProtectHome {
+    /// Leave `$HOME` untouched (no `ProtectHome` property is emitted).
+    Off,
+    /// Mount `$HOME` read-only (`ProtectHome=read-only`).
+    #[default]
+    ReadOnly,
+    /// Make `$HOME` inaccessible (`ProtectHome=yes`).
+    Yes,
+}
+
+/// Filesystem sandbox applied to a resource-scoped command.
+///
+/// The sandbox is opt-in: [`ResourceLimits::sandbox`] defaults to `None`, so
+/// existing callers keep the advisory-only boundary. When enabled, the command
+/// runs in a systemd unit whose filesystem view is restricted:
+///
+/// * `protect_system` mounts the system hierarchy (`/usr`, `/boot`, `/etc`, ...)
+///   read-only (`ProtectSystem=strict`).
+/// * `protect_home` controls how `$HOME` is exposed (`ProtectHome`).
+/// * `private_tmp` gives the command a private `/tmp` and `/var/tmp`
+///   (`PrivateTmp=yes`).
+/// * the workspace itself is always granted write access, and each
+///   [`Sandbox::write_paths`] entry adds another writable directory
+///   (`ReadWritePaths`).
+///
+/// # Running `cargo` inside a sandbox
+///
+/// With `ProtectSystem=strict` the whole hierarchy is read-only except the API
+/// filesystems and the granted `ReadWritePaths`. When `protect_home` is
+/// [`ProtectHome::ReadOnly`] or [`ProtectHome::Yes`], `$HOME` is read-only or
+/// hidden, so a build tool that keeps state there fails unless those
+/// directories are granted explicitly. Callers that run `cargo` (or `rustup`)
+/// inside a sandbox must therefore add `CARGO_HOME` (usually `~/.cargo`),
+/// `RUSTUP_HOME` (usually `~/.rustup`), and `XDG_CACHE_HOME` (usually
+/// `~/.cache`) to [`Sandbox::write_paths`].
+///
+/// # Implementation note
+///
+/// Namespace properties are not supported by transient *scopes*: `systemd-run
+/// --user --scope -p ProtectSystem=strict` fails with `Unknown assignment`.
+/// A sandboxed command is therefore run as a transient *service* (see
+/// [`SubagentWorkspace::build_scoped_std_command`]), which supports both the
+/// resource caps and the namespace properties.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sandbox {
+    /// Mount the system hierarchy read-only (`ProtectSystem=strict`).
+    pub protect_system: bool,
+    /// How `$HOME` is exposed inside the sandbox.
+    pub protect_home: ProtectHome,
+    /// Give the command a private `/tmp` and `/var/tmp` (`PrivateTmp=yes`).
+    pub private_tmp: bool,
+    /// Extra directories granted write access inside the sandbox.
+    ///
+    /// Relative entries are resolved against the workspace root. The workspace
+    /// itself is always writable and does not need to be listed here.
+    pub write_paths: Vec<PathBuf>,
+}
+
+impl Default for Sandbox {
+    fn default() -> Self {
+        Self {
+            protect_system: true,
+            protect_home: ProtectHome::ReadOnly,
+            private_tmp: true,
+            write_paths: Vec::new(),
+        }
+    }
+}
+
 /// Resource constraints and governance parameters for subagent execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLimits {
@@ -133,6 +204,10 @@ pub struct ResourceLimits {
     pub gpu_lock: Option<PathBuf>,
     /// When true, fails if `systemd-run` is not available rather than running uncapped.
     pub enforce_scope: bool,
+    /// Optional filesystem sandbox applied to the scoped command.
+    ///
+    /// `None` (the default) keeps the advisory-only boundary; see [`Sandbox`].
+    pub sandbox: Option<Sandbox>,
 }
 
 impl Default for ResourceLimits {
@@ -149,6 +224,9 @@ impl Default for ResourceLimits {
         let gpu_lock = env_var_nonempty("AGENT_GPU_LOCK")
             .map(PathBuf::from)
             .or_else(|| Some(default_gpu_lock_path()));
+        let sandbox = env_var_nonempty("AGENT_SANDBOX")
+            .filter(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .map(|_| Sandbox::default());
 
         Self {
             cpu_quota,
@@ -160,6 +238,7 @@ impl Default for ResourceLimits {
             gpu: false,
             gpu_lock,
             enforce_scope: true,
+            sandbox,
         }
     }
 }
@@ -186,6 +265,12 @@ impl ResourceLimits {
     /// Configure whether systemd scope enforcement is mandatory.
     pub fn with_enforce_scope(mut self, enforce: bool) -> Self {
         self.enforce_scope = enforce;
+        self
+    }
+
+    /// Enable filesystem sandboxing for this limit set.
+    pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
+        self.sandbox = Some(sandbox);
         self
     }
 }
@@ -565,7 +650,7 @@ impl SubagentWorkspace {
             if systemd_available {
                 cmd.arg("systemd-run");
                 cmd.arg("--user");
-                cmd.arg("--scope");
+                append_systemd_unit_mode(&mut cmd, limits.sandbox.is_some());
                 cmd.arg("--quiet");
                 cmd.arg("-p").arg(format!("CPUQuota={}", limits.cpu_quota));
                 cmd.arg("-p")
@@ -575,6 +660,10 @@ impl SubagentWorkspace {
 
                 if let Some(slice) = &limits.slice {
                     cmd.arg(format!("--slice={}", slice));
+                }
+
+                if let Some(sandbox) = &limits.sandbox {
+                    emit_sandbox_properties(&mut cmd, sandbox, &self.path);
                 }
 
                 cmd.arg("--");
@@ -587,7 +676,7 @@ impl SubagentWorkspace {
         } else if systemd_available {
             cmd = std::process::Command::new("systemd-run");
             cmd.arg("--user");
-            cmd.arg("--scope");
+            append_systemd_unit_mode(&mut cmd, limits.sandbox.is_some());
             cmd.arg("--quiet");
             cmd.arg("-p").arg(format!("CPUQuota={}", limits.cpu_quota));
             cmd.arg("-p")
@@ -597,6 +686,10 @@ impl SubagentWorkspace {
 
             if let Some(slice) = &limits.slice {
                 cmd.arg(format!("--slice={}", slice));
+            }
+
+            if let Some(sandbox) = &limits.sandbox {
+                emit_sandbox_properties(&mut cmd, sandbox, &self.path);
             }
 
             cmd.arg("--");
@@ -651,6 +744,68 @@ pub fn is_systemd_run_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Select the transient unit type for a `systemd-run` invocation.
+///
+/// Resource caps work on both scopes and services, but namespace properties
+/// (`ProtectSystem`, `ProtectHome`, `PrivateTmp`, `ReadWritePaths`) are only
+/// supported by services: `systemd-run --user --scope -p ProtectSystem=strict`
+/// is rejected with `Unknown assignment`. A sandboxed command therefore runs as
+/// a transient service, which additionally needs `--pipe` (forward stdio and
+/// wait for the exit status), `--collect` (unload the unit afterwards), and
+/// `-d` (a service does not inherit the caller's working directory).
+fn append_systemd_unit_mode(cmd: &mut std::process::Command, sandboxed: bool) {
+    if sandboxed {
+        cmd.arg("--pipe");
+        cmd.arg("--collect");
+        cmd.arg("-d");
+    } else {
+        cmd.arg("--scope");
+    }
+}
+
+/// Emit the `systemd-run` properties that implement `sandbox`.
+///
+/// The workspace itself is always granted write access; relative
+/// [`Sandbox::write_paths`] entries are resolved against the workspace. Paths
+/// are canonicalized when possible so symlinked workspaces grant the real
+/// directory.
+fn emit_sandbox_properties(cmd: &mut std::process::Command, sandbox: &Sandbox, workspace: &Path) {
+    if sandbox.protect_system {
+        cmd.arg("-p").arg("ProtectSystem=strict");
+    }
+
+    match sandbox.protect_home {
+        ProtectHome::Off => {}
+        ProtectHome::ReadOnly => {
+            cmd.arg("-p").arg("ProtectHome=read-only");
+        }
+        ProtectHome::Yes => {
+            cmd.arg("-p").arg("ProtectHome=yes");
+        }
+    }
+
+    if sandbox.private_tmp {
+        cmd.arg("-p").arg("PrivateTmp=yes");
+    }
+
+    let workspace = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    cmd.arg("-p")
+        .arg(format!("ReadWritePaths={}", workspace.display()));
+
+    for path in &sandbox.write_paths {
+        let resolved = if path.is_absolute() {
+            path.clone()
+        } else {
+            workspace.join(path)
+        };
+        let resolved = resolved.canonicalize().unwrap_or(resolved);
+        cmd.arg("-p")
+            .arg(format!("ReadWritePaths={}", resolved.display()));
+    }
 }
 
 /// Locate the nearest ancestor that is a native Juto workspace root.
@@ -889,6 +1044,7 @@ mod tests {
             "AGENT_SLICE_CPU_QUOTA",
             "AGENT_SLICE_MEMORY_MAX",
             "AGENT_GPU_LOCK",
+            "AGENT_SANDBOX",
         ]);
         let limits = ResourceLimits::default();
         assert_eq!(limits.cpu_quota, DEFAULT_CPU_QUOTA);
@@ -1452,6 +1608,7 @@ mod tests {
             "AGENT_SLICE_CPU_QUOTA",
             "AGENT_SLICE_MEMORY_MAX",
             "AGENT_GPU_LOCK",
+            "AGENT_SANDBOX",
         ];
         let _env = EnvGuard::clear(&vars);
         for var in vars {
