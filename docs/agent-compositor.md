@@ -27,6 +27,9 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   (`LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`, `MESA_LOADER_DRIVER_OVERRIDE`), and
   otherwise composes with pixman. A GLES renderer that resolves to a
   non-software device is discarded before any frame is composed.
+- Event replay: a bounded 256-event ring per environment. A subscriber that
+  falls behind receives `ResyncRequired` and must call `Describe` rather than
+  silently losing exits.
 - Request idempotency: a retried `Create` with the same owner and request id
   returns the existing environment instead of allocating a second one, and a
   retried `Launch` returns the running application handle instead of starting a

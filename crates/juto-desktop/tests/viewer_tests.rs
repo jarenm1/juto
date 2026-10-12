@@ -95,6 +95,80 @@ fn environment_config(env_id: &str) -> serde_json::Value {
 }
 
 #[test]
+fn a_lagging_event_subscriber_is_told_to_resync() {
+    let daemon = Daemon::start();
+    let env_id = format!("r-{}", &uuid::Uuid::now_v7().to_string()[24..]);
+    let created = daemon.call(DesktopCommand::Create {
+        spec: serde_json::from_value(environment_config(&env_id)).expect("config"),
+        request_id: "create".to_string(),
+    });
+    assert!(
+        matches!(created, DesktopResponse::Created { .. }),
+        "create failed: {created:?}"
+    );
+
+    // Subscribe and then stop reading while the environment emits far more
+    // events than the 256-event replay ring holds.
+    let mut stream = UnixStream::connect(&daemon.socket).expect("connect");
+    let subscribe = serde_json::to_vec(&DesktopCommand::Subscribe {
+        env_id: env_id.clone(),
+    })
+    .unwrap();
+    stream
+        .write_all(&(subscribe.len() as u32).to_be_bytes())
+        .unwrap();
+    stream.write_all(&subscribe).unwrap();
+    stream.flush().unwrap();
+    let mut length = [0u8; 4];
+    stream.read_exact(&mut length).expect("subscribed response");
+    let mut body = vec![0u8; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut body).unwrap();
+
+    for _ in 0..2000 {
+        let _ = daemon.call(DesktopCommand::Control {
+            env_id: env_id.clone(),
+            action: "acquire".to_string(),
+            is_human: false,
+        });
+        let _ = daemon.call(DesktopCommand::Control {
+            env_id: env_id.clone(),
+            action: "release".to_string(),
+            is_human: false,
+        });
+    }
+
+    // Reading now must surface a resynchronization instruction rather than a
+    // silent gap in the event stream.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut resync = false;
+    for _ in 0..4000 {
+        let mut length = [0u8; 4];
+        if stream.read_exact(&mut length).is_err() {
+            break;
+        }
+        let mut body = vec![0u8; u32::from_be_bytes(length) as usize];
+        if stream.read_exact(&mut body).is_err() {
+            break;
+        }
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body)
+            && value.get("event").and_then(|e| e.as_str()) == Some("resyncRequired")
+        {
+            resync = true;
+            break;
+        }
+    }
+    assert!(
+        resync,
+        "a subscriber that fell behind the replay ring must receive ResyncRequired"
+    );
+
+    drop(stream);
+    let _ = daemon.call(DesktopCommand::Destroy { env_id });
+}
+
+#[test]
 fn viewer_admission_is_bounded_and_released_on_disconnect() {
     let daemon = Daemon::start();
     let env_id = format!("a-{}", &uuid::Uuid::now_v7().to_string()[24..]);
@@ -139,7 +213,7 @@ fn viewer_admission_is_bounded_and_released_on_disconnect() {
         env_id: env_id.clone(),
     });
     assert!(
-        matches!(destroyed, DesktopResponse::Destroyed { .. }),
+        matches!(destroyed, DesktopResponse::Destroyed),
         "destroy failed: {destroyed:?}"
     );
 }
