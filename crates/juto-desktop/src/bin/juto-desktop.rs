@@ -332,7 +332,12 @@ fn handle(
         },
         DesktopCommand::Describe { env_id, .. } => match supervisor.get_environment(&env_id) {
             Ok(env) => DesktopResponse::Description(Box::new(env.get_status())),
-            Err(err) => error_response(&err),
+            // A destroyed environment's terminal state stays queryable for a
+            // bounded retention period (spec section 4).
+            Err(err) => match supervisor.retired_environment(&env_id) {
+                Some(status) => DesktopResponse::Description(Box::new(status)),
+                None => error_response(&err),
+            },
         },
         DesktopCommand::ConfigureOutput {
             env_id,

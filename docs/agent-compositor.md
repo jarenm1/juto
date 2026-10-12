@@ -27,6 +27,10 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   (`LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`, `MESA_LOADER_DRIVER_OVERRIDE`), and
   otherwise composes with pixman. A GLES renderer that resolves to a
   non-software device is discarded before any frame is composed.
+- Terminal state retention: a destroyed environment's final status stays
+  queryable through `Describe` for a bounded period (default 10 minutes), so a
+  client can learn why an environment stopped instead of receiving
+  `UnknownEnvironment`.
 - Event replay: a bounded 256-event ring per environment. A subscriber that
   falls behind receives `ResyncRequired` and must call `Describe` rather than
   silently losing exits.
