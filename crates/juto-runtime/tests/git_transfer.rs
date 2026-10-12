@@ -722,6 +722,136 @@ fn fork_workspace_skips_gitlink_and_capture_preserves_it() {
     );
 }
 
+/// A repo with `top.txt`, `crates/foo/a.txt`, and `crates/bar/b.txt`.
+fn sparse_repo(temp: &tempfile::TempDir) -> (std::path::PathBuf, String) {
+    let dir = repo(temp, "repo");
+    write_file(&dir.join("top.txt"), b"top\n");
+    fs::create_dir_all(dir.join("crates/foo")).unwrap();
+    write_file(&dir.join("crates/foo/a.txt"), b"a\n");
+    fs::create_dir_all(dir.join("crates/bar")).unwrap();
+    write_file(&dir.join("crates/bar/b.txt"), b"b\n");
+    let head = commit(&dir, "base");
+    (dir, head)
+}
+
+#[test]
+fn sparse_fork_materializes_only_the_requested_subtree() {
+    let temp = tempfile::tempdir().unwrap();
+    let (dir, head) = sparse_repo(&temp);
+    let repository = GitRepository::open(&dir).unwrap();
+    let destination = temp.path().join("sparse");
+    repository
+        .fork_workspace_sparse(&head, &destination, "thread-1", &["crates/foo".to_string()])
+        .unwrap();
+
+    assert_eq!(
+        fs::read(destination.join("crates/foo/a.txt")).unwrap(),
+        b"a\n"
+    );
+    assert!(
+        !destination.join("crates/bar").exists(),
+        "a path outside the spec must not be materialized"
+    );
+    assert!(
+        !destination.join("top.txt").exists(),
+        "a path outside the spec must not be materialized"
+    );
+
+    let fork = GitRepository::open(&destination).unwrap();
+    assert_eq!(fork.sparse(), Some(["crates/foo".to_string()].as_slice()));
+}
+
+#[test]
+fn sparse_fork_capture_preserves_paths_outside_the_spec() {
+    let temp = tempfile::tempdir().unwrap();
+    let (dir, head) = sparse_repo(&temp);
+    let repository = GitRepository::open(&dir).unwrap();
+    let destination = temp.path().join("sparse");
+    repository
+        .fork_workspace_sparse(&head, &destination, "thread-1", &["crates/foo".to_string()])
+        .unwrap();
+
+    // Nothing changed, so the captured tree must equal the base tree: the paths
+    // the fork never materialized must not read as deletions.
+    let git_dir = repository.git_dir().to_path_buf();
+    let base_tree = run(
+        "git",
+        &[
+            "--git-dir",
+            git_dir.to_str().unwrap(),
+            "rev-parse",
+            &format!("{head}^{{tree}}"),
+        ],
+        &dir,
+    );
+    let fork = GitRepository::open(&destination).unwrap();
+    assert_eq!(
+        fork.capture_tree(&head).unwrap(),
+        base_tree,
+        "a sparse fork must capture a tree identical to the base when nothing changed"
+    );
+}
+
+#[test]
+fn sparse_fork_capture_records_edits_inside_the_spec() {
+    let temp = tempfile::tempdir().unwrap();
+    let (dir, head) = sparse_repo(&temp);
+    let repository = GitRepository::open(&dir).unwrap();
+    let destination = temp.path().join("sparse");
+    repository
+        .fork_workspace_sparse(&head, &destination, "thread-1", &["crates/foo".to_string()])
+        .unwrap();
+
+    write_file(&destination.join("crates/foo/a.txt"), b"edited\n");
+    let fork = GitRepository::open(&destination).unwrap();
+    let captured = fork.capture_tree(&head).unwrap();
+    assert_ne!(captured, head, "the edit must change the tree");
+
+    let git_dir = repository.git_dir().to_path_buf();
+    let listing = run(
+        "git",
+        &[
+            "--git-dir",
+            git_dir.to_str().unwrap(),
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &captured,
+        ],
+        &dir,
+    );
+    // The edit is captured and the un-materialized paths survive.
+    assert!(listing.contains("crates/foo/a.txt"), "{listing}");
+    assert!(listing.contains("crates/bar/b.txt"), "{listing}");
+    assert!(listing.contains("top.txt"), "{listing}");
+}
+
+#[test]
+fn sparse_fork_rejects_a_malformed_prefix() {
+    let temp = tempfile::tempdir().unwrap();
+    let (dir, head) = sparse_repo(&temp);
+    let repository = GitRepository::open(&dir).unwrap();
+    let destination = temp.path().join("sparse");
+
+    let error = repository
+        .fork_workspace_sparse(&head, &destination, "thread-1", &[])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("at least one path prefix"),
+        "{error}"
+    );
+
+    let error = repository
+        .fork_workspace_sparse(&head, &destination, "thread-1", &["/abs".to_string()])
+        .unwrap_err();
+    assert!(error.to_string().contains("relative path"), "{error}");
+
+    let error = repository
+        .fork_workspace_sparse(&head, &destination, "thread-1", &["trailing/".to_string()])
+        .unwrap_err();
+    assert!(error.to_string().contains("relative path"), "{error}");
+}
+
 #[test]
 fn export_creates_commits_only_on_export_and_pushes() {
     let temp = tempfile::tempdir().unwrap();

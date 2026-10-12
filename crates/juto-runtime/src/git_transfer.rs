@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -127,6 +127,10 @@ pub struct MergeOutcome {
 struct WorkspaceLink {
     git_dir: PathBuf,
     thread: String,
+    /// The path prefixes a partial fork materialized. `None` means the fork
+    /// materialized the whole tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sparse: Option<Vec<String>>,
 }
 
 /// The on-disk contents of a pending-fork registry entry.
@@ -151,6 +155,8 @@ pub struct GitRepository {
     workspace: PathBuf,
     git_dir: PathBuf,
     thread: Option<String>,
+    /// Path prefixes this workspace materialized, when it is a partial fork.
+    sparse: Option<Vec<String>>,
 }
 
 impl GitRepository {
@@ -176,6 +182,7 @@ impl GitRepository {
                 workspace,
                 git_dir,
                 thread: Some(link.thread),
+                sparse: link.sparse,
             });
         }
         let (workspace, git_dir) = discover(workspace)?;
@@ -183,6 +190,7 @@ impl GitRepository {
             workspace,
             git_dir,
             thread: None,
+            sparse: None,
         })
     }
 
@@ -195,6 +203,16 @@ impl GitRepository {
     /// [`GitRepository::fork_workspace`].
     pub fn thread(&self) -> Option<&str> {
         self.thread.as_deref()
+    }
+
+    /// The path prefixes this workspace materialized, when it is a partial fork.
+    ///
+    /// `None` means the workspace holds the whole tree. A partial fork is
+    /// created by [`GitRepository::fork_workspace_sparse`]; capture preserves
+    /// every baseline path outside these prefixes instead of reading its absence
+    /// as a deletion.
+    pub fn sparse(&self) -> Option<&[String]> {
+        self.sparse.as_deref()
     }
 
     /// The resolved Git directory used for every plumbing command.
@@ -359,6 +377,45 @@ impl GitRepository {
     /// orphaned directory that blocks every retry; see
     /// [`GitRepository::cleanup_orphaned_forks`].
     pub fn fork_workspace(&self, tree: &str, destination: &Path, thread: &str) -> Result<()> {
+        self.fork_workspace_inner(tree, destination, thread, None)
+    }
+
+    /// Materialize only `paths` and their subtrees into a new partial fork.
+    ///
+    /// A partial fork is for a monorepo: an agent scoped to `crates/foo` pays
+    /// for that subtree instead of the whole tree. Capture preserves every
+    /// baseline path outside `paths` from the baseline, so the fork still
+    /// captures a complete tree and the absence of the other paths never reads
+    /// as a deletion. Each prefix is a repository-relative path with no leading
+    /// or trailing `/`.
+    pub fn fork_workspace_sparse(
+        &self,
+        tree: &str,
+        destination: &Path,
+        thread: &str,
+        paths: &[String],
+    ) -> Result<()> {
+        ensure!(
+            !paths.is_empty(),
+            "a sparse fork needs at least one path prefix"
+        );
+        for path in paths {
+            ensure!(!path.is_empty(), "sparse path prefix must not be empty");
+            ensure!(
+                !path.starts_with('/') && !path.ends_with('/'),
+                "sparse path prefix must be a relative path without a leading or trailing '/': {path:?}"
+            );
+        }
+        self.fork_workspace_inner(tree, destination, thread, Some(paths.to_vec()))
+    }
+
+    fn fork_workspace_inner(
+        &self,
+        tree: &str,
+        destination: &Path,
+        thread: &str,
+        sparse: Option<Vec<String>>,
+    ) -> Result<()> {
         if thread.is_empty() {
             bail!("fork thread name is empty");
         }
@@ -458,7 +515,8 @@ impl GitRepository {
             }
         }
 
-        let materialized = self.materialize_tree(&listing.stdout, destination, thread);
+        let materialized =
+            self.materialize_tree(&listing.stdout, destination, thread, sparse.as_deref());
         match materialized {
             Ok(()) => {
                 // The marker is the durable record; the pending file is done.
@@ -481,11 +539,30 @@ impl GitRepository {
 
     /// Write every `git ls-tree -r -z` entry into `destination` and add the
     /// workspace marker.
-    fn materialize_tree(&self, listing: &[u8], destination: &Path, thread: &str) -> Result<()> {
+    ///
+    /// When `sparse` is set, only entries at or under one of its prefixes are
+    /// written; the rest are left absent and preserved from the baseline by
+    /// capture.
+    fn materialize_tree(
+        &self,
+        listing: &[u8],
+        destination: &Path,
+        thread: &str,
+        sparse: Option<&[String]>,
+    ) -> Result<()> {
         let mut batch = BatchCatFile::spawn(self)?;
         for entry in listing.split(|byte| *byte == 0) {
             if entry.is_empty() {
                 continue;
+            }
+            if let Some(sparse) = sparse {
+                let path = entry_path(entry)?;
+                if !sparse
+                    .iter()
+                    .any(|prefix| path_under(path, prefix.as_bytes()))
+                {
+                    continue;
+                }
             }
             self.materialize_entry(entry, destination, &mut batch)?;
         }
@@ -493,6 +570,7 @@ impl GitRepository {
         let link = WorkspaceLink {
             git_dir: self.git_dir.clone(),
             thread: thread.to_string(),
+            sparse: sparse.map(<[String]>::to_vec),
         };
         let marker =
             serde_json::to_vec_pretty(&link).context("failed to encode the workspace link")?;
@@ -1121,6 +1199,17 @@ impl GitRepository {
             if baseline.get(path).map(|(mode, _)| mode.as_str()) == Some("160000") {
                 // A baseline gitlink is preserved exactly; submodules are never
                 // materialized or faked.
+                continue;
+            }
+            // A partial fork materialized only its sparse prefixes. A baseline
+            // path outside them is simply absent from the worktree, which must
+            // not read as a deletion: preserve it from the baseline.
+            if let Some(sparse) = &self.sparse
+                && baseline.contains_key(path)
+                && !sparse
+                    .iter()
+                    .any(|prefix| path_under(path, prefix.as_bytes()))
+            {
                 continue;
             }
             let target = self.workspace.join(OsStr::from_bytes(path));
@@ -1984,6 +2073,25 @@ fn find_workspace_link(start: &Path) -> Result<Option<(PathBuf, WorkspaceLink)>>
         current = directory.parent();
     }
     Ok(None)
+}
+
+/// The path of a `git ls-tree -r -z` entry: everything after the tab.
+fn entry_path(entry: &[u8]) -> Result<&[u8]> {
+    let tab = entry
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .context("malformed `git ls-tree` entry: missing tab")?;
+    Ok(&entry[tab + 1..])
+}
+
+/// Whether `path` is `prefix` or lies under it.
+///
+/// Used to decide whether a baseline path belongs to a partial fork's sparse
+/// prefixes. The comparison is byte-exact on whole path components, so `src`
+/// does not match `srcx`.
+pub(crate) fn path_under(path: &[u8], prefix: &[u8]) -> bool {
+    path == prefix
+        || (path.len() > prefix.len() && path.starts_with(prefix) && path[prefix.len()] == b'/')
 }
 
 /// Whether any component of `path` is snapshot metadata that must never be

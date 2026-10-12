@@ -116,6 +116,20 @@ pub fn mutate(
     let rel_bytes = rel.as_os_str().as_bytes().to_vec();
     let display = rel.to_string_lossy().replace('\\', "/");
 
+    // A partial fork holds only its sparse prefixes. An edit outside them would
+    // be written to disk but preserved from the baseline by the next capture, so
+    // it could never be recorded. Refuse it before the file is touched.
+    if let Some(sparse) = graph.repository().sparse()
+        && !sparse
+            .iter()
+            .any(|prefix| crate::git_transfer::path_under(&rel_bytes, prefix.as_bytes()))
+    {
+        return Err(format!(
+            "{display}: path is outside this workspace's sparse spec ({})",
+            sparse.join(", ")
+        ));
+    }
+
     // The lock covers the entire transaction: read, transform, write, snapshot,
     // and diff. It is held while the before/after trees are captured.
     let _lock = MutationLock::acquire(&root)?;
@@ -674,5 +688,39 @@ mod tests {
         let receipt = apply(cwd, &raw, "raw\n").unwrap();
         assert!(receipt["graph_node"].is_string(), "{receipt}");
         assert_eq!(std::fs::read(cwd.join(&raw)).unwrap(), b"raw\n");
+    }
+
+    #[test]
+    fn mutate_refuses_a_path_outside_the_sparse_spec() {
+        let directory = repo();
+        let cwd = directory.path();
+        std::fs::create_dir_all(cwd.join("crates/foo")).unwrap();
+        std::fs::write(cwd.join("crates/foo/a.txt"), "a\n").unwrap();
+        std::fs::create_dir_all(cwd.join("crates/bar")).unwrap();
+        std::fs::write(cwd.join("crates/bar/b.txt"), "b\n").unwrap();
+        git(cwd, &["add", "-A"]);
+        git(cwd, &["commit", "-q", "-m", "layout"]);
+
+        let graph = ChangeGraph::open(cwd).unwrap();
+        let root = graph.capture("main", provenance(), None).unwrap();
+
+        let workspaces = tempfile::tempdir().unwrap();
+        let left_dir = workspaces.path().join("left");
+        graph
+            .fork_sparse("left", &root.id, &left_dir, &["crates/foo".to_string()])
+            .unwrap();
+
+        let inside = apply(&left_dir, Path::new("crates/foo/a.txt"), "a edited\n").unwrap();
+        assert_eq!(inside["changed"], true, "{inside}");
+
+        let error = apply(&left_dir, Path::new("crates/bar/b.txt"), "b edited\n").unwrap_err();
+        assert!(
+            error.contains("outside this workspace's sparse spec"),
+            "{error}"
+        );
+        assert!(
+            !left_dir.join("crates/bar/b.txt").exists(),
+            "a refused edit must not create the file"
+        );
     }
 }
