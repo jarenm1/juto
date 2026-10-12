@@ -629,6 +629,76 @@ fn memory_pressure_emits_limit_pressure() {
 }
 
 #[test]
+fn input_requires_a_geometry_acknowledgement_after_resize() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("geometry")))
+        .expect("create environment");
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
+    let batch = InputBatch {
+        seq: 1,
+        client_timestamp_us: 0,
+        events: vec![InputEvent::PointerMoveAbs { x: 1, y: 1 }],
+    };
+
+    // The initial generation accepts input without an acknowledgement.
+    assert!(
+        env.dispatch_input("agent:test", lease.epoch, 1, batch.clone())
+            .is_ok()
+    );
+
+    // A resize invalidates the acknowledgement.
+    let new_gen = env
+        .configure_output(
+            1,
+            OutputConfig {
+                width: 800,
+                height: 600,
+                scale: 1,
+                fps: 30,
+            },
+        )
+        .expect("resize");
+    assert_eq!(new_gen, 2);
+    assert!(env.geometry_ready_viewers().is_empty());
+    assert!(matches!(
+        env.dispatch_input("agent:test", lease.epoch, 2, batch.clone()),
+        Err(juto_desktop::DesktopError::StaleGeneration { .. })
+    ));
+
+    // A stale acknowledgement is rejected; the current one resumes input.
+    assert!(env.acknowledge_geometry("viewer-1", 1).is_err());
+    env.acknowledge_geometry("viewer-1", 2)
+        .expect("acknowledge the current generation");
+    assert_eq!(env.geometry_ready_viewers(), vec!["viewer-1".to_string()]);
+    assert!(
+        env.dispatch_input("agent:test", lease.epoch, 2, batch.clone())
+            .is_ok()
+    );
+
+    // A further resize gates input again.
+    env.configure_output(
+        2,
+        OutputConfig {
+            width: 640,
+            height: 480,
+            scale: 1,
+            fps: 30,
+        },
+    )
+    .expect("resize");
+    assert!(matches!(
+        env.dispatch_input("agent:test", lease.epoch, 3, batch),
+        Err(juto_desktop::DesktopError::StaleGeneration { .. })
+    ));
+
+    env.destroy();
+}
+
+#[test]
 fn launch_rejects_missing_executable() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor

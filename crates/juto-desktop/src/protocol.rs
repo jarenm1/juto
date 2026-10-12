@@ -203,6 +203,10 @@ pub enum DesktopResponse {
     InputAccepted {
         applied_watermark: u64,
     },
+    GeometryAcknowledged {
+        viewer_id: String,
+        generation: GeometryGeneration,
+    },
     Destroyed,
     Subscribed {
         env_id: String,

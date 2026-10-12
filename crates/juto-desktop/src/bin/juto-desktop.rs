@@ -389,9 +389,20 @@ fn handle(
             }
             Err(err) => error_response(&err),
         },
-        DesktopCommand::GeometryReady { env_id, .. } => DesktopResponse::Error {
-            code: "TransportUnavailable".to_string(),
-            message: format!("geometry acknowledgement for `{env_id}` is not implemented yet"),
+        DesktopCommand::GeometryReady {
+            env_id,
+            viewer_id,
+            generation,
+            ..
+        } => match supervisor.get_environment(&env_id) {
+            Ok(env) => match env.acknowledge_geometry(&viewer_id, generation) {
+                Ok(()) => DesktopResponse::GeometryAcknowledged {
+                    viewer_id,
+                    generation,
+                },
+                Err(err) => error_response(&err),
+            },
+            Err(err) => error_response(&err),
         },
         DesktopCommand::Subscribe { .. } => DesktopResponse::Error {
             code: "Protocol".to_string(),

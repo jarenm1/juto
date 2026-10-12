@@ -199,6 +199,11 @@ reports connection state and errors instead of showing a stale frame as live.
 `juto --desktop <command> [args...]` opens the same viewer directly for
 development.
 
+**Resize gating.** A resize publishes a new geometry generation and clears every
+viewer's acknowledgement; pointer input is rejected with `StaleGeneration` until a
+viewer reports `GeometryReady` for the new generation, so a click cannot land on a
+stale frame even when the encoded size is unchanged.
+
 **Artifact resolution.** Opening a `desktop_artifact` card resolves the
 descriptor through the runtime: the host must be this host, the environment must
 exist here, and the grant must be issued to the requesting principal and
