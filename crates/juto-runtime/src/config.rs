@@ -121,6 +121,10 @@ pub struct RuntimeConfig {
     pub tools: Vec<String>,
     /// User-defined models merged over the bundled registry.
     pub custom_models: Vec<Model>,
+    /// Run the `bash` tool under the workspace's resource governance: a systemd
+    /// user scope with the CPU and memory caps from `AGENT_*`. Off by default,
+    /// because it changes how a command is supervised and needs `systemd-run`.
+    pub bash_scoped: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -141,6 +145,7 @@ impl Default for RuntimeConfig {
             keep_recent_messages: default_keep_recent(),
             tools: Vec::new(),
             custom_models: Vec::new(),
+            bash_scoped: false,
         }
     }
 }
