@@ -54,6 +54,10 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Aggregate environment cgroup: a transient `juto-desktop-<env>.slice` carries
   the environment limits and contains the application scopes; a monitor emits
   `LimitPressure` on memory pressure and CPU throttling.
+- Artifact resolution: the runtime validates host, environment, grant, principal,
+  and expiry before returning a same-host route or a one-time remote token, and
+  otherwise reports `Unsupported`, `Unauthorized`, `Expired`, `Stopped`, or
+  `Unavailable`.
 
 Not implemented: audio (private PipeWire sink plus Opus), Xwayland, the hardware
 render-node profile, DMA-BUF export/import, TURN relay configuration, running the

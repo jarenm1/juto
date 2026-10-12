@@ -5,6 +5,7 @@ pub mod change_graph;
 pub mod config;
 pub mod context;
 mod contextual;
+pub mod desktop_artifact;
 pub mod git_transfer;
 pub mod orchestrator;
 pub mod peers;
@@ -72,6 +73,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 pub use config::{ApprovalMode, RuntimeConfig};
+pub use desktop_artifact::{DesktopArtifactResolver, ResolveError, ViewerRoute};
 pub use orchestrator::{
     CommandGateRunner, GateResult, IntentRoute, MockGateRunner, Orchestrator, OrchestratorBuilder,
     OrchestratorConfig, OrchestratorError, OrchestratorEvent, PipelinePhase, QualityGateKind,
@@ -347,6 +349,15 @@ impl Runtime {
         let _report = supervisor.reconcile();
         *guard = Some(supervisor.clone());
         supervisor
+    }
+
+    /// A resolver for desktop artifacts against this process's supervisor.
+    pub fn desktop_artifact_resolver(&self) -> DesktopArtifactResolver {
+        DesktopArtifactResolver::new(
+            self.desktop_supervisor(),
+            self.signaling_handle(),
+            crate::tools::host_identifier(),
+        )
     }
 
     /// The process-wide signaling handle, created on first use.
