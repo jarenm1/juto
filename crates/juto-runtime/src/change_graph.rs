@@ -4,11 +4,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -66,6 +66,51 @@ pub struct GraphState {
     pub checkpoints: BTreeMap<String, String>,
 }
 
+/// On-disk journal format. Version 3 splits the graph into a small, frequently
+/// rewritten header (`graph.json`) and an append-only node journal
+/// (`nodes.jsonl`), so recording an edit no longer rewrites every node.
+const GRAPH_VERSION: u32 = 3;
+
+/// The compact, frequently rewritten part of a version 3 graph.
+///
+/// It carries everything except the nodes, which live in `nodes.jsonl` in
+/// topological (append) order.
+#[derive(Serialize, Deserialize)]
+struct GraphHeader {
+    version: u32,
+    base_commit: String,
+    base_tree: String,
+    heads: BTreeMap<String, String>,
+    workspace_heads: BTreeMap<String, String>,
+    checkpoints: BTreeMap<String, String>,
+}
+
+impl From<&GraphState> for GraphHeader {
+    fn from(state: &GraphState) -> Self {
+        Self {
+            version: GRAPH_VERSION,
+            base_commit: state.base_commit.clone(),
+            base_tree: state.base_tree.clone(),
+            heads: state.heads.clone(),
+            workspace_heads: state.workspace_heads.clone(),
+            checkpoints: state.checkpoints.clone(),
+        }
+    }
+}
+
+/// What a [`ChangeGraph::gc`] pass pruned and retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GcReport {
+    /// Nodes swept out of the journal because no head, workspace head, or
+    /// checkpoint reaches them.
+    pub pruned_nodes: usize,
+    /// Nodes kept because a head, workspace head, or checkpoint reaches them.
+    pub retained_nodes: usize,
+    /// Snapshot refs actually deleted by the sweep. A pruned node whose ref was
+    /// already gone does not count.
+    pub released_refs: usize,
+}
+
 pub struct ChangeGraph {
     repository: GitRepository,
     directory: PathBuf,
@@ -87,7 +132,7 @@ impl ChangeGraph {
             directory,
         };
         let _lock = graph.lock()?;
-        if graph.state_path().exists() {
+        if graph.graph_path().exists() || graph.legacy_path().exists() {
             let state = graph.load()?;
             if let Some(base) = base {
                 ensure!(
@@ -108,15 +153,17 @@ impl ChangeGraph {
             if !base_commit.bytes().all(|b| b == b'0') {
                 graph.repository.retain_snapshot("base", &base_commit)?;
             }
-            graph.save(&GraphState {
-                version: 2,
+            let state = GraphState {
+                version: GRAPH_VERSION,
                 base_commit,
                 base_tree,
                 nodes: Vec::new(),
                 heads: BTreeMap::new(),
                 workspace_heads: BTreeMap::new(),
                 checkpoints: BTreeMap::new(),
-            })?;
+            };
+            graph.write_nodes(&state.nodes)?;
+            graph.save_header(&state)?;
         }
         Ok(graph)
     }
@@ -228,7 +275,7 @@ impl ChangeGraph {
             state.heads.insert(thread, head.clone());
             state.workspace_heads.insert(self.workspace_key(), head);
         }
-        self.save(&state)?;
+        self.save_header(&state)?;
         Ok(node)
     }
 
@@ -270,7 +317,7 @@ impl ChangeGraph {
         state
             .workspace_heads
             .insert(self.workspace_key(), node.id.clone());
-        self.save(&state)?;
+        self.save_header(&state)?;
         Ok(node)
     }
 
@@ -281,6 +328,12 @@ impl ChangeGraph {
         let _lock = self.lock()?;
         let mut state = self.load()?;
         ensure!(!state.heads.contains_key(thread), "thread already exists");
+        // Reclaim fork directories left behind by interrupted provisions. This
+        // is best-effort housekeeping: a cleanup failure must never block
+        // provisioning the fork the caller actually asked for.
+        if let Err(error) = self.repository.cleanup_orphaned_forks() {
+            eprintln!("juto: failed to reclaim orphaned fork directories: {error:#}");
+        }
         let from = state
             .checkpoints
             .get(from)
@@ -300,7 +353,7 @@ impl ChangeGraph {
             state
                 .workspace_heads
                 .insert(destination.to_string_lossy().into_owned(), from.clone());
-            self.save(&state)
+            self.save_header(&state)
         })();
         match recorded {
             Ok(()) => Ok(state),
@@ -356,7 +409,10 @@ impl ChangeGraph {
         });
         let result = node.clone();
         state.checkpoints.insert(name.into(), id.into());
-        self.save(&state)?;
+        // A mark edits an existing node in place, so the append-only journal
+        // cannot express it: rewrite the journal atomically, then the header.
+        self.write_nodes(&state.nodes)?;
+        self.save_header(&state)?;
         Ok(result)
     }
 
@@ -372,6 +428,61 @@ impl ChangeGraph {
 
     pub fn push(&self, branch: &str, remote: &str) -> Result<()> {
         self.repository.push(branch, remote)
+    }
+
+    /// Sweep nodes no live reference reaches and release their snapshot refs.
+    ///
+    /// The keep-set is every node reachable by walking parents from every value
+    /// in `heads`, `workspace_heads`, and `checkpoints`. The state is reloaded
+    /// under the graph lock, so a stale `graph.json` can never cause a live
+    /// head or checkpoint to be pruned. Snapshot refs whose ids do not name a
+    /// node (the `base` and `base-tree` anchors) are never touched.
+    pub fn gc(&self) -> Result<GcReport> {
+        let _lock = self.lock()?;
+        let state = self.load()?;
+        let by_id: BTreeMap<&str, &ChangeNode> =
+            state.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        let mut keep: BTreeSet<&str> = BTreeSet::new();
+        let mut stack: Vec<&str> = state
+            .heads
+            .values()
+            .chain(state.workspace_heads.values())
+            .chain(state.checkpoints.values())
+            .map(String::as_str)
+            .collect();
+        while let Some(id) = stack.pop() {
+            if !keep.insert(id) {
+                continue;
+            }
+            if let Some(node) = by_id.get(id) {
+                stack.extend(node.parents.iter().map(String::as_str));
+            }
+        }
+        let (retained, pruned): (Vec<ChangeNode>, Vec<ChangeNode>) = state
+            .nodes
+            .iter()
+            .cloned()
+            .partition(|node| keep.contains(node.id.as_str()));
+        if pruned.is_empty() {
+            return Ok(GcReport {
+                pruned_nodes: 0,
+                retained_nodes: retained.len(),
+                released_refs: 0,
+            });
+        }
+        let mut released_refs = 0;
+        for node in &pruned {
+            if self.repository.release_snapshot(&node.id)? {
+                released_refs += 1;
+            }
+        }
+        self.write_nodes(&retained)?;
+        self.save_header(&state)?;
+        Ok(GcReport {
+            pruned_nodes: pruned.len(),
+            retained_nodes: retained.len(),
+            released_refs,
+        })
     }
 
     fn continuity_parents(
@@ -416,6 +527,10 @@ impl ChangeGraph {
             provenance,
             mark: None,
         };
+        // Journal first: a node line without a snapshot ref is recoverable (gc
+        // prunes the unreachable node), while a ref without a node line leaks
+        // forever because gc only releases refs named by a node.
+        self.append_node(&node)?;
         self.repository.retain_snapshot(&node.id, &node.tree)?;
         state.nodes.push(node.clone());
         Ok(node)
@@ -424,7 +539,16 @@ impl ChangeGraph {
     fn workspace_key(&self) -> String {
         self.workspace().to_string_lossy().into_owned()
     }
-    fn state_path(&self) -> PathBuf {
+    /// The compact header rewritten by every mutation.
+    fn graph_path(&self) -> PathBuf {
+        self.directory.join("graph.json")
+    }
+    /// The append-only node journal, in topological (append) order.
+    fn nodes_path(&self) -> PathBuf {
+        self.directory.join("nodes.jsonl")
+    }
+    /// The version 2 single-file graph, read once and then migrated.
+    fn legacy_path(&self) -> PathBuf {
         self.directory.join("change-graph.json")
     }
     fn lock(&self) -> Result<File> {
@@ -437,42 +561,111 @@ impl ChangeGraph {
         file.lock_exclusive()?;
         Ok(file)
     }
+
+    /// Read the graph, migrating a version 2 file to the version 3 layout.
+    ///
+    /// Callers hold the graph lock: migration writes the new files and then
+    /// deletes the legacy one, so a downgrade cannot resurrect a stale graph.
     fn load(&self) -> Result<GraphState> {
-        let state: GraphState = serde_json::from_reader(File::open(self.state_path())?)
-            .context("invalid native change graph; refusing to replace it")?;
-        ensure!(
-            state.version == 2,
-            "unsupported native change graph version {}",
-            state.version
-        );
-        let mut seen = BTreeSet::new();
-        for node in &state.nodes {
-            ensure!(
-                node.parents.iter().all(|p| seen.contains(p)),
-                "graph has missing or non-topological parents"
-            );
-            ensure!(seen.insert(node.id.clone()), "duplicate graph node ID");
-        }
-        ensure!(
-            state
-                .heads
-                .values()
-                .chain(state.workspace_heads.values())
-                .all(|h| seen.contains(h)),
-            "graph has missing head"
-        );
-        for (name, id) in &state.checkpoints {
-            ensure!(
-                state
-                    .nodes
-                    .iter()
-                    .any(|n| &n.id == id && n.mark.as_ref().is_some_and(|m| &m.name == name)),
-                "invalid checkpoint mapping"
-            );
-        }
+        let state = if self.graph_path().exists() {
+            self.read_v3()?
+        } else if self.legacy_path().exists() {
+            self.migrate_legacy()?
+        } else {
+            bail!("native change graph is missing; refusing to replace it");
+        };
+        validate_state(&state)?;
         Ok(state)
     }
-    fn save(&self, state: &GraphState) -> Result<()> {
+
+    fn read_v3(&self) -> Result<GraphState> {
+        let header: GraphHeader = serde_json::from_reader(File::open(self.graph_path())?)
+            .context("invalid native change graph header; refusing to replace it")?;
+        ensure!(
+            header.version == GRAPH_VERSION,
+            "unsupported native change graph version {}",
+            header.version
+        );
+        let journal = File::open(self.nodes_path())
+            .context("native change graph is missing its node journal")?;
+        let mut nodes = Vec::new();
+        for line in BufReader::new(journal).lines() {
+            let line = line.context("native change graph journal is unreadable")?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            nodes.push(
+                serde_json::from_str(&line)
+                    .context("invalid native change graph node; refusing to replace it")?,
+            );
+        }
+        Ok(GraphState {
+            version: header.version,
+            base_commit: header.base_commit,
+            base_tree: header.base_tree,
+            nodes,
+            heads: header.heads,
+            workspace_heads: header.workspace_heads,
+            checkpoints: header.checkpoints,
+        })
+    }
+
+    fn migrate_legacy(&self) -> Result<GraphState> {
+        let legacy: GraphState = serde_json::from_reader(File::open(self.legacy_path())?)
+            .context("invalid native change graph; refusing to replace it")?;
+        ensure!(
+            legacy.version == 2,
+            "unsupported native change graph version {}",
+            legacy.version
+        );
+        let state = GraphState {
+            version: GRAPH_VERSION,
+            ..legacy
+        };
+        self.write_nodes(&state.nodes)?;
+        self.save_header(&state)?;
+        // Both version 3 files are fsynced and renamed into place before the
+        // legacy file is dropped, so the migration is crash-safe.
+        fs::remove_file(self.legacy_path())?;
+        File::open(&self.directory)?.sync_all()?;
+        Ok(state)
+    }
+
+    /// Append one node line to the journal and flush it to disk.
+    fn append_node(&self, node: &ChangeNode) -> Result<()> {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(self.nodes_path())?;
+        serde_json::to_writer(&mut file, node)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// Rewrite the whole journal atomically. Only `mark` and `gc` need this.
+    fn write_nodes(&self, nodes: &[ChangeNode]) -> Result<()> {
+        self.atomic_write(&self.nodes_path(), |file| {
+            for node in nodes {
+                serde_json::to_writer(&mut *file, node)?;
+                file.write_all(b"\n")?;
+            }
+            Ok(())
+        })
+    }
+
+    fn save_header(&self, state: &GraphState) -> Result<()> {
+        let header = GraphHeader::from(state);
+        self.atomic_write(&self.graph_path(), |file| {
+            serde_json::to_writer(&mut *file, &header)?;
+            file.write_all(b"\n")?;
+            Ok(())
+        })
+    }
+
+    /// Write `path` through a same-directory temporary file and rename it into
+    /// place, fsyncing both the file and the directory.
+    fn atomic_write(&self, path: &Path, write: impl FnOnce(&mut File) -> Result<()>) -> Result<()> {
         let temporary = self
             .directory
             .join(format!(".graph-{}.tmp", Uuid::now_v7()));
@@ -481,10 +674,9 @@ impl ChangeGraph {
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;
-            serde_json::to_writer(&mut file, state)?;
-            file.write_all(b"\n")?;
+            write(&mut file)?;
             file.sync_all()?;
-            fs::rename(&temporary, self.state_path())?;
+            fs::rename(&temporary, path)?;
             File::open(&self.directory)?.sync_all()?;
             Ok(())
         })();
@@ -493,6 +685,40 @@ impl ChangeGraph {
         }
         result
     }
+}
+
+fn validate_state(state: &GraphState) -> Result<()> {
+    ensure!(
+        state.version == GRAPH_VERSION,
+        "unsupported native change graph version {}",
+        state.version
+    );
+    let mut seen = BTreeSet::new();
+    for node in &state.nodes {
+        ensure!(
+            node.parents.iter().all(|p| seen.contains(p)),
+            "graph has missing or non-topological parents"
+        );
+        ensure!(seen.insert(node.id.clone()), "duplicate graph node ID");
+    }
+    ensure!(
+        state
+            .heads
+            .values()
+            .chain(state.workspace_heads.values())
+            .all(|h| seen.contains(h)),
+        "graph has missing head"
+    );
+    for (name, id) in &state.checkpoints {
+        ensure!(
+            state
+                .nodes
+                .iter()
+                .any(|n| &n.id == id && n.mark.as_ref().is_some_and(|m| &m.name == name)),
+            "invalid checkpoint mapping"
+        );
+    }
+    Ok(())
 }
 
 fn validate_parents(state: &GraphState, parents: &[String]) -> Result<()> {
