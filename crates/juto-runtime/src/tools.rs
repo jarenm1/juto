@@ -25,7 +25,7 @@ use juto_agent::{
     AgentError, Tool, ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier,
 };
 use juto_ai::ContentBlock;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
@@ -1210,6 +1210,134 @@ impl Tool for BashTool {
 }
 
 // ---------------------------------------------------------------------------
+// Desktop remote-sharing artifact tool
+// ---------------------------------------------------------------------------
+
+/// Standard descriptor version for desktop artifacts.
+pub const DESKTOP_SESSION_ARTIFACT_VERSION: u32 = 1;
+
+fn default_artifact_version() -> u32 {
+    DESKTOP_SESSION_ARTIFACT_VERSION
+}
+
+/// Typed descriptor for an agent-mounted desktop session artifact.
+///
+/// Carries identifiers only. Bearer tokens, SDP payloads, and raw local socket
+/// paths are omitted by design so durable transcripts remain safe to share.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopSessionArtifact {
+    #[serde(default = "default_artifact_version")]
+    pub version: u32,
+    pub artifact_id: String,
+    pub title: String,
+    pub host_id: String,
+    pub environment_id: String,
+    pub grant_id: String,
+}
+
+#[derive(Deserialize)]
+struct DesktopArtifactArgs {
+    title: String,
+    host_id: String,
+    environment_id: String,
+    grant_id: String,
+    #[serde(default)]
+    artifact_id: Option<String>,
+}
+
+/// Tool enabling agents to register and mount a desktop sharing artifact in chat.
+pub struct DesktopArtifactTool;
+
+#[async_trait]
+impl Tool for DesktopArtifactTool {
+    fn definition(&self) -> juto_ai::ToolDefinition {
+        juto_ai::ToolDefinition {
+            name: "desktop_artifact".to_string(),
+            description: "Creates and mounts a remote desktop session artifact in the chat. Records durable identifier metadata (host_id, environment_id, grant_id, title) without embedding credentials or live stream state.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Human-readable label for the desktop sharing artifact."
+                    },
+                    "host_id": {
+                        "type": "string",
+                        "description": "Opaque identifier of the host machine or cluster."
+                    },
+                    "environment_id": {
+                        "type": "string",
+                        "description": "Opaque identifier of the isolated desktop environment."
+                    },
+                    "grant_id": {
+                        "type": "string",
+                        "description": "Opaque view/control grant identifier."
+                    },
+                    "artifact_id": {
+                        "type": "string",
+                        "description": "Optional explicit artifact identifier; generated if omitted."
+                    }
+                },
+                "required": ["title", "host_id", "environment_id", "grant_id"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Write
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Shared
+    }
+
+    async fn execute(&self, arguments: Value, _ctx: ToolContext) -> Result<ToolOutput, String> {
+        let args: DesktopArtifactArgs = serde_json::from_value(arguments)
+            .map_err(|e| format!("invalid desktop_artifact arguments: {e}"))?;
+
+        if args.title.trim().is_empty() {
+            return Err("desktop artifact title must not be empty".to_string());
+        }
+        if args.host_id.trim().is_empty() {
+            return Err("desktop artifact host_id must not be empty".to_string());
+        }
+        if args.environment_id.trim().is_empty() {
+            return Err("desktop artifact environment_id must not be empty".to_string());
+        }
+        if args.grant_id.trim().is_empty() {
+            return Err("desktop artifact grant_id must not be empty".to_string());
+        }
+
+        let artifact_id = args
+            .artifact_id
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or_else(|| format!("desk-{}", uuid::Uuid::now_v7()));
+
+        let artifact = DesktopSessionArtifact {
+            version: DESKTOP_SESSION_ARTIFACT_VERSION,
+            artifact_id: artifact_id.clone(),
+            title: args.title.clone(),
+            host_id: args.host_id.clone(),
+            environment_id: args.environment_id.clone(),
+            grant_id: args.grant_id.clone(),
+        };
+
+        let details = json!({
+            "type": "desktop_session_artifact",
+            "artifact": artifact
+        });
+
+        let summary = format!(
+            "Desktop sharing artifact mounted: \"{}\" [artifact_id: {}, env: {}, host: {}, grant: {}]",
+            args.title, artifact_id, args.environment_id, args.host_id, args.grant_id
+        );
+
+        Ok(output(summary, details))
+    }
+}
+// ---------------------------------------------------------------------------
 // registry
 // ---------------------------------------------------------------------------
 
@@ -1238,6 +1366,7 @@ pub fn builtin_tools(cwd: &Path) -> Result<ToolRegistry, AgentError> {
     registry.register(Arc::new(BashTool {
         cwd: cwd.to_path_buf(),
     }))?;
+    registry.register(Arc::new(DesktopArtifactTool))?;
     Ok(registry)
 }
 
@@ -1265,6 +1394,34 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn registry_has_builtin_tools_with_schemas() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = builtin_tools(dir.path()).expect("builtin tools");
+        let mut names: Vec<String> = registry
+            .definitions()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                "bash",
+                "desktop_artifact",
+                "edit",
+                "glob",
+                "grep",
+                "read",
+                "write"
+            ]
+        );
+        for def in registry.definitions() {
+            assert_eq!(def.parameters["type"], "object", "{}", def.name);
+            assert!(def.parameters["required"].is_array(), "{}", def.name);
+        }
     }
 
     #[test]
@@ -1330,6 +1487,11 @@ mod tests {
                 cwd: PathBuf::new()
             }
             .concurrency(),
+            ToolConcurrency::Shared
+        ));
+        assert!(matches!(DesktopArtifactTool.tier(), ToolTier::Write));
+        assert!(matches!(
+            DesktopArtifactTool.concurrency(),
             ToolConcurrency::Shared
         ));
     }
@@ -2045,5 +2207,87 @@ mod tests {
             .await
             .unwrap();
         assert!(text(&out).contains("1: other"));
+    }
+
+    #[tokio::test]
+    async fn desktop_artifact_tool_validates_and_generates_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = DesktopArtifactTool;
+
+        // Missing required field rejected
+        let err = tool
+            .execute(
+                json!({
+                    "title": "My Game",
+                    "host_id": "host-1",
+                    "environment_id": "env-1"
+                }),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("invalid desktop_artifact arguments"), "{err}");
+
+        // Empty field rejected
+        let err = tool
+            .execute(
+                json!({
+                    "title": "",
+                    "host_id": "host-1",
+                    "environment_id": "env-1",
+                    "grant_id": "grant-1"
+                }),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.contains("title must not be empty"), "{err}");
+
+        // Successful execution with explicit artifact_id
+        let out = tool
+            .execute(
+                json!({
+                    "title": "Interactive Game Desktop",
+                    "host_id": "host-us-central",
+                    "environment_id": "env-prod-99",
+                    "grant_id": "grant-view-play",
+                    "artifact_id": "custom-art-123"
+                }),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+
+        assert!(!out.is_error);
+        assert_eq!(out.details["type"], "desktop_session_artifact");
+        let art: DesktopSessionArtifact =
+            serde_json::from_value(out.details["artifact"].clone()).unwrap();
+        assert_eq!(art.version, DESKTOP_SESSION_ARTIFACT_VERSION);
+        assert_eq!(art.artifact_id, "custom-art-123");
+        assert_eq!(art.title, "Interactive Game Desktop");
+        assert_eq!(art.host_id, "host-us-central");
+        assert_eq!(art.environment_id, "env-prod-99");
+        assert_eq!(art.grant_id, "grant-view-play");
+
+        // Successful execution generating uuid v7 artifact_id
+        let out2 = tool
+            .execute(
+                json!({
+                    "title": "Auto ID Game",
+                    "host_id": "host-2",
+                    "environment_id": "env-2",
+                    "grant_id": "grant-2"
+                }),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        let art2: DesktopSessionArtifact =
+            serde_json::from_value(out2.details["artifact"].clone()).unwrap();
+        assert!(
+            art2.artifact_id.starts_with("desk-"),
+            "generated: {}",
+            art2.artifact_id
+        );
     }
 }

@@ -51,6 +51,7 @@ pub use subagents::{
     BlockerReason, ChildState, SchemaMode, SubagentError, SubagentManager, SubagentResult,
     SubagentStatus, SubagentSummary, TaskSpec,
 };
+pub use tools::{DESKTOP_SESSION_ARTIFACT_VERSION, DesktopArtifactTool, DesktopSessionArtifact};
 pub use workspace::{GpuLockGuard, ResourceLimits, SubagentWorkspace, WorkspaceError};
 
 use crate::change_graph::{ChangeGraph, EditProvenance};

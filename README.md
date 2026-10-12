@@ -98,6 +98,14 @@ computer-use control, and live human interaction with running games. Same-host
 viewing uses shared memory or negotiated DMA-BUF; remote laptop/phone viewing
 uses WebRTC. This is a design proposal, **not a shipped compositor or viewer**.
 
+**Remote sharing desktop artifacts in chat.** Agents mount remote desktop sharing
+sessions in chat conversations via the `desktop_artifact` tool. Artifact descriptors persist
+as IDs-only `DesktopSessionArtifact` records (`version`, `artifact_id`, `title`, `host_id`,
+`environment_id`, `grant_id`) without embedding bearer tokens, SDP payloads, or local paths.
+The chat view mounts typed desktop artifact cards with title, identifiers, and version badge.
+Clicking **Open Desktop ↗** inspects environment availability and explicitly reports when
+remote media/video backends are unconfigured, avoiding manufactured live streaming states.
+
 ## Development
 
 Requires Nix with flakes enabled. The supported development system is
@@ -317,15 +325,17 @@ xdotool key ctrl+q
 Run these commands in the same Xvfb session as the application. Synthetic typing
 can outpace software rendering: wait for the input queue and display to settle
 before capturing or asserting the visible result.
-Observed for the agent-wired chat view: locked application build; 5 unit tests
-passing in `juto` (112 across workspace); Clippy with warnings denied; native typing,
+Observed for the agent-wired chat view: locked application build; 15 unit tests
+passing in `juto` (116 across workspace); Clippy with warnings denied; native typing,
 Enter and Send submission, empty/whitespace rejection, attachment dropdown (+),
 attached file chips, message with attachment submission, attachment-only submission,
 chip removal (×), copy/cut/paste, long-input scrolling, wrapped messages, history
 scrolling, streaming assistant responses, durable append-only JSONL session creation
 and persistence, existing session loading via `--session`, model selection via `--model`,
-560×480 resizing, and Ctrl-Q exit status 0 under Xvfb/Mesa software Vulkan.
-Host Wayland, hardware acceleration, live provider network transport, and an actual platform IME
+mounting and rendering of `DesktopSessionArtifact` remote-sharing cards, explicit
+unavailable streaming notice on desktop open attempt, 560×480 resizing, and Ctrl-Q exit
+status 0 under Xvfb/Mesa software Vulkan.
+Host Wayland, hardware acceleration, live provider network transport, and live video streaming backend
 were not exercised.
 ## Dependency constraints
 
