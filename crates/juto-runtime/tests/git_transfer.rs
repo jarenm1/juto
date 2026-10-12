@@ -1583,6 +1583,59 @@ fn cleanup_orphaned_forks_skips_live_fork() {
 }
 
 #[test]
+fn update_tree_entry_matches_a_full_capture() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    fs::create_dir_all(dir.join("src")).unwrap();
+    write_file(&dir.join("src/a.txt"), b"a\n");
+    write_file(&dir.join("src/b.txt"), b"b\n");
+    write_file(&dir.join("top.txt"), b"top\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let head = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    // A one-entry delta must equal what a full workspace scan would produce.
+    write_file(&dir.join("src/a.txt"), b"edited\n");
+    let blob = repository.write_blob(b"edited\n").unwrap();
+    let delta = repository
+        .update_tree_entry(&head, b"src/a.txt", "100644", &blob)
+        .unwrap();
+    assert_eq!(
+        delta,
+        repository.capture_tree(&head).unwrap(),
+        "a one-entry delta must match a full capture"
+    );
+
+    // The exec bit is part of the entry. Base the delta on the previous result:
+    // a full capture sees every accumulated change.
+    let mut perms = fs::metadata(dir.join("src/b.txt")).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(dir.join("src/b.txt"), perms).unwrap();
+    let blob = repository.write_blob(b"b\n").unwrap();
+    let delta = repository
+        .update_tree_entry(&delta, b"src/b.txt", "100755", &blob)
+        .unwrap();
+    assert_eq!(
+        delta,
+        repository.capture_tree(&head).unwrap(),
+        "the exec bit must be recorded"
+    );
+
+    // Mode 0 removes the entry.
+    let delta = repository
+        .update_tree_entry(&delta, b"top.txt", "0", &"0".repeat(40))
+        .unwrap();
+    fs::remove_file(dir.join("top.txt")).unwrap();
+    assert_eq!(
+        delta,
+        repository.capture_tree(&head).unwrap(),
+        "mode 0 must remove the entry"
+    );
+}
+
+#[test]
 fn refs_transport_blobs_and_trees_over_a_bare_remote() {
     let temp = tempfile::tempdir().unwrap();
     let dir = repo(&temp, "repo");

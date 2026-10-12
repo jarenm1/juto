@@ -279,6 +279,43 @@ impl GitRepository {
         captured
     }
 
+    /// Return `tree` with a single path replaced by `blob` at `mode`.
+    ///
+    /// The edit tool knows exactly which path it changed, so applying a
+    /// one-entry delta avoids re-hashing the whole workspace: `capture_tree`
+    /// walks and hashes every tracked and untracked file, which dominates the
+    /// cost of an edit on a large repository. `mode` of `"0"` removes the entry.
+    pub fn update_tree_entry(
+        &self,
+        tree: &str,
+        path: &[u8],
+        mode: &str,
+        blob: &str,
+    ) -> Result<String> {
+        let tree = self.resolve_tree(tree)?;
+        validate_tree_path(path)?;
+        let directory = self
+            .git_dir
+            .join("juto")
+            .join(format!("delta-{}", Uuid::now_v7()));
+        fs::create_dir_all(&directory).with_context(|| {
+            format!(
+                "failed to create the delta index directory {}",
+                directory.display()
+            )
+        })?;
+        let index = directory.join("index");
+        let updated = (|| -> Result<String> {
+            self.run_with_index(&index, &["read-tree", tree.as_str()])?;
+            let mut info = Vec::new();
+            push_index_entry(&mut info, mode, blob, path);
+            self.update_index_info(&index, &info)?;
+            self.run_with_index(&index, &["write-tree"])
+        })();
+        let _ = fs::remove_dir_all(&directory);
+        updated
+    }
+
     /// Whether `path` exists in `tree`.
     ///
     /// `path` is the workspace-relative path as raw bytes (Git paths are byte
@@ -1366,7 +1403,7 @@ impl GitRepository {
     }
 
     /// Hash raw bytes as a blob, without any filters.
-    fn hash_bytes(&self, bytes: &[u8]) -> Result<String> {
+    pub(crate) fn hash_bytes(&self, bytes: &[u8]) -> Result<String> {
         self.run_with_stdin(&["hash-object", "--no-filters", "-w", "--stdin"], bytes)
     }
 
