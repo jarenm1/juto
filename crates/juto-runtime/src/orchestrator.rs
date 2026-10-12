@@ -27,6 +27,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::change_graph::ChangeGraph;
 use crate::subagents::{SubagentError, SubagentManager, SubagentResult, TaskSpec};
 
 /// Intent route classified by discrete triage.
@@ -565,6 +566,9 @@ pub struct OrchestratorConfig {
     pub default_model: Option<String>,
     /// Model selector override for reviewer subagents.
     pub reviewer_model: Option<String>,
+    /// Repository whose change graph records a verified checkpoint when a task
+    /// is approved. `None` disables the checkpoint.
+    pub repo_root: Option<PathBuf>,
 }
 
 impl Default for OrchestratorConfig {
@@ -582,6 +586,7 @@ impl Default for OrchestratorConfig {
             ],
             default_model: None,
             reviewer_model: None,
+            repo_root: None,
         }
     }
 }
@@ -1062,6 +1067,10 @@ impl Orchestrator {
                         format!("Task approved by reviewer: {summary}"),
                         None,
                     );
+                    // The builder's isolated workspace names its thread after the
+                    // subagent id, so its head is exactly the state the gates and
+                    // the reviewer just approved.
+                    self.mark_verified_checkpoint(&child_id, mission_id);
                     return Ok(TaskOutcome {
                         mission_id: mission_id.to_string(),
                         route: IntentRoute::EndToEndTask,
@@ -1212,6 +1221,46 @@ impl Orchestrator {
             usage: Usage::default(),
             duration_ms: start.elapsed().as_millis() as u64,
         })
+    }
+
+    /// Freeze the builder's thread head as a verified checkpoint.
+    ///
+    /// The builder runs in an isolated workspace whose thread is named after its
+    /// subagent id, so that thread's head is the state the quality gates and the
+    /// reviewer just approved. Best-effort: a missing graph or thread must never
+    /// fail an approved task, so a failure is reported and the task still
+    /// completes.
+    fn mark_verified_checkpoint(&self, thread: &str, mission_id: &str) {
+        let Some(repo_root) = &self.config.repo_root else {
+            return;
+        };
+        let result = (|| -> anyhow::Result<String> {
+            let graph = ChangeGraph::open(repo_root)?;
+            let head = graph
+                .state()?
+                .heads
+                .get(thread)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("thread {thread:?} has no head"))?;
+            let node = graph.mark(
+                &head,
+                &format!("verified-{mission_id}"),
+                &format!("verified: {mission_id}"),
+                true,
+            )?;
+            Ok(node.id)
+        })();
+        match result {
+            Ok(id) => self.emit_event(
+                mission_id,
+                PipelinePhase::Completed,
+                format!("Recorded verified checkpoint for node {id}"),
+                None,
+            ),
+            Err(error) => {
+                eprintln!("juto: failed to record a verified checkpoint: {error:#}");
+            }
+        }
     }
 
     fn emit_event(
