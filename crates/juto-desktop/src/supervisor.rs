@@ -663,16 +663,6 @@ impl DesktopEnvironment {
         }
         drop(lease);
 
-        if batch
-            .events
-            .iter()
-            .any(|event| matches!(event, InputEvent::TextCommit { .. }))
-        {
-            return Err(DesktopError::TextUnavailable(
-                "text-input-v3 is not advertised by this compositor".to_string(),
-            ));
-        }
-
         let compositor = self.compositor()?;
         for event in batch.events {
             compositor.send(CompositorCommand::Input(event))?;

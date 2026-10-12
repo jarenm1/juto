@@ -199,6 +199,13 @@ reports connection state and errors instead of showing a stale frame as live.
 `juto --desktop <command> [args...]` opens the same viewer directly for
 development.
 
+**Text input.** The compositor advertises `zwp_text_input_manager_v3` and acts as
+the input method for its own clients: focus changes send `enter`/`leave`, and
+`TextCommit`/`TextPreedit` input events are delivered as `commit_string` /
+`preedit_string` only to instances that enabled themselves for the focused
+surface. Events addressed to an idle client are flushed explicitly, so text and
+frame callbacks are not delayed until the client happens to send a request.
+
 **Same-host viewer transport.** The daemon's `Attach` command returns the
 environment's sealed frame pool as an `SCM_RIGHTS` descriptor alongside
 negotiated metadata (pool id, dimensions, stride, format, slot count, slot
@@ -228,8 +235,8 @@ are not reported. `DesktopSupervisor::reconcile` stops orphan
 previous process; the daemon and the runtime call it at startup.
 
 **Not yet shipped: audio and the remaining profiles.** Audio (private PipeWire
-sink plus Opus), Xwayland, text-input-v3, the hardware render-node profile,
-DMA-BUF export/import, and TURN relay configuration are not implemented.
+sink plus Opus), Xwayland, the hardware render-node profile, DMA-BUF
+export/import, and TURN relay configuration are not implemented.
 The embedded GPUI viewer still reads the pool in-process; wiring it to the
 daemon's `SCM_RIGHTS` attach path is a follow-up. A compile pass is not evidence of
 streaming; the shipped behavior is verified by the integration tests and the
