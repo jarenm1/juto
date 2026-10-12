@@ -111,14 +111,15 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Resize gating: a new geometry generation clears viewer acknowledgements and
   input is rejected until `GeometryReady` reports the new generation.
 
-Not implemented: the private audio server itself (a per-environment PipeWire
-sink), DMA-BUF export/import, and deployment provisioning (TLS termination,
-public reachability). Sections describing those remain design.
+Not implemented: DMA-BUF export/import and deployment provisioning (TLS
+termination, public reachability). Sections describing those remain design.
 
-The remote stream carries an Opus audio track when the environment's audio
-source is configured (`RemoteStreamConfig::audio_source`, for example
-`pulsesrc device=juto-sink.monitor`); audio and video share the environment's
-total-media ceiling.
+Each environment runs its own PipeWire instance with a private null sink
+(`juto-sink`) and a `pipewire-pulse` endpoint inside the environment slice;
+applications receive `PIPEWIRE_RUNTIME_DIR` and `PULSE_SERVER` pointing at it,
+never the host graph. The remote stream carries an Opus audio track captured
+from that sink's monitor (`DesktopEnvironment::audio_source`), and audio and
+video share the environment's total-media ceiling.
 
 Xwayland is implemented (one private X11 server per environment, driven by
 Smithay's X11 WM, with an `MIT-MAGIC-COOKIE-1` `XAUTHORITY` file). The hardware

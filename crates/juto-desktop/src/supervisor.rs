@@ -182,6 +182,33 @@ fn default_owner_timeout() -> u64 {
     60
 }
 
+/// Name of the private audio sink created inside each environment.
+pub const AUDIO_SINK_NAME: &str = "juto-sink";
+
+/// GStreamer description of the environment's private audio source.
+///
+/// The monitor of the environment's own sink is what the remote encoder
+/// captures; no host audio device or default graph is involved (spec section 7).
+pub fn audio_source_description() -> String {
+    format!("pulsesrc device={AUDIO_SINK_NAME}.monitor")
+}
+
+/// PipeWire drop-in that gives the environment a private null sink.
+const AUDIO_SINK_CONFIG: &str = r#"context.objects = [
+    { factory = adapter
+      args = {
+          factory.name     = support.null-audio-sink
+          node.name        = juto-sink
+          node.description = "Juto environment sink"
+          media.class      = Audio/Sink
+          object.linger    = true
+          audio.position   = [ FL FR ]
+          audio.rate       = 48000
+          audio.channels   = 2
+      } }
+]
+"#;
+
 /// Host-wide admission policy (spec section 6).
 ///
 /// Per-environment ceilings bound one desktop; this bounds the sum of admitted
@@ -318,6 +345,8 @@ struct InnerEnvironment {
     launch_requests: Mutex<HashMap<String, AppHandle>>,
     /// Xwayland display number, once the X11 server is ready.
     x11_display: Mutex<Option<u32>>,
+    /// Private audio server processes for this environment.
+    audio: Mutex<Vec<Child>>,
 }
 
 /// An active, isolated agent desktop environment.
@@ -481,8 +510,10 @@ impl DesktopEnvironment {
             viewers: Mutex::new(HashMap::new()),
             launch_requests: Mutex::new(HashMap::new()),
             x11_display: Mutex::new(None),
+            audio: Mutex::new(Vec::new()),
         });
 
+        spawn_audio_server(&inner)?;
         spawn_event_forwarder(inner.clone(), comp_rx);
         spawn_lease_reaper(Arc::downgrade(&inner));
         spawn_pressure_monitor(Arc::downgrade(&inner));
@@ -755,6 +786,19 @@ impl DesktopEnvironment {
             self.inner.runtime_dir.join("tmp").display().to_string(),
         ));
         app_env.push(("PWD".to_string(), work_dir.display().to_string()));
+        // Applications play into the environment's own audio server, never the
+        // host graph.
+        app_env.push((
+            "PIPEWIRE_RUNTIME_DIR".to_string(),
+            self.inner.runtime_dir.display().to_string(),
+        ));
+        app_env.push((
+            "PULSE_SERVER".to_string(),
+            format!(
+                "unix:{}",
+                self.inner.runtime_dir.join("pulse/native").display()
+            ),
+        ));
         // X11 applications reach the environment's private Xwayland instance
         // with the environment's own authorization cookie.
         if let Some(display_number) = *self.inner.x11_display.lock() {
@@ -1047,6 +1091,11 @@ impl DesktopEnvironment {
         self.inner.viewers.lock().remove(viewer_id);
     }
 
+    /// GStreamer description of the environment's private audio source.
+    pub fn audio_source(&self) -> String {
+        audio_source_description()
+    }
+
     /// Xwayland display number, once the X11 server is ready.
     pub fn x11_display(&self) -> Option<u32> {
         *self.inner.x11_display.lock()
@@ -1218,6 +1267,12 @@ impl DesktopEnvironment {
         // Dropping the lock file releases the shared GPU lock.
         drop(self.inner.gpu_lock.lock().take());
 
+        // Retire the private audio server; stopping the slice also covers it.
+        for mut child in self.inner.audio.lock().drain(..) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
         let _ = std::fs::remove_dir_all(&self.inner.runtime_dir);
         *self.inner.is_ready.lock() = false;
         let _ = self.inner.events.send(DesktopEvent::Stopped {
@@ -1288,6 +1343,76 @@ fn spawn_event_forwarder(inner: Arc<InnerEnvironment>, rx: std_mpsc::Receiver<De
             let _ = inner.events.send(event);
         }
     });
+}
+
+/// Starts the environment's private audio server.
+///
+/// A per-environment PipeWire instance with its own null sink keeps the
+/// environment's audio off the host graph; `pipewire-pulse` exposes it over the
+/// PulseAudio protocol so ordinary applications can play into it (spec section
+/// 7). Both processes run inside the environment slice, so the environment's
+/// CPU/RAM/task limits cover them.
+fn spawn_audio_server(inner: &Arc<InnerEnvironment>) -> Result<(), DesktopError> {
+    let config_dir = inner
+        .runtime_dir
+        .join("home/.config/pipewire/pipewire.conf.d");
+    std::fs::create_dir_all(&config_dir).map_err(|source| DesktopError::Io {
+        path: config_dir.clone(),
+        source,
+    })?;
+    let config = config_dir.join("10-juto-sink.conf");
+    std::fs::write(&config, AUDIO_SINK_CONFIG).map_err(|source| DesktopError::Io {
+        path: config.clone(),
+        source,
+    })?;
+
+    let runtime_dir = inner.runtime_dir.display().to_string();
+    let config_home = inner.runtime_dir.join("home/.config").display().to_string();
+    let home = inner.runtime_dir.join("home").display().to_string();
+    let path = std::env::var("PATH").unwrap_or_default();
+
+    for (index, program) in ["pipewire", "pipewire-pulse"].iter().enumerate() {
+        let mut command = if let Some(slice) = inner.slice.as_ref() {
+            let unit = format!(
+                "juto-desktop-{}-audio-{index}.scope",
+                sanitize(&inner.config.env_id)
+            );
+            let mut c = Command::new("systemd-run");
+            c.args(["--user", "--scope", "--quiet", "--collect"]);
+            c.arg(format!("--unit={unit}"));
+            c.arg(format!("--slice={slice}"));
+            c.arg("--");
+            c.arg("env").arg("-i");
+            c.arg(format!("PATH={path}"));
+            c.arg(format!("XDG_RUNTIME_DIR={runtime_dir}"));
+            c.arg(format!("PIPEWIRE_RUNTIME_DIR={runtime_dir}"));
+            c.arg(format!("XDG_CONFIG_HOME={config_home}"));
+            c.arg(format!("HOME={home}"));
+            c.arg(program);
+            c
+        } else {
+            let mut c = Command::new(program);
+            c.env_clear();
+            c.env("PATH", &path);
+            c.env("XDG_RUNTIME_DIR", &runtime_dir);
+            c.env("PIPEWIRE_RUNTIME_DIR", &runtime_dir);
+            c.env("XDG_CONFIG_HOME", &config_home);
+            c.env("HOME", &home);
+            c
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = command
+            .spawn()
+            .map_err(|e| DesktopError::ExecutableUnavailable {
+                path: PathBuf::from(program),
+                reason: e.to_string(),
+            })?;
+        inner.audio.lock().push(child);
+    }
+    Ok(())
 }
 
 /// Fraction of a limit at which a `LimitPressure` event is emitted.
