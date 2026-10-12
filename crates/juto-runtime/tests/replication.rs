@@ -472,6 +472,46 @@ fn reconcile_reports_a_conflicting_merge_and_changes_nothing() {
 }
 
 #[test]
+fn resolve_records_a_hand_resolved_merge_and_retires_the_remote_head() {
+    let fixture = SharedRemote::new();
+    let a = ChangeGraph::open(&fixture.a).unwrap();
+    let b = ChangeGraph::open(&fixture.b).unwrap();
+
+    // Both machines edit the same file differently: the merge must conflict.
+    fs::write(fixture.a.join("shared"), "from a\n").unwrap();
+    let a_head = a.capture("main", provenance("a"), None).unwrap();
+    a.push_graph(fixture.remote()).unwrap();
+
+    fs::write(fixture.b.join("shared"), "from b\n").unwrap();
+    let b_head = b.capture("main", provenance("b"), None).unwrap();
+    b.fetch_graph(fixture.remote()).unwrap();
+    let remote_head = format!("{}/main", a.machine_id().unwrap());
+    assert!(matches!(
+        b.reconcile("main").unwrap().as_slice(),
+        [ReconcileOutcome::Conflicted { .. }]
+    ));
+    assert_eq!(
+        b.pending_reconcile_threads().unwrap(),
+        vec!["main".to_string()],
+        "a conflict leaves the remote head pending"
+    );
+
+    // The agent resolves the file by hand and records the merge.
+    fs::write(fixture.b.join("shared"), "resolved\n").unwrap();
+    let node = b
+        .resolve("main", &b_head.id, &a_head.id, provenance("resolve"))
+        .unwrap();
+    assert_eq!(node.parents, vec![b_head.id.clone(), a_head.id.clone()]);
+
+    // The folded-in remote head is retired, so the flag clears rather than
+    // staying true after the agent acted on it.
+    let state = b.state().unwrap();
+    assert!(!state.heads.contains_key(&remote_head));
+    assert_eq!(state.heads["main"], node.id);
+    assert!(b.pending_reconcile_threads().unwrap().is_empty());
+}
+
+#[test]
 fn reconcile_adopts_a_remote_head_when_the_thread_has_no_local_head() {
     let fixture = SharedRemote::new();
     let a = ChangeGraph::open(&fixture.a).unwrap();

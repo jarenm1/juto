@@ -780,6 +780,42 @@ impl ChangeGraph {
         Ok(outcomes)
     }
 
+    /// Record a resolved merge: capture the workspace as a two-parent node and
+    /// retire any imported remote head it folded in.
+    ///
+    /// A conflicting [`ChangeGraph::reconcile`] changes nothing, so the remote
+    /// head stays and `needs_reconcile` keeps reporting it. Once the caller has
+    /// resolved the files and recorded the merge, that head is folded in and
+    /// must be retired — otherwise the flag stays true after the agent acted on
+    /// it, which is exactly the retry loop `pending_reconcile_threads` exists to
+    /// prevent.
+    pub fn resolve(
+        &self,
+        thread: &str,
+        left: &str,
+        right: &str,
+        provenance: EditProvenance,
+    ) -> Result<ChangeNode> {
+        let state = self.state()?;
+        let left = resolve_node(&state, left)?.id.clone();
+        let right = resolve_node(&state, right)?.id.clone();
+        let node = self.capture(thread, provenance, Some(vec![left.clone(), right.clone()]))?;
+        let suffix = format!("/{thread}");
+        let retired: Vec<String> = self
+            .state()?
+            .heads
+            .iter()
+            .filter(|(key, head)| {
+                key.ends_with(&suffix) && (head.as_str() == left || head.as_str() == right)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        for remote in retired {
+            self.drop_head(&remote)?;
+        }
+        Ok(node)
+    }
+
     /// Move `remote`'s head onto `thread`, retiring the owner-qualified key.
     fn adopt_head(&self, thread: &str, remote: &str) -> Result<()> {
         let _lock = self.lock()?;
