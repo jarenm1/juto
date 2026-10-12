@@ -319,6 +319,7 @@ pub(super) fn build(
         Api::Gemini => {
             json!({"contents":gemini_messages(model,context),"systemInstruction":{"parts":context.system_prompt.iter().map(|text|json!({"text":text})).collect::<Vec<_>>()},"generationConfig":{"maxOutputTokens":max_tokens}})
         }
+        Api::Devin => unreachable!("devin-agent builds requests in devin.rs"),
     };
     if let Some(temperature) = options.temperature {
         match api {
@@ -388,6 +389,7 @@ pub(super) fn build(
                 body["generationConfig"]["thinkingConfig"] = json!({"includeThoughts":true,"thinkingBudget":match effort{"minimal"|"low"=>1024,"medium"=>4096,_=>8192}})
             }
             Api::Ollama => body["think"] = json!(true),
+            Api::Devin => unreachable!("devin-agent builds requests in devin.rs"),
             _ => {}
         }
     }
@@ -402,6 +404,7 @@ pub(super) fn build(
         Api::Responses|Api::Codex|Api::Azure=>body["tools"]=json!(context.tools.iter().map(|tool|json!({"type":"function","name":tool.name,"description":tool.description,"parameters":tool.parameters})).collect::<Vec<_>>()),
         Api::Anthropic=>body["tools"]=json!(context.tools.iter().map(|tool|json!({"name":tool.name,"description":tool.description,"input_schema":tool.parameters})).collect::<Vec<_>>()),
         Api::Gemini=>body["tools"]=json!([{"functionDeclarations":context.tools.iter().map(|tool|json!({"name":tool.name,"description":tool.description,"parameters":tool.parameters})).collect::<Vec<_>>() }]),
+        Api::Devin => unreachable!("devin-agent builds requests in devin.rs"),
     }
     }
     let url = match api {
@@ -454,6 +457,7 @@ pub(super) fn build(
             )
         }
         Api::Ollama => format!("{}/api/chat", base(model, "http://localhost:11434")),
+        Api::Devin => unreachable!("devin-agent builds requests in devin.rs"),
     };
     let mut request = client
         .post(url)

@@ -11,5 +11,5 @@ pub use auth::{
     AuthError, Credential, CredentialKind, CredentialStore, CredentialSummary, OAuthLogin,
 };
 pub use judge::{TextJudge, TypeSafeJudge, create_judge};
-pub use provider::{HttpProvider, TRANSPORT_PENDING_PROVIDERS};
+pub use provider::HttpProvider;
 pub use types::*;

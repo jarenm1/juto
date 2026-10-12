@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use juto_agent::{AgentEvent, RunControl};
-use juto_ai::{HttpProvider, ProviderEvent, StopReason, TRANSPORT_PENDING_PROVIDERS};
+use juto_ai::{HttpProvider, ProviderEvent, StopReason};
 use juto_runtime::{ApprovalMode, EntryKind, Runtime, RuntimeConfig, Session, default_data_dir};
 use tokio::sync::mpsc;
 
@@ -184,8 +184,7 @@ async fn main() -> Result<()> {
             for model in runtime.catalog().iter().filter(|model| {
                 available.contains(&model.provider)
                     && matches!(model.kind.as_str(), "chat" | "tiny")
-                    && (HttpProvider::supports_model(model)
-                        || TRANSPORT_PENDING_PROVIDERS.contains(&model.provider.as_str()))
+                    && HttpProvider::supports_model(model)
                     && provider
                         .as_deref()
                         .is_none_or(|provider| provider == model.provider)

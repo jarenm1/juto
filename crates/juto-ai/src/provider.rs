@@ -14,7 +14,10 @@ use crate::{
     StreamOptions,
 };
 
+mod connect;
 mod decode;
+mod devin;
+mod proto;
 mod requests;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -26,6 +29,7 @@ enum Api {
     Anthropic,
     Gemini,
     Ollama,
+    Devin,
 }
 impl Api {
     fn for_model(model: &Model) -> Result<Self, ProviderError> {
@@ -37,17 +41,11 @@ impl Api {
             "anthropic-messages" => Ok(Self::Anthropic),
             "google-generative-ai" => Ok(Self::Gemini),
             "ollama-chat" => Ok(Self::Ollama),
+            "devin-agent" => Ok(Self::Devin),
             _ => Err(ProviderError::Unsupported(model.api.clone())),
         }
     }
 }
-
-/// Provider ids whose models surface in pickers once credentials exist even
-/// though their wire transport is not yet implemented (devin: the upstream
-/// `devin-agent` Cascade protobuf API is a planned follow-on). Selecting one
-/// fails at stream time with `ProviderError::Unsupported`, which chat renders
-/// as an error event.
-pub const TRANSPORT_PENDING_PROVIDERS: &[&str] = &["devin"];
 
 pub struct HttpProvider {
     credentials: Arc<CredentialStore>,
@@ -89,6 +87,17 @@ impl Provider for HttpProvider {
             _=cancel.cancelled()=>return Err(ProviderError::Aborted),
             result=self.credentials.resolve(model)=>result.map_err(|error|ProviderError::Authentication(error.to_string()))?,
         };
+        if api == Api::Devin {
+            return devin::stream_devin(
+                &self.client,
+                model,
+                context,
+                options,
+                credential.as_ref(),
+                cancel,
+            )
+            .await;
+        }
         let request = requests::build(
             &self.client,
             api,

@@ -206,6 +206,8 @@ impl Decoder {
             Api::Anthropic => self.anthropic(&value, events)?,
             Api::Gemini => self.gemini(&value, events)?,
             Api::Ollama => self.ollama(&value, events)?,
+            // Devin streams Connect frames through devin.rs, never SSE payloads.
+            Api::Devin => unreachable!("devin-agent does not decode SSE payloads"),
         }
         Ok(self.terminal)
     }

@@ -8,7 +8,7 @@ use gpui::{
     SharedString, Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*,
     px, rgb, uniform_list,
 };
-use juto_ai::{HttpProvider, TRANSPORT_PENDING_PROVIDERS};
+use juto_ai::HttpProvider;
 use juto_catalog::{Model, Registry};
 use juto_runtime::{Runtime, RuntimeConfig};
 
@@ -146,12 +146,10 @@ impl PickerData {
         let mut models = registry
             .iter()
             .filter(|model| {
-                // Providers with a ported login but a pending wire transport
-                // still appear once connected; selection surfaces the runtime's
-                // unsupported-transport error rather than hiding the models.
+                // Every catalog model whose wire transport juto implements is
+                // pickable once its provider is connected.
                 matches!(model.kind.as_str(), "chat" | "tiny")
-                    && (HttpProvider::supports_model(model)
-                        || TRANSPORT_PENDING_PROVIDERS.contains(&model.provider.as_str()))
+                    && HttpProvider::supports_model(model)
             })
             .map(ModelEntry::from_catalog)
             .collect::<Vec<_>>();
@@ -919,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn transport_pending_provider_models_are_offered_once_connected() {
+    fn devin_models_are_offered_once_connected() {
         let mut registry = Registry::empty();
         let model = Registry::bundled()
             .unwrap()
