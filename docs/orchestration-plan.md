@@ -264,6 +264,49 @@ Traditional PRs lose the reasoning behind changes. Inspired by Zed Delta:
    Named checkpoints (such as points verified working) freeze immutable snapshots,
    and `juto changes export/push` projects only named points onto Git feature branches
    using compare-and-swap ref updates and raw byte tree capture.
+
+### 5.3 Cross-Machine Replication
+
+Agents may run locally or on different machines at the same time. The DAG
+replicates over ordinary Git transport — no custom server — as a grow-only set of
+content-addressed refs:
+
+```
+refs/juto/nodes/<node-id>          -> blob(ChangeNode JSON)          create-only
+refs/juto/snapshots/<id>           -> tree | commit                  create-only
+refs/juto/heads/<owner>/<thread>   -> blob(head node id)             single writer per owner
+refs/juto/checkpoints/<name>       -> blob(node id)                  single writer per name
+```
+
+Node ids are UUIDv7 and node content is never rewritten, so union-by-id is
+idempotent and every ref update is a create or an identical-value no-op. A
+rejected push therefore means a real conflict, never a lost update.
+
+* **Publish** (`push_graph`): pin every node's metadata and tree, then push the
+  four namespaces. Only populated namespaces are pushed, because a wildcard
+  refspec that matches nothing is a hard `git push` error.
+* **Import** (`fetch_graph` → `import_refs`): fetch into a staging namespace,
+  union by node id with a hard content-equality assertion (a node present on both
+  sides with different content aborts the whole import and changes nothing),
+  verify every node's tree ref resolves, topologically sort with Kahn's algorithm,
+  and save the journal once under the graph lock. Staging refs are dropped on
+  every exit path. Re-running imports nothing and saves nothing.
+* **Thread identity**: head refs are owner-qualified at the wire level only, so
+  local thread names are unchanged. Two machines advancing the same thread
+  produce two heads rather than a conflict; `reconcile` folds the remote head into
+  the local thread — joining cleanly, adopting it when the thread has no local
+  head, or reporting the conflicting paths and changing nothing.
+* **Join** (`join`): merge base from the DAG (falling back to the graph base tree
+  when two threads share no node ancestor), then `git merge-tree --write-tree
+  --merge-base`, producing a two-parent node. A conflicted merge creates no node.
+* **Rewind** (`rewind`): materialize a tree delta into the workspace and append a
+  *forward* node whose tree equals the target, so history stays append-only.
+* **Reclaim** (`gc`): mark-sweep from heads, workspace heads, and checkpoints;
+  prune unreachable nodes and release both their snapshot and node refs.
+
+`workspace_heads` is keyed by absolute workspace path and is machine-local: it is
+never replicated.
+
 ---
 
 ## 6. Future Extensibility: Headless Daemon, Mobile & Automations
