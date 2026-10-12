@@ -296,6 +296,8 @@ struct InnerEnvironment {
     viewers: Mutex<HashMap<String, Instant>>,
     /// Launched applications keyed by request id, so a retry cannot double-launch.
     launch_requests: Mutex<HashMap<String, AppHandle>>,
+    /// Xwayland display number, once the X11 server is ready.
+    x11_display: Mutex<Option<u32>>,
 }
 
 /// An active, isolated agent desktop environment.
@@ -458,6 +460,7 @@ impl DesktopEnvironment {
             gpu_lock: Mutex::new(gpu_lock),
             viewers: Mutex::new(HashMap::new()),
             launch_requests: Mutex::new(HashMap::new()),
+            x11_display: Mutex::new(None),
         });
 
         spawn_event_forwarder(inner.clone(), comp_rx);
@@ -732,6 +735,19 @@ impl DesktopEnvironment {
             self.inner.runtime_dir.join("tmp").display().to_string(),
         ));
         app_env.push(("PWD".to_string(), work_dir.display().to_string()));
+        // X11 applications reach the environment's private Xwayland instance
+        // with the environment's own authorization cookie.
+        if let Some(display_number) = *self.inner.x11_display.lock() {
+            app_env.push(("DISPLAY".to_string(), format!(":{display_number}")));
+            app_env.push((
+                "XAUTHORITY".to_string(),
+                self.inner
+                    .runtime_dir
+                    .join("Xauthority")
+                    .display()
+                    .to_string(),
+            ));
+        }
         for (key, value) in env_overrides {
             app_env.retain(|(k, _)| k != key);
             app_env.push((key.clone(), value.clone()));
@@ -1011,6 +1027,11 @@ impl DesktopEnvironment {
         self.inner.viewers.lock().remove(viewer_id);
     }
 
+    /// Xwayland display number, once the X11 server is ready.
+    pub fn x11_display(&self) -> Option<u32> {
+        *self.inner.x11_display.lock()
+    }
+
     /// Number of viewers currently admitted to the environment.
     pub fn active_viewers(&self) -> usize {
         self.inner.viewers.lock().len()
@@ -1238,6 +1259,9 @@ fn spawn_event_forwarder(inner: Arc<InnerEnvironment>, rx: std_mpsc::Receiver<De
                 }
                 DesktopEvent::WindowUnmapped { window_id, .. } => {
                     inner.windows.lock().remove(window_id);
+                }
+                DesktopEvent::XwaylandReady { display_number, .. } => {
+                    *inner.x11_display.lock() = Some(*display_number);
                 }
                 _ => {}
             }

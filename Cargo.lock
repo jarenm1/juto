@@ -5836,6 +5836,7 @@ dependencies = [
  "cursor-icon",
  "downcast-rs",
  "drm-fourcc",
+ "encoding_rs",
  "errno",
  "gl_generator",
  "indexmap",
@@ -5845,6 +5846,7 @@ dependencies = [
  "profiling",
  "rand 0.9.5",
  "rustix 1.1.5",
+ "scopeguard",
  "sha2 0.10.9",
  "smallvec",
  "tempfile",
@@ -5854,6 +5856,7 @@ dependencies = [
  "wayland-protocols-misc",
  "wayland-protocols-wlr",
  "wayland-server",
+ "x11rb",
  "xkbcommon",
 ]
 

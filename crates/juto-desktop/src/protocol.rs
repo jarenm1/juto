@@ -306,6 +306,11 @@ pub enum DesktopEvent {
     ResyncRequired {
         env_id: String,
     },
+    /// Xwayland is ready; applications may use `DISPLAY=:<display_number>`.
+    XwaylandReady {
+        env_id: String,
+        display_number: u32,
+    },
     ApplicationExited {
         env_id: String,
         app_id: String,

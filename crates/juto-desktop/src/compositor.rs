@@ -57,6 +57,7 @@ use smithay::wayland::compositor::{
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::selection::data_device::{
     ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
 };
@@ -65,6 +66,11 @@ use smithay::wayland::shell::xdg::{
     XdgToplevelSurfaceData,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
+use smithay::xwayland::xwm::{
+    Reorder, ResizeEdge, WmWindowProperty, X11Surface, X11Wm, XwmHandler, XwmId,
+};
+use smithay::xwayland::{XWayland, XWaylandClientData, XWaylandEvent};
 
 use crate::error::DesktopError;
 use crate::protocol::{DesktopEvent, InputEvent, WindowInfo};
@@ -232,6 +238,42 @@ impl Drop for Compositor {
             let _ = std::fs::remove_file(&self.socket_path);
         }
     }
+}
+
+/// Writes an `MIT-MAGIC-COOKIE-1` Xauthority file for the environment's
+/// Xwayland instance and returns its path.
+///
+/// The cookie is generated here and handed to Xwayland and to launched
+/// applications, so the X11 socket is not usable by other local users
+/// (spec section 5).
+fn write_xauthority(runtime_dir: &Path) -> Result<PathBuf, DesktopError> {
+    use rand::RngCore;
+
+    let mut cookie = [0u8; 16];
+    rand::rng().fill_bytes(&mut cookie);
+    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|name| name.trim().to_string())
+        .unwrap_or_else(|_| "localhost".to_string());
+
+    fn push_field(entry: &mut Vec<u8>, bytes: &[u8]) {
+        entry.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        entry.extend_from_slice(bytes);
+    }
+
+    let mut entry: Vec<u8> = Vec::new();
+    // FamilyLocal (256), hostname address, any display number, cookie auth.
+    entry.extend_from_slice(&256u16.to_be_bytes());
+    push_field(&mut entry, hostname.as_bytes());
+    push_field(&mut entry, b"");
+    push_field(&mut entry, b"MIT-MAGIC-COOKIE-1");
+    push_field(&mut entry, &cookie);
+
+    let path = runtime_dir.join("Xauthority");
+    std::fs::write(&path, &entry).map_err(|source| DesktopError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(path)
 }
 
 /// True when the host exposes at least one DRM render node.
@@ -513,6 +555,106 @@ impl FrameRenderer {
     }
 }
 
+smithay::delegate_xwayland_shell!(DesktopState);
+
+impl XWaylandShellHandler for DesktopState {
+    fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
+        &mut self.xwayland_shell_state
+    }
+}
+
+impl XwmHandler for DesktopState {
+    fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
+        self.xwm.as_mut().expect("X11 window manager is running")
+    }
+
+    fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+
+    fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+
+    fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Err(err) = window.set_mapped(true) {
+            tracing::warn!(error = %err, "failed to map an X11 window");
+        }
+    }
+
+    fn map_window_notify(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.map_x11_window(window);
+    }
+
+    fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.map_x11_window(window);
+    }
+
+    fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.unmap_x11_window(&window);
+    }
+
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.unmap_x11_window(&window);
+    }
+
+    fn configure_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        x: Option<i32>,
+        y: Option<i32>,
+        w: Option<u32>,
+        h: Option<u32>,
+        _reorder: Option<Reorder>,
+    ) {
+        let mut geometry = window.geometry();
+        geometry.loc.x = x.unwrap_or(geometry.loc.x);
+        geometry.loc.y = y.unwrap_or(geometry.loc.y);
+        geometry.size.w = w.map(|w| w as i32).unwrap_or(geometry.size.w);
+        geometry.size.h = h.map(|h| h as i32).unwrap_or(geometry.size.h);
+        if let Err(err) = window.configure(geometry) {
+            tracing::warn!(error = %err, "failed to configure an X11 window");
+        }
+    }
+
+    fn configure_notify(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        geometry: Rectangle<i32, Logical>,
+        _above: Option<u32>,
+    ) {
+        if let Some(mapped) = self.x11_windows.get(&window.window_id()) {
+            self.space.map_element(mapped.clone(), geometry.loc, false);
+            self.dirty = true;
+        }
+    }
+
+    fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, _property: WmWindowProperty) {
+        if let Some(mapped) = self.x11_windows.get(&window.window_id())
+            && let Some(id) = self
+                .windows
+                .iter()
+                .find_map(|(id, m)| (m.window == *mapped).then_some(*id))
+        {
+            self.refresh_window_info(id);
+        }
+    }
+
+    fn resize_request(
+        &mut self,
+        _xwm: XwmId,
+        _window: X11Surface,
+        _button: u32,
+        _resize_edge: ResizeEdge,
+    ) {
+    }
+
+    fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {}
+
+    fn allow_selection_access(&mut self, _xwm: XwmId, _selection: SelectionTarget) -> bool {
+        // Clipboard stays environment-local; X11 selections are not bridged.
+        false
+    }
+}
+
 /// Per-client Wayland state.
 #[derive(Default)]
 struct ClientState {
@@ -570,6 +712,11 @@ struct DesktopState {
     start_time: Instant,
 
     windows: HashMap<u32, MappedWindow>,
+    /// X11 surfaces mapped through Xwayland, keyed by X11 window id.
+    x11_windows: HashMap<u32, Window>,
+    /// The X11 window manager driving Xwayland, once it is ready.
+    xwm: Option<X11Wm>,
+    xwayland_shell_state: XWaylandShellState,
     next_window_id: u32,
     cascade_index: i32,
 
@@ -604,11 +751,14 @@ impl DesktopState {
             .space
             .element_geometry(&mapped.window)
             .unwrap_or_else(|| Rectangle::from_size(self.logical_size()));
-        let (title, app_id) = mapped
-            .window
-            .toplevel()
-            .map(toplevel_identity)
-            .unwrap_or((None, None));
+        let (title, app_id) = match mapped.window.x11_surface() {
+            Some(x11) => (Some(x11.title()), Some(x11.class())),
+            None => mapped
+                .window
+                .toplevel()
+                .map(toplevel_identity)
+                .unwrap_or((None, None)),
+        };
         let is_focused = self
             .keyboard
             .current_focus()
@@ -675,6 +825,55 @@ impl DesktopState {
             env_id: self.env_id.clone(),
             window: info,
         });
+    }
+
+    /// Maps an X11 surface into the composited space and reports it.
+    fn map_x11_window(&mut self, surface: X11Surface) {
+        let x11_id = surface.window_id();
+        if self.x11_windows.contains_key(&x11_id) {
+            return;
+        }
+        let window = Window::new_x11_window(surface.clone());
+        let geometry = surface.geometry();
+        self.space.map_element(window.clone(), geometry.loc, true);
+        self.x11_windows.insert(x11_id, window.clone());
+        let id = self.next_window_id;
+        self.next_window_id = self.next_window_id.wrapping_add(1);
+        let mut mapped = MappedWindow {
+            id,
+            window,
+            info: WindowInfo {
+                window_id: id,
+                title: surface.title(),
+                app_id: surface.class(),
+                x: geometry.loc.x,
+                y: geometry.loc.y,
+                width: geometry.size.w.max(0) as u32,
+                height: geometry.size.h.max(0) as u32,
+                is_focused: false,
+            },
+        };
+        mapped.info = self.window_info(&mapped);
+        let info = mapped.info.clone();
+        self.windows.insert(id, mapped);
+        self.dirty = true;
+        let _ = self.events.send(DesktopEvent::WindowMapped {
+            env_id: self.env_id.clone(),
+            window: info,
+        });
+    }
+
+    /// Removes an X11 surface from the composited space.
+    fn unmap_x11_window(&mut self, surface: &X11Surface) {
+        let x11_id = surface.window_id();
+        if let Some(window) = self.x11_windows.remove(&x11_id)
+            && let Some(id) = self
+                .windows
+                .iter()
+                .find_map(|(id, mapped)| (mapped.window == window).then_some(*id))
+        {
+            self.unmap_window(id);
+        }
     }
 
     fn unmap_window(&mut self, id: u32) {
@@ -976,7 +1175,15 @@ impl CompositorHandler for DesktopState {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client.get_data::<ClientState>().unwrap().compositor_state
+        // Xwayland's own Wayland client carries `XWaylandClientData`; every
+        // other client carries our `ClientState`.
+        if let Some(state) = client.get_data::<ClientState>() {
+            &state.compositor_state
+        } else if let Some(xwayland) = client.get_data::<XWaylandClientData>() {
+            &xwayland.compositor_state
+        } else {
+            panic!("client has no compositor state");
+        }
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -1264,6 +1471,7 @@ pub(crate) fn run_compositor(
 
     let compositor_state = CompositorState::new::<DesktopState>(&dh);
     let xdg_shell_state = XdgShellState::new::<DesktopState>(&dh);
+    let xwayland_shell_state = XWaylandShellState::new::<DesktopState>(&dh);
     let shm_state = ShmState::new::<DesktopState>(&dh, vec![]);
     let data_device_state = DataDeviceState::new::<DesktopState>(&dh);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<DesktopState>(&dh);
@@ -1343,12 +1551,63 @@ pub(crate) fn run_compositor(
         dirty: true,
         start_time: Instant::now(),
         windows: HashMap::new(),
+        x11_windows: HashMap::new(),
+        xwm: None,
+        xwayland_shell_state,
         next_window_id: 1,
         cascade_index: 0,
         pending_snapshots: Vec::new(),
     };
 
     let handle = event_loop.handle();
+
+    // Xwayland: one private X11 server per environment, driven by our X11 WM.
+    // Sockets stay private (no abstract socket, no TCP listener) and Xwayland
+    // is supervised by this compositor process.
+    let runtime_dir = config
+        .socket_path
+        .parent()
+        .ok_or_else(|| DesktopError::Compositor("socket path has no parent".to_string()))?;
+    let xauthority = write_xauthority(runtime_dir)?;
+    let (xwayland, xwayland_client) = XWayland::spawn(
+        &dh,
+        None,
+        [("XAUTHORITY", xauthority.as_os_str())],
+        false,
+        std::process::Stdio::null(),
+        std::process::Stdio::null(),
+        |_| {},
+    )
+    .map_err(|e| DesktopError::Compositor(format!("failed to spawn Xwayland: {e}")))?;
+    let xwm_handle = handle.clone();
+    handle
+        .insert_source(
+            xwayland,
+            move |event, _, state: &mut DesktopState| match event {
+                XWaylandEvent::Ready {
+                    x11_socket,
+                    display_number,
+                } => {
+                    match X11Wm::start_wm(xwm_handle.clone(), x11_socket, xwayland_client.clone()) {
+                        Ok(wm) => {
+                            state.xwm = Some(wm);
+                            tracing::info!(display_number, "Xwayland ready");
+                            let _ = state.events.send(DesktopEvent::XwaylandReady {
+                                env_id: state.env_id.clone(),
+                                display_number,
+                            });
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "failed to start the X11 window manager")
+                        }
+                    }
+                }
+                XWaylandEvent::Error => {
+                    tracing::warn!("Xwayland exited during startup");
+                }
+            },
+        )
+        .map_err(|e| DesktopError::Compositor(format!("failed to register Xwayland: {e}")))?;
 
     // Wayland display socket: accept clients and dispatch their requests.
     let display_fd = display.backend().poll_fd().as_raw_fd();
