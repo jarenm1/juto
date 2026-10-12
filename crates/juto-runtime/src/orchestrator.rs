@@ -27,7 +27,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::change_graph::ChangeGraph;
+use crate::change_graph::{ChangeGraph, EditProvenance, JoinOutcome};
 use crate::subagents::{SubagentError, SubagentManager, SubagentResult, TaskSpec};
 use crate::workspace::{ResourceLimits, ScopedChild, ScopedStdio, SubagentWorkspace};
 
@@ -1127,6 +1127,7 @@ impl Orchestrator {
                     // subagent id, so its head is exactly the state the gates and
                     // the reviewer just approved.
                     self.mark_verified_checkpoint(&child_id, mission_id);
+                    self.fold_back(&child_id, mission_id);
                     return Ok(TaskOutcome {
                         mission_id: mission_id.to_string(),
                         route: IntentRoute::EndToEndTask,
@@ -1277,6 +1278,72 @@ impl Orchestrator {
             usage: Usage::default(),
             duration_ms: start.elapsed().as_millis() as u64,
         })
+    }
+
+    /// Fold the builder's approved thread back into the parent thread.
+    ///
+    /// The builder runs in an isolated workspace, so its work is not in the
+    /// parent's workspace until it is joined. The parent's own uncaptured edits
+    /// are captured first, so the merge cannot overwrite them. Best-effort, like
+    /// the checkpoint: a failure is reported and the task still completes.
+    fn fold_back(&self, child_thread: &str, mission_id: &str) {
+        let Some(repo_root) = &self.config.repo_root else {
+            return;
+        };
+        let result = (|| -> anyhow::Result<String> {
+            let graph = ChangeGraph::open(repo_root)?;
+            let parent = graph.thread().unwrap_or("main").to_string();
+            if parent == child_thread {
+                return Ok("the builder ran in the parent workspace".to_string());
+            }
+            let child_head = graph
+                .state()?
+                .heads
+                .get(child_thread)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("thread {child_thread:?} has no head"))?;
+            // Capture the parent's own edits first: `join` materializes the
+            // merge, which would otherwise overwrite them.
+            if !graph.dirty_paths()?.is_empty() {
+                graph.capture(
+                    &parent,
+                    EditProvenance {
+                        session_id: String::new(),
+                        tool: "orchestrator".into(),
+                        selection_mode: None,
+                        path: None,
+                    },
+                    None,
+                )?;
+            }
+            let Some(parent_head) = graph.state()?.heads.get(&parent).cloned() else {
+                // No local history on the parent: adopt rather than leave the
+                // work stranded on a thread nobody reads.
+                graph.adopt_head(&parent, child_thread)?;
+                return Ok(format!("adopted {child_thread} into {parent}"));
+            };
+            match graph.join(&parent, &parent_head, &child_head)? {
+                JoinOutcome::Joined { node, .. } => Ok(format!(
+                    "joined {child_thread} into {parent} as {}",
+                    node.id
+                )),
+                JoinOutcome::Conflicted { conflicts, .. } => Ok(format!(
+                    "the merge of {child_thread} into {parent} conflicts on {}",
+                    conflicts.join(", ")
+                )),
+            }
+        })();
+        match result {
+            Ok(summary) => self.emit_event(
+                mission_id,
+                PipelinePhase::Completed,
+                format!("Folded the builder's work back: {summary}"),
+                None,
+            ),
+            Err(error) => {
+                eprintln!("juto: failed to fold the builder's work back: {error:#}");
+            }
+        }
     }
 
     /// Freeze the builder's thread head as a verified checkpoint.
