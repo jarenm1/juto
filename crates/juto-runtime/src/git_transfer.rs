@@ -210,8 +210,9 @@ impl GitRepository {
     /// external filter is ever applied, so the snapshot is byte-exact. Normal
     /// Git ignores apply, but files already tracked by `baseline` are preserved
     /// even when they are now ignored. The workspace marker, the mutation lock,
-    /// `.git`, and `.jj` are always excluded. `baseline` may be an all-zero ID
-    /// for an empty starting tree.
+    /// `.git`, `.jj`, and any atomic-write temp file left behind by a crash are
+    /// always excluded. `baseline` may be an all-zero ID for an empty starting
+    /// tree.
     pub fn capture_tree(&self, baseline: &str) -> Result<String> {
         let baseline_tree = if baseline.is_empty() {
             bail!("baseline tree is empty");
@@ -238,22 +239,25 @@ impl GitRepository {
 
     /// Whether `path` exists in `tree`.
     ///
-    /// `path` is workspace-relative with forward slashes.
-    pub fn path_tracked(&self, tree: &str, path: &str) -> Result<bool> {
+    /// `path` is the workspace-relative path as raw bytes (Git paths are byte
+    /// strings, so a non-UTF-8 name is addressed exactly). It is matched
+    /// literally, never as a glob.
+    pub fn path_tracked(&self, tree: &str, path: &[u8]) -> Result<bool> {
         if path.is_empty() {
             bail!("path is empty");
         }
         let tree = self.resolve_tree(tree)?;
+        let args: [&OsStr; 7] = [
+            OsStr::new("--literal-pathspecs"),
+            OsStr::new("ls-tree"),
+            OsStr::new("-z"),
+            OsStr::new("--full-tree"),
+            OsStr::new(tree.as_str()),
+            OsStr::new("--"),
+            OsStr::from_bytes(path),
+        ];
         let output = self
-            .git(&[
-                "--literal-pathspecs",
-                "ls-tree",
-                "-z",
-                "--full-tree",
-                tree.as_str(),
-                "--",
-                path,
-            ])
+            .git_os(&args)
             .output()
             .context("failed to run `git ls-tree`")?;
         if !output.status.success() {
@@ -264,43 +268,50 @@ impl GitRepository {
 
     /// Whether `path` matches the repository's ignore rules.
     ///
-    /// `path` is workspace-relative with forward slashes. The check uses
+    /// `path` is the workspace-relative path as raw bytes. The check uses
     /// `git check-ignore --no-index`, so it reports the ignore rules alone and
     /// never consults the index: a path that is already tracked still reports
-    /// as ignored when a rule matches it. The expected "not ignored" exit (1)
-    /// is a plain `false`; any other failure is surfaced as an error.
-    pub fn path_ignored(&self, path: &str) -> Result<bool> {
+    /// as ignored when a rule matches it. `check-ignore` rejects
+    /// `--literal-pathspecs`, so the path is passed as an ordinary pathspec.
+    /// The expected "not ignored" exit (1) is a plain `false`; any other
+    /// failure is surfaced as an error.
+    pub fn path_ignored(&self, path: &[u8]) -> Result<bool> {
         if path.is_empty() {
             bail!("path is empty");
         }
-        Ok(self
-            .run_opt(&["check-ignore", "-q", "--no-index", "--", path])?
-            .is_some())
+        let args: [&OsStr; 4] = [
+            OsStr::new("check-ignore"),
+            OsStr::new("-q"),
+            OsStr::new("--no-index"),
+            OsStr::from_bytes(path),
+        ];
+        Ok(self.run_opt_os(&args)?.is_some())
     }
 
     /// Render the patch that turns `before` into `after` for `path`.
     ///
-    /// Both arguments are full commit or tree IDs; `path` is workspace-relative
-    /// with forward slashes and is matched literally, so a file named `*.txt`
-    /// is never attributed to another file. External diff drivers and textconv
-    /// filters are disabled so the patch is deterministic.
-    pub fn diff_trees(&self, before: &str, after: &str, path: &str) -> Result<String> {
+    /// Both arguments are full commit or tree IDs; `path` is the
+    /// workspace-relative path as raw bytes and is matched literally, so a file
+    /// named `*.txt` is never attributed to another file. External diff drivers
+    /// and textconv filters are disabled so the patch is deterministic.
+    pub fn diff_trees(&self, before: &str, after: &str, path: &[u8]) -> Result<String> {
         let before = self.resolve_tree(before)?;
         let after = self.resolve_tree(after)?;
-        self.run(&[
-            "--literal-pathspecs",
-            "diff-tree",
-            "-r",
-            "-p",
-            "--no-commit-id",
-            "--no-renames",
-            "--no-ext-diff",
-            "--no-textconv",
-            before.as_str(),
-            after.as_str(),
-            "--",
-            path,
-        ])
+        let args: [&OsStr; 12] = [
+            OsStr::new("--literal-pathspecs"),
+            OsStr::new("diff-tree"),
+            OsStr::new("-r"),
+            OsStr::new("-p"),
+            OsStr::new("--no-commit-id"),
+            OsStr::new("--no-renames"),
+            OsStr::new("--no-ext-diff"),
+            OsStr::new("--no-textconv"),
+            OsStr::new(before.as_str()),
+            OsStr::new(after.as_str()),
+            OsStr::new("--"),
+            OsStr::from_bytes(path),
+        ];
+        self.run_os(&args)
     }
 
     /// Materialize `tree` into a brand-new independent workspace at
@@ -531,7 +542,8 @@ impl GitRepository {
     /// normalization, and external filters never touch the snapshot), symlinks
     /// are hashed from their link bytes, executable bits are preserved, and
     /// baseline gitlinks are left untouched. Missing paths are removed from the
-    /// index. The result is written with `write-tree`; no commit is created.
+    /// index (only a path the baseline tracks needs a removal record). The
+    /// result is written with `write-tree`; no commit is created.
     fn capture_into(&self, baseline_tree: &str, index: &Path) -> Result<String> {
         self.run_with_index(index, &["read-tree", baseline_tree])?;
         let baseline = self.index_entries(index)?;
@@ -563,7 +575,15 @@ impl GitRepository {
             let target = self.workspace.join(OsStr::from_bytes(path));
             let metadata = match fs::symlink_metadata(&target) {
                 Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // The path is gone from the worktree: it vanished between the
+                // enumeration and this stat, or its parent is now a file
+                // (ENOTDIR). Either way it is a removal candidate.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
                     removals.push(path.to_vec());
                     continue;
                 }
@@ -601,10 +621,14 @@ impl GitRepository {
             push_index_entry(&mut info, "120000", oid, path);
         }
         for path in &removals {
-            let oid = baseline
-                .get(path.as_slice())
-                .map(|(_, oid)| oid.as_str())
-                .unwrap_or("");
+            // Only a path the baseline tracks needs a removal record. A path
+            // that is not in the index (an untracked directory such as a nested
+            // repository, or a file that vanished mid-capture) has no object ID
+            // to remove and would make `git update-index` reject the whole
+            // stream as malformed index info.
+            let Some((_, oid)) = baseline.get(path.as_slice()) else {
+                continue;
+            };
             info.extend_from_slice(b"0 ");
             info.extend_from_slice(oid.as_bytes());
             info.push(b'\t');
@@ -851,6 +875,43 @@ impl GitRepository {
             bail!(
                 "`git {}` failed: {}",
                 args.join(" "),
+                describe_failure(&output)
+            );
+        }
+    }
+
+    /// Run a command whose arguments are raw path bytes.
+    fn run_os(&self, args: &[&OsStr]) -> Result<String> {
+        let output = self
+            .git_os(args)
+            .output()
+            .with_context(|| format!("failed to run `git {}`", describe_args(args)))?;
+        if !output.status.success() {
+            bail!(
+                "`git {}` failed: {}",
+                describe_args(args),
+                describe_failure(&output)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Like [`GitRepository::run_opt`], but for arguments that are raw path bytes.
+    fn run_opt_os(&self, args: &[&OsStr]) -> Result<Option<String>> {
+        let output = self
+            .git_os(args)
+            .output()
+            .with_context(|| format!("failed to run `git {}`", describe_args(args)))?;
+        if output.status.success() {
+            Ok(Some(
+                String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            ))
+        } else if output.status.code() == Some(1) {
+            Ok(None)
+        } else {
+            bail!(
+                "`git {}` failed: {}",
+                describe_args(args),
                 describe_failure(&output)
             );
         }
@@ -1175,15 +1236,43 @@ fn find_workspace_link(start: &Path) -> Result<Option<(PathBuf, WorkspaceLink)>>
 }
 
 /// Whether any component of `path` is snapshot metadata that must never be
-/// captured (the Git directory, the Jujutsu directory, the fork marker, and the
-/// mutation lock).
+/// captured (the Git directory, the Jujutsu directory, the fork marker, the
+/// mutation lock, and an atomic-write temp file left behind by a crash).
 fn is_metadata_path(path: &[u8]) -> bool {
     path.split(|byte| *byte == b'/').any(|component| {
         component == b".git"
             || component == b".jj"
             || component == b".juto-workspace.json"
             || component == b".juto-mutation.lock"
+            || is_atomic_write_temp(component)
     })
+}
+
+/// Whether `component` is exactly the temp name
+/// `vcs::atomic_write_preserving` creates: `.<name>.juto-<pid>-<counter>.tmp`.
+///
+/// The match is deliberately tight: a leading dot, the `.juto-` marker, a
+/// numeric pid and counter, and the `.tmp` suffix. A user file that merely
+/// resembles the pattern is still captured.
+fn is_atomic_write_temp(component: &[u8]) -> bool {
+    let Some(rest) = component.strip_prefix(b".") else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(b".tmp") else {
+        return false;
+    };
+    // The marker is the last `.juto-` in the name, followed by `<pid>-<counter>`.
+    let Some(marker) = rest.windows(6).rposition(|window| window == b".juto-") else {
+        return false;
+    };
+    let mut fields = rest[marker + 6..].split(|byte| *byte == b'-');
+    let pid = fields.next().unwrap_or_default();
+    let counter = fields.next().unwrap_or_default();
+    !pid.is_empty()
+        && !counter.is_empty()
+        && fields.next().is_none()
+        && pid.iter().all(u8::is_ascii_digit)
+        && counter.iter().all(u8::is_ascii_digit)
 }
 
 /// Append one `git update-index --index-info -z` record.
@@ -1243,6 +1332,14 @@ fn parse_ident(ident: &str) -> Result<(String, String)> {
         bail!("git identity has an empty name or email: {ident:?}");
     }
     Ok((name.to_string(), email.to_string()))
+}
+
+/// Render raw argument bytes for a command error message.
+fn describe_args(args: &[&OsStr]) -> String {
+    args.iter()
+        .map(|arg| arg.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Render a failed command's stderr, falling back to its exit status.

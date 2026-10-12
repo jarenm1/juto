@@ -9,7 +9,9 @@
 //! 2. reject targets outside the canonical workspace root, through symlinks,
 //!    or inside `.git`/`.jj`/native metadata;
 //! 3. take a cross-process advisory lock (`.juto-mutation.lock`) in the
-//!    workspace root;
+//!    workspace root and re-validate the target, so a directory component
+//!    swapped for a symlink while waiting for the lock cannot redirect the
+//!    write outside the workspace;
 //! 4. capture the workspace tree before the edit;
 //! 5. reject ignored paths;
 //! 6. run the caller's transform, then atomically replace the file while
@@ -18,15 +20,20 @@
 //!    path-scoped diff between the two trees.
 //!
 //! No Git commit is created: live snapshots are trees/blobs only, and the
-//! path-scoped diff is computed from the two trees, so unrelated preexisting
-//! edits are never attributed to this operation.
+//! returned diff is computed from the two trees and scoped to the mutated path,
+//! so edits to other paths are never attributed to this operation. An external
+//! (non-juto) writer that touches the *same* path between the atomic replace and
+//! the after-snapshot is folded into `after_tree`: the diff stays path-scoped
+//! and honest, but it describes the file as it stands at snapshot time.
 //!
 //! Failures are honest: a Git failure is a true error, and an error after the
 //! file has been written explicitly reports that the file was applied and that
 //! bookkeeping failed. Nothing is rolled back and success is never fabricated.
 
 use std::{
-    io::Write as _,
+    io::{Read as _, Write as _},
+    os::unix::ffi::OsStrExt,
+    os::unix::fs::OpenOptionsExt,
     path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -103,11 +110,20 @@ pub fn mutate(
     let rel = target
         .strip_prefix(&root)
         .map_err(|_| format!("{} is outside {}", target.display(), root.display()))?;
+    // Git paths are raw bytes: a backslash is an ordinary filename byte and a
+    // non-UTF-8 name must never be lossily rewritten. `display` is for humans
+    // (messages and provenance) only.
+    let rel_bytes = rel.as_os_str().as_bytes().to_vec();
     let display = rel.to_string_lossy().replace('\\', "/");
 
     // The lock covers the entire transaction: read, transform, write, snapshot,
     // and diff. It is held while the before/after trees are captured.
     let _lock = MutationLock::acquire(&root)?;
+    // Re-validate after the lock. The check above fails fast, but a racing
+    // non-juto process can swap a directory component for a symlink pointing
+    // outside the workspace while this mutation waits for the lock; the write
+    // below would then follow it.
+    let target = validate_target(&root, cwd, path)?;
     let mut provenance = provenance.clone();
     provenance.path = Some(display.clone());
 
@@ -117,11 +133,11 @@ pub fn mutate(
     let before_text = read_optional(&target)?;
 
     let tracked = graph
-        .path_tracked(&before_tree, &display)
+        .path_tracked(&before_tree, &rel_bytes)
         .map_err(|e| format!("{display}: cannot check whether the path is tracked: {e:#}"))?;
     if !tracked
         && graph
-            .path_ignored(&display)
+            .path_ignored(&rel_bytes)
             .map_err(|e| format!("{display}: cannot check ignore rules: {e:#}"))?
     {
         return Err(format!(
@@ -166,7 +182,7 @@ pub fn mutate(
     // A newly created path may be ignored by Git; the capture silently omits it.
     // Fail honestly rather than record a node for a change Git cannot see.
     if !graph
-        .path_tracked(&after_tree, &display)
+        .path_tracked(&after_tree, &rel_bytes)
         .map_err(|e| format!(
             "{display}: file applied but the tracked-path check failed (before_tree={before_tree}, after_tree={after_tree}): {e:#}"
         ))?
@@ -177,7 +193,7 @@ pub fn mutate(
     }
 
     let raw_diff = graph
-        .diff_trees(&before_tree, &after_tree, &display)
+        .diff_trees(&before_tree, &after_tree, &rel_bytes)
         .map_err(|e| {
             format!(
                 "{display}: file applied but the diff failed (before_tree={before_tree}, after_tree={after_tree}): {e:#}"
@@ -296,6 +312,15 @@ fn validate_target(root: &Path, cwd: &Path, path: &Path) -> Result<PathBuf, Stri
                     lex.display()
                 ));
             }
+            // A FIFO, socket, or device is not a text file: reading one can
+            // block forever (a FIFO with no writer) while the workspace lock is
+            // held, and writing one is never a file edit.
+            if !md.is_file() {
+                return Err(format!(
+                    "refusing to write over non-regular file {} (only regular files are supported)",
+                    lex.display()
+                ));
+            }
         }
         // Defense in depth: the existing ancestor must resolve inside the root.
         let canon = std::fs::canonicalize(anc)
@@ -367,22 +392,42 @@ impl Drop for MutationLock {
 // ---------------------------------------------------------------------------
 
 /// Read a UTF-8 text file, returning `None` when it does not exist.
+///
+/// The file is opened with `O_NONBLOCK` and its type is checked on the open
+/// descriptor, so a FIFO or device swapped in after validation can never block
+/// the mutation while it holds the workspace lock.
 fn read_optional(path: &Path) -> Result<Option<String>, String> {
-    match std::fs::read(path) {
-        Ok(bytes) => {
-            if bytes.contains(&0) {
-                return Err(format!(
-                    "{}: binary file (NUL byte); only UTF-8 text is supported",
-                    path.display()
-                ));
-            }
-            let text = String::from_utf8(bytes)
-                .map_err(|e| format!("{}: not valid UTF-8 ({e})", path.display()))?;
-            Ok(Some(text))
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "refusing to read {}: not a regular file",
+            path.display()
+        ));
     }
+    let mut bytes = Vec::new();
+    (&file)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    if bytes.contains(&0) {
+        return Err(format!(
+            "{}: binary file (NUL byte); only UTF-8 text is supported",
+            path.display()
+        ));
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|e| format!("{}: not valid UTF-8 ({e})", path.display()))?;
+    Ok(Some(text))
 }
 
 /// Atomically replace `target` with `contents`, preserving existing permissions.
@@ -448,4 +493,186 @@ fn bound_text(text: String, max: usize) -> (String, bool) {
         end -= 1;
     }
     (text[..end].to_string(), true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn repo() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init", "-q", "-b", "main"]);
+        git(directory.path(), &["config", "user.name", "Vcs Test"]);
+        git(
+            directory.path(),
+            &["config", "user.email", "vcs@example.test"],
+        );
+        std::fs::write(directory.path().join("base"), "base\n").unwrap();
+        git(directory.path(), &["add", "-A"]);
+        git(directory.path(), &["commit", "-q", "-m", "base"]);
+        directory
+    }
+
+    fn provenance() -> EditProvenance {
+        EditProvenance {
+            session_id: "test-session".into(),
+            tool: "write".into(),
+            selection_mode: None,
+            path: None,
+        }
+    }
+
+    fn apply(cwd: &Path, path: &Path, contents: &str) -> Result<Value, String> {
+        mutate(cwd, path, &CancellationToken::new(), &provenance(), |_| {
+            Ok(contents.to_string())
+        })
+    }
+
+    #[test]
+    fn mutate_rejects_a_fifo_target_without_blocking() {
+        let directory = repo();
+        let cwd = directory.path().to_path_buf();
+        let fifo = cwd.join("pipe");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(apply(&cwd, Path::new("pipe"), "written\n"));
+        });
+
+        // Reading a FIFO blocks until a writer appears; the mutation must refuse
+        // the target instead of holding the workspace lock forever.
+        let outcome = receiver
+            .recv_timeout(Duration::from_secs(30))
+            .expect("mutate must not block on a FIFO target");
+        let error = outcome.expect_err("a FIFO target must be refused");
+        assert!(error.contains("regular file"), "{error}");
+        assert!(!std::fs::metadata(&fifo).unwrap().is_file());
+    }
+
+    #[test]
+    fn mutate_rejects_a_unix_socket_target() {
+        let directory = repo();
+        let cwd = directory.path();
+        let socket = cwd.join("sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+
+        let error = apply(cwd, Path::new("sock"), "written\n").unwrap_err();
+        assert!(error.contains("regular file"), "{error}");
+        drop(listener);
+    }
+
+    #[test]
+    fn mutate_revalidates_the_target_after_acquiring_the_lock() {
+        let directory = repo();
+        let cwd = directory.path().to_path_buf();
+        // The target is tracked and its directory is ignored, so the snapshot
+        // keeps the path and the pre-write ignore check is skipped: only the
+        // containment/symlink validation can stop the write.
+        std::fs::write(cwd.join(".gitignore"), "d\n").unwrap();
+        std::fs::create_dir_all(cwd.join("d")).unwrap();
+        std::fs::write(cwd.join("d/escaped.txt"), "original\n").unwrap();
+        git(&cwd, &["add", "-A"]);
+        git(&cwd, &["add", "-f", "d/escaped.txt"]);
+        git(&cwd, &["commit", "-q", "-m", "tracked target"]);
+        let outside = tempfile::tempdir().unwrap();
+        // The same relative path exists outside, so the snapshot still sees a
+        // tracked file through the swapped symlink.
+        std::fs::write(outside.path().join("escaped.txt"), "outside\n").unwrap();
+
+        // Hold the workspace mutation lock so the racing mutation blocks after
+        // its first (pre-lock) validation.
+        let root = std::fs::canonicalize(&cwd).unwrap();
+        let lock = MutationLock::acquire(&root).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let thread_cwd = cwd.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = sender.send(apply(&thread_cwd, Path::new("d/escaped.txt"), "escaped\n"));
+        });
+
+        // Wait until the mutation has opened the change graph (which happens
+        // before its pre-lock validation), then let that validation finish.
+        let state = cwd.join(".git/juto/change-graph.json");
+        for _ in 0..500 {
+            if state.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(state.exists(), "the change graph must be initialized");
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Swap the validated directory for a symlink pointing outside the
+        // workspace, then release the lock.
+        std::fs::remove_dir_all(cwd.join("d")).unwrap();
+        symlink(outside.path(), cwd.join("d")).unwrap();
+        drop(lock);
+
+        let outcome = receiver.recv_timeout(Duration::from_secs(30)).unwrap();
+        handle.join().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("escaped.txt")).unwrap(),
+            "outside\n",
+            "the write must not escape the workspace"
+        );
+        let error = outcome.expect_err("a swapped symlink must be refused");
+        assert!(
+            error.contains("refusing to edit through symlink"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn mutate_uses_raw_path_bytes_for_git_queries() {
+        let directory = repo();
+        let cwd = directory.path();
+
+        // A backslash is an ordinary filename byte; the human-readable display
+        // path must never be used to query Git.
+        let receipt = apply(cwd, Path::new("a\\b.txt"), "backslash\n").unwrap();
+        // `path` is the human-facing display form (backslashes normalized);
+        // Git queries use the raw relative bytes.
+        assert_eq!(receipt["path"], "a/b.txt");
+        assert!(receipt["graph_node"].is_string(), "{receipt}");
+        assert!(
+            receipt["diff"].as_str().unwrap().contains("backslash"),
+            "{receipt}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("a\\b.txt")).unwrap(),
+            "backslash\n"
+        );
+
+        // A non-UTF-8 name must round-trip as raw bytes rather than U+FFFD.
+        let raw = PathBuf::from(OsStr::from_bytes(b"raw-\xff.txt"));
+        let receipt = apply(cwd, &raw, "raw\n").unwrap();
+        assert!(receipt["graph_node"].is_string(), "{receipt}");
+        assert_eq!(std::fs::read(cwd.join(&raw)).unwrap(), b"raw\n");
+    }
 }
