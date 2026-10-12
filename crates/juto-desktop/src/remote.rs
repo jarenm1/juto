@@ -44,6 +44,15 @@ pub enum Negotiation {
     ViewerOffers,
 }
 
+/// Inserts ICE credentials into a TURN URL (`turn:host:port` ->
+/// `turn:user:credential@host:port`).
+fn with_ice_credentials(url: &str, username: &str, credential: &str) -> String {
+    match url.split_once(':') {
+        Some((scheme, rest)) => format!("{scheme}:{username}:{credential}@{rest}"),
+        None => url.to_string(),
+    }
+}
+
 /// A STUN/TURN server used for ICE.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -147,6 +156,8 @@ pub struct PresentationWorker {
     stop: Arc<AtomicBool>,
     env: DesktopEnvironment,
     config: RemoteStreamConfig,
+    /// Bitrate actually applied to the encoder, after the environment ceiling.
+    effective_bitrate_bps: u64,
 }
 
 static GST_INIT: Once = Once::new();
@@ -166,12 +177,24 @@ fn ensure_gst() -> Result<(), DesktopError> {
 impl PresentationWorker {
     /// Builds the pipeline, starts the GStreamer main loop, and waits for the
     /// initial SDP offer.
-    pub fn new(env: DesktopEnvironment, config: RemoteStreamConfig) -> Result<Self, DesktopError> {
+    pub fn new(
+        env: DesktopEnvironment,
+        mut config: RemoteStreamConfig,
+    ) -> Result<Self, DesktopError> {
         ensure_gst()?;
         let output = env.output();
         let width = output.width as i32;
         let height = output.height as i32;
         let fps = config.max_fps.max(1) as i32;
+
+        // The environment's total-media ceiling bounds the requested bitrate;
+        // the effective value is reported rather than silently exceeded
+        // (spec section 6).
+        let ceiling = env.limits().remote_bitrate_max_bps;
+        if config.max_bitrate_bps > ceiling {
+            config.max_bitrate_bps = ceiling;
+        }
+        let effective_bitrate_bps = config.max_bitrate_bps;
 
         let pipeline = gst::Pipeline::new();
         let appsrc = gst::ElementFactory::make("appsrc")
@@ -225,15 +248,28 @@ impl PresentationWorker {
             .build()
             .map_err(|e| DesktopError::TransportUnavailable(format!("queue: {e}")))?;
 
-        let mut webrtc_builder = gst::ElementFactory::make("webrtcbin")
+        let webrtc = gst::ElementFactory::make("webrtcbin")
             .name("sendrecv")
-            .property_from_str("bundle-policy", "max-bundle");
-        if let Some(server) = config.ice_servers.first() {
-            webrtc_builder = webrtc_builder.property_from_str("stun-server", server.url.as_str());
-        }
-        let webrtc = webrtc_builder
+            .property_from_str("bundle-policy", "max-bundle")
             .build()
             .map_err(|e| DesktopError::TransportUnavailable(format!("webrtcbin: {e}")))?;
+        // Every configured ICE server is applied: STUN through the property and
+        // TURN through the `add-turn-server` signal, with credentials embedded
+        // in the URL when the deployment supplies them (spec section 7).
+        for server in &config.ice_servers {
+            let url = match (&server.username, &server.credential) {
+                (Some(username), Some(credential)) => {
+                    with_ice_credentials(&server.url, username, credential)
+                }
+                _ => server.url.clone(),
+            };
+            if url.starts_with("turn:") || url.starts_with("turns:") {
+                // `add-turn-server` returns a boolean success flag.
+                let _ = webrtc.emit_by_name::<bool>("add-turn-server", &[&url]);
+            } else {
+                webrtc.set_property("stun-server", url.as_str());
+            }
+        }
 
         let appsrc_element: gst::Element = appsrc.clone().upcast();
         let elements = [
@@ -347,6 +383,7 @@ impl PresentationWorker {
             stop: Arc::new(AtomicBool::new(false)),
             env: env.clone(),
             config: config.clone(),
+            effective_bitrate_bps,
         };
 
         // GStreamer signals need a running main context.
@@ -449,6 +486,11 @@ impl PresentationWorker {
     ///
     /// Browser viewers offer instead, so they can create the input data channel;
     /// use [`PresentationWorker::answer_to`] for that direction.
+    /// Bitrate actually applied to the encoder, after the environment ceiling.
+    pub fn effective_bitrate_bps(&self) -> u64 {
+        self.effective_bitrate_bps
+    }
+
     pub fn offer(&self) -> Result<String, DesktopError> {
         if self.config.negotiation != Negotiation::SenderOffers {
             return Err(DesktopError::TransportUnavailable(

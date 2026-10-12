@@ -27,6 +27,11 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   (`LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`, `MESA_LOADER_DRIVER_OVERRIDE`), and
   otherwise composes with pixman. A GLES renderer that resolves to a
   non-software device is discarded before any frame is composed.
+- Remote transport limits: every configured ICE server is applied to
+  `webrtcbin` (STUN through the property, TURN through `add-turn-server`, with
+  credentials embedded when supplied), and the requested stream bitrate is
+  clamped to the environment's total-media ceiling with the effective value
+  reported.
 - Xwayland: one private X11 server per environment, spawned and supervised by
   the compositor. Smithay's X11 window manager handles map/configure/focus,
   X11 surfaces are composed alongside Wayland toplevels, and the environment
