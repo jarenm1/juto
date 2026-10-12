@@ -95,6 +95,10 @@ pub enum ReconcileOutcome {
         base: String,
         tree: String,
     },
+    /// The thread had no local head, so the remote head was adopted as the
+    /// thread's head and the owner-qualified key was retired. No merge was
+    /// needed: there was no competing local history.
+    Adopted { remote: String, node: ChangeNode },
     /// The remote head conflicts with the local thread. Nothing changed; both
     /// heads are still present and the conflicting paths are reported.
     Conflicted {
@@ -619,10 +623,22 @@ impl ChangeGraph {
         for remote in remotes {
             // Re-read each round: a clean join advances the local head.
             let state = self.state()?;
-            let Some(local) = state.heads.get(thread).cloned() else {
-                break;
-            };
             let Some(remote_head) = state.heads.get(&remote).cloned() else {
+                continue;
+            };
+            let Some(local) = state.heads.get(thread).cloned() else {
+                // No local history for this thread: adopt the remote head
+                // rather than leaving it stranded under the owner-qualified key.
+                let node = state
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == remote_head)
+                    .cloned()
+                    .with_context(|| {
+                        format!("head {remote} names an unknown node {remote_head}")
+                    })?;
+                self.adopt_head(thread, &remote)?;
+                outcomes.push(ReconcileOutcome::Adopted { remote, node });
                 continue;
             };
             match self.join(thread, &local, &remote_head)? {
@@ -645,6 +661,36 @@ impl ChangeGraph {
             }
         }
         Ok(outcomes)
+    }
+
+    /// Move `remote`'s head onto `thread`, retiring the owner-qualified key.
+    ///
+    /// The adopted tree is materialized into this workspace so a later capture
+    /// cannot silently revert files that existed only in the remote workspace.
+    fn adopt_head(&self, thread: &str, remote: &str) -> Result<()> {
+        let tree = {
+            let _lock = self.lock()?;
+            let mut state = self.load_locked()?;
+            let Some(head) = state.heads.remove(remote) else {
+                return Ok(());
+            };
+            let tree = state
+                .nodes
+                .iter()
+                .find(|node| node.id == head)
+                .with_context(|| format!("adopted head {remote} names an unknown node {head}"))?
+                .tree
+                .clone();
+            state.heads.insert(thread.to_string(), head);
+            self.save_locked(&state)?;
+            tree
+        };
+        let _workspace_lock =
+            crate::vcs::MutationLock::acquire(self.workspace()).map_err(anyhow::Error::msg)?;
+        let current = self.snapshot_tree()?;
+        self.repository
+            .restore_tree(&current, &tree, self.workspace())?;
+        Ok(())
     }
 
     /// Revert `thread` to an earlier point by materializing its tree.
