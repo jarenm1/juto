@@ -1692,15 +1692,16 @@ impl Tool for VcsTool {
                     let left = left.ok_or_else(|| "`resolve` needs a `left`".to_string())?;
                     let right = right.ok_or_else(|| "`resolve` needs a `right`".to_string())?;
                     let node = graph
-                        .capture(
+                        .resolve(
                             &thread,
+                            &left,
+                            &right,
                             EditProvenance {
                                 session_id,
                                 tool: "vcs".to_string(),
                                 selection_mode: None,
                                 path: None,
                             },
-                            Some(vec![left, right]),
                         )
                         .map_err(|e| format!("{e:#}"))?;
                     serde_json::to_value(node).map_err(|e| e.to_string())

@@ -89,6 +89,17 @@ pub enum ChangesCommand {
         #[arg(long)]
         right: String,
     },
+    /// Record a resolved merge: capture the workspace as a two-parent node.
+    ///
+    /// Edit the conflicted files first; this records the result.
+    Resolve {
+        #[arg(long)]
+        thread: String,
+        #[arg(long)]
+        left: String,
+        #[arg(long)]
+        right: String,
+    },
     /// Revert a thread to an earlier point by materializing its tree delta.
     Rewind {
         #[arg(long)]
@@ -197,6 +208,21 @@ pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
                 "conflicts": conflicts,
             }),
         },
+        ChangesCommand::Resolve {
+            thread,
+            left,
+            right,
+        } => serde_json::to_value(graph.resolve(
+            thread,
+            left,
+            right,
+            EditProvenance {
+                session_id: String::new(),
+                tool: "resolve".into(),
+                selection_mode: None,
+                path: None,
+            },
+        )?)?,
         ChangesCommand::Rewind { thread, to } => serde_json::to_value(graph.rewind(thread, to)?)?,
         ChangesCommand::Reconcile { thread } => serde_json::Value::Array(
             graph
