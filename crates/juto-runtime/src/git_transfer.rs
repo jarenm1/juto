@@ -111,6 +111,17 @@ pub struct ExportResult {
     pub commits: BTreeMap<String, String>,
 }
 
+/// The outcome of a three-way tree merge.
+///
+/// `tree` is the merged tree, written to the object store even when there are
+/// conflicts (the affected blobs then carry conflict markers). `conflicts`
+/// lists the paths that conflicted and is empty for a clean merge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeOutcome {
+    pub tree: String,
+    pub conflicts: Vec<String>,
+}
+
 /// The on-disk contents of [`WORKSPACE_MARKER`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceLink {
@@ -549,6 +560,337 @@ impl GitRepository {
         }
         self.run_trimmed(&["update-ref", "-d", refname.as_str()])?;
         Ok(true)
+    }
+
+    /// Write `bytes` as a blob and return its object id.
+    ///
+    /// The blob is written with `git hash-object --no-filters`, so no clean
+    /// filter, `text`/`autocrlf` normalization, or external filter can alter
+    /// the bytes: the id is the hash of exactly `bytes`.
+    pub fn write_blob(&self, bytes: &[u8]) -> Result<String> {
+        self.hash_bytes(bytes)
+    }
+
+    /// Read the raw bytes of the blob `oid`.
+    ///
+    /// The object must be a blob; a commit or tree id is rejected by Git. The
+    /// bytes are returned exactly as stored, with no filter applied.
+    pub fn read_blob(&self, oid: &str) -> Result<Vec<u8>> {
+        validate_object_id(oid, "blob")?;
+        let output = self
+            .git(&["cat-file", "blob", oid])
+            .output()
+            .context("failed to run `git cat-file blob`")?;
+        if !output.status.success() {
+            bail!(
+                "`git cat-file blob {oid}` failed: {}",
+                describe_failure(&output)
+            );
+        }
+        Ok(output.stdout)
+    }
+
+    /// Create or update `refname` to point at `object` with compare-and-swap
+    /// semantics.
+    ///
+    /// `expected` is `None` to require that the ref does not exist yet, or
+    /// `Some(old)` to require that it currently points at `old`. The update is
+    /// atomic: `git update-ref` is handed the expected old value, so a
+    /// concurrent writer loses the race instead of clobbering the ref. Returns
+    /// `true` when the ref changed and `false` when it already pointed at
+    /// `object`. `object` may be any object type (blob, tree, or commit) and
+    /// must already exist in the object store.
+    pub fn update_ref(&self, refname: &str, object: &str, expected: Option<&str>) -> Result<bool> {
+        self.validate_ref(refname)?;
+        validate_object_id(object, "object")?;
+        let current = self.run_opt(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            refname,
+        ])?;
+        match expected {
+            None => {
+                if let Some(current) = &current {
+                    bail!("ref {refname:?} already exists at {current}");
+                }
+            }
+            Some(old) => {
+                validate_object_id(old, "expected object")?;
+                match &current {
+                    Some(current) if current == old => {}
+                    Some(current) => bail!("ref {refname:?} is at {current}, expected {old}"),
+                    None => bail!("ref {refname:?} does not exist, expected {old}"),
+                }
+            }
+        }
+        if current.as_deref() == Some(object) {
+            return Ok(false);
+        }
+        let zero = "0".repeat(object.len());
+        let old = expected.unwrap_or(zero.as_str());
+        self.run_trimmed(&["update-ref", refname, object, old])?;
+        Ok(true)
+    }
+
+    /// List every ref under `prefix` as `(refname, object id)` pairs.
+    ///
+    /// The list is sorted by refname (Git's default) and includes refs of any
+    /// object type. An empty `prefix` lists every ref in the repository.
+    pub fn list_refs(&self, prefix: &str) -> Result<Vec<(String, String)>> {
+        if prefix.starts_with('-') {
+            bail!("ref prefix must not start with '-': {prefix:?}");
+        }
+        let mut args: Vec<&str> = vec!["for-each-ref", "--format=%(refname) %(objectname)"];
+        if !prefix.is_empty() {
+            args.push(prefix);
+        }
+        let output = self.run(&args)?;
+        let mut refs = Vec::new();
+        for line in output.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let (refname, object) = line
+                .split_once(' ')
+                .with_context(|| format!("malformed `git for-each-ref` line: {line:?}"))?;
+            refs.push((refname.to_string(), object.to_string()));
+        }
+        Ok(refs)
+    }
+
+    /// Delete `refname` if it exists.
+    ///
+    /// Intended for staging cleanup: deleting an absent ref is a no-op, not an
+    /// error.
+    pub fn delete_ref(&self, refname: &str) -> Result<()> {
+        self.validate_ref(refname)?;
+        self.run_trimmed(&["update-ref", "-d", refname])?;
+        Ok(())
+    }
+
+    /// Fetch `refspecs` from `remote` atomically.
+    ///
+    /// `--atomic` makes the whole fetch all-or-nothing and `--no-tags` keeps
+    /// tag auto-following from widening the transfer. Every refspec is passed
+    /// as an explicit argument (never an option). A remote that cannot do an
+    /// atomic fetch fails the command rather than silently degrading.
+    pub fn fetch(&self, remote: &str, refspecs: &[String]) -> Result<()> {
+        if remote.is_empty() {
+            bail!("remote is empty");
+        }
+        if remote.starts_with('-') {
+            bail!("remote must not start with '-': {remote:?}");
+        }
+        if refspecs.is_empty() {
+            bail!("no refspecs to fetch");
+        }
+        let mut args: Vec<&str> = vec!["fetch", "--atomic", "--no-tags", remote];
+        for refspec in refspecs {
+            if refspec.starts_with('-') {
+                bail!("refspec must not start with '-': {refspec:?}");
+            }
+            args.push(refspec);
+        }
+        let output = self
+            .git(&args)
+            .output()
+            .context("failed to run `git fetch`")?;
+        if !output.status.success() {
+            bail!("`git fetch {remote}` failed: {}", describe_failure(&output));
+        }
+        Ok(())
+    }
+
+    /// Push `refspecs` to `remote` atomically, never forcing.
+    ///
+    /// `--no-force` refuses any non-fast-forward update, `--atomic` makes the
+    /// whole push all-or-nothing, and `--no-follow-tags` keeps tag
+    /// auto-following from widening the transfer. Every refspec is passed as an
+    /// explicit argument (never an option). A remote that cannot do an atomic
+    /// push fails the command rather than silently degrading.
+    pub fn push_refs(&self, remote: &str, refspecs: &[String]) -> Result<()> {
+        if remote.is_empty() {
+            bail!("remote is empty");
+        }
+        if remote.starts_with('-') {
+            bail!("remote must not start with '-': {remote:?}");
+        }
+        if refspecs.is_empty() {
+            bail!("no refspecs to push");
+        }
+        let mut args: Vec<&str> =
+            vec!["push", "--no-force", "--atomic", "--no-follow-tags", remote];
+        for refspec in refspecs {
+            if refspec.starts_with('-') {
+                bail!("refspec must not start with '-': {refspec:?}");
+            }
+            args.push(refspec);
+        }
+        let output = self
+            .git(&args)
+            .output()
+            .context("failed to run `git push`")?;
+        if !output.status.success() {
+            bail!("`git push {remote}` failed: {}", describe_failure(&output));
+        }
+        Ok(())
+    }
+
+    /// Three-way merge `ours` and `theirs` with an explicit `base` tree,
+    /// writing the merged tree.
+    ///
+    /// All three arguments are resolved to trees. The merge runs `git merge-tree
+    /// --write-tree --merge-base=<base> -z --name-only --no-messages`, which
+    /// needs Git >= 2.45 to accept tree operands; see
+    /// [`GitRepository::supports_tree_merge`]. A clean merge returns the merged
+    /// tree with no conflicts. A conflicting merge still returns the merged tree
+    /// (with conflict markers in the affected blobs) plus the conflicting paths.
+    /// Any other exit status is an error.
+    pub fn merge_trees(&self, base: &str, ours: &str, theirs: &str) -> Result<MergeOutcome> {
+        let base = self.resolve_tree(base)?;
+        let ours = self.resolve_tree(ours)?;
+        let theirs = self.resolve_tree(theirs)?;
+        let merge_base = format!("--merge-base={base}");
+        let output = self
+            .git(&[
+                "merge-tree",
+                "--write-tree",
+                merge_base.as_str(),
+                "-z",
+                "--name-only",
+                "--no-messages",
+                ours.as_str(),
+                theirs.as_str(),
+            ])
+            .output()
+            .context("failed to run `git merge-tree`")?;
+        let code = output.status.code();
+        if code != Some(0) && code != Some(1) {
+            bail!("`git merge-tree` failed: {}", describe_failure(&output));
+        }
+        // With `-z` the output is `<tree-oid>\0` for a clean merge and
+        // `<tree-oid>\0<path>\0...` for a conflicting one.
+        let mut fields = output.stdout.split(|byte| *byte == 0);
+        let tree = fields
+            .next()
+            .filter(|field| !field.is_empty())
+            .context("`git merge-tree` produced no tree")?;
+        let tree = String::from_utf8(tree.to_vec())
+            .context("`git merge-tree` produced a non-UTF-8 tree id")?;
+        let mut conflicts = Vec::new();
+        for field in fields {
+            if field.is_empty() {
+                continue;
+            }
+            conflicts.push(String::from_utf8_lossy(field).into_owned());
+        }
+        Ok(MergeOutcome { tree, conflicts })
+    }
+
+    /// Apply the delta from the `current` tree to the `target` tree inside the
+    /// existing workspace directory `destination`.
+    ///
+    /// The delta is computed with `git diff-tree -r -z --no-renames --raw`.
+    /// Added, modified, and type-changed paths are materialized from the target
+    /// tree (regular files, executable bits, and symlinks are preserved; a
+    /// gitlink is refused). Deleted paths are removed and their now-empty parent
+    /// directories are pruned up to `destination`. Paths outside the delta are
+    /// never touched.
+    pub fn restore_tree(&self, current: &str, target: &str, destination: &Path) -> Result<()> {
+        let current = self.resolve_tree(current)?;
+        let target = self.resolve_tree(target)?;
+        if !destination.is_dir() {
+            bail!(
+                "restore destination {} is not a directory",
+                destination.display()
+            );
+        }
+        let output = self
+            .git(&[
+                "diff-tree",
+                "-r",
+                "-z",
+                "--no-renames",
+                "--raw",
+                current.as_str(),
+                target.as_str(),
+            ])
+            .output()
+            .context("failed to run `git diff-tree`")?;
+        if !output.status.success() {
+            bail!("`git diff-tree` failed: {}", describe_failure(&output));
+        }
+        let mut batch = BatchCatFile::spawn(self)?;
+        let mut fields = output.stdout.split(|byte| *byte == 0);
+        while let Some(meta) = fields.next() {
+            if meta.is_empty() {
+                continue;
+            }
+            let path = fields
+                .next()
+                .context("malformed `git diff-tree` record: missing path")?;
+            let change = parse_raw_change(meta)?;
+            match change.status {
+                b'A' | b'M' | b'T' => {
+                    let relative = validate_tree_path(path)?;
+                    let existing = destination.join(&relative);
+                    if let Ok(metadata) = fs::symlink_metadata(&existing) {
+                        if metadata.is_dir() {
+                            bail!(
+                                "cannot restore {}: a directory is in the way",
+                                relative.display()
+                            );
+                        }
+                        // Replace any existing entry so a type change (file
+                        // <-> symlink) never writes through a symlink or fails
+                        // on an existing one.
+                        fs::remove_file(&existing)
+                            .with_context(|| format!("failed to replace {}", existing.display()))?;
+                    }
+                    let entry = raw_entry(&change, path);
+                    self.materialize_entry(&entry, destination, &mut batch)?;
+                }
+                b'D' => {
+                    let relative = validate_tree_path(path)?;
+                    remove_path(destination, &relative)?;
+                }
+                other => bail!(
+                    "unsupported `git diff-tree` status {:?} for {}",
+                    other as char,
+                    String::from_utf8_lossy(path)
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this Git supports `merge-tree --write-tree --merge-base`.
+    ///
+    /// The probe runs `git merge-tree -h` and looks for `--write-tree` and
+    /// `merge-base` in the usage text (Git prints usage to stdout for `-h`; the
+    /// option is rendered as `--[no-]merge-base`, so the bare `merge-base`
+    /// substring is matched). If the usage text is unavailable, it falls back to
+    /// parsing `git version` and requiring Git >= 2.45, the release that added
+    /// `--merge-base` to `merge-tree`.
+    pub fn supports_tree_merge(&self) -> Result<bool> {
+        let output = self
+            .git(&["merge-tree", "-h"])
+            .output()
+            .context("failed to run `git merge-tree -h`")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let usage = if stdout.trim().is_empty() {
+            stderr
+        } else {
+            stdout
+        };
+        if !usage.trim().is_empty() {
+            return Ok(usage.contains("--write-tree") && usage.contains("merge-base"));
+        }
+        let version = self.run_trimmed(&["version"])?;
+        Ok(version_at_least(&version, 2, 45))
     }
 
     /// Reclaim fork directories left behind by a crashed
@@ -1702,6 +2044,125 @@ fn validate_object_id(id: &str, kind: &str) -> Result<()> {
         bail!("{kind} must be a full immutable object ID: {id:?}");
     }
     Ok(())
+}
+
+/// One parsed `git diff-tree --raw` record, minus its path.
+struct RawChange {
+    new_mode: String,
+    new_oid: String,
+    status: u8,
+}
+
+/// Parse the metadata field of a `git diff-tree --raw` record.
+///
+/// The field is `:<old-mode> <new-mode> <old-sha> <new-sha> <status>` (the
+/// leading colon is optional here so the parser also accepts the colon-less
+/// form). The path is a separate NUL-terminated field and is not parsed here.
+fn parse_raw_change(meta: &[u8]) -> Result<RawChange> {
+    let meta = meta.strip_prefix(b":").unwrap_or(meta);
+    let meta = std::str::from_utf8(meta).context("`git diff-tree` metadata is not UTF-8")?;
+    let mut fields = meta.split_whitespace();
+    let _old_mode = fields
+        .next()
+        .context("`git diff-tree` record is missing an old mode")?;
+    let new_mode = fields
+        .next()
+        .context("`git diff-tree` record is missing a new mode")?;
+    let _old_oid = fields
+        .next()
+        .context("`git diff-tree` record is missing an old object id")?;
+    let new_oid = fields
+        .next()
+        .context("`git diff-tree` record is missing a new object id")?;
+    let status = fields
+        .next()
+        .context("`git diff-tree` record is missing a status")?;
+    if fields.next().is_some() {
+        bail!("unexpected `git diff-tree` metadata: {meta:?}");
+    }
+    let status = status.as_bytes();
+    if status.len() != 1 {
+        bail!("`git diff-tree` status must be one character: {status:?}");
+    }
+    Ok(RawChange {
+        new_mode: new_mode.to_string(),
+        new_oid: new_oid.to_string(),
+        status: status[0],
+    })
+}
+
+/// Build a `git ls-tree`-style entry from a raw change and its path, so the
+/// existing [`GitRepository::materialize_entry`] can write it.
+fn raw_entry(change: &RawChange, path: &[u8]) -> Vec<u8> {
+    let kind = if change.new_mode == "160000" {
+        "commit"
+    } else {
+        "blob"
+    };
+    let mut entry =
+        Vec::with_capacity(change.new_mode.len() + change.new_oid.len() + path.len() + 4);
+    entry.extend_from_slice(change.new_mode.as_bytes());
+    entry.push(b' ');
+    entry.extend_from_slice(kind.as_bytes());
+    entry.push(b' ');
+    entry.extend_from_slice(change.new_oid.as_bytes());
+    entry.push(b'\t');
+    entry.extend_from_slice(path);
+    entry
+}
+
+/// Remove `relative` under `destination` and prune now-empty parent
+/// directories, stopping at `destination`.
+fn remove_path(destination: &Path, relative: &Path) -> Result<()> {
+    let target = destination.join(relative);
+    match fs::symlink_metadata(&target) {
+        Ok(metadata) if metadata.is_dir() => {
+            bail!("cannot delete {}: it is a directory", target.display());
+        }
+        Ok(_) => {
+            fs::remove_file(&target)
+                .with_context(|| format!("failed to delete {}", target.display()))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot stat {}", target.display()));
+        }
+    }
+    let mut parent = target.parent();
+    while let Some(directory) = parent {
+        if directory == destination {
+            break;
+        }
+        match fs::read_dir(directory) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+        if fs::remove_dir(directory).is_err() {
+            break;
+        }
+        parent = directory.parent();
+    }
+    Ok(())
+}
+
+/// Whether `git version` output names a version at least `major.minor`.
+fn version_at_least(version: &str, major: u32, minor: u32) -> bool {
+    let Some(rest) = version.trim().strip_prefix("git version ") else {
+        return false;
+    };
+    let mut fields = rest.split(|c: char| !c.is_ascii_digit());
+    let Some(found_major) = fields.next().and_then(|field| field.parse::<u32>().ok()) else {
+        return false;
+    };
+    let found_minor = fields
+        .next()
+        .and_then(|field| field.parse::<u32>().ok())
+        .unwrap_or(0);
+    (found_major, found_minor) >= (major, minor)
 }
 
 /// Parse `Name <email> timestamp tz` from `git var GIT_AUTHOR_IDENT`.
