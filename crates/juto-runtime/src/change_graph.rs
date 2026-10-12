@@ -885,7 +885,11 @@ impl ChangeGraph {
     }
 
     /// Move `remote`'s head onto `thread`, retiring the owner-qualified key.
-    fn adopt_head(&self, thread: &str, remote: &str) -> Result<()> {
+    ///
+    /// Public so a caller that knows a thread's work belongs on another thread
+    /// — the orchestrator folding a builder's approved thread back — can adopt
+    /// it when the target has no history yet.
+    pub fn adopt_head(&self, thread: &str, remote: &str) -> Result<()> {
         let _lock = self.lock()?;
         let mut state = self.load_locked()?;
         let Some(head) = state.heads.remove(remote) else {

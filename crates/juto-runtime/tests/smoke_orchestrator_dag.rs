@@ -320,10 +320,19 @@ async fn an_approved_task_records_a_verified_checkpoint() {
 
     // The builder's thread head is frozen as a verified checkpoint.
     let graph = ChangeGraph::open(&repo).expect("reopen graph");
-    let checkpoints = graph.state().expect("state").checkpoints;
+    let state = graph.state().expect("state");
     let expected = format!("verified-{}", outcome.mission_id);
     assert!(
-        checkpoints.contains_key(&expected),
-        "expected checkpoint {expected}, got {checkpoints:?}"
+        state.checkpoints.contains_key(&expected),
+        "expected checkpoint {expected}, got {:?}",
+        state.checkpoints
+    );
+
+    // The approved work is folded back onto the parent thread, so it is not
+    // stranded on a thread nobody reads.
+    assert!(
+        state.heads.contains_key("main"),
+        "the builder's work must reach the parent thread: {:?}",
+        state.heads
     );
 }
