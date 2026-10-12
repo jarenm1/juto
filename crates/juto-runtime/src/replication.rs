@@ -277,9 +277,12 @@ pub(crate) fn import_refs(graph: &ChangeGraph, staging: &str) -> Result<ImportRe
     }
 
     // Decode every incoming node; the ref name is authoritative for the id.
+    // One `cat-file --batch` child reads them all: a process per node would
+    // dominate an import of thousands of nodes.
     let mut incoming: BTreeMap<String, ChangeNode> = BTreeMap::new();
-    for (id, oid) in &node_refs {
-        let bytes = repository.read_blob(oid)?;
+    let ids: Vec<String> = node_refs.keys().cloned().collect();
+    let oids: Vec<String> = ids.iter().map(|id| node_refs[id].clone()).collect();
+    for (id, bytes) in ids.iter().zip(repository.read_blobs(&oids)?) {
         let node = decode_node(&bytes)?;
         ensure!(
             node.id == *id,
@@ -433,14 +436,37 @@ pub(crate) fn import_refs(graph: &ChangeGraph, staging: &str) -> Result<ImportRe
     }
 
     // Pin every newly imported node so the import is durable and re-publishable.
+    // The node blob already exists in staging with byte-identical content (the
+    // union check above proved it), so point the canonical ref at that object
+    // instead of re-encoding it. Both ref namespaces are written in one
+    // `update-ref --stdin` child: a process per node dominates a large import.
+    let mut existing: BTreeMap<String, String> =
+        repository.list_refs(NODES_PREFIX)?.into_iter().collect();
+    existing.extend(repository.list_refs(SNAPSHOTS_PREFIX)?);
+    let mut updates: Vec<(String, String, Option<String>)> = Vec::new();
     for id in &order {
         let node = &new_by_id[id];
-        repository.retain_snapshot(&node.id, &node.tree)?;
-        let blob = repository.write_blob(&encode_node(node)?)?;
+        let blob = node_refs
+            .get(&node.id)
+            .with_context(|| format!("imported node {} has no staging ref", node.id))?;
+        // The tree was validated against its staging snapshot ref above, so the
+        // snapshot ref can be written directly.
+        let snapshot_ref = format!("{SNAPSHOTS_PREFIX}/{}", node.id);
+        match existing.get(&snapshot_ref) {
+            Some(current) if current == &node.tree => {}
+            Some(current) => {
+                updates.push((snapshot_ref, node.tree.clone(), Some(current.clone())));
+            }
+            None => updates.push((snapshot_ref, node.tree.clone(), None)),
+        }
         let refname = node_ref(&node.id);
-        let current = current_ref(repository, &refname)?;
-        ensure_ref(repository, &refname, &blob, current.as_deref())?;
+        match existing.get(&refname) {
+            Some(current) if current == blob => {}
+            Some(current) => updates.push((refname, blob.clone(), Some(current.clone()))),
+            None => updates.push((refname, blob.clone(), None)),
+        }
     }
+    repository.update_refs(&updates)?;
 
     // Single atomic commit point; skipped entirely when nothing changed.
     if !order.is_empty() || heads_changed || checkpoints_changed || base_adopted {
@@ -538,15 +564,6 @@ fn ensure_ref(
             Ok(())
         }
     }
-}
-
-/// The current value of `refname`, or `None` when it does not exist.
-fn current_ref(repository: &GitRepository, refname: &str) -> Result<Option<String>> {
-    Ok(repository
-        .list_refs(refname)?
-        .into_iter()
-        .find(|(name, _)| name == refname)
-        .map(|(_, oid)| oid))
 }
 
 pub(crate) fn node_ref(id: &str) -> String {
