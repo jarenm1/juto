@@ -239,7 +239,7 @@ impl VcsSidebar {
         let request = self.diff_request;
         let worker = self
             .handle
-            .spawn_blocking(move || ChangeGraph::open(&cwd)?.diff_trees(&before, &after, ""));
+            .spawn_blocking(move || ChangeGraph::open(&cwd)?.diff_trees(&before, &after, b""));
         self.diff_task = Some(cx.spawn(async move |this, cx| {
             let result = worker.await;
             let _ = this.update(cx, |this, cx| {
