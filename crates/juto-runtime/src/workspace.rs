@@ -11,7 +11,7 @@
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
-    process::ExitStatus,
+    process::{ExitStatus, Stdio},
     sync::Arc,
 };
 
@@ -36,6 +36,19 @@ struct WorkspaceMarker {
 /// Wrap a native VCS failure with its full context chain.
 fn vcs_error(error: anyhow::Error) -> WorkspaceError {
     WorkspaceError::Vcs(format!("{error:#}"))
+}
+
+/// Read an environment variable, treating unset, empty, and whitespace-only
+/// values as absent.
+///
+/// `scripts/agent-scope.sh` uses `${VAR:-default}`, so an exported-but-empty
+/// variable means "unset". Reading it verbatim would forward an empty value to
+/// `systemd-run` (e.g. `-p CPUQuota=` applies `infinity`, silently uncapping a
+/// scope that claims `enforce_scope`).
+fn env_var_nonempty(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Default CPU quota assigned to a single subagent scope.
@@ -125,21 +138,16 @@ pub struct ResourceLimits {
 impl Default for ResourceLimits {
     fn default() -> Self {
         let cpu_quota =
-            std::env::var("AGENT_CPU_QUOTA").unwrap_or_else(|_| DEFAULT_CPU_QUOTA.to_string());
+            env_var_nonempty("AGENT_CPU_QUOTA").unwrap_or_else(|| DEFAULT_CPU_QUOTA.to_string());
         let memory_max =
-            std::env::var("AGENT_MEMORY_MAX").unwrap_or_else(|_| DEFAULT_MEMORY_MAX.to_string());
-        let slice = std::env::var("AGENT_SLICE")
-            .ok()
-            .or_else(|| Some(DEFAULT_SLICE.to_string()));
-        let slice_cpu_quota = std::env::var("AGENT_SLICE_CPU_QUOTA")
-            .ok()
+            env_var_nonempty("AGENT_MEMORY_MAX").unwrap_or_else(|| DEFAULT_MEMORY_MAX.to_string());
+        let slice = env_var_nonempty("AGENT_SLICE").or_else(|| Some(DEFAULT_SLICE.to_string()));
+        let slice_cpu_quota = env_var_nonempty("AGENT_SLICE_CPU_QUOTA")
             .or_else(|| Some(DEFAULT_SLICE_CPU_QUOTA.to_string()));
-        let slice_memory_max = std::env::var("AGENT_SLICE_MEMORY_MAX")
-            .ok()
+        let slice_memory_max = env_var_nonempty("AGENT_SLICE_MEMORY_MAX")
             .or_else(|| Some(DEFAULT_SLICE_MEMORY_MAX.to_string()));
-        let gpu_lock = std::env::var("AGENT_GPU_LOCK")
+        let gpu_lock = env_var_nonempty("AGENT_GPU_LOCK")
             .map(PathBuf::from)
-            .ok()
             .or_else(|| Some(default_gpu_lock_path()));
 
         Self {
@@ -229,6 +237,29 @@ impl Drop for GpuLockGuard {
     }
 }
 
+/// Stdio configuration applied to a resource-scoped command.
+///
+/// `std::process::Command` does not expose its configured stdio on stable, so a
+/// scoped command cannot inherit the original command's streams; callers pass
+/// what they need explicitly. [`Default`] inherits the parent's streams, which
+/// matches `std::process::Command`'s own default.
+#[derive(Debug)]
+pub struct ScopedStdio {
+    pub stdin: Stdio,
+    pub stdout: Stdio,
+    pub stderr: Stdio,
+}
+
+impl Default for ScopedStdio {
+    fn default() -> Self {
+        Self {
+            stdin: Stdio::inherit(),
+            stdout: Stdio::inherit(),
+            stderr: Stdio::inherit(),
+        }
+    }
+}
+
 /// An isolated native Juto workspace dedicated to a single subagent task.
 ///
 /// The workspace is an independent directory forked from an immutable live
@@ -256,7 +287,7 @@ impl SubagentWorkspace {
     /// `JUTO_REPO_ROOT` if set) and creates `~/workspaces/juto-<subagent-id>` (or
     /// under `JUTO_WORKSPACES_DIR` if set).
     pub async fn provision(base_change: &str, subagent_id: &str) -> Result<Self, WorkspaceError> {
-        let repo_root = if let Ok(root) = std::env::var("JUTO_REPO_ROOT") {
+        let repo_root = if let Some(root) = env_var_nonempty("JUTO_REPO_ROOT") {
             PathBuf::from(root)
         } else {
             let cwd = std::env::current_dir().map_err(|source| WorkspaceError::Io {
@@ -378,46 +409,89 @@ impl SubagentWorkspace {
     ///
     /// Wraps execution in `systemd-run --user --scope` with CPU, memory, and swap caps,
     /// and optionally serializes behind `flock` when `limits.gpu` is enabled.
+    ///
+    /// Convenience wrapper over [`Self::spawn_scoped`] with inherited stdio.
+    /// Callers that need to capture output must use `spawn_scoped` directly:
+    /// `std::process::Command` does not expose its configured stdio on stable,
+    /// so the scoped command cannot inherit the original command's streams.
     pub async fn run_scoped(
         &self,
         cmd: &mut Command,
         limits: ResourceLimits,
     ) -> Result<ExitStatus, WorkspaceError> {
+        let mut child = self
+            .spawn_scoped(cmd, limits, ScopedStdio::default())
+            .await?;
+
+        child
+            .wait()
+            .await
+            .map_err(|source| WorkspaceError::ExecutionFailed(source.to_string()))
+    }
+
+    /// Spawn a command inside this workspace under resource governance.
+    ///
+    /// Returns the running child so the caller can read piped output and control
+    /// its lifetime. The child is spawned with `kill_on_drop`, so dropping it
+    /// (or cancelling the awaiting future) terminates the process instead of
+    /// leaking it.
+    pub async fn spawn_scoped(
+        &self,
+        cmd: &mut Command,
+        limits: ResourceLimits,
+        stdio: ScopedStdio,
+    ) -> Result<tokio::process::Child, WorkspaceError> {
         let mut scoped = self.build_scoped_command(cmd.as_std(), &limits)?;
-        let mut child = scoped
+        scoped
+            .stdin(stdio.stdin)
+            .stdout(stdio.stdout)
+            .stderr(stdio.stderr)
+            .kill_on_drop(true);
+
+        scoped
             .spawn()
             .map_err(|source| WorkspaceError::CommandSpawnFailed {
                 command: format!("{:?}", cmd.as_std().get_program()),
                 source,
-            })?;
-
-        let status = child
-            .wait()
-            .await
-            .map_err(|source| WorkspaceError::ExecutionFailed(source.to_string()))?;
-
-        Ok(status)
+            })
     }
 
     /// Run a synchronous `std::process::Command` inside this workspace under resource governance.
+    ///
+    /// Convenience wrapper over [`Self::spawn_scoped_blocking`] with inherited
+    /// stdio.
     pub fn run_scoped_blocking(
         &self,
         cmd: &mut std::process::Command,
         limits: ResourceLimits,
     ) -> Result<ExitStatus, WorkspaceError> {
+        let mut child = self.spawn_scoped_blocking(cmd, limits, ScopedStdio::default())?;
+
+        child
+            .wait()
+            .map_err(|source| WorkspaceError::ExecutionFailed(source.to_string()))
+    }
+
+    /// Spawn a synchronous `std::process::Command` inside this workspace under
+    /// resource governance, returning the running child.
+    pub fn spawn_scoped_blocking(
+        &self,
+        cmd: &mut std::process::Command,
+        limits: ResourceLimits,
+        stdio: ScopedStdio,
+    ) -> Result<std::process::Child, WorkspaceError> {
         let mut scoped = self.build_scoped_std_command(cmd, &limits)?;
-        let mut child = scoped
+        scoped
+            .stdin(stdio.stdin)
+            .stdout(stdio.stdout)
+            .stderr(stdio.stderr);
+
+        scoped
             .spawn()
             .map_err(|source| WorkspaceError::CommandSpawnFailed {
                 command: format!("{:?}", cmd.get_program()),
                 source,
-            })?;
-
-        let status = child
-            .wait()
-            .map_err(|source| WorkspaceError::ExecutionFailed(source.to_string()))?;
-
-        Ok(status)
+            })
     }
 
     /// Build a resource-scoped `tokio::process::Command` from an existing `std::process::Command`.
@@ -468,6 +542,19 @@ impl SubagentWorkspace {
                 .gpu_lock
                 .clone()
                 .unwrap_or_else(default_gpu_lock_path);
+            // The wrapper's cwd is the workspace, so a relative lock path would
+            // resolve inside each agent's own workspace and two agents would
+            // lock different files. Resolve it against the caller's process cwd,
+            // matching `GpuLockGuard::acquire`.
+            let gpu_lock = if gpu_lock.is_absolute() {
+                gpu_lock
+            } else {
+                let caller_cwd = std::env::current_dir().map_err(|source| WorkspaceError::Io {
+                    path: PathBuf::from("."),
+                    source,
+                })?;
+                caller_cwd.join(&gpu_lock)
+            };
             if let Some(parent) = gpu_lock.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -588,10 +675,10 @@ pub fn find_repo_root(start_dir: &Path) -> Option<PathBuf> {
 
 /// Returns the default directory where subagent workspaces are placed (`~/workspaces`).
 pub fn default_workspaces_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("JUTO_WORKSPACES_DIR") {
+    if let Some(dir) = env_var_nonempty("JUTO_WORKSPACES_DIR") {
         return PathBuf::from(dir);
     }
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = env_var_nonempty("HOME") {
         return PathBuf::from(home).join("workspaces");
     }
     PathBuf::from("/tmp/workspaces")
@@ -599,10 +686,10 @@ pub fn default_workspaces_dir() -> PathBuf {
 
 /// Returns the default GPU lock file path (`/tmp/jtech-agent-gpu.lock` or XDG_RUNTIME_DIR).
 pub fn default_gpu_lock_path() -> PathBuf {
-    if let Ok(path) = std::env::var("AGENT_GPU_LOCK") {
+    if let Some(path) = env_var_nonempty("AGENT_GPU_LOCK") {
         return PathBuf::from(path);
     }
-    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+    if let Some(xdg) = env_var_nonempty("XDG_RUNTIME_DIR") {
         return PathBuf::from(xdg).join("jtech-agent-gpu.lock");
     }
     PathBuf::from("/tmp/jtech-agent-gpu.lock")
@@ -622,6 +709,15 @@ fn sanitize_workspace_slug(id: &str) -> String {
 }
 
 /// Validate that a requested working directory does not escape the assigned workspace boundary.
+///
+/// The requested directory is resolved physically: symlinks and `..` are
+/// followed by the kernel at `chdir`, so a lexical check alone is not enough.
+/// `out/missing/..` collapses lexically to `out`, which may be a symlink
+/// pointing outside the workspace; the canonicalized result is therefore
+/// re-checked against the canonical workspace root. A directory that cannot be
+/// canonicalized (for example one that does not exist) is rejected rather than
+/// silently accepted as a lexical path, because the kernel would fail the
+/// `chdir` anyway and a lexical path can still hide an escaping symlink.
 pub fn validate_scoped_cwd(
     workspace: &Path,
     requested_cwd: Option<&Path>,
@@ -638,16 +734,35 @@ pub fn validate_scoped_cwd(
             } else {
                 ws_canon.join(dir)
             };
-            let canon = resolved
-                .canonicalize()
-                .unwrap_or_else(|_| normalize_path(&resolved));
-            if !canon.starts_with(&ws_canon) {
-                return Err(WorkspaceError::CwdEscapedWorkspace {
-                    cwd: dir.to_path_buf(),
-                    workspace: workspace.to_path_buf(),
-                });
+            match resolved.canonicalize() {
+                // The workspace itself may be reached through symlinked
+                // parents, so containment is checked against the canonical
+                // result rather than the lexical path.
+                Ok(canon) => {
+                    if !canon.starts_with(&ws_canon) {
+                        return Err(WorkspaceError::CwdEscapedWorkspace {
+                            cwd: dir.to_path_buf(),
+                            workspace: workspace.to_path_buf(),
+                        });
+                    }
+                    canon
+                }
+                Err(source) => {
+                    // Unresolvable: keep the dedicated error for obvious
+                    // lexical traversal, and reject everything else instead of
+                    // falling back to a lexical path.
+                    if !normalize_path(&resolved).starts_with(&ws_canon) {
+                        return Err(WorkspaceError::CwdEscapedWorkspace {
+                            cwd: dir.to_path_buf(),
+                            workspace: workspace.to_path_buf(),
+                        });
+                    }
+                    return Err(WorkspaceError::Io {
+                        path: resolved,
+                        source,
+                    });
+                }
             }
-            canon
         }
     };
     Ok(target)
@@ -721,8 +836,60 @@ mod tests {
     use crate::change_graph::{ChangeGraph, EditProvenance};
     use tempfile::tempdir;
 
+    /// Serializes tests that mutate process-global environment variables.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Clear the named environment variables for the guard's lifetime.
+    ///
+    /// Callers must hold [`ENV_LOCK`] for as long as the guard lives.
+    struct EnvGuard(Vec<&'static str>);
+
+    impl EnvGuard {
+        fn clear(vars: &[&'static str]) -> Self {
+            for var in vars {
+                // SAFETY: callers hold ENV_LOCK for the guard's lifetime.
+                unsafe { std::env::remove_var(var) };
+            }
+            Self(vars.to_vec())
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for var in &self.0 {
+                // SAFETY: callers hold ENV_LOCK for the guard's lifetime.
+                unsafe { std::env::remove_var(var) };
+            }
+        }
+    }
+
+    fn workspace_at(path: &Path) -> SubagentWorkspace {
+        SubagentWorkspace {
+            path: path.to_path_buf(),
+            node_id: "test-node".to_string(),
+            thread: "test-ws".to_string(),
+            repo_root: path.to_path_buf(),
+            subagent_id: "test-agent".to_string(),
+        }
+    }
+
     #[test]
     fn test_resource_limits_defaults_and_builder() {
+        let _guard = env_lock();
+        let _env = EnvGuard::clear(&[
+            "AGENT_CPU_QUOTA",
+            "AGENT_MEMORY_MAX",
+            "AGENT_SLICE",
+            "AGENT_SLICE_CPU_QUOTA",
+            "AGENT_SLICE_MEMORY_MAX",
+            "AGENT_GPU_LOCK",
+        ]);
         let limits = ResourceLimits::default();
         assert_eq!(limits.cpu_quota, DEFAULT_CPU_QUOTA);
         assert_eq!(limits.memory_max, DEFAULT_MEMORY_MAX);
@@ -1206,5 +1373,244 @@ mod tests {
         // If agents.slice already exists and has non-infinity properties,
         // configure_slice_properties should not fail or clobber them.
         configure_slice_properties("agents.slice", "200%", "2G");
+    }
+
+    #[test]
+    fn test_scoped_cwd_rejects_symlink_escape() {
+        let dir = tempdir().expect("tempdir");
+        let ws_path = dir.path().join("subagent-ws");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&ws_path).expect("create workspace");
+        std::fs::create_dir_all(&outside).expect("create outside");
+        std::os::unix::fs::symlink(&outside, ws_path.join("out")).expect("create symlink");
+
+        let ws = workspace_at(&ws_path);
+        let limits = ResourceLimits::default();
+
+        // A symlink inside the workspace that points outside is rejected.
+        let mut direct = std::process::Command::new("ls");
+        direct.current_dir(ws_path.join("out"));
+        assert!(matches!(
+            ws.build_scoped_std_command(&direct, &limits),
+            Err(WorkspaceError::CwdEscapedWorkspace { .. })
+        ));
+
+        // `out/missing/..` collapses lexically to `out`, which is a symlink
+        // pointing outside the workspace. Canonicalization fails because
+        // `missing` does not exist, so the request must be rejected rather than
+        // accepted as the escaping symlink.
+        let mut traversal = std::process::Command::new("ls");
+        traversal.current_dir(ws_path.join("out/missing/.."));
+        assert!(
+            ws.build_scoped_std_command(&traversal, &limits).is_err(),
+            "a cwd collapsing to a symlink outside the workspace must be rejected"
+        );
+
+        // A real subdirectory still resolves inside the workspace.
+        std::fs::create_dir_all(ws_path.join("subdir")).expect("create subdir");
+        let mut valid = std::process::Command::new("ls");
+        valid.current_dir(ws_path.join("subdir"));
+        let scoped = ws
+            .build_scoped_std_command(&valid, &limits)
+            .expect("real subdirectory is accepted");
+        assert_eq!(
+            scoped.get_current_dir(),
+            Some(ws_path.canonicalize().unwrap().join("subdir").as_path())
+        );
+
+        // A workspace reached through a symlinked parent still accepts an
+        // absolute cwd expressed through that symlink.
+        let real_root = dir.path().join("real");
+        std::fs::create_dir_all(real_root.join("ws/subdir")).expect("create real workspace");
+        std::os::unix::fs::symlink(&real_root, dir.path().join("link")).expect("parent symlink");
+        let linked_ws = dir.path().join("link/ws");
+        let linked = workspace_at(&linked_ws);
+        let mut through_link = std::process::Command::new("ls");
+        through_link.current_dir(linked_ws.join("subdir"));
+        let scoped = linked
+            .build_scoped_std_command(&through_link, &limits)
+            .expect("a cwd through a symlinked parent that resolves inside is accepted");
+        assert_eq!(
+            scoped.get_current_dir(),
+            Some(
+                real_root
+                    .canonicalize()
+                    .unwrap()
+                    .join("ws/subdir")
+                    .as_path()
+            )
+        );
+    }
+
+    #[test]
+    fn test_resource_limits_treat_blank_env_as_unset() {
+        let _guard = env_lock();
+        let vars = [
+            "AGENT_CPU_QUOTA",
+            "AGENT_MEMORY_MAX",
+            "AGENT_SLICE",
+            "AGENT_SLICE_CPU_QUOTA",
+            "AGENT_SLICE_MEMORY_MAX",
+            "AGENT_GPU_LOCK",
+        ];
+        let _env = EnvGuard::clear(&vars);
+        for var in vars {
+            // SAFETY: serialized by ENV_LOCK.
+            unsafe { std::env::set_var(var, "") };
+        }
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe { std::env::set_var("AGENT_MEMORY_MAX", "   ") };
+
+        let limits = ResourceLimits::default();
+        assert_eq!(limits.cpu_quota, DEFAULT_CPU_QUOTA);
+        assert_eq!(limits.memory_max, DEFAULT_MEMORY_MAX);
+        assert_eq!(limits.slice.as_deref(), Some(DEFAULT_SLICE));
+        assert_eq!(
+            limits.slice_cpu_quota.as_deref(),
+            Some(DEFAULT_SLICE_CPU_QUOTA)
+        );
+        assert_eq!(
+            limits.slice_memory_max.as_deref(),
+            Some(DEFAULT_SLICE_MEMORY_MAX)
+        );
+        assert_eq!(
+            limits.gpu_lock.as_deref(),
+            Some(default_gpu_lock_path().as_path())
+        );
+    }
+
+    #[test]
+    fn test_default_workspaces_dir_treats_blank_env_as_unset() {
+        let _guard = env_lock();
+        let _env = EnvGuard::clear(&["JUTO_WORKSPACES_DIR"]);
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe { std::env::set_var("JUTO_WORKSPACES_DIR", "") };
+
+        let expected = match std::env::var("HOME") {
+            Ok(home) if !home.trim().is_empty() => PathBuf::from(home).join("workspaces"),
+            _ => PathBuf::from("/tmp/workspaces"),
+        };
+        assert_eq!(default_workspaces_dir(), expected);
+    }
+
+    #[test]
+    fn test_env_var_nonempty_treats_blank_as_unset() {
+        let _guard = env_lock();
+        let _env = EnvGuard::clear(&["JUTO_TEST_ENV_VAR"]);
+
+        assert_eq!(env_var_nonempty("JUTO_TEST_ENV_VAR"), None);
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe { std::env::set_var("JUTO_TEST_ENV_VAR", "") };
+        assert_eq!(env_var_nonempty("JUTO_TEST_ENV_VAR"), None);
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe { std::env::set_var("JUTO_TEST_ENV_VAR", "  \t ") };
+        assert_eq!(env_var_nonempty("JUTO_TEST_ENV_VAR"), None);
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe { std::env::set_var("JUTO_TEST_ENV_VAR", "value") };
+        assert_eq!(
+            env_var_nonempty("JUTO_TEST_ENV_VAR").as_deref(),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn test_gpu_lock_relative_path_resolved_against_caller_cwd() {
+        let dir = tempdir().expect("tempdir");
+        let ws_path = dir.path().join("subagent-ws");
+        std::fs::create_dir_all(&ws_path).expect("create workspace");
+        let ws = workspace_at(&ws_path);
+
+        let mut limits = ResourceLimits::default().with_gpu(true);
+        limits.gpu_lock = Some(PathBuf::from("relative-gpu.lock"));
+
+        let orig = std::process::Command::new("true");
+        let scoped = ws
+            .build_scoped_std_command(&orig, &limits)
+            .expect("build scoped with gpu");
+        assert_eq!(scoped.get_program(), "flock");
+
+        let lock_arg = scoped.get_args().next().expect("lock path argument");
+        let lock_path = PathBuf::from(lock_arg);
+        assert!(
+            lock_path.is_absolute(),
+            "gpu lock must be absolute so every agent locks the same file, got {lock_path:?}"
+        );
+        assert!(lock_path.ends_with("relative-gpu.lock"));
+        assert_eq!(
+            lock_path.parent(),
+            Some(std::env::current_dir().expect("process cwd").as_path())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_spawn_scoped_forwards_stdio_and_captures_output() {
+        use tokio::io::AsyncReadExt as _;
+
+        let dir = tempdir().expect("tempdir");
+        let ws = workspace_at(dir.path());
+        let limits = ResourceLimits::default().with_cpu_quota("200%");
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("echo captured-line; echo captured-err >&2");
+
+        let mut child = ws
+            .spawn_scoped(
+                &mut cmd,
+                limits,
+                ScopedStdio {
+                    stdin: Stdio::null(),
+                    stdout: Stdio::piped(),
+                    stderr: Stdio::piped(),
+                },
+            )
+            .await
+            .expect("spawn scoped");
+
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .expect("stdout must be piped")
+            .read_to_string(&mut stdout)
+            .await
+            .expect("read stdout");
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("stderr must be piped")
+            .read_to_string(&mut stderr)
+            .await
+            .expect("read stderr");
+        let status = child.wait().await.expect("wait");
+
+        assert!(status.success());
+        assert!(stdout.contains("captured-line"), "stdout: {stdout:?}");
+        assert!(stderr.contains("captured-err"), "stderr: {stderr:?}");
+    }
+
+    #[tokio::test]
+    async fn test_spawn_scoped_kills_child_on_drop() {
+        let dir = tempdir().expect("tempdir");
+        let ws = workspace_at(dir.path());
+        let limits = ResourceLimits::default().with_cpu_quota("200%");
+        let marker = dir.path().join("survived");
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 1; touch {}", marker.display()));
+
+        let child = ws
+            .spawn_scoped(&mut cmd, limits, ScopedStdio::default())
+            .await
+            .expect("spawn scoped");
+        drop(child);
+
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert!(
+            !marker.exists(),
+            "dropping a scoped child must terminate the process instead of leaking it"
+        );
     }
 }
