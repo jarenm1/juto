@@ -1425,6 +1425,8 @@ enum VcsAction {
     Resolve,
     /// List the paths where the workspace differs from its head.
     Dirty,
+    /// Capture the workspace as a new point on a thread.
+    Capture,
 }
 
 #[derive(Deserialize)]
@@ -1457,7 +1459,8 @@ impl Tool for VcsTool {
             description: "Inspect and synchronize Juto's native change graph. `status` reports \
                 counts, heads, and whether an imported head still needs reconciling; `dirty` \
                 lists paths edited outside the capture tools, since a `bash` command is not \
-                captured automatically; `fetch` imports another machine's graph; `reconcile` \
+                captured automatically, and `capture` records them as a new point; `fetch` \
+                imports another machine's graph; `reconcile` \
                 folds imported heads into the local thread; `push` publishes the local graph; \
                 `verify` checks that every node's snapshot ref is present and correct; `mark` \
                 freezes a point as a named checkpoint; `rewind` reverts a thread to an earlier \
@@ -1484,7 +1487,8 @@ impl Tool for VcsTool {
                             "fetch_branch",
                             "join",
                             "resolve",
-                            "dirty"
+                            "dirty",
+                            "capture"
                         ],
                         "description": "Which change-graph operation to run."
                     },
@@ -1726,6 +1730,21 @@ impl Tool for VcsTool {
                         "changed": changed,
                     }))
                 }
+                VcsAction::Capture => {
+                    let node = graph
+                        .capture(
+                            &thread,
+                            EditProvenance {
+                                session_id,
+                                tool: "vcs".to_string(),
+                                selection_mode: None,
+                                path: None,
+                            },
+                            None,
+                        )
+                        .map_err(|e| format!("{e:#}"))?;
+                    serde_json::to_value(node).map_err(|e| e.to_string())
+                }
             }
         })
         .await
@@ -1752,6 +1771,7 @@ fn action_label(action: &VcsAction) -> &'static str {
         VcsAction::Join => "join",
         VcsAction::Resolve => "resolve",
         VcsAction::Dirty => "dirty",
+        VcsAction::Capture => "capture",
     }
 }
 
@@ -2649,6 +2669,7 @@ mod tests {
             "join",
             "resolve",
             "dirty",
+            "capture",
         ] {
             assert!(
                 description.contains(action),
@@ -2785,6 +2806,39 @@ mod tests {
             "{:?}",
             out.details
         );
+
+        // `dirty` reports an uncaptured edit and `capture` records it, so an
+        // agent can close the loop a `bash` command leaves open.
+        std::fs::write(dir.path().join("shell.txt"), "shell\n").expect("write");
+        let out = tool
+            .execute(json!({"action": "dirty"}), ctx(dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(out.details["dirty"], true, "{:?}", out.details);
+        assert_eq!(
+            out.details["changed"],
+            json!(["shell.txt"]),
+            "{:?}",
+            out.details
+        );
+
+        let out = tool
+            .execute(
+                json!({"action": "capture", "thread": "integration"}),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            out.details["id"].as_str().is_some(),
+            "capture must return the new node: {:?}",
+            out.details
+        );
+        let out = tool
+            .execute(json!({"action": "dirty"}), ctx(dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(out.details["dirty"], false, "{:?}", out.details);
 
         // An unknown action is rejected rather than silently ignored.
         assert!(
