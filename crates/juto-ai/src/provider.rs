@@ -42,6 +42,13 @@ impl Api {
     }
 }
 
+/// Provider ids whose models surface in pickers once credentials exist even
+/// though their wire transport is not yet implemented (devin: the upstream
+/// `devin-agent` Cascade protobuf API is a planned follow-on). Selecting one
+/// fails at stream time with `ProviderError::Unsupported`, which chat renders
+/// as an error event.
+pub const TRANSPORT_PENDING_PROVIDERS: &[&str] = &["devin"];
+
 pub struct HttpProvider {
     credentials: Arc<CredentialStore>,
     client: reqwest::Client,

@@ -8,7 +8,7 @@ use gpui::{
     App, ClickEvent, Context, Entity, FocusHandle, Focusable, KeyBinding, ScrollHandle,
     SharedString, Subscription, Task, Window, actions, div, prelude::*, px, rgb,
 };
-use juto_ai::{CredentialKind, CredentialSummary, HttpProvider};
+use juto_ai::{CredentialKind, CredentialSummary};
 use juto_runtime::Runtime;
 use tokio_util::sync::CancellationToken;
 
@@ -272,6 +272,29 @@ pub const PROVIDERS: &[ProviderDefinition] = &[
             env_var: Some("PERPLEXITY_API_KEY"),
         }],
     },
+    ProviderDefinition {
+        id: "devin",
+        name: "Devin",
+        tagline: "SWE models via Devin account or API key",
+        methods: &[
+            AuthMethod {
+                id: "devin-oauth",
+                name: "Devin Account OAuth",
+                description: "Sign in with your Devin account in the system browser.",
+                backend_id: "devin",
+                kind: AuthMethodKind::OAuth,
+                env_var: None,
+            },
+            AuthMethod {
+                id: "devin-api-key",
+                name: "Devin API Key",
+                description: "Service credential API key from app.devin.ai",
+                backend_id: "devin",
+                kind: AuthMethodKind::ApiKey,
+                env_var: Some("DEVIN_API_KEY"),
+            },
+        ],
+    },
 ];
 
 pub struct AuthModal {
@@ -321,13 +344,13 @@ impl AuthModal {
         });
 
         let obs_search = cx.observe(&search_input, |_, _, cx| cx.notify());
+        // Providers surface when the catalog carries chat models for them —
+        // even ones whose transport is still pending, like devin — so login
+        // can be configured before the wire protocol lands.
         let supported: BTreeSet<&str> = runtime
             .catalog()
             .iter()
-            .filter(|model| {
-                matches!(model.kind.as_str(), "chat" | "tiny")
-                    && HttpProvider::supports_model(model)
-            })
+            .filter(|model| matches!(model.kind.as_str(), "chat" | "tiny"))
             .map(|model| model.provider.as_str())
             .collect();
         let providers = PROVIDERS
