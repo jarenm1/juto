@@ -1466,7 +1466,7 @@ impl Tool for VcsTool {
             name: "vcs".to_string(),
             description: "Inspect and synchronize Juto's native change graph. `status` reports \
                 counts, heads, and whether an imported head still needs reconciling; `log` \
-                prints the nodes, heads, and checkpoints; `dirty` \
+                prints the nodes, heads, checkpoints, and base anchor; `dirty` \
                 lists paths edited outside the capture tools, since a `bash` command is not \
                 captured automatically, and `capture` records them as a new point; `fetch` \
                 imports another machine's graph; `reconcile` \
@@ -1782,6 +1782,8 @@ impl Tool for VcsTool {
                         "total": total,
                         "heads": state.heads,
                         "checkpoints": state.checkpoints,
+                        "base_commit": state.base_commit,
+                        "base_tree": state.base_tree,
                     }))
                 }
                 VcsAction::Gc => {
@@ -2914,6 +2916,13 @@ mod tests {
         assert!(
             out.details["heads"].as_object().is_some(),
             "{:?}",
+            out.details
+        );
+        assert!(
+            out.details["base_commit"]
+                .as_str()
+                .is_some_and(|c| !c.is_empty()),
+            "log must report the graph's base anchor: {:?}",
             out.details
         );
 
