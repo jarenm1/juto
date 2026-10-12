@@ -713,6 +713,126 @@ fn join_in_a_sparse_workspace_records_the_full_merged_tree() {
 }
 
 #[test]
+fn resolve_in_a_sparse_workspace_records_the_full_merged_tree() {
+    let directory = fixture();
+    let cwd = directory.path();
+    fs::create_dir_all(cwd.join("crates/foo")).unwrap();
+    fs::write(cwd.join("crates/foo/a.txt"), "a\n").unwrap();
+    fs::create_dir_all(cwd.join("crates/bar")).unwrap();
+    fs::write(cwd.join("crates/bar/b.txt"), "b\n").unwrap();
+    command(cwd, "git", &["add", "-A"]);
+    command(cwd, "git", &["commit", "-m", "layout"]);
+
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+
+    let workspaces = tempfile::tempdir().unwrap();
+    let left_dir = workspaces.path().join("left");
+    let right_dir = workspaces.path().join("right");
+    let sparse = vec!["crates/foo".to_string()];
+    graph
+        .fork_sparse("left", &root.id, &left_dir, &sparse)
+        .unwrap();
+    // The right side is a full fork, so it can change a path the sparse left
+    // workspace never materialized.
+    graph.fork("right", &root.id, &right_dir).unwrap();
+
+    let left = ChangeGraph::open(&left_dir).unwrap();
+    fs::write(left_dir.join("crates/foo/a.txt"), "from left\n").unwrap();
+    let left_head = left.capture("left", provenance("left"), None).unwrap();
+
+    let right = ChangeGraph::open(&right_dir).unwrap();
+    fs::write(right_dir.join("crates/foo/a.txt"), "from right\n").unwrap();
+    fs::write(right_dir.join("crates/bar/b.txt"), "b from right\n").unwrap();
+    let right_head = right.capture("right", provenance("right"), None).unwrap();
+
+    // The agent resolves the conflict by hand, then records the merge. The
+    // merged tree carries the right side's crates/bar/b.txt, which this
+    // workspace never materialized, so the node must record the merge result
+    // rather than a snapshot of the sparse workspace.
+    fs::write(left_dir.join("crates/foo/a.txt"), "resolved\n").unwrap();
+    let node = left
+        .resolve("left", &left_head.id, &right_head.id, provenance("resolve"))
+        .unwrap();
+
+    let listing = command(cwd, "git", &["ls-tree", "-r", "--name-only", &node.tree]);
+    assert!(
+        listing.contains("crates/bar/b.txt"),
+        "the resolve must record the complete merged tree, got:\n{listing}"
+    );
+    assert_eq!(
+        command(
+            cwd,
+            "git",
+            &["show", &format!("{}:crates/bar/b.txt", node.tree)]
+        ),
+        "b from right",
+        "the resolve must carry the merge's version of an unmaterialized path"
+    );
+    assert_eq!(
+        command(
+            cwd,
+            "git",
+            &["show", &format!("{}:crates/foo/a.txt", node.tree)]
+        ),
+        "resolved"
+    );
+}
+
+#[test]
+fn resolve_carries_the_merge_and_materializes_it() {
+    let directory = fixture();
+    let cwd = directory.path();
+    fs::write(cwd.join("f.txt"), "line1\nline2\nline3\n").unwrap();
+    fs::write(cwd.join("g.txt"), "other\n").unwrap();
+    command(cwd, "git", &["add", "-A"]);
+    command(cwd, "git", &["commit", "-m", "base"]);
+
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+
+    let workspaces = tempfile::tempdir().unwrap();
+    let left_dir = workspaces.path().join("left");
+    let right_dir = workspaces.path().join("right");
+    graph.fork("left", &root.id, &left_dir).unwrap();
+    graph.fork("right", &root.id, &right_dir).unwrap();
+
+    let left = ChangeGraph::open(&left_dir).unwrap();
+    fs::write(left_dir.join("f.txt"), "from left\n").unwrap();
+    let left_head = left.capture("left", provenance("left"), None).unwrap();
+
+    let right = ChangeGraph::open(&right_dir).unwrap();
+    fs::write(right_dir.join("f.txt"), "from right\n").unwrap();
+    fs::write(right_dir.join("g.txt"), "g from right\n").unwrap();
+    let right_head = right.capture("right", provenance("right"), None).unwrap();
+
+    // The agent resolves the conflict on f.txt by hand. g.txt is not
+    // conflicted, so it must come from the merge, not this stale workspace.
+    fs::write(left_dir.join("f.txt"), "resolved\n").unwrap();
+    let node = left
+        .resolve("left", &left_head.id, &right_head.id, provenance("resolve"))
+        .unwrap();
+
+    assert_eq!(
+        command(cwd, "git", &["show", &format!("{}:g.txt", node.tree)]),
+        "g from right"
+    );
+    assert_eq!(
+        command(cwd, "git", &["show", &format!("{}:f.txt", node.tree)]),
+        "resolved"
+    );
+    // The workspace matches the node, so a later capture cannot revert g.txt.
+    assert_eq!(
+        fs::read_to_string(left_dir.join("g.txt")).unwrap(),
+        "g from right\n"
+    );
+    assert_eq!(
+        fs::read_to_string(left_dir.join("f.txt")).unwrap(),
+        "resolved\n"
+    );
+}
+
+#[test]
 fn rewind_in_a_sparse_workspace_records_the_target_tree() {
     let directory = fixture();
     let cwd = directory.path();
