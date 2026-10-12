@@ -240,6 +240,27 @@ fn serve(mut stream: UnixStream, supervisor: Arc<DesktopSupervisor>) -> std::io:
         let (response, fd) = handle(command, &supervisor);
         if let (Some(env_id), DesktopResponse::Attached { viewer_id, .. }) = (attach_env, &response)
         {
+            // `Destroy` closes viewers: watch the environment's events and shut
+            // this connection down when it stops, so the viewer cannot keep
+            // reading a retired pool (spec section 4).
+            if let Ok(env) = supervisor.get_environment(&env_id)
+                && let Ok(watcher_stream) = stream.try_clone()
+            {
+                let mut events = env.subscribe();
+                let _ = std::thread::Builder::new()
+                    .name(format!("juto-desktop-viewer-{viewer_id}"))
+                    .spawn(move || {
+                        while let Ok(event) = events.blocking_recv() {
+                            if matches!(
+                                event,
+                                DesktopEvent::Stopped { .. } | DesktopEvent::Failed { .. }
+                            ) {
+                                let _ = watcher_stream.shutdown(std::net::Shutdown::Both);
+                                return;
+                            }
+                        }
+                    });
+            }
             _viewer = Some(ViewerGuard {
                 supervisor: supervisor.clone(),
                 env_id,
