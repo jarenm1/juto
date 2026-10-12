@@ -8,6 +8,7 @@ use crate::auth_modal::{AuthModal, AuthModalEvent};
 use crate::chat_input::{ChatInput, SubmitMessage};
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
+use crate::vcs_sidebar::VcsSidebar;
 use gpui::{
     App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding, MouseButton,
     MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Subscription, Task,
@@ -45,6 +46,12 @@ pub enum ActiveModal {
     None,
     ModelPicker,
     AuthModal,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarTab {
+    Vcs,
+    Agents,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -189,6 +196,8 @@ pub struct ChatView {
     model_picker: Entity<ModelPicker>,
     auth_modal: Entity<AuthModal>,
     sidebar: Entity<Sidebar>,
+    vcs_sidebar: Entity<VcsSidebar>,
+    sidebar_tab: SidebarTab,
     subagents: Arc<juto_runtime::subagents::SubagentManager>,
     show_sidebar: bool,
     active_modal: ActiveModal,
@@ -242,6 +251,8 @@ impl ChatView {
         let subagent_control = RunControl::new();
         let subagents = runtime.subagent_manager(&subagent_control);
         let sidebar = cx.new(Sidebar::new);
+        let workspace_cwd = session.header().cwd.clone();
+        let vcs_sidebar = cx.new(|cx| VcsSidebar::new(workspace_cwd, tokio_handle.clone(), cx));
         let initial_summaries = subagents.list();
         sidebar.update(cx, |s, cx| {
             s.sync_from_summaries(&initial_summaries, cx);
@@ -339,6 +350,8 @@ impl ChatView {
             model_picker,
             auth_modal,
             sidebar,
+            vcs_sidebar,
+            sidebar_tab: SidebarTab::Vcs,
             subagents,
             show_sidebar: true,
             active_modal: ActiveModal::None,
@@ -849,7 +862,11 @@ impl ChatView {
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.toggle_sidebar(cx);
                             }))
-                            .child("⚡ Mission Control"),
+                            .child(if self.sidebar_tab == SidebarTab::Vcs {
+                                "⌥ VCS Graph"
+                            } else {
+                                "⚡ Mission Control"
+                            }),
                     ),
             )
     }
@@ -1411,9 +1428,96 @@ impl Render for ChatView {
                                 .w(px(380.0))
                                 .flex_none()
                                 .h_full()
+                                .flex()
+                                .flex_col()
+                                .bg(rgb(0x18181b))
                                 .border_l_1()
                                 .border_color(rgb(0x27272a))
-                                .child(self.sidebar.clone()),
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_none()
+                                        .border_b_1()
+                                        .border_color(rgb(0x27272a))
+                                        .bg(rgb(0x18181b))
+                                        .child(
+                                            div()
+                                                .id("sidebar-tab-vcs")
+                                                .flex_1()
+                                                .py_2()
+                                                .text_center()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .border_b_2()
+                                                .border_color(
+                                                    if self.sidebar_tab == SidebarTab::Vcs {
+                                                        rgb(0x60a5fa)
+                                                    } else {
+                                                        rgb(0x00000000)
+                                                    },
+                                                )
+                                                .text_color(
+                                                    if self.sidebar_tab == SidebarTab::Vcs {
+                                                        rgb(0xffffff)
+                                                    } else {
+                                                        rgb(0x9ca3af)
+                                                    },
+                                                )
+                                                .hover(|s| s.bg(rgb(0x27272a)))
+                                                .on_click(cx.listener(
+                                                    |this, _: &ClickEvent, _, cx| {
+                                                        this.sidebar_tab = SidebarTab::Vcs;
+                                                        cx.notify();
+                                                    },
+                                                ))
+                                                .child("Changes"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("sidebar-tab-agents")
+                                                .flex_1()
+                                                .py_2()
+                                                .text_center()
+                                                .text_xs()
+                                                .cursor_pointer()
+                                                .border_b_2()
+                                                .border_color(
+                                                    if self.sidebar_tab == SidebarTab::Agents {
+                                                        rgb(0x60a5fa)
+                                                    } else {
+                                                        rgb(0x00000000)
+                                                    },
+                                                )
+                                                .text_color(
+                                                    if self.sidebar_tab == SidebarTab::Agents {
+                                                        rgb(0xffffff)
+                                                    } else {
+                                                        rgb(0x9ca3af)
+                                                    },
+                                                )
+                                                .hover(|s| s.bg(rgb(0x27272a)))
+                                                .on_click(cx.listener(
+                                                    |this, _: &ClickEvent, _, cx| {
+                                                        this.sidebar_tab = SidebarTab::Agents;
+                                                        cx.notify();
+                                                    },
+                                                ))
+                                                .child("Agents"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_h_0()
+                                        .when(self.sidebar_tab == SidebarTab::Vcs, |view| {
+                                            view.child(self.vcs_sidebar.clone())
+                                        })
+                                        .when(self.sidebar_tab == SidebarTab::Agents, |view| {
+                                            view.child(self.sidebar.clone())
+                                        }),
+                                ),
                         )
                     }),
             )
