@@ -1411,6 +1411,10 @@ enum VcsAction {
     Mark,
     /// Revert a thread to an earlier point.
     Rewind,
+    /// Project marked points into Git commits on a branch.
+    Export,
+    /// Push an exported branch to a remote.
+    Publish,
 }
 
 #[derive(Deserialize)]
@@ -1428,6 +1432,8 @@ struct VcsParams {
     /// Whether `mark` records a verification attestation. It never runs or
     /// invents verification.
     verified: Option<bool>,
+    /// Git branch for `export` and `publish`.
+    branch: Option<String>,
 }
 
 #[async_trait]
@@ -1446,7 +1452,17 @@ impl Tool for VcsTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "fetch", "reconcile", "push", "verify", "mark", "rewind"],
+                        "enum": [
+                            "status",
+                            "fetch",
+                            "reconcile",
+                            "push",
+                            "verify",
+                            "mark",
+                            "rewind",
+                            "export",
+                            "publish"
+                        ],
                         "description": "Which change-graph operation to run."
                     },
                     "remote": {
@@ -1468,6 +1484,10 @@ impl Tool for VcsTool {
                     "verified": {
                         "type": "boolean",
                         "description": "Whether `mark` records a verification attestation. It never runs or invents verification."
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Git branch for `export` and `publish`."
                     }
                 },
                 "required": ["action"],
@@ -1492,6 +1512,7 @@ impl Tool for VcsTool {
             point,
             name,
             verified,
+            branch,
         } = serde_json::from_value(arguments).map_err(|e| format!("invalid vcs arguments: {e}"))?;
         check_cancel(&ctx.cancel)?;
         let cwd = effective_cwd(&self.cwd, &ctx).to_path_buf();
@@ -1600,6 +1621,19 @@ impl Tool for VcsTool {
                     let node = graph.rewind(&thread, &to).map_err(|e| format!("{e:#}"))?;
                     serde_json::to_value(node).map_err(|e| e.to_string())
                 }
+                VcsAction::Export => {
+                    let checkpoint = point.ok_or_else(|| "`export` needs a `point`".to_string())?;
+                    let branch = branch.ok_or_else(|| "`export` needs a `branch`".to_string())?;
+                    let result = graph
+                        .export(&checkpoint, &branch)
+                        .map_err(|e| format!("{e:#}"))?;
+                    serde_json::to_value(result).map_err(|e| e.to_string())
+                }
+                VcsAction::Publish => {
+                    let branch = branch.ok_or_else(|| "`publish` needs a `branch`".to_string())?;
+                    graph.push(&branch, &remote).map_err(|e| format!("{e:#}"))?;
+                    Ok(json!({ "branch": branch, "remote": remote, "pushed": true }))
+                }
             }
         })
         .await
@@ -1620,6 +1654,8 @@ fn action_label(action: &VcsAction) -> &'static str {
         VcsAction::Verify => "verify",
         VcsAction::Mark => "mark",
         VcsAction::Rewind => "rewind",
+        VcsAction::Export => "export",
+        VcsAction::Publish => "publish",
     }
 }
 
@@ -2544,6 +2580,23 @@ mod tests {
             .unwrap();
         assert_eq!(
             out.details["provenance"]["tool"], "rewind",
+            "{:?}",
+            out.details
+        );
+
+        // `export` projects the marked point into a Git commit on a branch.
+        let out = tool
+            .execute(
+                json!({"action": "export", "point": "c1", "branch": "juto-test"}),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(out.details["tip"].is_string(), "{:?}", out.details);
+        assert!(
+            out.details["commits"]
+                .as_object()
+                .is_some_and(|commits| !commits.is_empty()),
             "{:?}",
             out.details
         );
