@@ -11,7 +11,14 @@ use juto_desktop::supervisor::{
     DesktopSupervisor, EnvironmentConfig, OutputConfig, RenderProfile, SystemLimits,
 };
 
+/// The worker binary is the daemon; point the supervisor at it.
+fn worker_binary() -> &'static str {
+    env!("CARGO_BIN_EXE_juto-desktop")
+}
+
 fn test_config(env_id: &str) -> EnvironmentConfig {
+    // SAFETY: every test sets the same value, and it is read before spawning.
+    unsafe { std::env::set_var("JUTO_DESKTOP_WORKER", worker_binary()) };
     EnvironmentConfig {
         env_id: env_id.to_string(),
         owner_principal: "agent:test".to_string(),
@@ -25,6 +32,7 @@ fn test_config(env_id: &str) -> EnvironmentConfig {
         limits: SystemLimits::default(),
         workspace_dir: std::env::temp_dir(),
         lease_ttl_secs: 6,
+        compositor_mode: juto_desktop::CompositorMode::Worker,
     }
 }
 
@@ -430,10 +438,9 @@ fn text_input_v3_receives_committed_text() {
         if let Ok(info) = env.observe(Duration::from_secs(2)) {
             let pool = env.frame_pool();
             pool.acquire_slot(info.slot);
-            let mut pixels = Vec::new();
-            let header = pool.read_pixels(info.slot, &mut pixels);
+            let read = pool.read_slot(info.slot, pool.slot_size());
             pool.release_slot(info.slot);
-            if let Ok(header) = header
+            if let Ok((header, pixels)) = read
                 && header.width > 0
                 && pixels.len() >= 4
                 && pixels[0..4] == common::RED
@@ -590,7 +597,9 @@ fn environment_slice_aggregates_limits_and_contains_apps() {
 fn memory_pressure_emits_limit_pressure() {
     let supervisor = DesktopSupervisor::new();
     let mut config = test_config(&unique_env_id("pressure"));
-    config.limits.memory_max = "64M".to_string();
+    // Above the 90% threshold but below the limit, so the process is not
+    // OOM-killed before the monitor samples.
+    config.limits.memory_max = "256M".to_string();
     let env = supervisor
         .create_environment(config)
         .expect("create environment");
@@ -601,7 +610,7 @@ fn memory_pressure_emits_limit_pressure() {
         &[
             "perl".to_string(),
             "-e".to_string(),
-            "my $x = 'a' x (60 * 1024 * 1024); sleep 20;".to_string(),
+            "my $x = 'a' x (240 * 1024 * 1024); sleep 20;".to_string(),
         ],
         None,
         &[],
@@ -699,6 +708,62 @@ fn input_requires_a_geometry_acknowledgement_after_resize() {
 }
 
 #[test]
+fn compositor_worker_runs_inside_the_environment_slice() {
+    let supervisor = DesktopSupervisor::new();
+    let env_id = unique_env_id("worker");
+    let env = supervisor
+        .create_environment(test_config(&env_id))
+        .expect("create environment");
+    let slice = env.slice().expect("environment slice").to_string();
+
+    // The compositor runs in its own scope inside the slice, so its memory is
+    // charged to the environment.
+    let unit = format!("juto-desktop-{env_id}-compositor.scope");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut scope = String::new();
+    while Instant::now() < deadline {
+        scope = systemctl_show(&unit, &["ControlGroup"]);
+        if scope.contains(&slice) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        scope.contains(&slice),
+        "compositor scope {unit} is not inside {slice}: {scope}"
+    );
+
+    // The compositor is a separate process, not a supervisor thread.
+    let cgroup = scope
+        .trim()
+        .strip_prefix("ControlGroup=")
+        .expect("ControlGroup")
+        .to_string();
+    let procs = std::fs::read_to_string(format!("/sys/fs/cgroup{cgroup}/cgroup.procs"))
+        .expect("read the compositor cgroup");
+    let pids: Vec<i32> = procs
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    assert!(!pids.is_empty(), "the compositor cgroup has no processes");
+    assert!(
+        !pids.contains(&(std::process::id() as i32)),
+        "the compositor must not be the test process: {pids:?}"
+    );
+
+    // Frames still flow through the worker's pool.
+    let info = env.observe(Duration::from_secs(5)).expect("observe");
+    assert_eq!(info.width, 640);
+    assert!(info.ticks > 0);
+
+    env.destroy();
+    assert!(
+        !unit_is_active(&unit),
+        "compositor scope must stop on destroy"
+    );
+}
+
+#[test]
 fn launch_rejects_missing_executable() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor
@@ -721,11 +786,8 @@ fn launch_rejects_missing_executable() {
     env.destroy();
 }
 
-fn read_pixel(pool: &ShmFramePool, slot: usize, x: u32, y: u32, width: u32) -> [u8; 4] {
-    let fd = unsafe { libc::dup(pool.raw_fd()) };
-    assert!(fd >= 0, "dup failed");
-    let reader = ShmReader::attach(fd, pool.size()).expect("attach reader");
-    let (_header, pixels) = reader.read_slot(slot, pool.slot_size()).expect("read slot");
+fn read_pixel(pool: &ShmReader, slot: usize, x: u32, y: u32, width: u32) -> [u8; 4] {
+    let (_header, pixels) = pool.read_slot(slot, pool.slot_size()).expect("read slot");
     let idx = ((y * width + x) * 4) as usize;
     [
         pixels[idx],

@@ -28,6 +28,7 @@ impl Daemon {
             .arg("--socket")
             .arg(&socket)
             .env("JUTO_DESKTOP_RUNTIME_DIR", &root)
+            .env("JUTO_DESKTOP_WORKER", env!("CARGO_BIN_EXE_juto-desktop"))
             .stdout(Stdio::null())
             .stderr(Stdio::from(log))
             .spawn()

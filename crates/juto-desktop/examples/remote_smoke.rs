@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(60);
 
+    // The compositor worker is the daemon binary; JUTO_DESKTOP_WORKER names it.
     let supervisor = Arc::new(DesktopSupervisor::new());
     let env = supervisor.create_environment(EnvironmentConfig {
         env_id: format!("remote-smoke-{}", uuid::Uuid::now_v7()),
@@ -42,6 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         limits: SystemLimits::default(),
         workspace_dir: std::env::temp_dir(),
         lease_ttl_secs: 6,
+        compositor_mode: juto_desktop::CompositorMode::Worker,
     })?;
 
     env.launch(
@@ -58,10 +60,9 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Ok(info) = env.observe(Duration::from_secs(2)) {
             let pool = env.frame_pool();
             pool.acquire_slot(info.slot);
-            let mut pixels = Vec::new();
-            let header = pool.read_pixels(info.slot, &mut pixels);
+            let read = pool.read_slot(info.slot, pool.slot_size());
             pool.release_slot(info.slot);
-            if let Ok(header) = header
+            if let Ok((header, pixels)) = read
                 && header.width > 0
                 && pixels.len() >= 4
                 && pixels[0..4] == client::RED

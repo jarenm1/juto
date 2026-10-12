@@ -52,6 +52,20 @@ impl ShmFramePool {
         width: u32,
         height: u32,
     ) -> Result<Self, DesktopError> {
+        let pool = Self::create_unsealed(pool_id, width, height)?;
+        pool.seal()?;
+        Ok(pool)
+    }
+
+    /// Creates a pool whose producer mapping is writable but not yet sealed.
+    ///
+    /// A compositor worker maps the pool writable and then seals it, so the
+    /// supervisor and every viewer can only map it read-only afterwards.
+    pub fn create_unsealed(
+        pool_id: impl Into<String>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, DesktopError> {
         let pool_id = pool_id.into();
         let stride = width * 4;
         let pixel_bytes = (stride * height) as usize;
@@ -103,27 +117,6 @@ impl ShmFramePool {
             )));
         }
 
-        // 4. Apply write and size seals: F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_FUTURE_WRITE | F_SEAL_SEAL
-        // This guarantees that any viewer receiving the passed descriptor cannot create new writable mappings,
-        // while the producer's existing mapping remains valid.
-        const F_SEAL_SEAL: libc::c_int = 0x0001;
-        const F_SEAL_SHRINK: libc::c_int = 0x0002;
-        const F_SEAL_GROW: libc::c_int = 0x0004;
-        const F_SEAL_FUTURE_WRITE: libc::c_int = 0x0010;
-
-        let seals = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_FUTURE_WRITE;
-        let seal_res = unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, seals) };
-        if seal_res != 0 {
-            unsafe {
-                libc::munmap(mmap_ptr, total_size);
-                libc::close(fd);
-            }
-            return Err(DesktopError::Shm(format!(
-                "F_ADD_SEALS failed: {}",
-                std::io::Error::last_os_error()
-            )));
-        }
-
         let file = unsafe { Arc::new(File::from_raw_fd(fd)) };
 
         Ok(Self {
@@ -136,6 +129,29 @@ impl ShmFramePool {
             active_slot: Mutex::new(0),
             in_flight_readers: Mutex::new([0; POOL_SLOT_COUNT]),
         })
+    }
+
+    /// Applies the write and size seals.
+    ///
+    /// `F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_FUTURE_WRITE | F_SEAL_SEAL` denies
+    /// future writable mappings to anyone receiving the descriptor, while the
+    /// producer's existing mapping stays writable. `F_SEAL_WRITE` is deliberately
+    /// not used: it would forbid the reusable producer mapping.
+    pub fn seal(&self) -> Result<(), DesktopError> {
+        const F_SEAL_SEAL: libc::c_int = 0x0001;
+        const F_SEAL_SHRINK: libc::c_int = 0x0002;
+        const F_SEAL_GROW: libc::c_int = 0x0004;
+        const F_SEAL_FUTURE_WRITE: libc::c_int = 0x0010;
+
+        let seals = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_FUTURE_WRITE;
+        let result = unsafe { libc::fcntl(self.fd, libc::F_ADD_SEALS, seals) };
+        if result != 0 {
+            return Err(DesktopError::Shm(format!(
+                "F_ADD_SEALS failed: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(())
     }
 
     pub fn pool_id(&self) -> &str {
@@ -304,6 +320,10 @@ pub struct ShmReader {
     size: usize,
     slot_size: usize,
     mmap_ptr: *const u8,
+    pool_id: String,
+    /// Notified when a slot is reserved or released, so a producer in another
+    /// process can honour the reservation.
+    reservation: Option<Box<dyn Fn(usize, bool) + Send + Sync>>,
 }
 
 unsafe impl Send for ShmReader {}
@@ -311,6 +331,16 @@ unsafe impl Sync for ShmReader {}
 
 impl ShmReader {
     pub fn attach(fd: RawFd, size: usize) -> Result<Self, DesktopError> {
+        Self::attach_named(fd, size, String::new(), None)
+    }
+
+    /// Attaches with an identity and a reservation callback.
+    pub fn attach_named(
+        fd: RawFd,
+        size: usize,
+        pool_id: String,
+        reservation: Option<Box<dyn Fn(usize, bool) + Send + Sync>>,
+    ) -> Result<Self, DesktopError> {
         let mmap_ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -333,7 +363,38 @@ impl ShmReader {
             size,
             slot_size: size / POOL_SLOT_COUNT,
             mmap_ptr: mmap_ptr as *const u8,
+            pool_id,
+            reservation,
         })
+    }
+
+    /// The pool's identity.
+    pub fn pool_id(&self) -> &str {
+        &self.pool_id
+    }
+
+    /// The descriptor backing the mapping (read-only for viewers).
+    pub fn raw_fd(&self) -> RawFd {
+        self.fd
+    }
+
+    /// Total mapped size in bytes.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Reserves a slot so a producer does not overwrite it while it is read.
+    pub fn acquire_slot(&self, slot: usize) {
+        if let Some(reservation) = &self.reservation {
+            reservation(slot, true);
+        }
+    }
+
+    /// Releases a previously reserved slot.
+    pub fn release_slot(&self, slot: usize) {
+        if let Some(reservation) = &self.reservation {
+            reservation(slot, false);
+        }
     }
 
     /// Byte size of one slot in the mapped pool.

@@ -76,13 +76,12 @@ impl DesktopViewer {
                 let read = cx
                     .background_executor()
                     .spawn(async move {
-                        let frame = pool.latest_frame()?;
+                        let frame = pool.latest_frame().ok()??;
                         pool.acquire_slot(frame.slot);
-                        let mut pixels = Vec::new();
-                        let header = pool.read_pixels(frame.slot, &mut pixels);
+                        let read = pool.read_slot(frame.slot, pool.slot_size());
                         pool.release_slot(frame.slot);
-                        let header = header.ok()?;
-                        Some((header, pixels))
+                        let (header, pixels) = read.ok()?;
+                        Some((header, pixels.to_vec()))
                     })
                     .await;
                 let Some((header, pixels)) = read else {

@@ -12,7 +12,14 @@ use juto_desktop::supervisor::{
     DesktopSupervisor, EnvironmentConfig, OutputConfig, RenderProfile, SystemLimits,
 };
 
+/// The worker binary is the daemon; point the supervisor at it.
+fn worker_binary() -> &'static str {
+    env!("CARGO_BIN_EXE_juto-desktop")
+}
+
 fn test_config(env_id: &str) -> EnvironmentConfig {
+    // SAFETY: every test sets the same value, and it is read before spawning.
+    unsafe { std::env::set_var("JUTO_DESKTOP_WORKER", worker_binary()) };
     EnvironmentConfig {
         env_id: env_id.to_string(),
         owner_principal: "agent:test".to_string(),
@@ -26,6 +33,7 @@ fn test_config(env_id: &str) -> EnvironmentConfig {
         limits: SystemLimits::default(),
         workspace_dir: std::env::temp_dir(),
         lease_ttl_secs: 6,
+        compositor_mode: juto_desktop::CompositorMode::Worker,
     }
 }
 
@@ -47,10 +55,9 @@ fn webrtc_streams_composed_frames_to_a_native_receiver() {
         if let Ok(info) = env.observe(Duration::from_secs(2)) {
             let pool = env.frame_pool();
             pool.acquire_slot(info.slot);
-            let mut pixels = Vec::new();
-            let header = pool.read_pixels(info.slot, &mut pixels);
+            let read = pool.read_slot(info.slot, pool.slot_size());
             pool.release_slot(info.slot);
-            if let Ok(header) = header
+            if let Ok((header, pixels)) = read
                 && header.width > 0
                 && pixels.len() >= 4 * 4
                 && pixels[0..4] == common::RED

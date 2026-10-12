@@ -21,6 +21,17 @@ const MAX_FRAME: usize = 64 * 1024;
 fn main() {
     tracing_subscriber_init();
 
+    // `juto-desktop worker ...` runs the compositor for one environment inside
+    // that environment's slice.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("worker") {
+        if let Err(err) = run_worker_command(&args[1..]) {
+            eprintln!("juto-desktop worker: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let socket_path = parse_socket_path();
     if let Some(parent) = socket_path.parent()
         && let Err(err) = std::fs::create_dir_all(parent)
@@ -81,6 +92,47 @@ fn main() {
             Err(err) => eprintln!("juto-desktop: accept failed: {err}"),
         }
     }
+}
+
+fn run_worker_command(args: &[String]) -> Result<(), juto_desktop::DesktopError> {
+    let mut env_id = None;
+    let mut width = 1280u32;
+    let mut height = 720u32;
+    let mut scale = 1u32;
+    let mut fps = 30u32;
+    let mut wayland_socket = None;
+    let mut control_socket = None;
+    let mut index = 0;
+    while index < args.len() {
+        let value = args.get(index + 1).cloned().unwrap_or_default();
+        match args[index].as_str() {
+            "--env" => env_id = Some(value),
+            "--width" => width = value.parse().unwrap_or(width),
+            "--height" => height = value.parse().unwrap_or(height),
+            "--scale" => scale = value.parse().unwrap_or(scale),
+            "--fps" => fps = value.parse().unwrap_or(fps),
+            "--wayland-socket" => wayland_socket = Some(PathBuf::from(value)),
+            "--control-socket" => control_socket = Some(PathBuf::from(value)),
+            _ => {}
+        }
+        index += 2;
+    }
+    let (Some(env_id), Some(wayland_socket), Some(control_socket)) =
+        (env_id, wayland_socket, control_socket)
+    else {
+        return Err(juto_desktop::DesktopError::Protocol(
+            "worker requires --env, --wayland-socket, and --control-socket".to_string(),
+        ));
+    };
+    juto_desktop::run_worker(juto_desktop::WorkerArgs {
+        env_id,
+        width,
+        height,
+        scale,
+        fps,
+        wayland_socket,
+        control_socket,
+    })
 }
 
 fn tracing_subscriber_init() {

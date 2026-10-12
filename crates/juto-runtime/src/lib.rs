@@ -39,7 +39,8 @@ use juto_catalog::{Model, Registry};
 pub use juto_desktop::protocol;
 pub use juto_desktop::signaling::{SignalingServer, ViewerReport};
 pub use juto_desktop::supervisor::{
-    AppHandle, EnvironmentConfig, EnvironmentStatus, OutputConfig, RenderProfile, SystemLimits,
+    AppHandle, CompositorMode, EnvironmentConfig, EnvironmentStatus, OutputConfig, RenderProfile,
+    SystemLimits,
 };
 pub use juto_desktop::{DesktopEnvironment, DesktopError, DesktopSupervisor};
 

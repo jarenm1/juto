@@ -54,6 +54,9 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Aggregate environment cgroup: a transient `juto-desktop-<env>.slice` carries
   the environment limits and contains the application scopes; a monitor emits
   `LimitPressure` on memory pressure and CPU throttling.
+- Compositor worker: the compositor runs in its own process inside the slice, owns
+  the writable frame-pool mapping, and seals it before handing the descriptor to
+  the supervisor; slot reservations travel back over the control socket.
 - Artifact resolution: the runtime validates host, environment, grant, principal,
   and expiry before returning a same-host route or a one-time remote token, and
   otherwise reports `Unsupported`, `Unauthorized`, `Expired`, `Stopped`, or
@@ -62,8 +65,7 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   input is rejected until `GeometryReady` reports the new generation.
 
 Not implemented: audio (private PipeWire sink plus Opus), Xwayland, the hardware
-render-node profile, DMA-BUF export/import, TURN relay configuration, running the
-compositor in a separate worker process inside the environment cgroup, and
+render-node profile, DMA-BUF export/import, TURN relay configuration, and
 deployment provisioning (TLS termination, public reachability). Sections
 describing those remain design.
 

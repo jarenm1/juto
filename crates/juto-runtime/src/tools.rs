@@ -1584,6 +1584,14 @@ fn run_desktop_action(
                 limits: SystemLimits::default(),
                 workspace_dir: workspace.to_path_buf(),
                 lease_ttl_secs: 6,
+                // Run the compositor in its own process inside the environment
+                // slice when the worker binary is available; otherwise fall back
+                // to a supervisor thread and say so.
+                compositor_mode: if juto_desktop::worker_available() {
+                    juto_desktop::supervisor::CompositorMode::Worker
+                } else {
+                    juto_desktop::supervisor::CompositorMode::InProcess
+                },
             };
             let env = supervisor
                 .create_environment(config)
