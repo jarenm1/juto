@@ -30,6 +30,8 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
+use crate::workspace::{ResourceLimits, SubagentWorkspace};
+
 // ---------------------------------------------------------------------------
 // Bounds (source: streaming-output.ts, glob.ts, grep.ts, tool-timeouts.ts)
 // ---------------------------------------------------------------------------
@@ -1050,6 +1052,9 @@ impl Drop for ProcessGroupGuard {
 
 struct BashTool {
     cwd: PathBuf,
+    /// When set, the command runs under the workspace's resource governance
+    /// (a systemd user scope with CPU/memory caps) instead of a bare spawn.
+    limits: Option<ResourceLimits>,
 }
 
 #[async_trait]
@@ -1113,9 +1118,37 @@ impl Tool for BashTool {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("failed to spawn `sh`: {e}"))?;
+        // Under governance the command runs inside a systemd user scope, so the
+        // caps apply to the whole tree. `enforce_scope` is the caller's choice:
+        // with it off, a host without `systemd-run` degrades to a bare spawn
+        // rather than failing the tool.
+        let mut child = match &self.limits {
+            Some(limits) => {
+                let workspace = SubagentWorkspace {
+                    path: cwd.clone(),
+                    node_id: String::new(),
+                    thread: String::new(),
+                    repo_root: cwd.clone(),
+                    subagent_id: String::new(),
+                };
+                let mut scoped = workspace
+                    .build_scoped_command_named(command.as_std(), limits, None)
+                    .map_err(|e| format!("failed to build a scoped command: {e}"))?;
+                scoped
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .kill_on_drop(true);
+                #[cfg(unix)]
+                scoped.process_group(0);
+                scoped
+                    .spawn()
+                    .map_err(|e| format!("failed to spawn `sh`: {e}"))?
+            }
+            None => command
+                .spawn()
+                .map_err(|e| format!("failed to spawn `sh`: {e}"))?,
+        };
         let pid = child.id();
         let mut guard = ProcessGroupGuard::new(pid);
 
@@ -1347,6 +1380,18 @@ impl Tool for DesktopArtifactTool {
 /// policy is enforced by agent hooks via each tool's [`Tool::tier`]; these
 /// tools perform real filesystem/process work and return true errors.
 pub fn builtin_tools(cwd: &Path) -> Result<ToolRegistry, AgentError> {
+    builtin_tools_with_limits(cwd, None)
+}
+
+/// Build the builtin tool registry, running `bash` under `limits` when set.
+///
+/// Governance wraps the command in a systemd user scope so the CPU and memory
+/// caps apply to the whole process tree. Whether a missing `systemd-run` is a
+/// hard failure or a fallback to a bare spawn is `ResourceLimits::enforce_scope`.
+pub fn builtin_tools_with_limits(
+    cwd: &Path,
+    limits: Option<ResourceLimits>,
+) -> Result<ToolRegistry, AgentError> {
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(ReadTool {
         cwd: cwd.to_path_buf(),
@@ -1365,6 +1410,7 @@ pub fn builtin_tools(cwd: &Path) -> Result<ToolRegistry, AgentError> {
     }))?;
     registry.register(Arc::new(BashTool {
         cwd: cwd.to_path_buf(),
+        limits,
     }))?;
     registry.register(Arc::new(DesktopArtifactTool))?;
     Ok(registry)
@@ -1463,7 +1509,8 @@ mod tests {
         ));
         assert!(matches!(
             BashTool {
-                cwd: PathBuf::new()
+                cwd: PathBuf::new(),
+                limits: None,
             }
             .tier(),
             ToolTier::Exec
@@ -1484,7 +1531,8 @@ mod tests {
         ));
         assert!(matches!(
             BashTool {
-                cwd: PathBuf::new()
+                cwd: PathBuf::new(),
+                limits: None,
             }
             .concurrency(),
             ToolConcurrency::Shared
@@ -2086,6 +2134,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = BashTool {
             cwd: dir.path().to_path_buf(),
+            limits: None,
         };
         let out = tool
             .execute(json!({"command": "echo hi; echo err >&2"}), ctx(dir.path()))
@@ -2107,11 +2156,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn governed_bash_runs_under_a_systemd_scope() {
+        if !crate::workspace::is_systemd_run_available() {
+            eprintln!("skipping governed-bash test: systemd-run unavailable");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BashTool {
+            cwd: dir.path().to_path_buf(),
+            limits: Some(ResourceLimits::default().with_enforce_scope(false)),
+        };
+        // A scoped command runs in its own cgroup, so its cgroup path names a
+        // scope rather than the test process's.
+        let out = tool
+            .execute(json!({"command": "cat /proc/self/cgroup"}), ctx(dir.path()))
+            .await
+            .unwrap();
+        let body = text(&out);
+        assert!(
+            body.contains(".scope"),
+            "expected a systemd scope cgroup, got: {body}"
+        );
+    }
+
+    #[tokio::test]
     async fn bash_runs_in_cwd_and_honors_cwd_param() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
         let tool = BashTool {
             cwd: dir.path().to_path_buf(),
+            limits: None,
         };
         let out = tool
             .execute(json!({"command": "pwd", "cwd": "sub"}), ctx(dir.path()))
@@ -2134,6 +2208,7 @@ mod tests {
         let sentinel = dir.path().join("sentinel");
         let tool = BashTool {
             cwd: dir.path().to_path_buf(),
+            limits: None,
         };
         // Grandchild survives the shell if only the leader is killed.
         let command = format!("(sleep 2; touch {}) & wait", sentinel.display());
@@ -2159,6 +2234,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let tool = BashTool {
             cwd: dir.path().to_path_buf(),
+            limits: None,
         };
         let mut context = ctx(dir.path());
         context.cancel = cancel.clone();
@@ -2178,6 +2254,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = BashTool {
             cwd: dir.path().to_path_buf(),
+            limits: None,
         };
         let out = tool
             .execute(

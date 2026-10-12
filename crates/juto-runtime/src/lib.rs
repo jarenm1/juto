@@ -361,7 +361,15 @@ impl Runtime {
             ))
         };
         let _children = ChildCancellation(manager.clone());
-        let mut registry = tools::builtin_tools(&self.inner.cwd)?;
+        // Governance is opt-in and degrades to a bare spawn when `systemd-run`
+        // is unavailable, so enabling it can never fail the tool outright.
+        let limits = self
+            .inner
+            .config
+            .read()
+            .bash_scoped
+            .then(|| ResourceLimits::default().with_enforce_scope(false));
+        let mut registry = tools::builtin_tools_with_limits(&self.inner.cwd, limits)?;
         if !read_only && depth < settings.max_recursion_depth {
             register_agent_tools(&mut registry, manager)?;
         }
