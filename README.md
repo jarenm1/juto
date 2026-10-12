@@ -20,9 +20,15 @@ capabilities to preserve, primary-source references, and acceptance criteria.
 Agent contributors should read [AGENTS.md](AGENTS.md).
 
 **Workspace isolation and resource governance.** `juto-runtime` provides `SubagentWorkspace`
-for provisioning dedicated Jujutsu (`jj`) workspaces per subagent task, executing commands under
-systemd user scopes (`agents.slice`) with configurable CPU, memory, and swap ceilings, serializing
-GPU access with `flock`, and rebasing completed changes back into the repository.
+for provisioning a dedicated fork directory per subagent task: a native change-graph fork that
+shares the parent's Git object store, not a `jj` workspace and not a Git worktree. Commands run
+under systemd user scopes (`agents.slice`) with configurable CPU, memory, and swap ceilings, and
+GPU access is serialized with `flock`. Completed work is folded back with `join`/`reconcile`, which
+merge trees into a two-parent node rather than rebasing.
+
+`jj` is the *human's* interface to this repository (see [AGENTS.md](AGENTS.md)); the runtime does
+not invoke it. The only place `jj` appears in the runtime is the `.jj` metadata-path exclusion, so
+a capture never records Jujutsu's own directory.
 
 **Sandboxed commands (opt-in).** `ResourceLimits::sandbox` adds a real filesystem boundary:
 `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=yes`, and `ReadWritePaths` covering the

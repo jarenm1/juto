@@ -189,21 +189,26 @@ Subagents coordinate as specialized coworkers rather than an uncontrolled group 
 
 ## 4. Workspace Isolation & Resource Governance
 
-### 4.1 Jujutsu (`jj`) Workspace Isolation
+### 4.1 Workspace Isolation
 Concurrent agents editing the same files cause corrupted working copies, broken compiler
 caches, and merge races.
 
 Juto establishes strict workspace isolation:
-1. **Creation**: When a task requiring code edits is spawned:
-   ```bash
-   jj workspace add ~/workspaces/juto-<subagent-id> -r <parent-change-id>
+1. **Creation**: When a task requiring code edits is spawned, the runtime forks a dedicated
+   directory from an immutable change-graph point:
+   ```rust
+   SubagentWorkspace::provision_in(repo_root, path, base_change, subagent_id)
    ```
+   The fork shares the parent's Git object store through a marker file; no Git branch,
+   worktree, or index is created, and no `jj` workspace is involved. The original plan called
+   for `jj workspace add`; the implementation went with native forks so the runtime does not
+   depend on `jj` being installed.
 2. **Execution**: The subagent executes all filesystem mutations, formatting, builds,
    and tests strictly inside that directory.
-3. **Integration**:
-   * Once verification and review pass, the Manager rebases or merges the subagent's
-     change ID into the main working copy (`jj rebase -s <change-id> -d <target>`).
-   * On failure or abandonment, the subagent workspace is forgotten (`jj workspace forget`).
+3. **Integration**: Once verification and review pass, the work is folded back with
+   `join`/`reconcile`, which merge trees into a two-parent node rather than rebasing. On
+   failure or abandonment, `SubagentWorkspace::cleanup` removes the fork directory and `gc`
+   reclaims the nodes only that workspace kept alive.
 
 ### 4.2 Resource Governance (`agent-scope.sh` Model)
 To prevent parallel agents from exhausting host memory, CPU, or lock contention:
