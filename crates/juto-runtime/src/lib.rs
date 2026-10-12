@@ -640,7 +640,28 @@ async fn finish_isolated_run(
         return result;
     };
     let path = workspace.path.clone();
-    match workspace.cleanup().await {
+    let repo_root = workspace.repo_root.clone();
+    let cleanup = workspace.cleanup().await;
+    if cleanup.is_ok() {
+        // The workspace head is now stale — its directory is gone — so reclaim
+        // the graph: gc drops the stale head and releases any node only it kept
+        // alive, and packs the refs. Best-effort, like the cleanup itself, and
+        // off the async runtime because it shells out to git.
+        match tokio::task::spawn_blocking(move || -> Result<()> {
+            ChangeGraph::open(&repo_root)?.gc().map(|_| ())
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("juto: failed to reclaim the change graph: {error:#}");
+            }
+            Err(join) => {
+                eprintln!("juto: change graph reclaim task failed: {join}");
+            }
+        }
+    }
+    match cleanup {
         Ok(()) => result,
         Err(cleanup_error) => match result {
             Ok(value) => {
@@ -1112,6 +1133,58 @@ mod tests {
         assert!(
             workspace_dir.exists(),
             "refused cleanup leaves the directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_isolated_run_reclaims_the_graph() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+
+        let workspace = provision_workspace(&repo, &data_dir, "reclaimed-child").await;
+        let workspace_dir = workspace.path.clone();
+        let key = workspace_dir
+            .canonicalize()
+            .expect("canonicalize")
+            .to_string_lossy()
+            .into_owned();
+        let graph = ChangeGraph::open(&repo).expect("open graph");
+        assert!(
+            graph
+                .state()
+                .expect("state")
+                .workspace_heads
+                .contains_key(&key),
+            "provisioning must register a workspace head"
+        );
+
+        finish_isolated_run(
+            Ok(SubagentResult {
+                id: "child".to_string(),
+                output: "done".to_string(),
+                data: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                session_path: PathBuf::from("/tmp/session"),
+            }),
+            Some(workspace),
+        )
+        .await
+        .expect("run result");
+
+        // The workspace directory is gone, so its head can never advance again:
+        // the reclaim must drop it rather than pin the thread's nodes forever.
+        assert!(!workspace_dir.exists(), "workspace must be removed");
+        let graph = ChangeGraph::open(&repo).expect("reopen graph");
+        assert!(
+            !graph
+                .state()
+                .expect("state")
+                .workspace_heads
+                .contains_key(&key),
+            "a finished run must reclaim the stale workspace head"
         );
     }
 }
