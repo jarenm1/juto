@@ -1143,6 +1143,39 @@ impl GitRepository {
         Ok(())
     }
 
+    /// The paths that differ between two trees, in `git diff-tree` order.
+    ///
+    /// Used to report a workspace's uncaptured edits: a `bash` command is not
+    /// captured automatically, so an agent needs a way to notice one before it
+    /// is attributed to a later capture.
+    pub fn changed_paths(&self, before: &str, after: &str) -> Result<Vec<String>> {
+        let before = self.resolve_tree(before)?;
+        let after = self.resolve_tree(after)?;
+        let output = self
+            .git(&[
+                "diff-tree",
+                "-r",
+                "-z",
+                "--no-renames",
+                "--name-only",
+                before.as_str(),
+                after.as_str(),
+            ])
+            .output()
+            .context("failed to run `git diff-tree`")?;
+        if !output.status.success() {
+            bail!("`git diff-tree` failed: {}", describe_failure(&output));
+        }
+        let mut paths = Vec::new();
+        for field in output.stdout.split(|byte| *byte == 0) {
+            if field.is_empty() {
+                continue;
+            }
+            paths.push(String::from_utf8_lossy(field).into_owned());
+        }
+        Ok(paths)
+    }
+
     /// Whether this Git supports `merge-tree --write-tree --merge-base`.
     ///
     /// The probe runs `git merge-tree -h` and looks for `--write-tree` and
