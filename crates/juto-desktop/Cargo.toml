@@ -15,10 +15,23 @@ libc = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+smithay = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+
+[[bin]]
+name = "juto-desktop"
+path = "src/bin/juto-desktop.rs"
+
+[[example]]
+name = "test_client"
+path = "examples/test_client.rs"
