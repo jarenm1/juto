@@ -24,6 +24,23 @@ for provisioning dedicated Jujutsu (`jj`) workspaces per subagent task, executin
 systemd user scopes (`agents.slice`) with configurable CPU, memory, and swap ceilings, serializing
 GPU access with `flock`, and rebasing completed changes back into the repository.
 
+**Sandboxed commands (opt-in).** `ResourceLimits::sandbox` adds a real filesystem boundary:
+`ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=yes`, and `ReadWritePaths` covering the
+workspace plus the toolchain directories a build must write (`CARGO_HOME`, `RUSTUP_HOME`,
+`XDG_CACHE_HOME`). Enable it with `AGENT_SANDBOX=1` or `ResourceLimits::with_sandbox`.
+
+Two details matter in practice. Transient *scopes* reject namespace properties, so a sandboxed
+command runs as a transient *service* instead — which does not inherit the caller's environment, so
+the caller's variables are forwarded explicitly with `--setenv`. And a service outlives its
+`systemd-run` client, so the unit is named and stopped when the child is dropped; otherwise a
+cancelled command would keep running.
+
+It is **not the default**: `ResourceLimits::default()` leaves `sandbox` unset. Enabling it turns a
+missing `systemd-run` into a hard failure rather than an uncapped run, and it changes how a command
+is supervised — a service rather than a scope, which is why the environment and the unit lifecycle
+are handled explicitly above. The mechanism is tested against a real `cargo check` inside the
+sandbox.
+
 **Multi-agent orchestrator and peer review DAG.** `juto-runtime` provides `Orchestrator`
 for end-to-end task execution: intent triage via discrete classification (`Judge`), persona
 routing (`builder`, `reviewer`, `scout`, `sonic`), sequential verification quality gates
