@@ -9,7 +9,7 @@ use juto_desktop::DesktopError;
 use juto_desktop::protocol::*;
 use juto_desktop::shm::{ShmFramePool, ShmReader};
 use juto_desktop::supervisor::{
-    DesktopSupervisor, EnvironmentConfig, OutputConfig, RenderProfile, SystemLimits,
+    DesktopSupervisor, EnvironmentConfig, HostPolicy, OutputConfig, RenderProfile, SystemLimits,
 };
 
 /// The worker binary is the daemon; point the supervisor at it.
@@ -295,6 +295,32 @@ fn hardware_profile_renders_and_serializes_on_the_shared_device() {
     let third = supervisor
         .create_environment(third, &unique_env_id("req"))
         .expect("the shared device is released after destroy");
+    third.destroy();
+}
+
+#[test]
+fn host_aggregate_pixel_rate_is_admitted() {
+    // 640x480@30 is 9,216,000 px/s, so two fit and a third does not.
+    let supervisor = DesktopSupervisor::with_host_policy(HostPolicy {
+        max_aggregate_pixel_rate: 20_000_000,
+    });
+    let first = supervisor
+        .create_environment(test_config(&unique_env_id("agg")), &unique_env_id("req"))
+        .expect("first environment");
+    let second = supervisor
+        .create_environment(test_config(&unique_env_id("agg")), &unique_env_id("req"))
+        .expect("second environment");
+    assert!(matches!(
+        supervisor.create_environment(test_config(&unique_env_id("agg")), &unique_env_id("req")),
+        Err(DesktopError::LimitExceeded(_))
+    ));
+
+    // Destroying an environment releases its share of the host budget.
+    first.destroy();
+    let third = supervisor
+        .create_environment(test_config(&unique_env_id("agg")), &unique_env_id("req"))
+        .expect("the host budget is released after destroy");
+    second.destroy();
     third.destroy();
 }
 
