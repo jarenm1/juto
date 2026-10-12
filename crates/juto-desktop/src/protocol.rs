@@ -302,6 +302,10 @@ pub enum DesktopEvent {
     Ready {
         env_id: String,
     },
+    /// A subscriber lagged past the bounded replay ring and must call `Describe`.
+    ResyncRequired {
+        env_id: String,
+    },
     ApplicationExited {
         env_id: String,
         app_id: String,

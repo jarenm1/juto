@@ -274,9 +274,10 @@ fn stream_events(
                 write_frame(&mut stream, &bytes)?;
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                let event = DesktopEvent::Failed {
+                // The consumer fell behind the 256-event ring: tell it to
+                // resynchronize with `Describe` rather than losing exits.
+                let event = DesktopEvent::ResyncRequired {
                     env_id: env_id.clone(),
-                    reason: "ResyncRequired".to_string(),
                 };
                 let bytes = serde_json::to_vec(&event).unwrap_or_default();
                 write_frame(&mut stream, &bytes)?;
