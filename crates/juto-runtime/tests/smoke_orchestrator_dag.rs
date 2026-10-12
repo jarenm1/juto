@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use juto_agent::{AgentEvent, RunControl};
 use juto_ai::{StopReason, Usage};
+use juto_runtime::change_graph::{ChangeGraph, EditProvenance};
 use juto_runtime::orchestrator::{
-    CommandGateRunner, IntentRoute, Orchestrator, PipelinePhase, QualityGateKind, QualityGateSpec,
-    ReviewVerdict, RuleBasedJudge, ScriptedJudge,
+    CommandGateRunner, IntentRoute, Orchestrator, OrchestratorConfig, PipelinePhase,
+    QualityGateKind, QualityGateSpec, ReviewVerdict, RuleBasedJudge, ScriptedJudge,
 };
 use juto_runtime::subagents::{SubagentFactory, SubagentManager, SubagentResult, TaskSpec};
 use tokio::sync::mpsc;
@@ -212,4 +213,117 @@ async fn smoke_triage_routing_matrix() {
         );
         println!("[SMOKE-TRIAGE] '{prompt}' => {:?}", route);
     }
+}
+
+/// A factory that records a real change-graph node on the child's thread, the
+/// way an isolated builder workspace does.
+#[derive(Clone)]
+struct GraphSubagentFactory {
+    repo: PathBuf,
+}
+
+#[async_trait]
+impl SubagentFactory for GraphSubagentFactory {
+    async fn run(
+        &self,
+        id: &str,
+        spec: TaskSpec,
+        _control: RunControl,
+        _events: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<SubagentResult, String> {
+        let persona = spec.name.as_deref().unwrap_or("unknown");
+        if persona == "builder" {
+            let repo = self.repo.clone();
+            let thread = id.to_string();
+            tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let graph = ChangeGraph::open(&repo).map_err(|e| e.to_string())?;
+                graph
+                    .capture(
+                        &thread,
+                        EditProvenance {
+                            session_id: "smoke".into(),
+                            tool: "builder".into(),
+                            selection_mode: None,
+                            path: None,
+                        },
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| e.to_string())??;
+        }
+
+        let output = if persona == "reviewer" {
+            "Adversarial review complete: approved.".to_string()
+        } else {
+            format!("Builder implemented task: {}", spec.task)
+        };
+        Ok(SubagentResult {
+            id: id.to_string(),
+            output,
+            data: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            session_path: PathBuf::from(format!("/tmp/juto-smoke-session-{id}")),
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_approved_task_records_a_verified_checkpoint() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Smoke"]);
+    git(&["config", "user.email", "smoke@example.test"]);
+    std::fs::write(repo.join("f.txt"), "base\n").expect("write");
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "base"]);
+    ChangeGraph::open(&repo).expect("init graph");
+
+    let subagents = Arc::new(SubagentManager::new(
+        Arc::new(GraphSubagentFactory { repo: repo.clone() }),
+        4,
+        CancellationToken::new(),
+    ));
+
+    let config = OrchestratorConfig {
+        repo_root: Some(repo.clone()),
+        gates: vec![QualityGateSpec::new(QualityGateKind::Build, "ok", "echo").with_args(["ok"])],
+        ..OrchestratorConfig::default()
+    };
+
+    let orchestrator = Orchestrator::builder()
+        .with_judge(Arc::new(ScriptedJudge::single("end_to_end_task")))
+        .with_subagents(subagents)
+        .with_verifier(Arc::new(CommandGateRunner))
+        .with_config(config)
+        .build()
+        .expect("orchestrator should build");
+
+    let outcome = orchestrator
+        .execute_task("implement the thing")
+        .await
+        .expect("task execution");
+    assert_eq!(outcome.final_phase, PipelinePhase::Completed);
+
+    // The builder's thread head is frozen as a verified checkpoint.
+    let graph = ChangeGraph::open(&repo).expect("reopen graph");
+    let checkpoints = graph.state().expect("state").checkpoints;
+    let expected = format!("verified-{}", outcome.mission_id);
+    assert!(
+        checkpoints.contains_key(&expected),
+        "expected checkpoint {expected}, got {checkpoints:?}"
+    );
 }
