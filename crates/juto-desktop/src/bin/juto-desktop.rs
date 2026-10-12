@@ -12,7 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use juto_desktop::protocol::{DesktopCommand, DesktopEvent, DesktopResponse};
+use juto_desktop::protocol::{
+    DesktopCommand, DesktopEvent, DesktopRequest, DesktopResponse, PROTOCOL_VERSION,
+};
 use juto_desktop::supervisor::DesktopSupervisor;
 
 /// Maximum accepted control frame size (spec section 4).
@@ -193,8 +195,8 @@ fn serve(mut stream: UnixStream, supervisor: Arc<DesktopSupervisor>) -> std::io:
         let Some(frame) = read_frame(&mut stream)? else {
             return Ok(());
         };
-        let command: DesktopCommand = match serde_json::from_slice(&frame) {
-            Ok(command) => command,
+        let request: DesktopRequest = match serde_json::from_slice(&frame) {
+            Ok(request) => request,
             Err(err) => {
                 write_response(
                     &mut stream,
@@ -206,6 +208,20 @@ fn serve(mut stream: UnixStream, supervisor: Arc<DesktopSupervisor>) -> std::io:
                 continue;
             }
         };
+        if request.version != PROTOCOL_VERSION {
+            write_response(
+                &mut stream,
+                &DesktopResponse::Error {
+                    code: "Protocol".to_string(),
+                    message: format!(
+                        "unsupported protocol version {} (this daemon speaks {PROTOCOL_VERSION})",
+                        request.version
+                    ),
+                },
+            )?;
+            continue;
+        }
+        let command = request.command;
 
         if let DesktopCommand::Subscribe { env_id } = command {
             write_response(
