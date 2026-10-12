@@ -649,6 +649,22 @@ impl DesktopEnvironment {
         }
     }
 
+    /// Observes a fresh frame and encodes it as a lossless PNG.
+    ///
+    /// The returned image is the composed desktop, not a streamed frame: it is
+    /// suitable as durable evidence for a caller.
+    pub fn snapshot_png(&self, timeout: Duration) -> Result<(SnapshotInfo, Vec<u8>), DesktopError> {
+        let info = self.observe(timeout)?;
+        let pool = self.frame_pool();
+        pool.acquire_slot(info.slot);
+        let mut pixels = Vec::new();
+        let header = pool.read_pixels(info.slot, &mut pixels);
+        pool.release_slot(info.slot);
+        let header = header?;
+        let png = crate::png::encode_bgra(header.width, header.height, &pixels)?;
+        Ok((info, png))
+    }
+
     /// Reconfigures output mode atomically with a new geometry generation.
     pub fn configure_output(
         &self,

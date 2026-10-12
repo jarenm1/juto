@@ -26,7 +26,26 @@
             libxcb
             pixman
             vulkan-loader
+            glib
+            gst_all_1.gstreamer
+            gst_all_1.gst-plugins-base
+            gst_all_1.gst-plugins-bad
+            gst_all_1.gst-plugins-good
           ];
+          # Pin `.out`: default outputs can be `-bin` splits without the plugin .so files
+          # (core `queue` lives in `gstreamer`'s main output; `libgstnice.so` in libnice's).
+          gstPluginPath = pkgs.lib.makeSearchPath "lib/gstreamer-1.0" (
+            map (pkg: pkg.out) (
+              with pkgs;
+              [
+                gst_all_1.gstreamer
+                gst_all_1.gst-plugins-base
+                gst_all_1.gst-plugins-good
+                gst_all_1.gst-plugins-bad
+                libnice
+              ]
+            )
+          );
           juto = pkgs.rustPlatform.buildRustPackage {
             pname = "juto";
             version = "0.1.0";
@@ -62,7 +81,8 @@
             doCheck = false;
             postFixup = ''
               wrapProgram $out/bin/juto \
-                --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath nativeLibraries}"
+                --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath nativeLibraries}" \
+                --set GST_PLUGIN_SYSTEM_PATH_1_0 "${gstPluginPath}"
             '';
             meta = {
               description = "Native GPUI agent runtime";
@@ -104,6 +124,7 @@
             # GPUI loads graphics libraries at runtime. Use the host GPU driver.
             shellHook = ''
               export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath nativeLibraries}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export GST_PLUGIN_SYSTEM_PATH_1_0="${gstPluginPath}"
             '';
           };
 

@@ -5,9 +5,11 @@
 
 pub mod compositor;
 pub mod error;
+pub mod png;
 pub mod protocol;
 pub mod remote;
 pub mod shm;
+pub mod signaling;
 pub mod supervisor;
 
 pub use compositor::{
@@ -19,9 +21,11 @@ pub use protocol::{
     GeometryGeneration, Grant, GrantRole, InputBatch, InputEvent, WindowInfo,
 };
 pub use remote::{
-    RemoteStreamConfig, RemoteStreamSession, WebRtcCandidate, WebRtcSessionDescription,
+    IceServer, NativeReceiver, PresentationWorker, ReceivedFrame, RemoteStreamConfig,
+    SignalingMessage, VideoCodec, WebRtcCandidate, WebRtcSessionDescription,
 };
 pub use shm::{ShmFrame, ShmFramePool, ShmReader, ShmWriter};
+pub use signaling::{AttachGrant, SignalingServer, ViewerReport};
 pub use supervisor::{
     AppHandle, DesktopEnvironment, DesktopSupervisor, EnvironmentConfig, EnvironmentStatus,
     OutputConfig, OutputProfile, RenderProfile, SystemLimits,

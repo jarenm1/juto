@@ -158,7 +158,8 @@ computer-use control, and live human interaction with running games. Same-host
 viewing uses shared memory or negotiated DMA-BUF; remote laptop/phone viewing
 uses WebRTC.
 
-**Shipped: the headless compositor, environment supervisor, and control daemon.**
+**Shipped: the headless compositor, environment supervisor, control daemon,
+runtime tool, and embedded viewer.**
 `juto-desktop` runs a Smithay Wayland compositor with one virtual output and one
 virtual seat per environment — no host display, no physical input. An environment
 owns a private `XDG_RUNTIME_DIR` and Wayland socket, launches applications by
@@ -172,6 +173,13 @@ idempotent. Applications inherit only an approved environment allowlist plus
 environment-private paths — never the host display, session bus, SSH agent, or
 provider secrets.
 
+The runtime owns a process-wide `DesktopSupervisor` and exposes a `desktop` tool
+with `create`, `launch`, `observe`, `input`, `describe`, and `destroy` actions.
+`create` returns the environment id, host id, and an owner grant id, which feed
+the `desktop_artifact` chat descriptor. `observe` writes a lossless PNG snapshot
+of the composed desktop and returns frame metadata plus the mapped window list,
+so an agent can attach the running application as evidence.
+
 ```sh
 scripts/agent-scope.sh -- nix develop . -c cargo run -p juto-desktop -- --socket /tmp/juto-desktop.sock
 scripts/agent-scope.sh -- nix develop . -c cargo test -p juto-desktop
@@ -181,22 +189,41 @@ The daemon serves a length-prefixed JSON control protocol over a private Unix
 socket (`Create`, `Launch`, `Describe`, `Observe`, `ConfigureOutput`, `Grant`,
 `Revoke`, `Control`, `Input`, `AutomationQuiesced`, `Destroy`, `Subscribe`).
 
-**Not yet shipped: the viewers and remote transport.** The same-host shared-memory
-viewer, the GPUI embedded viewer, the runtime `desktop_*` tools, and the WebRTC
-remote path are not implemented. `Observe` returns frame metadata and the pool
-identifier; descriptor passing to a viewer process (SCM_RIGHTS) is not wired yet.
-The compositor is a software (pixman) profile only: the hardware render-node
-profile, DMA-BUF export/import, Xwayland, text-input-v3, and audio are not
-implemented. A compile pass is not evidence of streaming; the shipped behavior is
-verified by the integration tests and the daemon smoke described below.
+**Embedded viewer.** The `desktop_artifact` card's **Open Desktop ↗** resolves the
+environment through the runtime supervisor and opens a modal that renders
+composed frames from the environment's sealed shared-memory pool — no video
+codec on this path — and forwards pointer, scroll, and keyboard input to the
+virtual seat. The viewer letterboxes the frame, maps pointer coordinates to
+desktop pixels, holds a human control lease with a 2-second heartbeat, and
+reports connection state and errors instead of showing a stale frame as live.
+`juto --desktop <command> [args...]` opens the same viewer directly for
+development.
+
+**Remote across-device viewing.** `desktop attach` issues a one-time attach
+token (60-second expiry, consumed on use) and returns a loopback viewer URL. The
+signaling server serves the browser viewer page and relays SDP/ICE over a
+WebSocket; the presentation worker encodes composed frames with GStreamer
+`webrtcbin` (VP8 by default, H.264 available) and carries pointer, scroll, and
+keyboard input back over a reliable ordered data channel. A native receiver
+(`NativeReceiver`) decodes the same stream for non-browser clients. TLS
+termination and public reachability belong to the deployment gateway; the
+shipped server binds loopback and never creates a world-readable attach URL.
+
+**Not yet shipped: audio and the remaining profiles.** Audio (private PipeWire
+sink plus Opus), Xwayland, text-input-v3, the hardware render-node profile,
+DMA-BUF export/import, and TURN relay configuration are not implemented.
+Descriptor passing (SCM_RIGHTS) to an out-of-process viewer is not wired; the
+embedded viewer reads the pool in-process. A compile pass is not evidence of
+streaming; the shipped behavior is verified by the integration tests and the
+smokes described below.
 
 **Remote sharing desktop artifacts in chat.** Agents mount remote desktop sharing
 sessions in chat conversations via the `desktop_artifact` tool. Artifact descriptors persist
 as IDs-only `DesktopSessionArtifact` records (`version`, `artifact_id`, `title`, `host_id`,
 `environment_id`, `grant_id`) without embedding bearer tokens, SDP payloads, or local paths.
 The chat view mounts typed desktop artifact cards with title, identifiers, and version badge.
-Clicking **Open Desktop ↗** inspects environment availability and explicitly reports when
-remote media/video backends are unconfigured, avoiding manufactured live streaming states.
+Clicking **Open Desktop ↗** resolves the environment through the runtime supervisor and opens
+the embedded viewer, or explicitly reports `Unavailable` when the environment does not exist.
 
 ## Development
 
@@ -426,8 +453,38 @@ client in a `juto-desktop-<env>-<app>.scope` systemd scope; `Describe` reported
 the mapped window (`juto-test-client`, `dev.juto.test-client`, 320×240);
 `Observe` returned a 640×480 frame; `Destroy` removed the runtime directory and
 left no active scope. The integration test pixel-verified the composed frame as
-the client's two-tone pattern (left red, right blue). No viewer, remote
-transport, hardware renderer, or Xwayland behavior was exercised.
+the client's two-tone pattern (left red, right blue).
+
+The runtime tool and the embedded viewer are covered by:
+
+```sh
+scripts/agent-scope.sh -- nix develop . -c cargo test -p juto-runtime --lib tools::tests::desktop
+scripts/agent-scope.sh -- nix develop .#smoke -c xvfb-run -a -s "-screen 0 1280x1024x24" \
+  ./target/debug/juto --desktop ./target/debug/examples/test_client 60
+```
+
+Observed: the `desktop` tool created an environment, launched `sleep` in a
+systemd scope, wrote a lossless PNG snapshot that begins with the PNG signature,
+reported one running application, issued a loopback viewer URL, and destroyed the
+environment. Under Xvfb/Mesa software Vulkan the `--desktop` mode opened the
+embedded viewer, which rendered the client's two-tone frame letterboxed inside
+the harness window (`live 1280x720`), and a click inside the surface acquired the
+human control lease (the button changed from **Take control** to **Renew
+control**) with no error reported.
+
+The remote path is covered by an end-to-end WebRTC test and a browser smoke:
+
+```sh
+scripts/agent-scope.sh -- nix develop . -c cargo test -p juto-desktop --test remote_tests
+# Browser viewer: run the remote_smoke harness and point headless Chromium at the URL it prints.
+```
+
+Observed: the native receiver decoded the composed desktop over DTLS/SRTP and
+the two-tone pattern survived VP8 (left red, right blue); a headless Chromium
+viewer reported `connected: true`, a 640×480 video, a sampled red pixel, and
+`inputSent: true`, and the data-channel input reached the environment's virtual
+seat. No audio, hardware renderer, Xwayland, TURN relay, or real remote-network
+behavior was exercised.
 
 For a headless **native-window** check, `devShells.smoke` supplies Xvfb, xdotool,
 ImageMagick, Python, a DejaVu font configuration, and a pinned Mesa software
