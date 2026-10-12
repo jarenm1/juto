@@ -200,6 +200,12 @@ pub(crate) fn publish(graph: &ChangeGraph, remote: &str) -> Result<PublishReport
 pub(crate) fn fetch_graph(graph: &ChangeGraph, remote: &str) -> Result<ImportReport> {
     ensure!(!remote.is_empty(), "remote is empty");
     let staging = staging_prefix(&staging_slug(remote));
+    // Start from a clean staging namespace. A forced refspec overwrites the refs
+    // the remote still has but never removes one the remote dropped, so a
+    // previous failed fetch could otherwise leave a stale ref behind.
+    for (refname, _) in graph.repository().list_refs(&staging)? {
+        graph.repository().delete_ref(&refname)?;
+    }
     let refspecs = vec![
         format!("+{NODES_PREFIX}/*:{staging}/nodes/*"),
         format!("+{SNAPSHOTS_PREFIX}/*:{staging}/snapshots/*"),
@@ -208,6 +214,25 @@ pub(crate) fn fetch_graph(graph: &ChangeGraph, remote: &str) -> Result<ImportRep
     ];
     graph.repository().fetch(remote, &refspecs)?;
     import_refs(graph, &staging)
+}
+
+/// Deletes the staging refs it was built from when dropped.
+///
+/// A staging namespace is transient: it exists only between a fetch and the
+/// import that consumes it. Cleaning up in `Drop` means an import that fails
+/// partway (a base mismatch, a content mismatch, a missing tree) still removes
+/// `refs/juto/incoming/<slug>/*` instead of leaking refs that pin objects.
+struct StagingGuard<'a> {
+    repository: &'a GitRepository,
+    refs: Vec<String>,
+}
+
+impl Drop for StagingGuard<'_> {
+    fn drop(&mut self) {
+        for refname in &self.refs {
+            let _ = self.repository.delete_ref(refname);
+        }
+    }
 }
 
 /// Union already-fetched staging refs into the local journal. No network access.
@@ -223,6 +248,12 @@ pub(crate) fn import_refs(graph: &ChangeGraph, staging: &str) -> Result<ImportRe
     let owner = graph.machine_id_locked()?;
 
     let refs = repository.list_refs(staging)?;
+    // Drop the staging refs on every exit path, including an early `bail!`, so a
+    // failed import never leaves `refs/juto/incoming/<slug>/*` pinning objects.
+    let _staging = StagingGuard {
+        repository,
+        refs: refs.iter().map(|(name, _)| name.clone()).collect(),
+    };
     let mut node_refs: BTreeMap<String, String> = BTreeMap::new();
     let mut snapshot_refs: BTreeMap<String, String> = BTreeMap::new();
     let mut head_refs: Vec<(String, String, String)> = Vec::new();
@@ -419,9 +450,6 @@ pub(crate) fn import_refs(graph: &ChangeGraph, staging: &str) -> Result<ImportRe
         graph.save_locked(&state)?;
     }
 
-    for (refname, _) in &refs {
-        repository.delete_ref(refname)?;
-    }
     Ok(report)
 }
 
@@ -521,7 +549,7 @@ fn current_ref(repository: &GitRepository, refname: &str) -> Result<Option<Strin
         .map(|(_, oid)| oid))
 }
 
-fn node_ref(id: &str) -> String {
+pub(crate) fn node_ref(id: &str) -> String {
     format!("{NODES_PREFIX}/{id}")
 }
 

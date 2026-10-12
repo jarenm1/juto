@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, ensure};
 use clap::Subcommand;
-use juto_runtime::change_graph::{ChangeGraph, EditProvenance};
+use juto_runtime::change_graph::{ChangeGraph, EditProvenance, JoinOutcome};
 
 #[derive(Subcommand)]
 pub enum ChangesCommand {
@@ -58,6 +58,33 @@ pub enum ChangesCommand {
         branch: String,
         #[arg(long, default_value = "origin")]
         remote: String,
+    },
+    /// Publish the whole live-change DAG to a remote as `refs/juto/*`.
+    PushGraph {
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    /// Fetch `refs/juto/*` from a remote and union it into the local DAG.
+    Fetch {
+        #[arg(long, default_value = "origin")]
+        remote: String,
+    },
+    /// Join two threads' trees into one node with two parents.
+    Join {
+        #[arg(long)]
+        thread: String,
+        #[arg(long)]
+        left: String,
+        #[arg(long)]
+        right: String,
+    },
+    /// Revert a thread to an earlier point by materializing its tree delta.
+    Rewind {
+        #[arg(long)]
+        thread: String,
+        /// Checkpoint name or native point ID.
+        #[arg(long)]
+        to: String,
     },
 }
 
@@ -116,6 +143,26 @@ pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
             graph.push(branch, remote)?;
             serde_json::json!({"branch":branch, "remote":remote, "pushed":true})
         }
+        ChangesCommand::PushGraph { remote } => serde_json::to_value(graph.push_graph(remote)?)?,
+        ChangesCommand::Fetch { remote } => serde_json::to_value(graph.fetch_graph(remote)?)?,
+        ChangesCommand::Join {
+            thread,
+            left,
+            right,
+        } => match graph.join(thread, left, right)? {
+            JoinOutcome::Joined { node, base, tree } => serde_json::json!({
+                "status": "joined",
+                "node": node,
+                "base": base,
+                "tree": tree,
+            }),
+            JoinOutcome::Conflicted { base, conflicts } => serde_json::json!({
+                "status": "conflicted",
+                "base": base,
+                "conflicts": conflicts,
+            }),
+        },
+        ChangesCommand::Rewind { thread, to } => serde_json::to_value(graph.rewind(thread, to)?)?,
     };
     serde_json::to_writer_pretty(std::io::stdout().lock(), &value)?;
     println!();
