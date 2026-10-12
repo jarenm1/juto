@@ -461,9 +461,10 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         let resolver = self.runtime.desktop_artifact_resolver();
-        let principal = artifact.grant_id.clone();
-        let _ = principal;
-        match resolver.resolve("agent:session", artifact) {
+        // Resolution is bound to this session's authenticated principal, not
+        // to whoever issued the grant: a grant issued to another principal
+        // must be rejected, and one issued to this session must be honored.
+        match resolver.resolve(crate::desktop_viewer::SESSION_PRINCIPAL, artifact) {
             Ok(juto_runtime::ViewerRoute::Local { env_id, .. }) => {
                 self.open_desktop_viewer(&env_id, window, cx);
             }
@@ -523,7 +524,7 @@ impl ChatView {
         let env_id = format!("desk-{}", uuid::Uuid::now_v7());
         let config = juto_runtime::EnvironmentConfig {
             env_id: env_id.clone(),
-            owner_principal: "human:viewer".to_string(),
+            owner_principal: crate::desktop_viewer::SESSION_PRINCIPAL.to_string(),
             output: juto_runtime::OutputConfig {
                 width: 1280,
                 height: 720,

@@ -1519,6 +1519,9 @@ impl Tool for DesktopTool {
         let data_dir = self.data_dir.clone();
         let workspace = effective_cwd(Path::new(""), &ctx).to_path_buf();
         let cancel = ctx.cancel.clone();
+        // Each agent session owns the environments it creates; a shared
+        // principal would let one session drive another's desktop.
+        let owner_principal = format!("agent:{}", ctx.session_id);
 
         tokio::task::spawn_blocking(move || {
             run_desktop_action(
@@ -1526,6 +1529,7 @@ impl Tool for DesktopTool {
                 &signaling,
                 &data_dir,
                 &workspace,
+                &owner_principal,
                 args,
                 &cancel,
             )
@@ -1540,6 +1544,7 @@ fn run_desktop_action(
     signaling: &crate::SignalingHandle,
     data_dir: &Path,
     workspace: &Path,
+    owner_principal: &str,
     args: DesktopArgs,
     cancel: &CancellationToken,
 ) -> Result<ToolOutput, String> {
@@ -1573,7 +1578,7 @@ fn run_desktop_action(
             let id = format!("desk-{}", uuid::Uuid::now_v7());
             let config = EnvironmentConfig {
                 env_id: id.clone(),
-                owner_principal: "agent:session".to_string(),
+                owner_principal: owner_principal.to_string(),
                 output: OutputConfig {
                     width,
                     height,
@@ -1600,8 +1605,11 @@ fn run_desktop_action(
             let env = supervisor
                 .create_environment(config, &request_id)
                 .map_err(|e| e.to_string())?;
+            // The artifact flow resolves against the interactive session's
+            // authenticated principal, so the mountable grant is issued to
+            // that human viewer rather than to the agent session itself.
             let grant = env.issue_grant(
-                "agent:session".to_string(),
+                "human:viewer".to_string(),
                 vec![
                     juto_desktop::protocol::GrantRole::Owner,
                     juto_desktop::protocol::GrantRole::View,
@@ -3637,12 +3645,13 @@ mod tests {
             grant_id: grant_id.clone(),
         };
 
-        // A valid descriptor resolves to the same-host route.
-        let route = resolver.resolve("agent:session", &artifact).unwrap();
+        // A valid descriptor resolves to the same-host route for the
+        // interactive session's authenticated principal.
+        let route = resolver.resolve("human:viewer", &artifact).unwrap();
         assert!(matches!(route, ViewerRoute::Local { .. }), "{route:?}");
 
         // The remote route issues a one-time token.
-        let route = resolver.resolve_remote("agent:session", &artifact).unwrap();
+        let route = resolver.resolve_remote("human:viewer", &artifact).unwrap();
         match route {
             ViewerRoute::Remote { url, token, .. } => {
                 assert!(url.starts_with("http://127.0.0.1:"), "{url}");
@@ -3655,21 +3664,21 @@ mod tests {
         let mut wrong_host = artifact.clone();
         wrong_host.host_id = "other-host".to_string();
         assert!(matches!(
-            resolver.resolve("agent:session", &wrong_host),
+            resolver.resolve("human:viewer", &wrong_host),
             Err(ResolveError::Unsupported(_))
         ));
 
         let mut wrong_env = artifact.clone();
         wrong_env.environment_id = "missing".to_string();
         assert!(matches!(
-            resolver.resolve("agent:session", &wrong_env),
+            resolver.resolve("human:viewer", &wrong_env),
             Err(ResolveError::Unavailable(_))
         ));
 
         let mut wrong_grant = artifact.clone();
         wrong_grant.grant_id = "missing".to_string();
         assert!(matches!(
-            resolver.resolve("agent:session", &wrong_grant),
+            resolver.resolve("human:viewer", &wrong_grant),
             Err(ResolveError::Unauthorized(_))
         ));
 
@@ -3681,7 +3690,7 @@ mod tests {
         // An expired grant is reported as expired, not unauthorized.
         let env = supervisor.get_environment(&env_id).unwrap();
         let expired = env.issue_grant(
-            "agent:session".to_string(),
+            "human:viewer".to_string(),
             vec![juto_desktop::protocol::GrantRole::View],
             "session".to_string(),
             0,
@@ -3689,14 +3698,14 @@ mod tests {
         let mut expired_artifact = artifact.clone();
         expired_artifact.grant_id = expired.grant_id.clone();
         assert!(matches!(
-            resolver.resolve("agent:session", &expired_artifact),
+            resolver.resolve("human:viewer", &expired_artifact),
             Err(ResolveError::Expired(_))
         ));
 
         // A destroyed environment is reported as stopped.
         env.destroy();
         assert!(matches!(
-            resolver.resolve("agent:session", &artifact),
+            resolver.resolve("human:viewer", &artifact),
             Err(ResolveError::Stopped(_))
         ));
     }

@@ -150,7 +150,12 @@ fn a_destroyed_environment_stays_describable() {
         env_id: env_id.clone(),
         after_event_seq: None,
     }) {
-        DesktopResponse::Description(status) => assert_eq!(status.env_id, env_id),
+        DesktopResponse::Description(status) => {
+            assert_eq!(status.env_id, env_id);
+            // The retained snapshot is the terminal state: readiness must be
+            // cleared by `destroy`, not copied from the live environment.
+            assert!(!status.is_ready, "a destroyed environment is not ready");
+        }
         other => panic!("expected the retained terminal state, got {other:?}"),
     }
 
@@ -162,6 +167,133 @@ fn a_destroyed_environment_stays_describable() {
     assert!(
         matches!(unknown, DesktopResponse::Error { .. }),
         "unknown environments must not be described: {unknown:?}"
+    );
+}
+
+#[test]
+fn retention_records_the_authenticated_peer_not_a_claimed_name() {
+    let daemon = Daemon::start();
+    let env_id = format!("r-{}", &uuid::Uuid::now_v7().to_string()[24..]);
+    let created = daemon.call(DesktopCommand::Create {
+        spec: serde_json::from_value(environment_config(&env_id)).expect("config"),
+        request_id: "create".to_string(),
+    });
+    assert!(
+        matches!(created, DesktopResponse::Created { .. }),
+        "create failed: {created:?}"
+    );
+
+    match daemon.call(DesktopCommand::Retain {
+        env_id: env_id.clone(),
+        human_owner: "spoofed:admin".to_string(),
+        deadline_seconds: 60,
+    }) {
+        DesktopResponse::Retained { human_owner, .. } => {
+            let uid = unsafe { libc::geteuid() };
+            assert_eq!(
+                human_owner,
+                format!("user:{uid}"),
+                "retention must bind the kernel-authenticated peer"
+            );
+        }
+        other => panic!("expected retention, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_lease_heartbeat_without_the_epoch_is_rejected() {
+    let daemon = Daemon::start();
+    let env_id = format!("h-{}", &uuid::Uuid::now_v7().to_string()[24..]);
+    let created = daemon.call(DesktopCommand::Create {
+        spec: serde_json::from_value(environment_config(&env_id)).expect("config"),
+        request_id: "create".to_string(),
+    });
+    assert!(
+        matches!(created, DesktopResponse::Created { .. }),
+        "create failed: {created:?}"
+    );
+
+    match daemon.call(DesktopCommand::Control {
+        env_id: env_id.clone(),
+        action: "acquire".to_string(),
+        is_human: false,
+    }) {
+        DesktopResponse::ControlChanged { lease: Some(lease) } => {
+            let renewed = daemon.call(DesktopCommand::Heartbeat {
+                env_id: env_id.clone(),
+                target: "lease".to_string(),
+                epoch: None,
+            });
+            assert!(
+                matches!(renewed, DesktopResponse::Error { .. }),
+                "a missing epoch must not renew the lease: {renewed:?}"
+            );
+            let renewed = daemon.call(DesktopCommand::Heartbeat {
+                env_id: env_id.clone(),
+                target: "lease".to_string(),
+                epoch: Some(lease.epoch),
+            });
+            assert!(
+                matches!(renewed, DesktopResponse::HeartbeatExtended { .. }),
+                "the matching epoch must renew the lease: {renewed:?}"
+            );
+        }
+        other => panic!("expected a control lease, got {other:?}"),
+    }
+}
+
+#[test]
+fn geometry_ready_is_bound_to_the_attached_viewer() {
+    let daemon = Daemon::start();
+    let env_id = format!("g-{}", &uuid::Uuid::now_v7().to_string()[24..]);
+    let created = daemon.call(DesktopCommand::Create {
+        spec: serde_json::from_value(environment_config(&env_id)).expect("config"),
+        request_id: "create".to_string(),
+    });
+    assert!(
+        matches!(created, DesktopResponse::Created { .. }),
+        "create failed: {created:?}"
+    );
+
+    let mut viewer = ViewerClient::attach(&daemon.socket, &env_id).expect("attach");
+    let viewer_id = viewer.info().viewer_id.clone();
+
+    let described = daemon.call(DesktopCommand::Describe {
+        env_id: env_id.clone(),
+        after_event_seq: None,
+    });
+    let generation = match described {
+        DesktopResponse::Description(status) => status.generation,
+        other => panic!("expected a description, got {other:?}"),
+    };
+
+    // A connection without an attached viewer cannot acknowledge at all, and
+    // it cannot answer for the attached viewer's identity either.
+    let rejected = daemon.call(DesktopCommand::GeometryReady {
+        env_id: env_id.clone(),
+        viewer_id: "unadmitted".to_string(),
+        generation,
+        track_or_pool_id: viewer.info().pool_id.clone(),
+    });
+    assert!(
+        matches!(rejected, DesktopResponse::Error { .. }),
+        "an unattached connection must not acknowledge: {rejected:?}"
+    );
+    let forged = daemon.call(DesktopCommand::GeometryReady {
+        env_id: env_id.clone(),
+        viewer_id: viewer_id.clone(),
+        generation,
+        track_or_pool_id: viewer.info().pool_id.clone(),
+    });
+    assert!(
+        matches!(forged, DesktopResponse::Error { .. }),
+        "another connection must not answer for the viewer: {forged:?}"
+    );
+
+    // The owning connection acknowledges for itself.
+    assert!(
+        viewer.geometry_ready(generation).is_ok(),
+        "the attached viewer acknowledges its own presentation"
     );
 }
 
@@ -355,15 +487,21 @@ fn viewer_attaches_over_scm_rights_and_reads_composed_frames() {
     assert_eq!(header.generation, 1);
 
     // The viewer can take the human control lease and send input.
-    let epoch = viewer.take_control(&env_id).expect("take control");
+    let epoch = viewer.take_control().expect("take control");
     assert!(epoch >= 1);
     viewer
         .send_input(
-            &env_id,
             1,
             vec![juto_desktop::protocol::InputEvent::PointerMoveAbs { x: 5, y: 5 }],
         )
         .expect("send input");
+
+    // Observe must address the attached environment, not the frame-pool name
+    // (regression: the command used to carry `pool_id` and always failed).
+    let (observed, _pixels) = viewer
+        .observe(header.generation, Duration::from_secs(5))
+        .expect("observe must target the attached environment");
+    assert_eq!(observed.width, 640);
 
     let described = daemon.call(DesktopCommand::Describe {
         env_id: env_id.clone(),

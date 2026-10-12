@@ -641,13 +641,48 @@ impl XwmHandler for DesktopState {
     fn resize_request(
         &mut self,
         _xwm: XwmId,
-        _window: X11Surface,
-        _button: u32,
-        _resize_edge: ResizeEdge,
+        window: X11Surface,
+        button: u32,
+        resize_edge: ResizeEdge,
     ) {
+        self.start_x11_grab(window, button, X11GrabKind::Resize(resize_edge));
     }
 
-    fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {}
+    fn move_request(&mut self, _xwm: XwmId, window: X11Surface, button: u32) {
+        self.start_x11_grab(window, button, X11GrabKind::Move);
+    }
+
+    fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.set_x11_output_geometry(&window, |surface| {
+            if let Err(err) = surface.set_maximized(true) {
+                tracing::warn!(error = %err, "failed to mark an X11 window maximized");
+            }
+        });
+    }
+
+    fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.restore_x11_geometry(&window, |surface| {
+            if let Err(err) = surface.set_maximized(false) {
+                tracing::warn!(error = %err, "failed to clear X11 maximized state");
+            }
+        });
+    }
+
+    fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.set_x11_output_geometry(&window, |surface| {
+            if let Err(err) = surface.set_fullscreen(true) {
+                tracing::warn!(error = %err, "failed to mark an X11 window fullscreen");
+            }
+        });
+    }
+
+    fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.restore_x11_geometry(&window, |surface| {
+            if let Err(err) = surface.set_fullscreen(false) {
+                tracing::warn!(error = %err, "failed to clear X11 fullscreen state");
+            }
+        });
+    }
 
     fn allow_selection_access(&mut self, _xwm: XwmId, _selection: SelectionTarget) -> bool {
         // Clipboard stays environment-local; X11 selections are not bridged.
@@ -673,6 +708,28 @@ struct MappedWindow {
     info: WindowInfo,
 }
 
+/// How an X11 interactive move/resize grab changes the window geometry.
+enum X11GrabKind {
+    Move,
+    Resize(ResizeEdge),
+}
+
+/// State of an in-progress X11 interactive move or resize grab.
+///
+/// The X client holds the pointer grab it requested; the compositor tracks the
+/// drag in `apply_input` until the grab button is released.
+struct X11Grab {
+    surface: X11Surface,
+    button: u32,
+    kind: X11GrabKind,
+    /// Pointer position where the grab began.
+    start_location: Point<f64, Logical>,
+    /// Pointer position at the last delivered absolute pointer event.
+    last_location: Point<f64, Logical>,
+    /// Window geometry when the grab began.
+    start_geometry: Rectangle<i32, Logical>,
+}
+
 /// The single-threaded Smithay state owned by the compositor thread.
 struct DesktopState {
     display: Option<Display<DesktopState>>,
@@ -680,6 +737,7 @@ struct DesktopState {
 
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
+    xwayland_shell_state: XWaylandShellState,
     shm_state: ShmState,
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
@@ -716,7 +774,11 @@ struct DesktopState {
     x11_windows: HashMap<u32, Window>,
     /// The X11 window manager driving Xwayland, once it is ready.
     xwm: Option<X11Wm>,
-    xwayland_shell_state: XWaylandShellState,
+    /// X11 surface geometries saved when a window is maximized or fullscreened,
+    /// so unmaximize/unfullscreen restore the previous layout.
+    x11_saved_geometries: HashMap<u32, Rectangle<i32, Logical>>,
+    /// In-progress X11 interactive move/resize grab, if any.
+    x11_grab: Option<X11Grab>,
     next_window_id: u32,
     cascade_index: i32,
 
@@ -866,6 +928,14 @@ impl DesktopState {
     /// Removes an X11 surface from the composited space.
     fn unmap_x11_window(&mut self, surface: &X11Surface) {
         let x11_id = surface.window_id();
+        if self
+            .x11_grab
+            .as_ref()
+            .is_some_and(|grab| grab.surface.window_id() == x11_id)
+        {
+            self.x11_grab = None;
+        }
+        self.x11_saved_geometries.remove(&x11_id);
         if let Some(window) = self.x11_windows.remove(&x11_id)
             && let Some(id) = self
                 .windows
@@ -874,6 +944,130 @@ impl DesktopState {
         {
             self.unmap_window(id);
         }
+    }
+
+    /// Begins an X11 interactive move or resize grab.
+    ///
+    /// The grabbed window is raised and focused, and subsequent pointer motion
+    /// updates its geometry until the grab button is released.
+    fn start_x11_grab(&mut self, surface: X11Surface, button: u32, kind: X11GrabKind) {
+        let x11_id = surface.window_id();
+        let Some(window) = self.x11_windows.get(&x11_id).cloned() else {
+            return;
+        };
+        self.space.raise_element(&window, true);
+        self.focus_window(&window);
+        let location = self.pointer.current_location();
+        let geometry = surface.geometry();
+        self.x11_grab = Some(X11Grab {
+            surface,
+            button,
+            kind,
+            start_location: location,
+            last_location: location,
+            start_geometry: geometry,
+        });
+    }
+
+    /// Applies pointer motion to an in-progress X11 move/resize grab.
+    /// Returns `true` when the event was consumed by the grab.
+    fn update_x11_grab(&mut self, event: &InputEvent) -> bool {
+        let Some(grab) = self.x11_grab.as_mut() else {
+            return false;
+        };
+        let point = match event {
+            InputEvent::PointerMoveAbs { x, y } => Point::<f64, Logical>::from((
+                *x as f64 / self.scale.max(1) as f64,
+                *y as f64 / self.scale.max(1) as f64,
+            )),
+            InputEvent::PointerDelta { dx, dy } => Point::<f64, Logical>::from((
+                grab.last_location.x + *dx as f64,
+                grab.last_location.y + *dy as f64,
+            )),
+            InputEvent::PointerButton { button, pressed } => {
+                if *button == grab.button && !*pressed {
+                    self.x11_grab = None;
+                }
+                return true;
+            }
+            _ => return true,
+        };
+        grab.last_location = point;
+        let delta_x = (point.x - grab.start_location.x) as i32;
+        let delta_y = (point.y - grab.start_location.y) as i32;
+        let mut geometry = grab.start_geometry;
+        match grab.kind {
+            X11GrabKind::Move => {
+                geometry.loc.x += delta_x;
+                geometry.loc.y += delta_y;
+            }
+            X11GrabKind::Resize(edge) => {
+                match edge {
+                    ResizeEdge::TopLeft | ResizeEdge::Left | ResizeEdge::BottomLeft => {
+                        let applied = delta_x.min(geometry.size.w - 1);
+                        geometry.loc.x += applied;
+                        geometry.size.w -= applied;
+                    }
+                    ResizeEdge::TopRight | ResizeEdge::Right | ResizeEdge::BottomRight => {
+                        geometry.size.w = (geometry.size.w + delta_x).max(1);
+                    }
+                    _ => {}
+                }
+                match edge {
+                    ResizeEdge::TopLeft | ResizeEdge::Top | ResizeEdge::TopRight => {
+                        let applied = delta_y.min(geometry.size.h - 1);
+                        geometry.loc.y += applied;
+                        geometry.size.h -= applied;
+                    }
+                    ResizeEdge::BottomLeft | ResizeEdge::Bottom | ResizeEdge::BottomRight => {
+                        geometry.size.h = (geometry.size.h + delta_y).max(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let x11_id = grab.surface.window_id();
+        if self.x11_windows.contains_key(&x11_id) {
+            if let Err(err) = grab.surface.configure(geometry) {
+                tracing::warn!(error = %err, "X11 interactive grab configure failed");
+                self.x11_grab = None;
+            }
+        } else {
+            self.x11_grab = None;
+        }
+        self.dirty = true;
+        true
+    }
+
+    /// Moves `surface` onto the full output and remembers its layout for
+    /// `restore_x11_geometry`. `mark` updates the X11 window state.
+    fn set_x11_output_geometry(&mut self, surface: &X11Surface, mark: impl FnOnce(&X11Surface)) {
+        let x11_id = surface.window_id();
+        self.x11_saved_geometries
+            .entry(x11_id)
+            .or_insert_with(|| surface.geometry());
+        mark(surface);
+        let geometry = Rectangle::new(Point::from((0, 0)), self.logical_size());
+        if let Err(err) = surface.configure(geometry) {
+            tracing::warn!(error = %err, "failed to fullscreen an X11 window");
+        }
+        if let Some(window) = self.x11_windows.get(&x11_id).cloned() {
+            self.space.raise_element(&window, true);
+            self.focus_window(&window);
+        }
+        self.dirty = true;
+    }
+
+    /// Restores an X11 window's saved pre-maximize/pre-fullscreen geometry.
+    fn restore_x11_geometry(&mut self, surface: &X11Surface, mark: impl FnOnce(&X11Surface)) {
+        let x11_id = surface.window_id();
+        mark(surface);
+        if let Some(geometry) = self.x11_saved_geometries.remove(&x11_id)
+            && let Err(err) = surface.configure(geometry)
+        {
+            tracing::warn!(error = %err, "failed to restore X11 window geometry");
+        }
+        self.dirty = true;
     }
 
     fn unmap_window(&mut self, id: u32) {
@@ -1021,6 +1215,11 @@ impl DesktopState {
     }
 
     fn apply_input(&mut self, event: InputEvent) {
+        // An interactive X11 move/resize grab owns pointer traffic until the
+        // grab button is released.
+        if self.x11_grab.is_some() && self.update_x11_grab(&event) {
+            return;
+        }
         let time = self.start_time.elapsed().as_millis() as u32;
         let serial = SERIAL_COUNTER.next_serial();
         let pointer = self.pointer.clone();
@@ -1553,6 +1752,8 @@ pub(crate) fn run_compositor(
         windows: HashMap::new(),
         x11_windows: HashMap::new(),
         xwm: None,
+        x11_saved_geometries: HashMap::new(),
+        x11_grab: None,
         xwayland_shell_state,
         next_window_id: 1,
         cascade_index: 0,

@@ -331,6 +331,40 @@ fn read_frame(stream: &mut UnixStream) -> Result<Option<Vec<u8>>, DesktopError> 
     Ok(Some(payload))
 }
 
+/// Retires a freshly spawned worker (and its systemd scope, when used) if the
+/// startup handshake fails before [`WorkerCompositor`] takes the child.
+struct WorkerGuard {
+    child: Option<Child>,
+    unit: Option<String>,
+}
+
+impl WorkerGuard {
+    /// Transfers ownership of the child to the caller once the handshake has
+    /// succeeded.
+    fn disarm(&mut self) -> (Child, Option<String>) {
+        (
+            self.child.take().expect("worker guard armed"),
+            self.unit.take(),
+        )
+    }
+}
+
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        if let Some(unit) = self.unit.take() {
+            let _ = Command::new("systemctl")
+                .args(["--user", "stop", &unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Supervisor-side handle for a compositor worker process.
 pub struct WorkerCompositor {
     socket: Arc<Mutex<UnixStream>>,
@@ -407,7 +441,20 @@ impl WorkerCompositor {
             DesktopError::Compositor(format!("cannot spawn the compositor worker: {e}"))
         })?;
 
-        let (stream, handshake, fd) = accept_ready(&listener)?;
+        // Every error after the spawn must retire the worker and its scope;
+        // the guard owns that until the live compositor takes the child.
+        let mut worker_guard = WorkerGuard {
+            child: Some(child),
+            unit,
+        };
+        let spawned = accept_ready(&listener);
+        let (stream, handshake, fd) = match spawned {
+            Ok(parts) => parts,
+            Err(err) => {
+                let _ = std::fs::remove_file(&control_socket);
+                return Err(err);
+            }
+        };
         let _ = std::fs::remove_file(&control_socket);
 
         let ready = match handshake {
@@ -499,6 +546,7 @@ impl WorkerCompositor {
                 .ok()
         };
 
+        let (child, unit) = worker_guard.disarm();
         Ok(Self {
             socket,
             reader,
@@ -644,12 +692,34 @@ fn resolve_worker_executable() -> Result<PathBuf, DesktopError> {
 fn accept_ready(
     listener: &std::os::unix::net::UnixListener,
 ) -> Result<(UnixStream, WorkerResponse, Option<std::os::fd::OwnedFd>), DesktopError> {
+    // The handshake is bounded: environment creation holds the supervisor's
+    // admission lock, so a worker that never connects must not block every
+    // other environment operation indefinitely.
     listener
-        .set_nonblocking(false)
+        .set_nonblocking(true)
         .map_err(|e| DesktopError::Compositor(format!("worker listener: {e}")))?;
-    let (stream, _) = listener
-        .accept()
-        .map_err(|e| DesktopError::Compositor(format!("worker did not connect: {e}")))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let (stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(DesktopError::Compositor(
+                        "worker did not connect within 20s".to_string(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                return Err(DesktopError::Compositor(format!(
+                    "worker did not connect: {err}"
+                )));
+            }
+        }
+    };
+    stream
+        .set_nonblocking(false)
+        .map_err(|e| DesktopError::Compositor(format!("worker socket: {e}")))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(20)))
         .map_err(|e| DesktopError::Compositor(format!("worker socket: {e}")))?;
