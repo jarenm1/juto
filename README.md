@@ -37,8 +37,25 @@ independent threads fork isolated workspaces without Git worktrees, and named
 checkpoints (e.g. verified-working states) project into deterministic Git commits
 that can be safely published to a feature branch.
 
-Native forks preserve Git submodule (gitlink) entries in captured snapshots but omit submodule working directories; submodule content is not materialized.
+**Cross-machine replication.** The DAG replicates over ordinary Git transport, so
+agents can work locally or on different machines at the same time. It is a
+grow-only set of content-addressed refs — `refs/juto/nodes/<id>` (node metadata),
+`refs/juto/snapshots/<id>` (trees), `refs/juto/heads/<owner>/<thread>`, and
+`refs/juto/checkpoints/<name>` — so every update is a create or an identical-value
+no-op and a rejected push is a real conflict, never a lost update. `push_graph`
+publishes, `fetch_graph` imports into a staging namespace and unions by node id
+with a hard content-equality assertion, and `reconcile` folds another machine's
+head into the local thread (joining cleanly, adopting when the thread has no local
+head, or reporting conflicting paths). `join` merges two threads into a two-parent
+node via `git merge-tree`; `rewind` reverts a thread by materializing a tree delta
+and appending a forward node, so history stays append-only. `gc` mark-sweeps
+unreachable nodes and releases their refs. All of it is exposed as
+`juto-cli changes push-graph|fetch|reconcile|join|rewind`.
 
+Fork provisioning materializes a tree with a single `git cat-file --batch` child,
+recovers forks interrupted mid-provision, and skips gitlink (submodule) entries —
+a baseline gitlink is preserved by capture, so a fork that omits the submodule
+still captures a tree identical to the base.
 
 The `edit` tool selects a unique tree-sitter
 AST selection for Rust, Python, JavaScript, TypeScript, and TSX; unsupported
