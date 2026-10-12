@@ -37,6 +37,9 @@ independent threads fork isolated workspaces without Git worktrees, and named
 checkpoints (e.g. verified-working states) project into deterministic Git commits
 that can be safely published to a feature branch.
 
+Native forks preserve Git submodule (gitlink) entries in captured snapshots but omit submodule working directories; submodule content is not materialized.
+
+
 The `edit` tool selects a unique tree-sitter
 AST selection for Rust, Python, JavaScript, TypeScript, and TSX; unsupported
 languages, invalid queries, parse errors, and ambiguous captures fail explicitly
