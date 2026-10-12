@@ -853,6 +853,52 @@ fn sparse_fork_rejects_a_malformed_prefix() {
 }
 
 #[test]
+fn sparse_fork_restore_tree_leaves_paths_outside_the_spec_alone() {
+    let temp = tempfile::tempdir().unwrap();
+    let (dir, head) = sparse_repo(&temp);
+    let repository = GitRepository::open(&dir).unwrap();
+    let destination = temp.path().join("sparse");
+    repository
+        .fork_workspace_sparse(&head, &destination, "thread-1", &["crates/foo".to_string()])
+        .unwrap();
+
+    let git_dir = repository.git_dir().to_path_buf();
+    let tree_of = |rev: &str| {
+        run(
+            "git",
+            &[
+                "--git-dir",
+                git_dir.to_str().unwrap(),
+                "rev-parse",
+                &format!("{rev}^{{tree}}"),
+            ],
+            &dir,
+        )
+    };
+    let base_tree = tree_of(&head);
+
+    // A target that changes a path inside the spec and one outside it.
+    write_file(&dir.join("crates/foo/a.txt"), b"inside\n");
+    write_file(&dir.join("crates/bar/b.txt"), b"outside\n");
+    let target_tree = tree_of(&commit(&dir, "target"));
+
+    let fork = GitRepository::open(&destination).unwrap();
+    fork.restore_tree(&base_tree, &target_tree, &destination)
+        .unwrap();
+
+    // The in-spec path is updated; the out-of-spec path is never written, so the
+    // workspace cannot diverge from what the next capture records.
+    assert_eq!(
+        fs::read(destination.join("crates/foo/a.txt")).unwrap(),
+        b"inside\n"
+    );
+    assert!(
+        !destination.join("crates/bar/b.txt").exists(),
+        "restore must not write outside the sparse spec"
+    );
+}
+
+#[test]
 fn export_creates_commits_only_on_export_and_pushes() {
     let temp = tempfile::tempdir().unwrap();
     let dir = repo(&temp, "repo");
