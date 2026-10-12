@@ -1419,8 +1419,11 @@ enum VcsAction {
     FetchBranch,
     /// Merge two threads' trees into one node with two parents.
     Join,
-    /// Record a resolved merge: capture the workspace as a two-parent node.
+    /// Record a resolved merge: the merge result with the conflicted paths
+    /// taken from the workspace, as a two-parent node.
     Resolve,
+    /// List the paths where the workspace differs from its head.
+    Dirty,
 }
 
 #[derive(Deserialize)]
@@ -1473,7 +1476,8 @@ impl Tool for VcsTool {
                             "publish",
                             "fetch_branch",
                             "join",
-                            "resolve"
+                            "resolve",
+                            "dirty"
                         ],
                         "description": "Which change-graph operation to run."
                     },
@@ -1555,6 +1559,7 @@ impl Tool for VcsTool {
                         state.heads.keys().filter(|key| key.contains('/')).collect();
                     Ok(json!({
                         "thread": graph.thread(),
+                        "workspace": graph.workspace(),
                         "sparse": graph.sparse(),
                         "nodes": state.nodes.len(),
                         "heads": state.heads,
@@ -1564,6 +1569,7 @@ impl Tool for VcsTool {
                             .pending_reconcile_threads()
                             .map_err(|e| format!("{e:#}"))?,
                         "checkpoints": state.checkpoints,
+                        "workspace_heads": state.workspace_heads.len(),
                     }))
                 }
                 VcsAction::Fetch => {
@@ -1706,6 +1712,13 @@ impl Tool for VcsTool {
                         .map_err(|e| format!("{e:#}"))?;
                     serde_json::to_value(node).map_err(|e| e.to_string())
                 }
+                VcsAction::Dirty => {
+                    let changed = graph.dirty_paths().map_err(|e| format!("{e:#}"))?;
+                    Ok(json!({
+                        "dirty": !changed.is_empty(),
+                        "changed": changed,
+                    }))
+                }
             }
         })
         .await
@@ -1731,6 +1744,7 @@ fn action_label(action: &VcsAction) -> &'static str {
         VcsAction::FetchBranch => "fetch_branch",
         VcsAction::Join => "join",
         VcsAction::Resolve => "resolve",
+        VcsAction::Dirty => "dirty",
     }
 }
 

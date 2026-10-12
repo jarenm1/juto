@@ -833,6 +833,36 @@ fn resolve_carries_the_merge_and_materializes_it() {
 }
 
 #[test]
+fn dirty_paths_reports_uncaptured_edits() {
+    let directory = fixture();
+    let cwd = directory.path();
+    fs::write(cwd.join("f.txt"), "base\n").unwrap();
+    fs::write(cwd.join("g.txt"), "other\n").unwrap();
+    command(cwd, "git", &["add", "-A"]);
+    command(cwd, "git", &["commit", "-m", "base"]);
+
+    let graph = ChangeGraph::open(cwd).unwrap();
+    graph.capture("main", provenance("init"), None).unwrap();
+    assert!(graph.dirty_paths().unwrap().is_empty());
+
+    // A shell edit is not captured automatically, so it must be reported.
+    fs::write(cwd.join("f.txt"), "changed\n").unwrap();
+    fs::remove_file(cwd.join("g.txt")).unwrap();
+    fs::write(cwd.join("h.txt"), "new\n").unwrap();
+    assert_eq!(
+        graph.dirty_paths().unwrap(),
+        vec![
+            "f.txt".to_string(),
+            "g.txt".to_string(),
+            "h.txt".to_string()
+        ]
+    );
+
+    graph.capture("main", provenance("e1"), None).unwrap();
+    assert!(graph.dirty_paths().unwrap().is_empty());
+}
+
+#[test]
 fn rewind_in_a_sparse_workspace_records_the_target_tree() {
     let directory = fixture();
     let cwd = directory.path();
