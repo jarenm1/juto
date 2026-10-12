@@ -8,9 +8,14 @@ mod client;
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let socket = std::env::var("WAYLAND_DISPLAY")?;
-    let seconds = std::env::var("JUTO_TEST_CLIENT_SECONDS")
-        .ok()
+    let seconds = std::env::args()
+        .nth(1)
         .and_then(|v| v.parse().ok())
+        .or_else(|| {
+            std::env::var("JUTO_TEST_CLIENT_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
         .unwrap_or(3);
     let frames = client::run(&socket, seconds)?;
     eprintln!("test-client: presented {frames} frame(s)");

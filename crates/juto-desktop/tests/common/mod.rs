@@ -1,5 +1,8 @@
 //! Shared test support: a deterministic Wayland client used by both the
 //! integration tests and the `test_client` example.
+//!
+//! Each consumer uses a subset of this module, so unused items are expected.
+#![allow(dead_code)]
 
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;

@@ -3,6 +3,7 @@
 mod auth_modal;
 mod chat;
 mod chat_input;
+mod desktop_viewer;
 mod model_picker;
 mod sidebar;
 mod task_card;
@@ -21,11 +22,14 @@ use juto_runtime::{Runtime, RuntimeConfig, Session, default_data_dir};
 actions!(juto, [Quit]);
 
 const USAGE: &str = "Usage: juto [--version] [--help] [--session <path>] [--model <model>]
+            juto --desktop <command> [args...]
 Opens the Juto local chat window connected to the agent runtime.
 
 Options:
   --session <path>  Open an existing session journal
   --model <model>   Select a model (e.g. anthropic/claude-sonnet-4-5)
+  --desktop <cmd>   Create a headless desktop, launch <cmd> into it, and open
+                    the embedded viewer (developer mode)
   --version         Print version and exit
   --help            Print this help and exit";
 
@@ -36,6 +40,7 @@ fn print_version() {
 fn run() -> ExitCode {
     let mut session_path = None;
     let mut model_arg = None;
+    let mut desktop_argv: Option<Vec<String>> = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -61,6 +66,15 @@ fn run() -> ExitCode {
                     return ExitCode::from(2);
                 }
             },
+            "--desktop" => {
+                let command: Vec<String> = args.by_ref().collect();
+                if command.is_empty() {
+                    eprintln!("error: `--desktop` requires a command\n\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+                desktop_argv = Some(command);
+                break;
+            }
             arg => {
                 eprintln!("error: unrecognized argument `{arg}`\n\n{USAGE}");
                 return ExitCode::from(2);
@@ -167,7 +181,14 @@ fn run() -> ExitCode {
                 ..Default::default()
             },
             |window, cx| {
-                cx.new(|cx| chat::ChatView::new(runtime, session, tokio_handle, window, cx))
+                let chat =
+                    cx.new(|cx| chat::ChatView::new(runtime, session, tokio_handle, window, cx));
+                if let Some(argv) = desktop_argv.clone() {
+                    chat.update(cx, |chat, cx| {
+                        chat.open_desktop_command(argv, window, cx);
+                    });
+                }
+                chat
             },
         )
         .unwrap();

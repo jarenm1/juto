@@ -1377,6 +1377,441 @@ impl Tool for DesktopArtifactTool {
     }
 }
 // ---------------------------------------------------------------------------
+// desktop environment tool
+// ---------------------------------------------------------------------------
+
+/// Tool enabling an agent to own and drive an isolated headless desktop.
+pub struct DesktopTool {
+    supervisor: Arc<juto_desktop::DesktopSupervisor>,
+    signaling: Arc<crate::SignalingHandle>,
+    data_dir: PathBuf,
+}
+
+/// Registers the desktop environment tool against a supervisor.
+pub fn register_desktop_tools(
+    registry: &mut ToolRegistry,
+    supervisor: Arc<juto_desktop::DesktopSupervisor>,
+    signaling: Arc<crate::SignalingHandle>,
+    data_dir: PathBuf,
+) -> Result<(), AgentError> {
+    registry.register(Arc::new(DesktopTool {
+        supervisor,
+        signaling,
+        data_dir,
+    }))?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct DesktopArgs {
+    action: String,
+    #[serde(default)]
+    env_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    fps: Option<u32>,
+    #[serde(default)]
+    scale: Option<u32>,
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    argv: Option<Vec<String>>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    env: Option<std::collections::HashMap<String, String>>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    events: Option<Vec<juto_desktop::protocol::InputEvent>>,
+    #[serde(default)]
+    snapshot_path: Option<String>,
+}
+
+#[async_trait]
+impl Tool for DesktopTool {
+    fn definition(&self) -> juto_ai::ToolDefinition {
+        juto_ai::ToolDefinition {
+            name: "desktop".to_string(),
+            description: "Owns an isolated headless desktop environment: create it, launch \
+                          applications into it, observe lossless snapshots, inject input, and \
+                          destroy it. The desktop has no host display; applications run in a \
+                          per-environment systemd scope with enforced CPU/memory/task limits."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "launch", "observe", "input", "describe", "attach", "destroy"],
+                        "description": "Operation to perform."
+                    },
+                    "env_id": {
+                        "type": "string",
+                        "description": "Environment identifier returned by `create`. Required for every action except `create`."
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "create: human-readable label for the environment."
+                    },
+                    "width": { "type": "integer", "description": "create: output width in pixels (default 1280)." },
+                    "height": { "type": "integer", "description": "create: output height in pixels (default 720)." },
+                    "fps": { "type": "integer", "description": "create: virtual output refresh cap (default 30)." },
+                    "scale": { "type": "integer", "description": "create: integer output scale, 1 or 2 (default 1)." },
+                    "app_id": {
+                        "type": "string",
+                        "description": "launch: identifier for the launched application."
+                    },
+                    "argv": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "launch: executable and arguments. Never shell-interpolated."
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "launch: working directory inside the session workspace (defaults to the workspace root)."
+                    },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "launch: explicit environment overrides for the application."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "observe: how long to wait for a fresh frame (default 5000)."
+                    },
+                    "snapshot_path": {
+                        "type": "string",
+                        "description": "observe: where to write the lossless PNG snapshot (defaults to the runtime data directory)."
+                    },
+                    "events": {
+                        "type": "array",
+                        "description": "input: ordered input events, e.g. {\"kind\":\"pointerMoveAbs\",\"x\":10,\"y\":20}, {\"kind\":\"pointerButton\",\"button\":272,\"pressed\":true}, {\"kind\":\"key\",\"keycode\":30,\"pressed\":true}, {\"kind\":\"pointerScroll\",\"axis\":1,\"value\":-1}.",
+                        "items": { "type": "object" }
+                    }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Exec
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Shared
+    }
+
+    async fn execute(&self, arguments: Value, ctx: ToolContext) -> Result<ToolOutput, String> {
+        let args: DesktopArgs = serde_json::from_value(arguments)
+            .map_err(|e| format!("invalid desktop arguments: {e}"))?;
+        check_cancel(&ctx.cancel)?;
+
+        let supervisor = self.supervisor.clone();
+        let signaling = self.signaling.clone();
+        let data_dir = self.data_dir.clone();
+        let workspace = effective_cwd(Path::new(""), &ctx).to_path_buf();
+        let cancel = ctx.cancel.clone();
+
+        tokio::task::spawn_blocking(move || {
+            run_desktop_action(
+                &supervisor,
+                &signaling,
+                &data_dir,
+                &workspace,
+                args,
+                &cancel,
+            )
+        })
+        .await
+        .map_err(|e| format!("desktop task failed: {e}"))?
+    }
+}
+
+fn run_desktop_action(
+    supervisor: &juto_desktop::DesktopSupervisor,
+    signaling: &crate::SignalingHandle,
+    data_dir: &Path,
+    workspace: &Path,
+    args: DesktopArgs,
+    cancel: &CancellationToken,
+) -> Result<ToolOutput, String> {
+    use juto_desktop::supervisor::{EnvironmentConfig, OutputConfig, RenderProfile, SystemLimits};
+
+    if cancel.is_cancelled() {
+        return Err("cancelled".to_string());
+    }
+
+    let env_id = || -> Result<String, String> {
+        args.env_id
+            .clone()
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| "env_id is required for this action".to_string())
+    };
+    let env = || -> Result<juto_desktop::DesktopEnvironment, String> {
+        let id = env_id()?;
+        supervisor.get_environment(&id).map_err(|e| e.to_string())
+    };
+
+    match args.action.as_str() {
+        "create" => {
+            let width = args.width.unwrap_or(1280);
+            let height = args.height.unwrap_or(720);
+            let fps = args.fps.unwrap_or(30);
+            let scale = args.scale.unwrap_or(1);
+            let title = args
+                .title
+                .clone()
+                .unwrap_or_else(|| "agent desktop".to_string());
+            let id = format!("desk-{}", uuid::Uuid::now_v7());
+            let config = EnvironmentConfig {
+                env_id: id.clone(),
+                owner_principal: "agent:session".to_string(),
+                output: OutputConfig {
+                    width,
+                    height,
+                    scale,
+                    fps,
+                },
+                render_profile: RenderProfile::Software,
+                limits: SystemLimits::default(),
+                workspace_dir: workspace.to_path_buf(),
+            };
+            let env = supervisor
+                .create_environment(config)
+                .map_err(|e| e.to_string())?;
+            let grant = env.issue_grant(
+                "agent:session".to_string(),
+                vec![
+                    juto_desktop::protocol::GrantRole::Owner,
+                    juto_desktop::protocol::GrantRole::View,
+                    juto_desktop::protocol::GrantRole::Control,
+                ],
+                "session".to_string(),
+                1800,
+            );
+            let host_id = host_identifier();
+            let summary = format!(
+                "Desktop environment created: {id} \"{title}\" ({width}x{height}@{fps}, scale {scale}). \
+                 Socket: {}. Owner grant: {}.",
+                env.socket_path().display(),
+                grant.grant_id
+            );
+            Ok(output(
+                summary,
+                json!({
+                    "action": "create",
+                    "envId": id,
+                    "title": title,
+                    "hostId": host_id,
+                    "grantId": grant.grant_id,
+                    "socketPath": env.socket_path().to_string_lossy(),
+                    "output": env.output(),
+                    "limits": env.limits(),
+                }),
+            ))
+        }
+        "launch" => {
+            let env = env()?;
+            let app_id = args
+                .app_id
+                .clone()
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| "app_id is required for launch".to_string())?;
+            let argv = args
+                .argv
+                .clone()
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| "argv is required for launch".to_string())?;
+            let cwd = args.cwd.as_ref().map(PathBuf::from);
+            let overrides: Vec<(String, String)> =
+                args.env.clone().unwrap_or_default().into_iter().collect();
+            let handle = env
+                .launch(&app_id, &argv, cwd.as_deref(), &overrides)
+                .map_err(|e| e.to_string())?;
+            let summary = format!(
+                "Launched `{}` (pid {}) in environment {}.",
+                handle.app_id,
+                handle.pid,
+                env.env_id()
+            );
+            Ok(output(
+                summary,
+                json!({
+                    "action": "launch",
+                    "envId": env.env_id(),
+                    "appId": handle.app_id,
+                    "pid": handle.pid,
+                    "unit": handle.unit,
+                }),
+            ))
+        }
+        "observe" => {
+            let env = env()?;
+            let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(5000).max(1));
+            let (info, png) = env.snapshot_png(timeout).map_err(|e| e.to_string())?;
+            let path = match args.snapshot_path.as_ref() {
+                Some(raw) => resolve_path(workspace, raw),
+                None => data_dir.join("desktop-snapshots").join(format!(
+                    "{}-{}.png",
+                    env.env_id(),
+                    info.frame_id
+                )),
+            };
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            }
+            std::fs::write(&path, &png)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            let status = env.get_status();
+            let summary = format!(
+                "Observed frame {} of {} ({}x{}, generation {}); snapshot written to {} ({} bytes).",
+                info.frame_id,
+                env.env_id(),
+                info.width,
+                info.height,
+                info.generation,
+                path.display(),
+                png.len()
+            );
+            Ok(output(
+                summary,
+                json!({
+                    "action": "observe",
+                    "envId": env.env_id(),
+                    "frameId": info.frame_id,
+                    "generation": info.generation,
+                    "timestampUs": info.timestamp_us,
+                    "width": info.width,
+                    "height": info.height,
+                    "snapshotPath": path.to_string_lossy(),
+                    "snapshotBytes": png.len(),
+                    "windows": status.mapped_windows,
+                    "apps": env.apps(),
+                }),
+            ))
+        }
+        "input" => {
+            let env = env()?;
+            let events = args
+                .events
+                .clone()
+                .filter(|e| !e.is_empty())
+                .ok_or_else(|| "events are required for input".to_string())?;
+            let owner = env.get_status().owner_principal;
+            let lease = match env.get_status().active_control_lease {
+                Some(lease) if lease.holder == owner => lease,
+                _ => env
+                    .set_control(&owner, "acquire", false)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| "failed to acquire control".to_string())?,
+            };
+            let batch = juto_desktop::protocol::InputBatch {
+                seq: 0,
+                client_timestamp_us: 0,
+                events,
+            };
+            let watermark = env
+                .dispatch_input(&owner, lease.epoch, env.generation(), batch)
+                .map_err(|e| e.to_string())?;
+            Ok(output(
+                format!(
+                    "Input accepted for {} (lease epoch {}, watermark {}).",
+                    env.env_id(),
+                    lease.epoch,
+                    watermark
+                ),
+                json!({
+                    "action": "input",
+                    "envId": env.env_id(),
+                    "epoch": lease.epoch,
+                    "appliedWatermark": watermark,
+                }),
+            ))
+        }
+        "describe" => {
+            let env = env()?;
+            let status = env.get_status();
+            let summary = format!(
+                "Environment {} is {} at {}x{}@{} (generation {}), {} window(s), {} app(s).",
+                status.env_id,
+                if status.is_ready { "ready" } else { "stopped" },
+                status.output.width,
+                status.output.height,
+                status.output.fps,
+                status.generation,
+                status.mapped_windows.len(),
+                env.apps().len()
+            );
+            Ok(output(
+                summary,
+                json!({
+                    "action": "describe",
+                    "status": status,
+                    "apps": env.apps(),
+                }),
+            ))
+        }
+        "attach" => {
+            let env = env()?;
+            let server = signaling.get().map_err(|e| e.to_string())?;
+            let grant = server.issue_token(
+                env.env_id(),
+                "remote-viewer",
+                vec![
+                    juto_desktop::protocol::GrantRole::View,
+                    juto_desktop::protocol::GrantRole::Control,
+                ],
+            );
+            let url = server.viewer_url(&grant.token);
+            let summary = format!(
+                "Remote viewer ready for {}: {url} (one-time token, expires in 60 seconds). \
+                 Open it on another device on this network; TLS termination and public \
+                 reachability belong to the deployment gateway.",
+                env.env_id()
+            );
+            Ok(output(
+                summary,
+                json!({
+                    "action": "attach",
+                    "envId": env.env_id(),
+                    "viewerUrl": url,
+                    "token": grant.token,
+                    "expiresAt": grant.expires_at,
+                    "transport": "webrtc",
+                }),
+            ))
+        }
+        "destroy" => {
+            let id = env_id()?;
+            supervisor
+                .destroy_environment(&id)
+                .map_err(|e| e.to_string())?;
+            Ok(output(
+                format!("Desktop environment {id} destroyed."),
+                json!({ "action": "destroy", "envId": id }),
+            ))
+        }
+        other => Err(format!("unknown desktop action `{other}`")),
+    }
+}
+
+fn host_identifier() -> String {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| "local-host".to_string())
+}
+
+// ---------------------------------------------------------------------------
 // registry
 // ---------------------------------------------------------------------------
 
@@ -3149,6 +3584,105 @@ mod tests {
             art2.artifact_id.starts_with("desk-"),
             "generated: {}",
             art2.artifact_id
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_tool_creates_launches_observes_and_destroys() {
+        let supervisor = Arc::new(juto_desktop::DesktopSupervisor::new());
+        let data_dir = tempfile::tempdir().unwrap();
+        let tool = DesktopTool {
+            supervisor: supervisor.clone(),
+            signaling: Arc::new(crate::SignalingHandle::new(supervisor.clone())),
+            data_dir: data_dir.path().to_path_buf(),
+        };
+        let ctx = ctx(data_dir.path());
+
+        let created = tool
+            .execute(
+                json!({"action": "create", "title": "smoke", "width": 640, "height": 480, "fps": 30}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(!created.is_error);
+        let env_id = created.details["envId"].as_str().unwrap().to_string();
+        assert!(env_id.starts_with("desk-"));
+        assert!(
+            created.details["grantId"]
+                .as_str()
+                .unwrap()
+                .starts_with("grant-")
+        );
+        assert_eq!(created.details["output"]["width"], 640);
+
+        let launched = tool
+            .execute(
+                json!({"action": "launch", "env_id": env_id, "app_id": "sleeper",
+                       "argv": ["sleep", "60"]}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(launched.details["pid"].as_u64().unwrap() > 0);
+        assert!(
+            launched.details["unit"]
+                .as_str()
+                .unwrap()
+                .ends_with(".scope")
+        );
+
+        let observed = tool
+            .execute(
+                json!({"action": "observe", "env_id": env_id, "timeout_ms": 5000}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        let snapshot = observed.details["snapshotPath"].as_str().unwrap();
+        let bytes = std::fs::read(snapshot).unwrap();
+        assert_eq!(
+            &bytes[..8],
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+        assert!(bytes.len() > 100, "png is {} bytes", bytes.len());
+        assert_eq!(observed.details["width"], 640);
+
+        let described = tool
+            .execute(json!({"action": "describe", "env_id": env_id}), ctx.clone())
+            .await
+            .unwrap();
+        assert_eq!(described.details["apps"].as_array().unwrap().len(), 1);
+
+        let attached = tool
+            .execute(json!({"action": "attach", "env_id": env_id}), ctx.clone())
+            .await
+            .unwrap();
+        let url = attached.details["viewerUrl"].as_str().unwrap();
+        assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        assert!(
+            attached.details["token"]
+                .as_str()
+                .unwrap()
+                .starts_with("attach-")
+        );
+        assert_eq!(attached.details["transport"], "webrtc");
+
+        tool.execute(json!({"action": "destroy", "env_id": env_id}), ctx.clone())
+            .await
+            .unwrap();
+        assert!(supervisor.get_environment(&env_id).is_err());
+
+        // Unknown action and missing env_id are rejected.
+        assert!(
+            tool.execute(json!({"action": "frobnicate"}), ctx.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            tool.execute(json!({"action": "describe"}), ctx.clone())
+                .await
+                .is_err()
         );
     }
 }

@@ -10,7 +10,8 @@ implementation inventory.
 
 ### Implementation status
 
-Implemented (verified by `cargo test -p juto-desktop` and the daemon smoke):
+Implemented (verified by `cargo test -p juto-desktop`, `cargo test -p
+juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 
 - Headless Smithay compositor: one virtual output, one virtual seat, xdg-shell
   toplevels, `wl_shm` buffers, software (pixman) composition, frame callbacks on
@@ -22,14 +23,27 @@ Implemented (verified by `cargo test -p juto-desktop` and the daemon smoke):
   allowlist, window/geometry reporting, grants, control leases, and idempotent
   destroy that terminates the application tree and removes the runtime directory.
 - Sealed shared-memory frame pool (`F_SEAL_GROW | F_SEAL_SHRINK |
-  F_SEAL_FUTURE_WRITE | F_SEAL_SEAL`) with three slots and reader backpressure.
+  F_SEAL_FUTURE_WRITE | F_SEAL_SEAL`) with three slots and reader backpressure,
+  plus lossless PNG snapshots for observation.
 - `juto-desktop` daemon: length-prefixed JSON control protocol over a private
   Unix socket, including event subscription.
+- Runtime `desktop` tool (`create`, `launch`, `observe`, `input`, `describe`,
+  `destroy`) backed by a process-wide supervisor.
+- Same-host embedded viewer in the harness: composes from the sealed pool with no
+  codec, letterboxes, maps pointer coordinates to desktop pixels, forwards
+  pointer/scroll/keyboard input, and holds a human control lease with a
+  heartbeat.
+- Remote presentation: a GStreamer `webrtcbin` sender (VP8 default, H.264
+  available) fed from the composed pool, a one-time-token signaling server that
+  serves a browser viewer page and relays SDP/ICE over a WebSocket, pointer and
+  keyboard input over a reliable ordered data channel, and a native receiver that
+  decodes the same stream.
 
-Not implemented: same-host viewer and descriptor passing (SCM_RIGHTS), GPUI
-embedded viewer, runtime `desktop_*` tools, WebRTC/remote presentation, audio,
-Xwayland, text-input-v3, the hardware render-node profile, DMA-BUF export/import,
-and deployment provisioning. Sections describing those remain design.
+Not implemented: audio (private PipeWire sink plus Opus), Xwayland,
+text-input-v3, the hardware render-node profile, DMA-BUF export/import, TURN
+relay configuration, descriptor passing (SCM_RIGHTS) to an out-of-process
+viewer, and deployment provisioning (TLS termination, public reachability).
+Sections describing those remain design.
 
 ## 1. Decision and scope
 

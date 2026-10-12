@@ -8,6 +8,7 @@ license.workspace = true
 juto-ai.workspace = true
 juto-agent.workspace = true
 juto-catalog.workspace = true
+juto-desktop.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 fs2.workspace = true
