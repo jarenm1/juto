@@ -1407,6 +1407,10 @@ enum VcsAction {
     Push,
     /// Check that every node's snapshot ref is present and correct.
     Verify,
+    /// Freeze a point as a named checkpoint.
+    Mark,
+    /// Revert a thread to an earlier point.
+    Rewind,
 }
 
 #[derive(Deserialize)]
@@ -1414,8 +1418,16 @@ struct VcsParams {
     action: VcsAction,
     /// Remote name or path; defaults to `origin`.
     remote: Option<String>,
-    /// Thread for `reconcile`; defaults to `main`.
+    /// Thread for `reconcile` and `rewind`; defaults to `main`.
     thread: Option<String>,
+    /// Point to freeze (`mark`) or revert to (`rewind`): a node id or a
+    /// checkpoint name. `mark` defaults to the thread head.
+    point: Option<String>,
+    /// Checkpoint name for `mark`; defaults to the point's id.
+    name: Option<String>,
+    /// Whether `mark` records a verification attestation. It never runs or
+    /// invents verification.
+    verified: Option<bool>,
 }
 
 #[async_trait]
@@ -1434,7 +1446,7 @@ impl Tool for VcsTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["status", "fetch", "reconcile", "push", "verify"],
+                        "enum": ["status", "fetch", "reconcile", "push", "verify", "mark", "rewind"],
                         "description": "Which change-graph operation to run."
                     },
                     "remote": {
@@ -1443,7 +1455,19 @@ impl Tool for VcsTool {
                     },
                     "thread": {
                         "type": "string",
-                        "description": "Thread for `reconcile`; defaults to `main`."
+                        "description": "Thread for `reconcile` and `rewind`; defaults to `main`."
+                    },
+                    "point": {
+                        "type": "string",
+                        "description": "Point to freeze (`mark`) or revert to (`rewind`): a node id or a checkpoint name. `mark` defaults to the thread head."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Checkpoint name for `mark`; defaults to the point's id."
+                    },
+                    "verified": {
+                        "type": "boolean",
+                        "description": "Whether `mark` records a verification attestation. It never runs or invents verification."
                     }
                 },
                 "required": ["action"],
@@ -1461,13 +1485,18 @@ impl Tool for VcsTool {
     }
 
     async fn execute(&self, arguments: Value, ctx: ToolContext) -> Result<ToolOutput, String> {
-        let params: VcsParams =
-            serde_json::from_value(arguments).map_err(|e| format!("invalid vcs arguments: {e}"))?;
+        let VcsParams {
+            action,
+            remote,
+            thread,
+            point,
+            name,
+            verified,
+        } = serde_json::from_value(arguments).map_err(|e| format!("invalid vcs arguments: {e}"))?;
         check_cancel(&ctx.cancel)?;
         let cwd = effective_cwd(&self.cwd, &ctx).to_path_buf();
-        let remote = params.remote.unwrap_or_else(|| "origin".to_string());
-        let thread = params.thread.unwrap_or_else(|| "main".to_string());
-        let action = params.action;
+        let remote = remote.unwrap_or_else(|| "origin".to_string());
+        let thread = thread.unwrap_or_else(|| "main".to_string());
         let label = action_label(&action);
 
         // The graph shells out to git, so keep it off the async runtime.
@@ -1546,6 +1575,31 @@ impl Tool for VcsTool {
                             .collect(),
                     ))
                 }
+                VcsAction::Mark => {
+                    // Default to the thread head: an agent checkpointing "where
+                    // I am now" should not have to look up the node id first.
+                    let id = match point {
+                        Some(point) => point,
+                        None => graph
+                            .state()
+                            .map_err(|e| format!("{e:#}"))?
+                            .heads
+                            .get(&thread)
+                            .cloned()
+                            .ok_or_else(|| format!("thread {thread:?} has no head"))?,
+                    };
+                    let name = name.unwrap_or_else(|| id.clone());
+                    let message = format!("checkpoint: {name}");
+                    let node = graph
+                        .mark(&id, &name, &message, verified.unwrap_or(false))
+                        .map_err(|e| format!("{e:#}"))?;
+                    serde_json::to_value(node).map_err(|e| e.to_string())
+                }
+                VcsAction::Rewind => {
+                    let to = point.ok_or_else(|| "`rewind` needs a `point`".to_string())?;
+                    let node = graph.rewind(&thread, &to).map_err(|e| format!("{e:#}"))?;
+                    serde_json::to_value(node).map_err(|e| e.to_string())
+                }
             }
         })
         .await
@@ -1564,6 +1618,8 @@ fn action_label(action: &VcsAction) -> &'static str {
         VcsAction::Reconcile => "reconcile",
         VcsAction::Push => "push",
         VcsAction::Verify => "verify",
+        VcsAction::Mark => "mark",
+        VcsAction::Rewind => "rewind",
     }
 }
 
@@ -1618,6 +1674,7 @@ pub fn builtin_tools_with_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change_graph::EditProvenance;
 
     fn ctx(dir: &Path) -> ToolContext {
         ToolContext {
@@ -2443,7 +2500,7 @@ mod tests {
     #[tokio::test]
     async fn vcs_tool_reports_status_and_verifies() {
         let dir = git_dir();
-        ChangeGraph::open(dir.path()).expect("init graph");
+        let graph = ChangeGraph::open(dir.path()).expect("init graph");
         let tool = VcsTool {
             cwd: dir.path().to_path_buf(),
         };
@@ -2461,6 +2518,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.details["ok"], true, "{:?}", out.details);
+
+        // `mark` defaults to the thread head, and `rewind` returns to it.
+        graph
+            .capture(
+                "main",
+                EditProvenance {
+                    session_id: "test".into(),
+                    tool: "test".into(),
+                    selection_mode: None,
+                    path: None,
+                },
+                None,
+            )
+            .expect("capture");
+        let out = tool
+            .execute(json!({"action": "mark", "name": "c1"}), ctx(dir.path()))
+            .await
+            .unwrap();
+        assert!(out.details["id"].is_string(), "{:?}", out.details);
+
+        let out = tool
+            .execute(json!({"action": "rewind", "point": "c1"}), ctx(dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.details["provenance"]["tool"], "rewind",
+            "{:?}",
+            out.details
+        );
 
         // An unknown action is rejected rather than silently ignored.
         assert!(
