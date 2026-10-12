@@ -27,6 +27,11 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   (`LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`, `MESA_LOADER_DRIVER_OVERRIDE`), and
   otherwise composes with pixman. A GLES renderer that resolves to a
   non-software device is discarded before any frame is composed.
+- Host aggregate admission: `HostPolicy::max_aggregate_pixel_rate` (default
+  497,664,000 px/s, the hardware profile's per-environment ceiling) bounds the
+  sum of admitted pixel rates across live environments; a create that would
+  exceed it is rejected with `LimitExceeded`, and destroying an environment
+  releases its share.
 - Protocol versioning: control requests carry a protocol version
   (`PROTOCOL_VERSION = 1`); a request with any other version is rejected with a
   `Protocol` error before dispatch.

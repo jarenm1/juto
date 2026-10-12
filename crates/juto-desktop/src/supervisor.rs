@@ -182,6 +182,26 @@ fn default_owner_timeout() -> u64 {
     60
 }
 
+/// Host-wide admission policy (spec section 6).
+///
+/// Per-environment ceilings bound one desktop; this bounds the sum of admitted
+/// pixel rates across the host so cooperating environments cannot overcommit
+/// composition capacity.
+#[derive(Debug, Clone, Copy)]
+pub struct HostPolicy {
+    pub max_aggregate_pixel_rate: u64,
+}
+
+impl Default for HostPolicy {
+    fn default() -> Self {
+        Self {
+            // The hardware profile's per-environment ceiling: the host admits
+            // the equivalent of one 4K60 desktop in aggregate by default.
+            max_aggregate_pixel_rate: 497_664_000,
+        }
+    }
+}
+
 /// Bounded wait for the shared GPU lock before reporting the device busy.
 const GPU_LOCK_WAIT_SECS: u64 = 5;
 
@@ -1614,6 +1634,7 @@ fn in_process_command(request: WorkerRequest) -> CompositorCommand {
 /// Central supervisor managing multiple isolated desktop environments.
 pub struct DesktopSupervisor {
     environments: Mutex<HashMap<String, DesktopEnvironment>>,
+    host_policy: HostPolicy,
     /// Environment ids keyed by `owner:request_id` for idempotent `Create`.
     create_requests: Mutex<HashMap<String, String>>,
     /// Terminal state of destroyed environments, retained for a bounded period.
@@ -1638,8 +1659,14 @@ impl Default for DesktopSupervisor {
 
 impl DesktopSupervisor {
     pub fn new() -> Self {
+        Self::with_host_policy(HostPolicy::default())
+    }
+
+    /// Builds a supervisor with an explicit host-wide admission policy.
+    pub fn with_host_policy(host_policy: HostPolicy) -> Self {
         Self {
             environments: Mutex::new(HashMap::new()),
+            host_policy,
             create_requests: Mutex::new(HashMap::new()),
             retired: Mutex::new(HashMap::new()),
         }
@@ -1665,6 +1692,28 @@ impl DesktopSupervisor {
             }
             requests.insert(key, env_id.clone());
         }
+        // Host-wide admission: the sum of admitted pixel rates must stay within
+        // the host policy (spec section 6).
+        {
+            let environments = self.environments.lock();
+            let admitted: u64 = environments
+                .values()
+                .filter(|env| !env.is_destroyed())
+                .map(|env| {
+                    let output = env.output();
+                    output.width as u64 * output.height as u64 * output.fps as u64
+                })
+                .sum();
+            let requested =
+                config.output.width as u64 * config.output.height as u64 * config.output.fps as u64;
+            if admitted + requested > self.host_policy.max_aggregate_pixel_rate {
+                return Err(DesktopError::LimitExceeded(format!(
+                    "host aggregate pixel rate {} px/s plus {} px/s exceeds the admitted {} px/s",
+                    admitted, requested, self.host_policy.max_aggregate_pixel_rate
+                )));
+            }
+        }
+
         let env = DesktopEnvironment::new(config)?;
         self.environments.lock().insert(env_id, env.clone());
         Ok(env)
