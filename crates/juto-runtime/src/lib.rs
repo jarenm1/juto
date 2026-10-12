@@ -3,11 +3,13 @@
 
 pub mod config;
 pub mod context;
+mod contextual;
 pub mod orchestrator;
 pub mod peers;
 pub mod session;
 pub mod subagents;
 pub mod tools;
+mod vcs;
 pub mod workspace;
 
 use std::{
