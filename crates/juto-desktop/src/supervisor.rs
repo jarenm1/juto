@@ -178,6 +178,7 @@ struct InnerEnvironment {
     last_automation_barrier: Mutex<Option<AutomationBarrier>>,
     destroyed: AtomicBool,
     use_scope: bool,
+    slice: Option<String>,
 }
 
 /// An active, isolated agent desktop environment.
@@ -211,6 +212,11 @@ impl DesktopEnvironment {
         }
 
         let use_scope = scope_enforced()?;
+        let slice = if use_scope {
+            Some(create_environment_slice(&config.env_id, &config.limits)?)
+        } else {
+            None
+        };
 
         let runtime_dir = environment_runtime_dir(&config.env_id);
         prepare_runtime_dir(&runtime_dir)?;
@@ -278,10 +284,12 @@ impl DesktopEnvironment {
             last_automation_barrier: Mutex::new(None),
             destroyed: AtomicBool::new(false),
             use_scope,
+            slice,
         });
 
         spawn_event_forwarder(inner.clone(), comp_rx);
         spawn_lease_reaper(Arc::downgrade(&inner));
+        spawn_pressure_monitor(Arc::downgrade(&inner));
 
         let _ = events.send(DesktopEvent::Ready {
             env_id: config.env_id.clone(),
@@ -302,6 +310,11 @@ impl DesktopEnvironment {
     /// Private runtime directory (`XDG_RUNTIME_DIR`) for the environment.
     pub fn runtime_dir(&self) -> &Path {
         &self.inner.runtime_dir
+    }
+
+    /// The transient slice that aggregates the environment's limits.
+    pub fn slice(&self) -> Option<&str> {
+        self.inner.slice.as_deref()
     }
 
     /// The environment's primary composed-frame pool.
@@ -540,6 +553,9 @@ impl DesktopEnvironment {
             let mut c = Command::new("systemd-run");
             c.args(["--user", "--scope", "--quiet", "--collect"]);
             c.arg(format!("--unit={unit}"));
+            if let Some(slice) = self.inner.slice.as_ref() {
+                c.arg(format!("--slice={slice}"));
+            }
             c.arg("-p").arg(format!("CPUQuota={}", limits.cpu_quota));
             c.arg("-p").arg(format!("MemoryMax={}", limits.memory_max));
             c.arg("-p")
@@ -817,6 +833,16 @@ impl DesktopEnvironment {
             compositor.shutdown();
         }
 
+        // Stopping the slice retires every scope inside it, including any
+        // process that outlived its launcher.
+        if let Some(slice) = self.inner.slice.as_ref() {
+            let _ = Command::new("systemctl")
+                .args(["--user", "stop", slice])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+
         let _ = std::fs::remove_dir_all(&self.inner.runtime_dir);
         *self.inner.is_ready.lock() = false;
         let _ = self.inner.events.send(DesktopEvent::Stopped {
@@ -844,6 +870,13 @@ impl Drop for InnerEnvironment {
         if !self.destroyed.swap(true, Ordering::SeqCst) {
             if let Some(compositor) = self.compositor.lock().take() {
                 compositor.shutdown();
+            }
+            if let Some(slice) = self.slice.as_ref() {
+                let _ = Command::new("systemctl")
+                    .args(["--user", "stop", slice])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
             }
             let _ = std::fs::remove_dir_all(&self.runtime_dir);
         }
@@ -877,6 +910,73 @@ fn spawn_event_forwarder(inner: Arc<InnerEnvironment>, rx: std_mpsc::Receiver<De
             let _ = inner.events.send(event);
         }
     });
+}
+
+/// Fraction of a limit at which a `LimitPressure` event is emitted.
+const PRESSURE_THRESHOLD: f64 = 0.9;
+
+/// Samples the environment slice's cgroup and reports pressure.
+///
+/// The slice aggregates the whole environment, so this observes the effective
+/// limits rather than a single process.
+fn spawn_pressure_monitor(inner: std::sync::Weak<InnerEnvironment>) {
+    let _ = std::thread::Builder::new()
+        .name("juto-desktop-pressure".to_string())
+        .spawn(move || {
+            let mut cgroup: Option<PathBuf> = None;
+            let mut last_throttled = 0u64;
+            loop {
+                std::thread::sleep(Duration::from_secs(2));
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                if inner.destroyed.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Some(slice) = inner.slice.as_ref() else {
+                    continue;
+                };
+                if cgroup.is_none() {
+                    cgroup = unit_cgroup_path(slice);
+                }
+                let Some(cgroup) = cgroup.as_ref() else {
+                    continue;
+                };
+
+                if let (Some(current), Some(max)) = (
+                    read_cgroup_bytes(&cgroup.join("memory.current")),
+                    read_cgroup_bytes(&cgroup.join("memory.max")),
+                ) && max > 0
+                {
+                    let ratio = current as f64 / max as f64;
+                    if ratio >= PRESSURE_THRESHOLD {
+                        let _ = inner.events.send(DesktopEvent::LimitPressure {
+                            env_id: inner.config.env_id.clone(),
+                            metric: "memory".to_string(),
+                            current_value: current,
+                            threshold: max,
+                        });
+                    }
+                }
+
+                if let Ok(stat) = std::fs::read_to_string(cgroup.join("cpu.stat")) {
+                    let throttled = stat
+                        .lines()
+                        .find_map(|line| line.strip_prefix("nr_throttled "))
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                        .unwrap_or(0);
+                    if throttled > last_throttled {
+                        last_throttled = throttled;
+                        let _ = inner.events.send(DesktopEvent::LimitPressure {
+                            env_id: inner.config.env_id.clone(),
+                            metric: "cpu_throttled".to_string(),
+                            current_value: throttled,
+                            threshold: 0,
+                        });
+                    }
+                }
+            }
+        });
 }
 
 /// Periodically clears expired control leases so a stale holder cannot keep
@@ -1158,7 +1258,9 @@ impl DesktopSupervisor {
             if owner.map(process_alive).unwrap_or(false) {
                 continue;
             }
-            for unit in scopes_for_environment(&name) {
+            let mut units = scopes_for_environment(&name);
+            units.push(environment_slice_name(&name));
+            for unit in units {
                 let _ = Command::new("systemctl")
                     .args(["--user", "stop", &unit])
                     .stdout(Stdio::null())
@@ -1308,6 +1410,98 @@ fn sanitize(value: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The transient slice that aggregates an environment's cgroup limits.
+///
+/// systemd treats `-` in a unit name as a path separator, so a literal dash in
+/// the environment id would create a chain of parent slices. Dashes are escaped
+/// to `_` for the slice name only.
+fn environment_slice_name(env_id: &str) -> String {
+    let escaped: String = sanitize(env_id)
+        .chars()
+        .map(|c| if c == '-' { '_' } else { c })
+        .collect();
+    format!("juto-desktop-{escaped}.slice")
+}
+
+/// Creates the environment slice and applies the aggregate limits.
+///
+/// Applications and (later) the compositor worker run as scopes inside this
+/// slice, so the limits bound the whole environment rather than each process.
+fn create_environment_slice(env_id: &str, limits: &SystemLimits) -> Result<String, DesktopError> {
+    let slice = environment_slice_name(env_id);
+    let started = Command::new("systemctl")
+        .args(["--user", "start", &slice])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !started {
+        return Err(DesktopError::IsolationUnavailable(format!(
+            "cannot create the environment slice `{slice}`"
+        )));
+    }
+    let applied = Command::new("systemctl")
+        .args([
+            "--user",
+            "set-property",
+            &slice,
+            &format!("CPUQuota={}", limits.cpu_quota),
+            &format!("MemoryMax={}", limits.memory_max),
+            &format!("MemorySwapMax={}", limits.memory_swap_max),
+            &format!("TasksMax={}", limits.tasks_max),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !applied {
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &slice])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        return Err(DesktopError::IsolationUnavailable(format!(
+            "cannot apply resource limits to the environment slice `{slice}`"
+        )));
+    }
+    Ok(slice)
+}
+
+/// The cgroup path backing a unit, if the unit exists.
+fn unit_cgroup_path(unit: &str) -> Option<PathBuf> {
+    let output = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            unit,
+            "--property=ControlGroup",
+            "--no-pager",
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let path = text
+        .lines()
+        .find_map(|line| line.strip_prefix("ControlGroup="))?
+        .trim();
+    if path.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from("/sys/fs/cgroup").join(path.trim_start_matches('/')))
+}
+
+/// Reads a cgroup file as a byte count, treating `max` as unlimited.
+fn read_cgroup_bytes(path: &Path) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let text = text.trim();
+    if text == "max" {
+        return None;
+    }
+    text.parse::<u64>().ok()
 }
 
 fn scope_unit_name(env_id: &str, app_id: &str) -> String {

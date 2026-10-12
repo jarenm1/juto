@@ -51,6 +51,9 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Pacing: a virtual clock at the effective FPS with no catch-up bursts, and
   observation statistics (ticks, frames composed, frames dropped, composition
   duration) reported with every snapshot.
+- Aggregate environment cgroup: a transient `juto-desktop-<env>.slice` carries
+  the environment limits and contains the application scopes; a monitor emits
+  `LimitPressure` on memory pressure and CPU throttling.
 
 Not implemented: audio (private PipeWire sink plus Opus), Xwayland, the hardware
 render-node profile, DMA-BUF export/import, TURN relay configuration, running the
