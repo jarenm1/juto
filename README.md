@@ -347,6 +347,15 @@ configuration. The app needs a graphical session and working Vulkan driver;
 the package supplies Juto's native libraries and uses `/run/opengl-driver/lib`
 for the host GPU driver.
 
+**Updates without recompiling.** The flake advertises `juto.cachix.org` via
+`nixConfig`; accept the substituter prompt (or run as a `trusted-user`) and
+`nix profile upgrade` downloads the CI-built binary instead of compiling.
+Without the cache, the crane-based build compiles the dependency graph once
+per `Cargo.lock`/toolchain change and caches it in the Nix store — updates
+that only touch Juto source recompile a few workspace crates, not the whole
+graph, and doc/script-only changes reuse the existing store path entirely.
+The cache is populated by `.github/workflows/cache.yml` on pushes to `main`.
+
 Headless informational commands do not initialize GPUI:
 
 ```sh
@@ -578,6 +587,20 @@ viewer reported `connected: true`, a 640×480 video, a sampled red pixel, and
 seat. No audio, hardware renderer, Xwayland, TURN relay, or real remote-network
 behavior was exercised.
 
+### Release binary cache
+
+`.github/workflows/cache.yml` builds `packages.default` on every `main` push
+and uploads the store closure to `juto.cachix.org`; the flake's `nixConfig`
+advertises that substituter to installers. Provisioning is manual and lives
+with the repo owner: create the public `juto` cache at
+<https://app.cachix.org> with Cachix-managed signing, copy its public key into
+`flake.nix` `nixConfig`, create a personal access token at
+<https://app.cachix.org/personal-access-tokens> and store it as the
+`CACHIX_AUTH_TOKEN` Actions secret, then set the `CACHIX_ENABLED=1` Actions
+variable. Until then the workflow is inert and installs fall back to local
+builds, still split by crane so unchanged dependency graphs are not
+recompiled.
+
 For a headless **native-window** check, `devShells.smoke` supplies Xvfb, xdotool,
 ImageMagick, Python, a DejaVu font configuration, and a pinned Mesa software
 Vulkan driver. It does not require the hardware GPU lock:
@@ -617,6 +640,7 @@ unavailable streaming notice on desktop open attempt, 560×480 resizing, and Ctr
 status 0 under Xvfb/Mesa software Vulkan.
 Host Wayland, hardware acceleration, live provider network transport, and live video streaming backend
 were not exercised.
+
 ## Dependency constraints
 
 GPUI 0.2.2's `gpui_http_client → zed-async-tar → xattr 0.2.3` dependency references
