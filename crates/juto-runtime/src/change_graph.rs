@@ -172,6 +172,36 @@ pub struct GcReport {
     pub dropped_workspace_heads: usize,
 }
 
+/// What a [`ChangeGraph::verify`] pass found.
+///
+/// `load` validates the journal's internal consistency; this additionally
+/// checks the Git refs the journal depends on.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyReport {
+    /// Nodes in the journal.
+    pub nodes: usize,
+    /// Nodes whose `refs/juto/snapshots/<id>` ref is absent.
+    pub missing_snapshot_refs: Vec<String>,
+    /// Nodes whose snapshot ref resolves to a different tree than the journal
+    /// records.
+    pub mismatched_snapshot_refs: Vec<String>,
+    /// Nodes whose `refs/juto/nodes/<id>` ref is absent. This is a replication
+    /// artifact, not a graph dependency: a purely local graph has none, and
+    /// `push_graph` recreates any that are missing. Reported for visibility
+    /// only, and not part of [`VerifyReport::is_ok`].
+    pub missing_node_refs: Vec<String>,
+}
+
+impl VerifyReport {
+    /// Whether every ref the graph depends on is present and correct.
+    ///
+    /// Only the snapshot refs count: `fork` and `export` resolve a node's tree
+    /// through them. Missing node refs are informational.
+    pub fn is_ok(&self) -> bool {
+        self.missing_snapshot_refs.is_empty() && self.mismatched_snapshot_refs.is_empty()
+    }
+}
+
 pub struct ChangeGraph {
     repository: GitRepository,
     directory: PathBuf,
@@ -934,6 +964,46 @@ impl ChangeGraph {
             released_node_refs,
             dropped_workspace_heads,
         })
+    }
+
+    /// Check that every node's refs exist and resolve to its tree.
+    ///
+    /// `load` validates the journal's internal consistency; this additionally
+    /// checks the Git refs it depends on, so a pruned or partially imported
+    /// snapshot ref is reported here rather than surfacing later as a confusing
+    /// `fork` or `export` failure. The comparison is by object id, so no
+    /// per-node process is needed.
+    pub fn verify(&self) -> Result<VerifyReport> {
+        let state = self.state()?;
+        let snapshots: BTreeMap<String, String> = self
+            .repository
+            .list_refs("refs/juto/snapshots")?
+            .into_iter()
+            .collect();
+        let nodes: BTreeMap<String, String> = self
+            .repository
+            .list_refs("refs/juto/nodes")?
+            .into_iter()
+            .collect();
+        let mut report = VerifyReport {
+            nodes: state.nodes.len(),
+            ..VerifyReport::default()
+        };
+        for node in &state.nodes {
+            let snapshot_ref = format!("refs/juto/snapshots/{}", node.id);
+            match snapshots.get(&snapshot_ref) {
+                None => report.missing_snapshot_refs.push(node.id.clone()),
+                Some(oid) if oid != &node.tree => {
+                    report.mismatched_snapshot_refs.push(node.id.clone());
+                }
+                Some(_) => {}
+            }
+            let node_ref = format!("refs/juto/nodes/{}", node.id);
+            if !nodes.contains_key(&node_ref) {
+                report.missing_node_refs.push(node.id.clone());
+            }
+        }
+        Ok(report)
     }
 
     fn continuity_parents(

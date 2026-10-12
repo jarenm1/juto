@@ -101,6 +101,10 @@ pub enum ChangesCommand {
     ///
     /// Unlike `log`, this stays small for a long session.
     Status,
+    /// Check that every node's snapshot ref exists and resolves to its tree.
+    ///
+    /// Exits non-zero when a ref the graph depends on is missing or wrong.
+    Verify,
 }
 
 pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
@@ -237,8 +241,23 @@ pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
                 "workspace_heads": state.workspace_heads.len(),
             })
         }
+        ChangesCommand::Verify => {
+            let report = graph.verify()?;
+            let ok = report.is_ok();
+            let mut value = serde_json::to_value(&report)?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("ok".to_string(), serde_json::Value::Bool(ok));
+            }
+            value
+        }
     };
     serde_json::to_writer_pretty(std::io::stdout().lock(), &value)?;
     println!();
+    // A verification command that always exits zero is not useful in a script.
+    if matches!(command, ChangesCommand::Verify)
+        && value.get("ok") == Some(&serde_json::Value::Bool(false))
+    {
+        anyhow::bail!("verification failed: a snapshot ref is missing or wrong");
+    }
     Ok(())
 }

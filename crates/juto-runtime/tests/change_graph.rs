@@ -782,6 +782,55 @@ fn gc_packs_loose_refs() {
 }
 
 #[test]
+fn verify_reports_missing_and_mismatched_snapshot_refs() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    fs::write(cwd.join("next"), "next\n").unwrap();
+    let next = graph.capture("main", provenance("next"), None).unwrap();
+
+    let report = graph.verify().unwrap();
+    assert_eq!(report.nodes, 2);
+    assert!(report.is_ok(), "{report:?}");
+
+    let git_dir = GitRepository::open(cwd).unwrap().git_dir().to_path_buf();
+    let snapshot_ref = format!("refs/juto/snapshots/{}", next.id);
+
+    // A missing snapshot ref is reported.
+    command(
+        cwd,
+        "git",
+        &[
+            "--git-dir",
+            git_dir.to_str().unwrap(),
+            "update-ref",
+            "-d",
+            &snapshot_ref,
+        ],
+    );
+    let report = graph.verify().unwrap();
+    assert_eq!(report.missing_snapshot_refs, vec![next.id.clone()]);
+    assert!(!report.is_ok());
+
+    // A snapshot ref pointing at the wrong tree is reported.
+    command(
+        cwd,
+        "git",
+        &[
+            "--git-dir",
+            git_dir.to_str().unwrap(),
+            "update-ref",
+            &snapshot_ref,
+            &root.tree,
+        ],
+    );
+    let report = graph.verify().unwrap();
+    assert_eq!(report.mismatched_snapshot_refs, vec![next.id.clone()]);
+    assert!(!report.is_ok());
+}
+
+#[test]
 fn fork_survives_a_stale_pending_fork_entry() {
     let directory = fixture();
     let cwd = directory.path();
