@@ -254,20 +254,23 @@ requires passing a verified quality gate:
 
 ### 5.2 Zed Delta Model: Anchoring Reasoning to Code
 Traditional PRs lose the reasoning behind changes. Inspired by Zed Delta:
-1. **Conversation-Anchored Diffs**:
-   Every diff chunk (`Hunk`) stores metadata pointing back to the subagent session ID,
-   the conversational turn ID, and the specific prompt/tool result that motivated the edit.
-2. **Live Multiplayer / Collaborative View**:
+1. **Conversation-Anchored Diffs** *(shipped, partial)*:
+   Every edit records `EditProvenance` — the session ID, the tool, the selection
+   mode, and the path — so a diff chunk points back to the session and tool call
+   that produced it. The conversational turn ID and the motivating prompt are
+   **not** recorded.
+2. **Live Multiplayer / Collaborative View** *(proposed)*:
    In the sidebar or diff viewer, diffs are live-updated as the subagent edits files.
    Reviewers (human or AI) can attach comments directly to hunks while the agent is
-   still working.
-3. **Replay & Auditability**:
-   exact thoughts and tool executions that created it.
-4. **Native Live DAG to Git Transfer**:
+   still working. The sidebar renders live diffs today; hunk comments are not built.
+3. **Replay & Auditability** *(shipped, partial)*:
+   Every node carries its provenance, so a change traces back to the session and
+   tool call that created it. Replaying the reasoning that produced it is not built.
+4. **Native Live DAG to Git Transfer** *(shipped)*:
    Instead of generating premature Git commits or depending on external VCS wrappers
    during live tool loops, Juto tracks atomic edit trees and thread branches natively.
    Named checkpoints (such as points verified working) freeze immutable snapshots,
-   and `juto changes export/push` projects only named points onto Git feature branches
+   and `juto-cli changes export/push` projects only named points onto Git feature branches
    using compare-and-swap ref updates and raw byte tree capture.
 
 ### 5.3 Cross-Machine Replication
