@@ -399,17 +399,19 @@ impl PresentationWorker {
                 let mut frame_index: u64 = 0;
                 while !stop.load(Ordering::SeqCst) {
                     let started = std::time::Instant::now();
-                    let Some(frame) = pool.latest_frame() else {
+                    let Ok(Some(frame)) = pool.latest_frame() else {
                         std::thread::sleep(interval);
                         continue;
                     };
                     pool.acquire_slot(frame.slot);
-                    let header = pool.read_pixels(frame.slot, &mut pixels);
+                    let read = pool.read_slot(frame.slot, pool.slot_size());
                     pool.release_slot(frame.slot);
-                    let Ok(header) = header else {
+                    let Ok((header, slice)) = read else {
                         std::thread::sleep(interval);
                         continue;
                     };
+                    pixels.clear();
+                    pixels.extend_from_slice(slice);
                     if header.size_bytes == 0 {
                         std::thread::sleep(interval);
                         continue;

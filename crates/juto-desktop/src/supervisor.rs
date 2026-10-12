@@ -20,7 +20,8 @@ use tokio::sync::broadcast;
 use crate::compositor::{Compositor, CompositorCommand, CompositorConfig, SnapshotInfo};
 use crate::error::DesktopError;
 use crate::protocol::*;
-use crate::shm::ShmFramePool;
+use crate::shm::{ShmFramePool, ShmReader};
+use crate::worker::{WorkerCompositor, WorkerRequest};
 
 /// Environment variables inherited by launched applications.
 const ENV_ALLOWLIST: &[&str] = &[
@@ -56,6 +57,21 @@ impl Default for OutputConfig {
             fps: 30,
         }
     }
+}
+
+/// Where the compositor runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CompositorMode {
+    /// A separate process inside the environment slice (production).
+    Worker,
+    /// A thread in the supervisor process (tests and hosts without the worker
+    /// binary).
+    InProcess,
+}
+
+fn default_compositor_mode() -> CompositorMode {
+    CompositorMode::Worker
 }
 
 /// Rendering profile: software LLVMpipe or hardware render node.
@@ -131,6 +147,9 @@ pub struct EnvironmentConfig {
     /// Control-lease lifetime in seconds (spec section 8: heartbeat 2s, expiry 6s).
     #[serde(default = "default_lease_ttl")]
     pub lease_ttl_secs: u64,
+    /// Where the compositor runs.
+    #[serde(default = "default_compositor_mode")]
+    pub compositor_mode: CompositorMode,
 }
 
 fn default_lease_ttl() -> u64 {
@@ -171,8 +190,8 @@ struct InnerEnvironment {
     lease: Mutex<Option<ControlLease>>,
     grants: Mutex<HashMap<String, Grant>>,
     windows: Mutex<HashMap<u32, WindowInfo>>,
-    pool: Arc<ShmFramePool>,
-    compositor: Mutex<Option<Compositor>>,
+    pool: Arc<ShmReader>,
+    compositor: Mutex<Option<CompositorHandle>>,
     apps: Mutex<HashMap<String, AppHandle>>,
     events: broadcast::Sender<DesktopEvent>,
     last_automation_barrier: Mutex<Option<AutomationBarrier>>,
@@ -235,37 +254,78 @@ impl DesktopEnvironment {
             )));
         }
 
-        let pool = match ShmFramePool::create(
-            format!("{}-primary", config.env_id),
-            config.output.width,
-            config.output.height,
-        ) {
-            Ok(pool) => Arc::new(pool),
-            Err(err) => {
-                let _ = std::fs::remove_dir_all(&runtime_dir);
-                return Err(err);
-            }
-        };
-
         let (events, _) = broadcast::channel(256);
         let (comp_tx, comp_rx) = std_mpsc::channel::<DesktopEvent>();
 
-        let compositor = match Compositor::spawn(
-            CompositorConfig {
-                env_id: config.env_id.clone(),
-                width: config.output.width,
-                height: config.output.height,
-                scale: config.output.scale,
-                fps: config.output.fps,
-                socket_path: socket_path.clone(),
-            },
-            pool.clone(),
-            comp_tx,
-        ) {
-            Ok(compositor) => compositor,
-            Err(err) => {
-                let _ = std::fs::remove_dir_all(&runtime_dir);
-                return Err(err);
+        // The compositor runs in its own process inside the environment slice, so
+        // its memory is charged to the environment and its failure cannot take
+        // the supervisor down.
+        let compositor_config = CompositorConfig {
+            env_id: config.env_id.clone(),
+            width: config.output.width,
+            height: config.output.height,
+            scale: config.output.scale,
+            fps: config.output.fps,
+            socket_path: socket_path.clone(),
+        };
+        let (compositor, pool) = match config.compositor_mode {
+            CompositorMode::Worker => {
+                let compositor_unit =
+                    format!("juto-desktop-{}-compositor.scope", sanitize(&config.env_id));
+                let scope = slice
+                    .as_deref()
+                    .map(|slice| (slice, compositor_unit.as_str()));
+                match WorkerCompositor::spawn(compositor_config, comp_tx, scope) {
+                    Ok(compositor) => {
+                        let reader = compositor.reader();
+                        (CompositorHandle::Worker(Arc::new(compositor)), reader)
+                    }
+                    Err(err) => {
+                        if let Some(slice) = slice.as_ref() {
+                            let _ = Command::new("systemctl")
+                                .args(["--user", "stop", slice])
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .status();
+                        }
+                        let _ = std::fs::remove_dir_all(&runtime_dir);
+                        return Err(err);
+                    }
+                }
+            }
+            CompositorMode::InProcess => {
+                let pool = match ShmFramePool::create(
+                    format!("{}-primary", config.env_id),
+                    config.output.width,
+                    config.output.height,
+                ) {
+                    Ok(pool) => Arc::new(pool),
+                    Err(err) => {
+                        let _ = std::fs::remove_dir_all(&runtime_dir);
+                        return Err(err);
+                    }
+                };
+                let compositor = match Compositor::spawn(compositor_config, pool.clone(), comp_tx) {
+                    Ok(compositor) => compositor,
+                    Err(err) => {
+                        let _ = std::fs::remove_dir_all(&runtime_dir);
+                        return Err(err);
+                    }
+                };
+                let fd = unsafe { libc::dup(pool.raw_fd()) };
+                if fd < 0 {
+                    let _ = std::fs::remove_dir_all(&runtime_dir);
+                    return Err(DesktopError::Shm(
+                        "cannot duplicate the pool fd".to_string(),
+                    ));
+                }
+                let reader = Arc::new(ShmReader::attach_named(
+                    fd,
+                    pool.size(),
+                    pool.pool_id().to_string(),
+                    None,
+                )?);
+                (CompositorHandle::InProcess(Arc::new(compositor)), reader)
             }
         };
 
@@ -320,8 +380,12 @@ impl DesktopEnvironment {
         self.inner.slice.as_deref()
     }
 
-    /// The environment's primary composed-frame pool.
-    pub fn frame_pool(&self) -> Arc<ShmFramePool> {
+    /// The environment's primary composed-frame pool, read-only.
+    ///
+    /// The compositor worker owns the writable mapping; every reader in this
+    /// process maps it read-only and signals slot reservations back to the
+    /// worker.
+    pub fn frame_pool(&self) -> Arc<ShmReader> {
         self.inner.pool.clone()
     }
 
@@ -699,7 +763,7 @@ impl DesktopEnvironment {
 
         let compositor = self.compositor()?;
         for event in batch.events {
-            compositor.send(CompositorCommand::Input(event))?;
+            compositor.send(WorkerRequest::Input(event))?;
         }
         Ok(batch.seq)
     }
@@ -729,19 +793,7 @@ impl DesktopEnvironment {
 
     /// Forces a fresh composition and returns the resulting frame metadata.
     pub fn observe(&self, timeout: Duration) -> Result<SnapshotInfo, DesktopError> {
-        let compositor = self.compositor()?;
-        let (reply, rx) = std_mpsc::sync_channel(1);
-        compositor.send(CompositorCommand::Snapshot { reply })?;
-        match rx.recv_timeout(timeout) {
-            Ok(Ok(info)) => Ok(info),
-            Ok(Err(msg)) => Err(DesktopError::Compositor(msg)),
-            Err(std_mpsc::RecvTimeoutError::Timeout) => Err(DesktopError::ObservationTimeout {
-                timeout_ms: timeout.as_millis() as u64,
-            }),
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => Err(DesktopError::Compositor(
-                "compositor stopped before producing a frame".to_string(),
-            )),
-        }
+        self.compositor()?.snapshot(timeout)
     }
 
     /// Observes a fresh frame and encodes it as a lossless PNG.
@@ -752,11 +804,10 @@ impl DesktopEnvironment {
         let info = self.observe(timeout)?;
         let pool = self.frame_pool();
         pool.acquire_slot(info.slot);
-        let mut pixels = Vec::new();
-        let header = pool.read_pixels(info.slot, &mut pixels);
+        let read = pool.read_slot(info.slot, pool.slot_size());
         pool.release_slot(info.slot);
-        let header = header?;
-        let png = crate::png::encode_bgra(header.width, header.height, &pixels)?;
+        let (header, pixels) = read?;
+        let png = crate::png::encode_bgra(header.width, header.height, pixels)?;
         Ok((info, png))
     }
 
@@ -785,29 +836,13 @@ impl DesktopEnvironment {
 
         let new_gen = current_gen + 1;
         let compositor = self.compositor()?;
-        let (reply, rx) = std_mpsc::sync_channel(1);
-        compositor.send(CompositorCommand::Configure {
+        compositor.send(WorkerRequest::Configure {
             width: new_mode.width,
             height: new_mode.height,
             scale: new_mode.scale,
             fps: new_mode.fps,
             generation: new_gen,
-            reply,
         })?;
-        match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => {}
-            Ok(Err(msg)) => return Err(DesktopError::Compositor(msg)),
-            Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                return Err(DesktopError::Compositor(
-                    "output reconfiguration timed out".to_string(),
-                ));
-            }
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(DesktopError::Compositor(
-                    "compositor stopped during reconfiguration".to_string(),
-                ));
-            }
-        }
         *self.inner.output.lock() = new_mode;
         self.inner.generation.store(new_gen, Ordering::SeqCst);
         // Every viewer must present a new-generation frame before input resumes.
@@ -905,12 +940,12 @@ impl DesktopEnvironment {
         });
     }
 
-    fn compositor(&self) -> Result<crate::compositor::CompositorSender, DesktopError> {
+    fn compositor(&self) -> Result<CompositorHandle, DesktopError> {
         self.inner
             .compositor
             .lock()
             .as_ref()
-            .map(|c| c.sender())
+            .cloned()
             .ok_or_else(|| {
                 DesktopError::EnvironmentFailed(
                     self.env_id().to_string(),
@@ -1229,6 +1264,82 @@ fn parse_size(value: &str) -> Option<u64> {
 pub struct ReconcileReport {
     pub stopped_units: Vec<String>,
     pub removed_directories: Vec<PathBuf>,
+}
+
+/// A compositor running either in its own process or in a supervisor thread.
+#[derive(Clone)]
+enum CompositorHandle {
+    Worker(Arc<WorkerCompositor>),
+    InProcess(Arc<Compositor>),
+}
+
+impl CompositorHandle {
+    fn send(&self, request: WorkerRequest) -> Result<(), DesktopError> {
+        match self {
+            CompositorHandle::Worker(worker) => worker.send(request),
+            CompositorHandle::InProcess(compositor) => compositor.send(in_process_command(request)),
+        }
+    }
+
+    fn snapshot(&self, timeout: Duration) -> Result<SnapshotInfo, DesktopError> {
+        match self {
+            CompositorHandle::Worker(worker) => worker.snapshot(timeout),
+            CompositorHandle::InProcess(compositor) => {
+                let (reply, rx) = std_mpsc::sync_channel(1);
+                compositor.send(CompositorCommand::Snapshot { reply })?;
+                match rx.recv_timeout(timeout) {
+                    Ok(Ok(info)) => Ok(info),
+                    Ok(Err(message)) => Err(DesktopError::Compositor(message)),
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        Err(DesktopError::ObservationTimeout {
+                            timeout_ms: timeout.as_millis() as u64,
+                        })
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                        Err(DesktopError::Compositor("compositor stopped".to_string()))
+                    }
+                }
+            }
+        }
+    }
+
+    fn shutdown(&self) {
+        match self {
+            CompositorHandle::Worker(worker) => worker.shutdown(),
+            CompositorHandle::InProcess(_) => {}
+        }
+    }
+}
+
+/// Maps a worker request onto the in-process command set.
+fn in_process_command(request: WorkerRequest) -> CompositorCommand {
+    match request {
+        WorkerRequest::Input(event) => CompositorCommand::Input(event),
+        WorkerRequest::Configure {
+            width,
+            height,
+            scale,
+            fps,
+            generation,
+        } => {
+            let (reply, _rx) = std_mpsc::sync_channel(1);
+            CompositorCommand::Configure {
+                width,
+                height,
+                scale,
+                fps,
+                generation,
+                reply,
+            }
+        }
+        WorkerRequest::AcquireSlot { slot } => CompositorCommand::AcquireSlot {
+            slot: slot as usize,
+        },
+        WorkerRequest::ReleaseSlot { slot } => CompositorCommand::ReleaseSlot {
+            slot: slot as usize,
+        },
+        WorkerRequest::Snapshot | WorkerRequest::Shutdown => CompositorCommand::Shutdown,
+    }
 }
 
 /// Central supervisor managing multiple isolated desktop environments.

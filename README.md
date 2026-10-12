@@ -212,6 +212,15 @@ attach token, and otherwise reports `Unsupported`, `Unauthorized`, `Expired`,
 `Stopped`, or `Unavailable` explicitly. A resolved route is not proof of a live
 stream — only received frames establish that.
 
+**Compositor worker process.** The compositor runs in its own process inside the
+environment slice (`juto-desktop-<env>-compositor.scope`), so its CPU and memory
+are charged to the environment and a compositor failure cannot take the
+supervisor down. The worker owns the writable frame-pool mapping and applies the
+seals; the supervisor and every viewer map the pool read-only, and slot
+reservations travel back over the control socket so the producer honours a reader
+in another process. `CompositorMode::InProcess` keeps a supervisor-thread
+fallback for hosts without the worker binary.
+
 **Aggregate environment cgroup.** Each environment owns a transient
 `juto-desktop-<env>.slice` carrying the configured `CPUQuota`, `MemoryMax`,
 `MemorySwapMax`, and `TasksMax`; applications run as scopes inside that slice, so

@@ -14,6 +14,7 @@ pub mod signaling;
 pub mod supervisor;
 pub mod text_input;
 pub mod viewer;
+pub mod worker;
 
 pub use compositor::{
     Compositor, CompositorCommand, CompositorConfig, CompositorSender, SnapshotInfo,
@@ -30,7 +31,10 @@ pub use remote::{
 pub use shm::{ShmFrame, ShmFramePool, ShmReader, ShmWriter};
 pub use signaling::{AttachGrant, SignalingServer, ViewerReport};
 pub use supervisor::{
-    AppHandle, DesktopEnvironment, DesktopSupervisor, EnvironmentConfig, EnvironmentStatus,
-    OutputConfig, OutputProfile, ReconcileReport, RenderProfile, SystemLimits,
+    AppHandle, CompositorMode, DesktopEnvironment, DesktopSupervisor, EnvironmentConfig,
+    EnvironmentStatus, OutputConfig, OutputProfile, ReconcileReport, RenderProfile, SystemLimits,
 };
 pub use viewer::{AttachInfo, ViewerClient};
+pub use worker::{
+    WorkerArgs, WorkerCompositor, WorkerRequest, WorkerResponse, run_worker, worker_available,
+};

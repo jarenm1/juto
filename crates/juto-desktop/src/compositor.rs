@@ -96,6 +96,10 @@ pub enum CompositorCommand {
     Snapshot {
         reply: std_mpsc::SyncSender<Result<SnapshotInfo, String>>,
     },
+    /// Reserve a pool slot so a reader in another process is not overwritten.
+    AcquireSlot { slot: usize },
+    /// Release a previously reserved pool slot.
+    ReleaseSlot { slot: usize },
     /// Stop the compositor and release the socket.
     Shutdown,
 }
@@ -1005,7 +1009,7 @@ impl AsMut<SeatState<DesktopState>> for DesktopState {
     }
 }
 
-fn run_compositor(
+pub(crate) fn run_compositor(
     config: CompositorConfig,
     pool: Arc<ShmFramePool>,
     events: std_mpsc::Sender<DesktopEvent>,
@@ -1199,6 +1203,8 @@ fn run_compositor(
                     CompositorCommand::Snapshot { reply } => {
                         state.pending_snapshots.push(reply);
                     }
+                    CompositorCommand::AcquireSlot { slot } => state.pool.acquire_slot(slot),
+                    CompositorCommand::ReleaseSlot { slot } => state.pool.release_slot(slot),
                     CompositorCommand::Shutdown => state.signal.stop(),
                 }
             }

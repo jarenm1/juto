@@ -534,6 +534,7 @@ impl ChatView {
             limits: juto_runtime::SystemLimits::default(),
             workspace_dir: self.runtime.cwd().to_path_buf(),
             lease_ttl_secs: 6,
+            compositor_mode: juto_runtime::CompositorMode::Worker,
         };
         let env = match supervisor.create_environment(config) {
             Ok(env) => env,
