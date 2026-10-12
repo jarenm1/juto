@@ -103,6 +103,26 @@ fn parse_socket_path() -> PathBuf {
 }
 
 fn serve(mut stream: UnixStream, supervisor: Arc<DesktopSupervisor>) -> std::io::Result<()> {
+    // Local attachment is authenticated by peer credentials: only the daemon's
+    // own user may drive its environments (spec section 3).
+    match juto_desktop::scm::peer_credentials(&stream) {
+        Ok(creds) if creds.uid == unsafe { libc::geteuid() } => {}
+        Ok(creds) => {
+            let _ = write_response(
+                &mut stream,
+                &DesktopResponse::Error {
+                    code: "Unauthorized".to_string(),
+                    message: format!("peer uid {} is not the daemon user", creds.uid),
+                },
+            );
+            return Ok(());
+        }
+        Err(err) => {
+            eprintln!("juto-desktop: cannot read peer credentials: {err}");
+            return Ok(());
+        }
+    }
+
     loop {
         let Some(frame) = read_frame(&mut stream)? else {
             return Ok(());
@@ -131,8 +151,8 @@ fn serve(mut stream: UnixStream, supervisor: Arc<DesktopSupervisor>) -> std::io:
             return stream_events(stream, supervisor, env_id);
         }
 
-        let response = handle(command, &supervisor);
-        write_response(&mut stream, &response)?;
+        let (response, fd) = handle(command, &supervisor);
+        write_response_with_fd(&mut stream, &response, fd)?;
     }
 }
 
@@ -173,8 +193,11 @@ fn stream_events(
     }
 }
 
-fn handle(command: DesktopCommand, supervisor: &DesktopSupervisor) -> DesktopResponse {
-    match command {
+fn handle(
+    command: DesktopCommand,
+    supervisor: &DesktopSupervisor,
+) -> (DesktopResponse, Option<std::os::fd::RawFd>) {
+    let response = match command {
         DesktopCommand::Create { spec, .. } => match supervisor.create_environment(spec) {
             Ok(env) => DesktopResponse::Created {
                 env_id: env.env_id().to_string(),
@@ -322,9 +345,37 @@ fn handle(command: DesktopCommand, supervisor: &DesktopSupervisor) -> DesktopRes
             Ok(_) => DesktopResponse::HeartbeatExtended { expires_at: 0 },
             Err(err) => error_response(&err),
         },
-        DesktopCommand::Attach { env_id, .. } => DesktopResponse::Error {
-            code: "TransportUnavailable".to_string(),
-            message: format!("attaching to `{env_id}` is not implemented yet"),
+        DesktopCommand::Attach { env_id, .. } => match supervisor.get_environment(&env_id) {
+            Ok(env) => {
+                let pool = env.frame_pool();
+                let output = env.output();
+                let fd = unsafe { libc::dup(pool.raw_fd()) };
+                if fd < 0 {
+                    return (
+                        DesktopResponse::Error {
+                            code: "Shm".to_string(),
+                            message: "cannot duplicate the frame pool descriptor".to_string(),
+                        },
+                        None,
+                    );
+                }
+                return (
+                    DesktopResponse::Attached {
+                        viewer_id: format!("local-{}", uuid::Uuid::now_v7()),
+                        negotiated_transport: "shm".to_string(),
+                        pool_id: pool.pool_id().to_string(),
+                        width: output.width,
+                        height: output.height,
+                        stride: output.width * 4,
+                        format: "argb8888".to_string(),
+                        slot_count: juto_desktop::shm::POOL_SLOT_COUNT as u32,
+                        slot_size: pool.slot_size() as u32,
+                        pool_bytes: pool.size() as u64,
+                    },
+                    Some(fd),
+                );
+            }
+            Err(err) => error_response(&err),
         },
         DesktopCommand::GeometryReady { env_id, .. } => DesktopResponse::Error {
             code: "TransportUnavailable".to_string(),
@@ -334,7 +385,8 @@ fn handle(command: DesktopCommand, supervisor: &DesktopSupervisor) -> DesktopRes
             code: "Protocol".to_string(),
             message: "Subscribe is handled before dispatch".to_string(),
         },
-    }
+    };
+    (response, None)
 }
 
 fn error_response(err: &juto_desktop::DesktopError) -> DesktopResponse {
@@ -395,8 +447,25 @@ fn write_frame(stream: &mut UnixStream, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 fn write_response(stream: &mut UnixStream, response: &DesktopResponse) -> std::io::Result<()> {
+    write_response_with_fd(stream, response, None)
+}
+
+fn write_response_with_fd(
+    stream: &mut UnixStream,
+    response: &DesktopResponse,
+    fd: Option<std::os::fd::RawFd>,
+) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(response).unwrap_or_default();
-    write_frame(stream, &bytes)
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&bytes);
+    match fd {
+        Some(fd) => juto_desktop::scm::send_with_fd(stream, &frame, fd),
+        None => {
+            stream.write_all(&frame)?;
+            stream.flush()
+        }
+    }
 }
 
 /// Minimal SIGINT/SIGTERM handling: the signal handler only writes one byte to

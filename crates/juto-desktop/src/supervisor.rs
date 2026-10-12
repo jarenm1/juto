@@ -208,6 +208,17 @@ impl DesktopEnvironment {
         let runtime_dir = environment_runtime_dir(&config.env_id);
         prepare_runtime_dir(&runtime_dir)?;
         let socket_path = runtime_dir.join("wayland-0");
+        // Unix socket paths are limited to SUN_LEN (108 bytes including the
+        // terminator); fail with a clear error rather than a bind failure.
+        if socket_path.as_os_str().len() >= 108 {
+            let _ = std::fs::remove_dir_all(&runtime_dir);
+            return Err(DesktopError::Protocol(format!(
+                "environment `{}` runtime path is too long for a Unix socket ({} bytes, limit 107): {}",
+                config.env_id,
+                socket_path.as_os_str().len(),
+                socket_path.display()
+            )));
+        }
 
         let pool = match ShmFramePool::create(
             format!("{}-primary", config.env_id),
@@ -999,7 +1010,50 @@ fn prepare_runtime_dir(dir: &Path) -> Result<(), DesktopError> {
             source: e,
         })?;
     }
+    // Record the owning supervisor so reconciliation can tell a live
+    // environment from one left behind by a dead process.
+    let owner = dir.join("owner");
+    std::fs::write(&owner, format!("{}\n", std::process::id())).map_err(|e| DesktopError::Io {
+        path: owner.clone(),
+        source: e,
+    })?;
     Ok(())
+}
+
+/// Whether a process is still alive.
+fn process_alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Scope units belonging to one environment id.
+fn scopes_for_environment(sanitized_env_id: &str) -> Vec<String> {
+    let prefix = format!("juto-desktop-{sanitized_env_id}-");
+    let Ok(output) = Command::new("systemctl")
+        .args([
+            "--user",
+            "list-units",
+            "--all",
+            "--no-legend",
+            "--plain",
+            "juto-desktop-*.scope",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+        .filter(|unit| unit.starts_with(&prefix))
+        .map(|unit| unit.to_string())
+        .collect()
 }
 
 fn sanitize(value: &str) -> String {
