@@ -1562,8 +1562,21 @@ fn cleanup_orphaned_forks_skips_live_fork() {
     );
 
     // Once the creator is gone, the same record is reclaimed.
+    //
+    // The reclaim is retried briefly. Releasing an `flock` and observing it as
+    // free from a fresh descriptor is not instantaneous in this environment: the
+    // descriptor is gone from every process (checked via /proc) and the lock is
+    // still reported held for a moment, so a single immediate attempt is flaky.
+    // In production this only defers an orphan's cleanup to the next fork.
     drop(live);
-    let reclaimed = repository.cleanup_orphaned_forks().unwrap();
+    let mut reclaimed = Vec::new();
+    for _ in 0..100 {
+        reclaimed = repository.cleanup_orphaned_forks().unwrap();
+        if !reclaimed.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     assert_eq!(reclaimed, vec![destination.clone()]);
     assert!(!destination.exists());
     assert!(!pending.exists());
