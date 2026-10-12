@@ -57,10 +57,15 @@ recovers forks interrupted mid-provision, and skips gitlink (submodule) entries 
 a baseline gitlink is preserved by capture, so a fork that omits the submodule
 still captures a tree identical to the base.
 
-The `changes fork --sparse <prefix>` option materializes only selected subtrees
-while capture preserves the complete base tree; runtime edits outside the
-declared prefixes are rejected before writing.
-
+**Sparse forks.** `fork_workspace_sparse` (CLI: `changes fork --sparse <path>`)
+materializes only the requested subtrees, so an agent scoped to one crate in a
+monorepo does not pay for the whole tree. The workspace marker records the spec,
+and every path that produces a node honours it: capture and `restore_tree`
+preserve baseline paths outside the spec instead of reading their absence as a
+deletion, `join` and `rewind` record the derived tree directly rather than
+snapshotting the partial workspace, and the edit tool refuses an out-of-spec
+path before touching the file. A sparse fork therefore still records a complete
+tree.
 
 The `edit` tool selects a unique tree-sitter
 AST selection for Rust, Python, JavaScript, TypeScript, and TSX; unsupported
