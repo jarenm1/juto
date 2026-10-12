@@ -713,6 +713,42 @@ fn join_in_a_sparse_workspace_records_the_full_merged_tree() {
 }
 
 #[test]
+fn rewind_in_a_sparse_workspace_records_the_target_tree() {
+    let directory = fixture();
+    let cwd = directory.path();
+    fs::create_dir_all(cwd.join("crates/foo")).unwrap();
+    fs::write(cwd.join("crates/foo/a.txt"), "a\n").unwrap();
+    fs::create_dir_all(cwd.join("crates/bar")).unwrap();
+    fs::write(cwd.join("crates/bar/b.txt"), "b\n").unwrap();
+    command(cwd, "git", &["add", "-A"]);
+    command(cwd, "git", &["commit", "-m", "layout"]);
+
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+
+    let workspaces = tempfile::tempdir().unwrap();
+    let left_dir = workspaces.path().join("left");
+    graph
+        .fork_sparse("left", &root.id, &left_dir, &["crates/foo".to_string()])
+        .unwrap();
+
+    let left = ChangeGraph::open(&left_dir).unwrap();
+    fs::write(left_dir.join("crates/foo/a.txt"), "a edited\n").unwrap();
+    let edited = left.capture("left", provenance("left"), None).unwrap();
+    assert_ne!(edited.tree, root.tree);
+
+    // Rewinding to the fork point must record the fork point's complete tree,
+    // including crates/bar/b.txt, which this workspace never materialized.
+    let rewound = left.rewind("left", &root.id).unwrap();
+    assert_eq!(rewound.tree, root.tree);
+    assert_eq!(rewound.parents, vec![edited.id.clone()]);
+
+    let listing = command(cwd, "git", &["ls-tree", "-r", "--name-only", &rewound.tree]);
+    assert!(listing.contains("crates/bar/b.txt"), "{listing}");
+    assert!(listing.contains("crates/foo/a.txt"), "{listing}");
+}
+
+#[test]
 fn fork_survives_a_stale_pending_fork_entry() {
     let directory = fixture();
     let cwd = directory.path();
