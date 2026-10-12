@@ -32,6 +32,10 @@ pub enum ChangesCommand {
         from: String,
         #[arg(long)]
         directory: PathBuf,
+        /// Materialize only these repository-relative subtrees (repeatable).
+        /// Capture still records a complete tree.
+        #[arg(long)]
+        sparse: Vec<String>,
     },
     /// Name and freeze this exact native point as a future Git commit.
     Mark {
@@ -129,7 +133,12 @@ pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
             thread,
             from,
             directory,
-        } => serde_json::to_value(graph.fork(thread, from, directory)?)?,
+            sparse,
+        } => serde_json::to_value(if sparse.is_empty() {
+            graph.fork(thread, from, directory)?
+        } else {
+            graph.fork_sparse(thread, from, directory, sparse)?
+        })?,
         ChangesCommand::Mark {
             node,
             name,

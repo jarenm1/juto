@@ -382,6 +382,32 @@ impl ChangeGraph {
     /// Fork an independent native workspace from an immutable live point.
     /// No Git branch/worktree/commit is created; its edits share only the object store.
     pub fn fork(&self, thread: &str, from: &str, destination: &Path) -> Result<GraphState> {
+        self.fork_inner(thread, from, destination, None)
+    }
+
+    /// Fork a live point into a partial workspace holding only `paths`.
+    ///
+    /// The fork materializes just those subtrees, so an agent scoped to one
+    /// crate in a monorepo does not pay for the whole tree. Capture preserves
+    /// every baseline path outside `paths`, so the thread still records a
+    /// complete tree.
+    pub fn fork_sparse(
+        &self,
+        thread: &str,
+        from: &str,
+        destination: &Path,
+        paths: &[String],
+    ) -> Result<GraphState> {
+        self.fork_inner(thread, from, destination, Some(paths))
+    }
+
+    fn fork_inner(
+        &self,
+        thread: &str,
+        from: &str,
+        destination: &Path,
+        sparse: Option<&[String]>,
+    ) -> Result<GraphState> {
         validate_thread_name(thread)?;
         let _lock = self.lock()?;
         let mut state = self.load()?;
@@ -403,8 +429,15 @@ impl ChangeGraph {
             .iter()
             .find(|n| n.id == from)
             .context("unknown fork point")?;
-        self.repository
-            .fork_workspace(&node.tree, destination, thread)?;
+        match sparse {
+            Some(paths) => {
+                self.repository
+                    .fork_workspace_sparse(&node.tree, destination, thread, paths)?
+            }
+            None => self
+                .repository
+                .fork_workspace(&node.tree, destination, thread)?,
+        }
         let recorded = (|| -> Result<()> {
             let destination = destination.canonicalize()?;
             state.heads.insert(thread.into(), from.clone());
