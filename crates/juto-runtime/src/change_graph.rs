@@ -14,8 +14,9 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::git_transfer::{ExportPlan, ExportPoint, ExportResult, GitRepository, Signature};
+use crate::replication::{ImportReport, PublishReport};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditProvenance {
     pub session_id: String,
     pub tool: String,
@@ -34,7 +35,7 @@ impl EditProvenance {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mark {
     pub name: String,
     pub message: String,
@@ -43,7 +44,7 @@ pub struct Mark {
     pub signature: Signature,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeNode {
     pub id: String,
     pub thread: String,
@@ -51,6 +52,28 @@ pub struct ChangeNode {
     pub tree: String,
     pub provenance: EditProvenance,
     pub mark: Option<Mark>,
+}
+
+/// The result of [`ChangeGraph::join`].
+///
+/// A clean join materializes the merged tree into the workspace and appends a
+/// node with both sides as parents. A conflicted join changes nothing: the
+/// caller resolves the listed paths and retries.
+///
+/// The `Joined` variant carries the whole node by value because callers consume
+/// it directly; boxing it would only add indirection to a cold path.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JoinOutcome {
+    Joined {
+        node: ChangeNode,
+        base: String,
+        tree: String,
+    },
+    Conflicted {
+        base: String,
+        conflicts: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -226,7 +249,7 @@ impl ChangeGraph {
             .thread()
             .unwrap_or(&provenance.session_id)
             .to_owned();
-        ensure!(!thread.trim().is_empty(), "edit thread must not be empty");
+        validate_thread_name(&thread)?;
         let _lock = self.lock()?;
         let mut state = self.load()?;
         let parents = self.continuity_parents(&state, &thread, before_tree);
@@ -287,7 +310,7 @@ impl ChangeGraph {
         provenance: EditProvenance,
         parents: Option<Vec<String>>,
     ) -> Result<ChangeNode> {
-        ensure!(!thread.trim().is_empty(), "thread must not be empty");
+        validate_thread_name(thread)?;
         if let Some(assigned) = self.repository.thread() {
             ensure!(
                 thread == assigned,
@@ -324,7 +347,7 @@ impl ChangeGraph {
     /// Fork an independent native workspace from an immutable live point.
     /// No Git branch/worktree/commit is created; its edits share only the object store.
     pub fn fork(&self, thread: &str, from: &str, destination: &Path) -> Result<GraphState> {
-        ensure!(!thread.trim().is_empty(), "thread must not be empty");
+        validate_thread_name(thread)?;
         let _lock = self.lock()?;
         let mut state = self.load()?;
         ensure!(!state.heads.contains_key(thread), "thread already exists");
@@ -428,6 +451,174 @@ impl ChangeGraph {
 
     pub fn push(&self, branch: &str, remote: &str) -> Result<()> {
         self.repository.push(branch, remote)
+    }
+
+    /// This repository's stable replication identity.
+    ///
+    /// A UUIDv7 stored in `<git-dir>/juto/machine-id`, created on first use
+    /// under the graph lock. It is local and never replicated; every workspace
+    /// sharing this Git directory (including native forks) shares the identity.
+    pub fn machine_id(&self) -> Result<String> {
+        let _lock = self.lock()?;
+        self.machine_id_locked()
+    }
+
+    /// Publish the whole graph to `remote` as `refs/juto/*` refs.
+    pub fn push_graph(&self, remote: &str) -> Result<PublishReport> {
+        crate::replication::publish(self, remote)
+    }
+
+    /// Fetch `refs/juto/*` from `remote` and union it into the local journal.
+    pub fn fetch_graph(&self, remote: &str) -> Result<ImportReport> {
+        crate::replication::fetch_graph(self, remote)
+    }
+
+    /// Import already-fetched staging refs. Performs no network access.
+    pub fn import_refs(&self, staging: &str) -> Result<ImportReport> {
+        crate::replication::import_refs(self, staging)
+    }
+
+    /// Join two threads' trees into a new node with both sides as parents.
+    ///
+    /// The merge base is the maximal common ancestor of `left` and `right`. A
+    /// conflicted merge changes nothing; a clean merge materializes the merged
+    /// tree into this workspace and appends a two-parent node.
+    pub fn join(&self, thread: &str, left: &str, right: &str) -> Result<JoinOutcome> {
+        validate_thread_name(thread)?;
+        let state = self.state()?;
+        let left_node = resolve_node(&state, left)?;
+        let right_node = resolve_node(&state, right)?;
+        let base_id = merge_base(&state, &left_node.id, &right_node.id)?;
+        let base = state
+            .nodes
+            .iter()
+            .find(|n| n.id == base_id)
+            .context("missing merge base")?;
+        ensure!(
+            self.repository.supports_tree_merge()?,
+            "this Git does not support three-way tree merges (needs git >= 2.45)"
+        );
+        let merged = self
+            .repository
+            .merge_trees(&base.tree, &left_node.tree, &right_node.tree)?;
+        if !merged.conflicts.is_empty() {
+            return Ok(JoinOutcome::Conflicted {
+                base: base_id,
+                conflicts: merged.conflicts,
+            });
+        }
+        let merged_tree = merged.tree;
+        let left_id = left_node.id.clone();
+        let right_id = right_node.id.clone();
+        // The workspace materialization is serialized against other mutations,
+        // but `capture` takes the same lock itself, so the guard is released
+        // before the node is appended.
+        {
+            let _lock =
+                crate::vcs::MutationLock::acquire(self.workspace()).map_err(anyhow::Error::msg)?;
+            let current = self.snapshot_tree()?;
+            self.repository
+                .restore_tree(&current, &merged_tree, self.workspace())?;
+        }
+        let node = self.capture(
+            thread,
+            EditProvenance {
+                session_id: String::new(),
+                tool: "join".into(),
+                selection_mode: None,
+                path: None,
+            },
+            Some(vec![left_id, right_id]),
+        )?;
+        ensure!(
+            node.tree == merged_tree,
+            "joined node tree does not match the merged tree"
+        );
+        Ok(JoinOutcome::Joined {
+            node,
+            base: base_id,
+            tree: merged_tree,
+        })
+    }
+
+    /// Revert `thread` to an earlier point by materializing its tree.
+    ///
+    /// The rewind is recorded as a *forward* node whose tree equals the target,
+    /// so the audit trail survives and a head never moves backward silently.
+    pub fn rewind(&self, thread: &str, to: &str) -> Result<ChangeNode> {
+        validate_thread_name(thread)?;
+        let state = self.state()?;
+        let target = resolve_node(&state, to)?;
+        let target_tree = target.tree.clone();
+        let current_head = state.heads.get(thread).cloned();
+        // As in `join`, the mutation lock covers the workspace materialization
+        // only; `capture` re-acquires it for the append.
+        {
+            let _lock =
+                crate::vcs::MutationLock::acquire(self.workspace()).map_err(anyhow::Error::msg)?;
+            let current = self.snapshot_tree()?;
+            self.repository
+                .restore_tree(&current, &target_tree, self.workspace())?;
+        }
+        let node = self.capture(
+            thread,
+            EditProvenance {
+                session_id: String::new(),
+                tool: "rewind".into(),
+                selection_mode: None,
+                path: None,
+            },
+            current_head.map(|head| vec![head]),
+        )?;
+        ensure!(
+            node.tree == target_tree,
+            "rewound node tree does not match the target tree"
+        );
+        Ok(node)
+    }
+
+    /// The Git repository backing this graph. Used by `replication`.
+    pub(crate) fn repository(&self) -> &GitRepository {
+        &self.repository
+    }
+
+    /// Acquire the graph lock. Callers must not call [`ChangeGraph::machine_id`]
+    /// or any other locking method while holding it.
+    pub(crate) fn graph_lock(&self) -> Result<File> {
+        self.lock()
+    }
+
+    /// Read the graph while the caller holds the graph lock.
+    pub(crate) fn load_locked(&self) -> Result<GraphState> {
+        self.load()
+    }
+
+    /// Rewrite the header while the caller holds the graph lock.
+    pub(crate) fn save_locked(&self, state: &GraphState) -> Result<()> {
+        self.save_header(state)
+    }
+
+    /// Rewrite the node journal while the caller holds the graph lock.
+    pub(crate) fn write_nodes_locked(&self, nodes: &[ChangeNode]) -> Result<()> {
+        self.write_nodes(nodes)
+    }
+
+    /// Read or create the replication identity while the caller holds the lock.
+    pub(crate) fn machine_id_locked(&self) -> Result<String> {
+        let path = self.directory.join("machine-id");
+        if let Ok(existing) = fs::read_to_string(&path) {
+            let trimmed = existing.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
+        }
+        let id = Uuid::now_v7().to_string();
+        self.atomic_write(&path, |file| {
+            file.write_all(id.as_bytes())?;
+            file.write_all(b"\n")?;
+            Ok(())
+        })?;
+        Ok(id)
     }
 
     /// Sweep nodes no live reference reaches and release their snapshot refs.
@@ -687,7 +878,7 @@ impl ChangeGraph {
     }
 }
 
-fn validate_state(state: &GraphState) -> Result<()> {
+pub(crate) fn validate_state(state: &GraphState) -> Result<()> {
     ensure!(
         state.version == GRAPH_VERSION,
         "unsupported native change graph version {}",
@@ -719,6 +910,92 @@ fn validate_state(state: &GraphState) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Reject thread names that would make an owner-qualified head ref ambiguous.
+///
+/// Replication attaches the publishing owner as a `<owner>/<thread>` prefix, so
+/// a local thread name containing `/` could collide with a qualified name.
+fn validate_thread_name(thread: &str) -> Result<()> {
+    ensure!(!thread.trim().is_empty(), "thread must not be empty");
+    ensure!(
+        !thread.contains('/'),
+        "thread name must not contain '/': {thread:?}"
+    );
+    Ok(())
+}
+
+/// Resolve a node id or checkpoint name to its node.
+fn resolve_node<'a>(state: &'a GraphState, spec: &str) -> Result<&'a ChangeNode> {
+    let id = state
+        .checkpoints
+        .get(spec)
+        .map(String::as_str)
+        .unwrap_or(spec);
+    state
+        .nodes
+        .iter()
+        .find(|n| n.id == id)
+        .with_context(|| format!("unknown change node {spec:?}"))
+}
+
+/// Every node reachable from `id` by walking parents, including `id` itself.
+fn ancestor_closure(state: &GraphState, id: &str) -> BTreeSet<String> {
+    let by_id: BTreeMap<&str, &ChangeNode> =
+        state.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![id];
+    while let Some(current) = stack.pop() {
+        if !seen.insert(current.to_string()) {
+            continue;
+        }
+        if let Some(node) = by_id.get(current) {
+            stack.extend(node.parents.iter().map(String::as_str));
+        }
+    }
+    seen
+}
+
+/// The merge base of two nodes: the maximal common ancestors of both.
+///
+/// Exactly one maximal ancestor is the usual case. Several (a criss-cross
+/// merge) resolve to the one with the greatest index in `state.nodes`, which is
+/// the most recently appended and therefore the most conservative choice.
+fn merge_base(state: &GraphState, left: &str, right: &str) -> Result<String> {
+    let common: BTreeSet<String> = ancestor_closure(state, left)
+        .intersection(&ancestor_closure(state, right))
+        .cloned()
+        .collect();
+    ensure!(!common.is_empty(), "cannot join unrelated histories");
+    let mut dominated: BTreeSet<String> = BTreeSet::new();
+    for id in &common {
+        for ancestor in ancestor_closure(state, id) {
+            if &ancestor != id {
+                dominated.insert(ancestor);
+            }
+        }
+    }
+    let mut maximal: Vec<&String> = common
+        .iter()
+        .filter(|id| !dominated.contains(*id))
+        .collect();
+    ensure!(!maximal.is_empty(), "cannot determine a merge base");
+    let index = |id: &str| {
+        state
+            .nodes
+            .iter()
+            .position(|n| n.id == id)
+            .unwrap_or(usize::MAX)
+    };
+    maximal.sort_by_key(|id| index(id));
+    let base = maximal.last().expect("maximal is non-empty").to_string();
+    if maximal.len() > 1 {
+        eprintln!(
+            "juto: join chose merge base {base} among {} common ancestors",
+            maximal.len()
+        );
+    }
+    Ok(base)
 }
 
 fn validate_parents(state: &GraphState, parents: &[String]) -> Result<()> {
