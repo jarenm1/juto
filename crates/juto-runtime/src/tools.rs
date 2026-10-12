@@ -1443,6 +1443,8 @@ struct VcsParams {
     point: Option<String>,
     /// Checkpoint name for `mark`; defaults to the point's id.
     name: Option<String>,
+    /// Git commit message for `mark`; defaults to the checkpoint name.
+    message: Option<String>,
     /// Whether `mark` records a verification attestation. It never runs or
     /// invents verification.
     verified: Option<bool>,
@@ -1468,7 +1470,8 @@ impl Tool for VcsTool {
                 imports another machine's graph; `reconcile` \
                 folds imported heads into the local thread; `push` publishes the local graph; \
                 `verify` checks that every node's snapshot ref is present and correct; `mark` \
-                freezes a point as a named checkpoint; `rewind` reverts a thread to an earlier \
+                freezes a point as a named checkpoint with a commit message; `rewind` reverts a \
+                thread to an earlier \
                 point; `export` projects marked points into Git commits on a branch; `publish` \
                 and `fetch_branch` move that branch to and from a remote; `join` merges two \
                 threads into a two-parent node; `resolve` records a conflict resolved by hand \
@@ -1514,6 +1517,10 @@ impl Tool for VcsTool {
                         "type": "string",
                         "description": "Checkpoint name for `mark`; defaults to the point's id."
                     },
+                    "message": {
+                        "type": "string",
+                        "description": "Git commit message for `mark`; defaults to the checkpoint name."
+                    },
                     "verified": {
                         "type": "boolean",
                         "description": "Whether `mark` records a verification attestation. It never runs or invents verification."
@@ -1556,6 +1563,7 @@ impl Tool for VcsTool {
             thread,
             point,
             name,
+            message,
             verified,
             branch,
             left,
@@ -1664,7 +1672,7 @@ impl Tool for VcsTool {
                             .ok_or_else(|| format!("thread {thread:?} has no head"))?,
                     };
                     let name = name.unwrap_or_else(|| id.clone());
-                    let message = format!("checkpoint: {name}");
+                    let message = message.unwrap_or_else(|| name.clone());
                     let node = graph
                         .mark(&id, &name, &message, verified.unwrap_or(false))
                         .map_err(|e| format!("{e:#}"))?;
@@ -2743,10 +2751,18 @@ mod tests {
             )
             .expect("capture");
         let out = tool
-            .execute(json!({"action": "mark", "name": "c1"}), ctx(dir.path()))
+            .execute(
+                json!({"action": "mark", "name": "c1", "message": "feat: c1"}),
+                ctx(dir.path()),
+            )
             .await
             .unwrap();
         assert!(out.details["id"].is_string(), "{:?}", out.details);
+        assert_eq!(
+            out.details["mark"]["message"], "feat: c1",
+            "the commit message must be the one the caller gave: {:?}",
+            out.details
+        );
 
         let out = tool
             .execute(json!({"action": "rewind", "point": "c1"}), ctx(dir.path()))
