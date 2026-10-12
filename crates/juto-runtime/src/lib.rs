@@ -34,6 +34,11 @@ use juto_ai::{
     StopReason, StreamOptions, ToolCall, ToolDefinition, Usage,
 };
 use juto_catalog::{Model, Registry};
+pub use juto_desktop::protocol;
+pub use juto_desktop::supervisor::{
+    AppHandle, EnvironmentConfig, EnvironmentStatus, OutputConfig, RenderProfile, SystemLimits,
+};
+pub use juto_desktop::{DesktopEnvironment, DesktopError, DesktopSupervisor};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -53,7 +58,10 @@ pub use subagents::{
     BlockerReason, ChildState, SchemaMode, SubagentError, SubagentManager, SubagentResult,
     SubagentStatus, SubagentSummary, TaskSpec,
 };
-pub use tools::{DESKTOP_SESSION_ARTIFACT_VERSION, DesktopArtifactTool, DesktopSessionArtifact};
+pub use tools::{
+    DESKTOP_SESSION_ARTIFACT_VERSION, DesktopArtifactTool, DesktopSessionArtifact, DesktopTool,
+    register_desktop_tools,
+};
 pub use workspace::{GpuLockGuard, ResourceLimits, ScopedStdio, SubagentWorkspace, WorkspaceError};
 
 use crate::change_graph::{ChangeGraph, EditProvenance};
@@ -82,6 +90,7 @@ struct RuntimeInner {
     provider: Arc<dyn Provider>,
     approval: Option<Arc<dyn ApprovalHandler>>,
     subagent_manager: Mutex<Option<Arc<SubagentManager>>>,
+    desktop_supervisor: Mutex<Option<Arc<DesktopSupervisor>>>,
 }
 pub fn default_data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("JUTO_DATA_DIR") {
@@ -151,6 +160,7 @@ impl Runtime {
                 provider,
                 approval,
                 subagent_manager: Mutex::new(None),
+                desktop_supervisor: Mutex::new(None),
             }),
         };
         if !runtime.inner.config.read().model.is_empty() {
@@ -174,6 +184,11 @@ impl Runtime {
     }
     pub fn data_dir(&self) -> &Path {
         &self.inner.data_dir
+    }
+
+    /// The session working directory the runtime was opened with.
+    pub fn cwd(&self) -> &Path {
+        &self.inner.cwd
     }
 
     pub fn resolve_model(&self, selector: &str) -> Result<(Model, StreamOptions)> {
@@ -291,6 +306,17 @@ impl Runtime {
         std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))
     }
 
+    /// The process-wide desktop supervisor, created on first use.
+    pub fn desktop_supervisor(&self) -> Arc<DesktopSupervisor> {
+        let mut guard = self.inner.desktop_supervisor.lock();
+        if let Some(supervisor) = &*guard {
+            return supervisor.clone();
+        }
+        let supervisor = Arc::new(DesktopSupervisor::new());
+        *guard = Some(supervisor.clone());
+        supervisor
+    }
+
     pub fn subagent_manager(&self, control: &RunControl) -> Arc<SubagentManager> {
         let mut guard = self.inner.subagent_manager.lock();
         if let Some(mgr) = &*guard {
@@ -363,6 +389,13 @@ impl Runtime {
         let mut registry = tools::builtin_tools(&self.inner.cwd)?;
         if !read_only && depth < settings.max_recursion_depth {
             register_agent_tools(&mut registry, manager)?;
+        }
+        if !read_only {
+            tools::register_desktop_tools(
+                &mut registry,
+                self.desktop_supervisor(),
+                self.inner.data_dir.clone(),
+            )?;
         }
         if !settings.tools.is_empty() {
             registry.retain_names(&settings.tools);

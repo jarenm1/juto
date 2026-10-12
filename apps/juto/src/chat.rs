@@ -46,6 +46,7 @@ pub enum ActiveModal {
     None,
     ModelPicker,
     AuthModal,
+    DesktopViewer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -216,6 +217,7 @@ pub struct ChatView {
     active_control: Option<RunControl>,
     run_task: Option<Task<()>>,
     artifact_notice: Option<SharedString>,
+    desktop_viewer: Option<Entity<crate::desktop_viewer::DesktopViewer>>,
     _subscriptions: Vec<Subscription>,
 }
 impl Drop for ChatView {
@@ -362,6 +364,7 @@ impl ChatView {
             menu_just_dismissed: false,
             attachment_error: None,
             artifact_notice: None,
+            desktop_viewer: None,
             picker: None,
             scroll: ScrollHandle::new(),
             runtime,
@@ -446,9 +449,80 @@ impl ChatView {
         cx.notify();
     }
 
+    /// Opens the embedded viewer for an existing desktop environment.
+    ///
+    /// Resolution is explicit: an unknown or stopped environment reports
+    /// `Unavailable` rather than fabricating a live stream.
+    pub fn open_desktop_viewer(
+        &mut self,
+        env_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let supervisor = self.runtime.desktop_supervisor();
+        match supervisor.get_environment(env_id) {
+            Ok(env) => {
+                let title = format!("Desktop {env_id}");
+                let viewer =
+                    cx.new(|cx| crate::desktop_viewer::DesktopViewer::new(env, title, window, cx));
+                self.desktop_viewer = Some(viewer);
+                self.active_modal = ActiveModal::DesktopViewer;
+                self.artifact_notice = None;
+            }
+            Err(err) => {
+                self.artifact_notice =
+                    Some(format!("Desktop environment '{env_id}' is unavailable: {err}").into());
+            }
+        }
+        cx.notify();
+    }
+
+    /// Creates a desktop environment, launches `argv` into it, and opens the
+    /// embedded viewer. Used by the `--desktop` developer mode.
+    pub fn open_desktop_command(
+        &mut self,
+        argv: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let supervisor = self.runtime.desktop_supervisor();
+        let env_id = format!("desk-{}", uuid::Uuid::now_v7());
+        let config = juto_runtime::EnvironmentConfig {
+            env_id: env_id.clone(),
+            owner_principal: "human:viewer".to_string(),
+            output: juto_runtime::OutputConfig {
+                width: 1280,
+                height: 720,
+                scale: 1,
+                fps: 30,
+            },
+            render_profile: juto_runtime::RenderProfile::Software,
+            limits: juto_runtime::SystemLimits::default(),
+            workspace_dir: self.runtime.cwd().to_path_buf(),
+        };
+        let env = match supervisor.create_environment(config) {
+            Ok(env) => env,
+            Err(err) => {
+                self.artifact_notice = Some(format!("cannot create desktop: {err}").into());
+                cx.notify();
+                return;
+            }
+        };
+        if let Err(err) = env.launch("desktop-app", &argv, None, &[]) {
+            self.artifact_notice = Some(format!("cannot launch desktop application: {err}").into());
+            env.destroy();
+            cx.notify();
+            return;
+        }
+        self.open_desktop_viewer(&env_id, window, cx);
+    }
+
     pub fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_modal == ActiveModal::AuthModal {
             self.auth_modal.update(cx, |modal, cx| modal.dismiss(cx));
+        }
+        if self.active_modal == ActiveModal::DesktopViewer {
+            self.desktop_viewer = None;
         }
         self.active_modal = ActiveModal::None;
         self.focus_input(window, cx);
@@ -912,84 +986,74 @@ impl ChatView {
                                 ),
                         )
                     })
-                    .children(
-                        messages
-                            .iter()
-                            .enumerate()
-                            .map(|(index, message)| {
-                                let author = match message.role {
-                                    MessageRole::User => "You",
-                                    MessageRole::Assistant => "Assistant",
-                                };
-                                let artifacts = message.desktop_artifacts.clone();
+                    .children(messages.iter().enumerate().map(|(index, message)| {
+                        let author = match message.role {
+                            MessageRole::User => "You",
+                            MessageRole::Assistant => "Assistant",
+                        };
+                        let artifacts = message.desktop_artifacts.clone();
+                        div()
+                            .id(("message", index))
+                            .flex_none()
+                            .w_full()
+                            .min_w_0()
+                            .child(
                                 div()
-                                    .id(("message", index))
-                                    .flex_none()
-                                    .w_full()
-                                    .min_w_0()
-                                    .child(
-                                        div()
-                                            .mb_2()
-                                            .text_xs()
-                                            .text_color(rgb(0xa0a0a0))
-                                            .child(author),
-                                    )
-                                    .when(!message.text.is_empty(), |row| {
-                                        row.child(
-                                            div()
-                                                .w_full()
-                                                .text_size(px(15.))
-                                                .child(message.text.clone()),
-                                        )
-                                    })
-                                    .when(!message.attachments.is_empty(), |row| {
-                                        row.child(
-                                            div().mt_2().flex().flex_wrap().gap_2().children(
-                                                message
-                                                    .attachments
-                                                    .iter()
-                                                    .map(|attachment| attachment_chip(attachment.label.clone()).pr_2()),
-                                            ),
-                                        )
-                                    })
-                                    .when(!artifacts.is_empty(), |row| {
-                                        row.child(
-                                            div().mt_3().flex().flex_col().gap_2().children(
-                                                artifacts
-                                                    .into_iter()
-                                                    .enumerate()
-                                                    .map(|(art_idx, artifact)| {
-                                                        let env_id = artifact.environment_id.clone();
-                                                        let art_id = artifact.artifact_id.clone();
-                                                        let btn = div()
-                                                            .id(("open-desktop-btn", (index * 1000 + art_idx) as u32))
-                                                            .px_2p5()
-                                                            .py_1()
-                                                            .rounded_md()
-                                                            .bg(rgb(0x2563eb))
-                                                            .hover(|s| s.bg(rgb(0x1d4ed8)))
-                                                            .text_xs()
-                                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                                            .text_color(rgb(0xffffff))
-                                                            .cursor_pointer()
-                                                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                                                this.artifact_notice = Some(
-                                                                    format!(
-                                                                        "Desktop streaming backend is unavailable for environment '{}' (artifact '{}'). No active video/WebRTC adapter configured.",
-                                                                        env_id, art_id
-                                                                    )
-                                                                    .into(),
-                                                                );
-                                                                cx.notify();
-                                                            }))
-                                                            .child("Open Desktop ↗");
-                                                        desktop_artifact_card(&artifact, btn)
-                                                    }),
-                                            ),
-                                        )
-                                    })
-                            }),
-                    ),
+                                    .mb_2()
+                                    .text_xs()
+                                    .text_color(rgb(0xa0a0a0))
+                                    .child(author),
+                            )
+                            .when(!message.text.is_empty(), |row| {
+                                row.child(
+                                    div()
+                                        .w_full()
+                                        .text_size(px(15.))
+                                        .child(message.text.clone()),
+                                )
+                            })
+                            .when(!message.attachments.is_empty(), |row| {
+                                row.child(div().mt_2().flex().flex_wrap().gap_2().children(
+                                    message.attachments.iter().map(|attachment| {
+                                        attachment_chip(attachment.label.clone()).pr_2()
+                                    }),
+                                ))
+                            })
+                            .when(!artifacts.is_empty(), |row| {
+                                row.child(
+                                    div().mt_3().flex().flex_col().gap_2().children(
+                                        artifacts.into_iter().enumerate().map(
+                                            |(art_idx, artifact)| {
+                                                let env_id = artifact.environment_id.clone();
+                                                let btn = div()
+                                                    .id((
+                                                        "open-desktop-btn",
+                                                        (index * 1000 + art_idx) as u32,
+                                                    ))
+                                                    .px_2p5()
+                                                    .py_1()
+                                                    .rounded_md()
+                                                    .bg(rgb(0x2563eb))
+                                                    .hover(|s| s.bg(rgb(0x1d4ed8)))
+                                                    .text_xs()
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(rgb(0xffffff))
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(
+                                                        move |this, _: &ClickEvent, window, cx| {
+                                                            this.open_desktop_viewer(
+                                                                &env_id, window, cx,
+                                                            );
+                                                        },
+                                                    ))
+                                                    .child("Open Desktop ↗");
+                                                desktop_artifact_card(&artifact, btn)
+                                            },
+                                        ),
+                                    ),
+                                )
+                            })
+                    })),
             )
     }
 
@@ -1222,6 +1286,7 @@ impl ChatView {
         match self.active_modal {
             ActiveModal::ModelPicker => Some(self.model_picker.clone().into()),
             ActiveModal::AuthModal => Some(self.auth_modal.clone().into()),
+            ActiveModal::DesktopViewer => self.desktop_viewer.clone().map(|viewer| viewer.into()),
             ActiveModal::None => None,
         }
     }

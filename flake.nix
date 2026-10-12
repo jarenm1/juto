@@ -24,6 +24,7 @@
             wayland
             libxkbcommon
             libxcb
+            pixman
             vulkan-loader
           ];
           juto = pkgs.rustPlatform.buildRustPackage {

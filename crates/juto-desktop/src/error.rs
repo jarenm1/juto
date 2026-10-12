@@ -60,4 +60,13 @@ pub enum DesktopError {
 
     #[error("SHM buffer error: {0}")]
     Shm(String),
+
+    #[error("compositor error: {0}")]
+    Compositor(String),
+
+    #[error("isolation unavailable: {0}")]
+    IsolationUnavailable(String),
+
+    #[error("text input unavailable: {0}")]
+    TextUnavailable(String),
 }

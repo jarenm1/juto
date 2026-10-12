@@ -90,21 +90,69 @@ Subagent `output_schema` validation is strict by default. Task requests may set
 data is absent or does not match the declared schema; malformed schema definitions
 remain errors in either mode.
 
-### Proposed agent desktop
+### Agent desktop compositor
 
 The [agent-owned headless compositor design](docs/agent-compositor.md) specifies
 isolated application environments, configurable output/FPS/resource limits,
 computer-use control, and live human interaction with running games. Same-host
 viewing uses shared memory or negotiated DMA-BUF; remote laptop/phone viewing
-uses WebRTC. This is a design proposal, **not a shipped compositor or viewer**.
+uses WebRTC.
+
+**Shipped: the headless compositor, environment supervisor, control daemon,
+runtime tool, and embedded viewer.**
+`juto-desktop` runs a Smithay Wayland compositor with one virtual output and one
+virtual seat per environment — no host display, no physical input. An environment
+owns a private `XDG_RUNTIME_DIR` and Wayland socket, launches applications by
+argv into a per-environment systemd scope (`CPUQuota`, `MemoryMax`,
+`MemorySwapMax`, `TasksMax`), composes toplevels with Smithay's software (pixman)
+renderer into a sealed shared-memory frame pool, injects authorized pointer and
+keyboard input into the virtual seat, and reports mapped windows, geometry
+generations, grants, and control leases. `Destroy` terminates the application
+tree, stops the compositor, and removes the private runtime directory; it is
+idempotent. Applications inherit only an approved environment allowlist plus
+environment-private paths — never the host display, session bus, SSH agent, or
+provider secrets.
+
+The runtime owns a process-wide `DesktopSupervisor` and exposes a `desktop` tool
+with `create`, `launch`, `observe`, `input`, `describe`, and `destroy` actions.
+`create` returns the environment id, host id, and an owner grant id, which feed
+the `desktop_artifact` chat descriptor. `observe` writes a lossless PNG snapshot
+of the composed desktop and returns frame metadata plus the mapped window list,
+so an agent can attach the running application as evidence.
+
+```sh
+scripts/agent-scope.sh -- nix develop . -c cargo run -p juto-desktop -- --socket /tmp/juto-desktop.sock
+scripts/agent-scope.sh -- nix develop . -c cargo test -p juto-desktop
+```
+
+The daemon serves a length-prefixed JSON control protocol over a private Unix
+socket (`Create`, `Launch`, `Describe`, `Observe`, `ConfigureOutput`, `Grant`,
+`Revoke`, `Control`, `Input`, `AutomationQuiesced`, `Destroy`, `Subscribe`).
+
+**Embedded viewer.** The `desktop_artifact` card's **Open Desktop ↗** resolves the
+environment through the runtime supervisor and opens a modal that renders
+composed frames from the environment's sealed shared-memory pool — no video
+codec on this path — and forwards pointer, scroll, and keyboard input to the
+virtual seat. The viewer letterboxes the frame, maps pointer coordinates to
+desktop pixels, holds a human control lease with a 2-second heartbeat, and
+reports connection state and errors instead of showing a stale frame as live.
+`juto --desktop <command> [args...]` opens the same viewer directly for
+development.
+
+**Not yet shipped: remote transport and the remaining profiles.** The WebRTC
+laptop/phone path, audio, Xwayland, text-input-v3, the hardware render-node
+profile, and DMA-BUF export/import are not implemented. Descriptor passing
+(SCM_RIGHTS) to an out-of-process viewer is not wired; the shipped viewer reads
+the pool in-process. A compile pass is not evidence of streaming; the shipped
+behavior is verified by the integration tests and the smokes described below.
 
 **Remote sharing desktop artifacts in chat.** Agents mount remote desktop sharing
 sessions in chat conversations via the `desktop_artifact` tool. Artifact descriptors persist
 as IDs-only `DesktopSessionArtifact` records (`version`, `artifact_id`, `title`, `host_id`,
 `environment_id`, `grant_id`) without embedding bearer tokens, SDP payloads, or local paths.
 The chat view mounts typed desktop artifact cards with title, identifiers, and version badge.
-Clicking **Open Desktop ↗** inspects environment availability and explicitly reports when
-remote media/video backends are unconfigured, avoiding manufactured live streaming states.
+Clicking **Open Desktop ↗** resolves the environment through the runtime supervisor and opens
+the embedded viewer, or explicitly reports `Unavailable` when the environment does not exist.
 
 ## Development
 
@@ -307,6 +355,52 @@ Build or run the packaged application with `nix build .#default` or
 `nix run .#default`. For a headless native-window smoke, see the
 `devShells.smoke` instructions below; that exercises the development binary,
 not the packaged artifact.
+
+### Agent desktop compositor verification
+
+```sh
+scripts/agent-scope.sh -- nix develop . -c cargo test -p juto-desktop --locked
+```
+
+The integration tests create real environments and verify admission and
+geometry-generation rules, sealed shared-memory round-trip, control-lease
+preemption, input validation, a real Wayland client's composed frame (pixel
+checked), systemd-scope launch, and destroy cleanup (application scope stopped,
+runtime directory removed).
+
+The daemon smoke drives the control protocol end to end with the bundled
+deterministic Wayland client:
+
+```sh
+scripts/agent-scope.sh -- nix develop . -c cargo build -p juto-desktop --bin juto-desktop --example test_client
+./target/debug/juto-desktop --socket /tmp/juto-desktop.sock   # in the dev shell
+# then Create -> Launch (target/debug/examples/test_client) -> Describe -> Observe -> Destroy
+```
+
+Observed: `Create` returned effective output and limits; `Launch` started the
+client in a `juto-desktop-<env>-<app>.scope` systemd scope; `Describe` reported
+the mapped window (`juto-test-client`, `dev.juto.test-client`, 320×240);
+`Observe` returned a 640×480 frame; `Destroy` removed the runtime directory and
+left no active scope. The integration test pixel-verified the composed frame as
+the client's two-tone pattern (left red, right blue).
+
+The runtime tool and the embedded viewer are covered by:
+
+```sh
+scripts/agent-scope.sh -- nix develop . -c cargo test -p juto-runtime --lib tools::tests::desktop
+scripts/agent-scope.sh -- nix develop .#smoke -c xvfb-run -a -s "-screen 0 1280x1024x24" \
+  ./target/debug/juto --desktop ./target/debug/examples/test_client 60
+```
+
+Observed: the `desktop` tool created an environment, launched `sleep` in a
+systemd scope, wrote a lossless PNG snapshot that begins with the PNG signature,
+reported one running application, and destroyed the environment. Under
+Xvfb/Mesa software Vulkan the `--desktop` mode opened the embedded viewer, which
+rendered the client's two-tone frame letterboxed inside the harness window
+(`live 1280x720`), and a click inside the surface acquired the human control
+lease (the button changed from **Take control** to **Renew control**) with no
+error reported. No remote transport, hardware renderer, Xwayland, or audio
+behavior was exercised.
 
 For a headless **native-window** check, `devShells.smoke` supplies Xvfb, xdotool,
 ImageMagick, Python, a DejaVu font configuration, and a pinned Mesa software

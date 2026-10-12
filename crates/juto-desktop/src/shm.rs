@@ -150,6 +150,11 @@ impl ShmFramePool {
         self.size
     }
 
+    /// Byte size of one slot (header plus pixel payload, page aligned).
+    pub fn slot_size(&self) -> usize {
+        self.slot_size
+    }
+
     /// Renders or copies new desktop content into the next available slot.
     pub fn write_frame(
         &self,
@@ -231,6 +236,55 @@ impl ShmFramePool {
             let mut readers = self.in_flight_readers.lock();
             readers[slot] += 1;
         }
+    }
+
+    /// Describes the most recently written frame, if the pool has been written.
+    pub fn latest_frame(&self) -> Option<ShmFrame> {
+        let slot = *self.active_slot.lock();
+        let offset = slot * self.slot_size;
+        let header = unsafe { *(self.mmap_ptr.add(offset) as *const ShmSlotHeader) };
+        if header.size_bytes == 0 {
+            return None;
+        }
+        Some(ShmFrame {
+            slot,
+            header,
+            offset,
+            length: self.slot_size,
+        })
+    }
+
+    /// Copies the pixel payload of `slot` into `out`, replacing its contents.
+    ///
+    /// Callers that must not race the producer should bracket this with
+    /// [`ShmFramePool::acquire_slot`] and [`ShmFramePool::release_slot`].
+    pub fn read_pixels(
+        &self,
+        slot: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<ShmSlotHeader, DesktopError> {
+        if slot >= POOL_SLOT_COUNT {
+            return Err(DesktopError::Shm(format!("slot {slot} out of range")));
+        }
+        let offset = slot * self.slot_size;
+        let header = unsafe { *(self.mmap_ptr.add(offset) as *const ShmSlotHeader) };
+        let len = header.size_bytes as usize;
+        if len > self.slot_size - std::mem::size_of::<ShmSlotHeader>() {
+            return Err(DesktopError::Shm(format!(
+                "slot {slot} header claims {len} bytes, larger than the slot payload"
+            )));
+        }
+        out.clear();
+        out.resize(len, 0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.mmap_ptr
+                    .add(offset + std::mem::size_of::<ShmSlotHeader>()),
+                out.as_mut_ptr(),
+                len,
+            );
+        }
+        Ok(header)
     }
 }
 
