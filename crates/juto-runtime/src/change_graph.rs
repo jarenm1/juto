@@ -803,6 +803,12 @@ impl ChangeGraph {
         &self.repository
     }
 
+    /// The sparse path prefixes this workspace materialized, when it is a
+    /// partial fork. `None` means the workspace holds the whole tree.
+    pub fn sparse(&self) -> Option<&[String]> {
+        self.repository.sparse()
+    }
+
     /// Acquire the graph lock. Callers must not call [`ChangeGraph::machine_id`]
     /// or any other locking method while holding it.
     pub(crate) fn graph_lock(&self) -> Result<File> {

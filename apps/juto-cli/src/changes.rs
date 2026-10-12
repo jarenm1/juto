@@ -97,6 +97,10 @@ pub enum ChangesCommand {
     },
     /// Reclaim unreachable nodes, release their refs, and pack loose refs.
     Gc,
+    /// Print a compact summary: counts, heads, and what needs reconciling.
+    ///
+    /// Unlike `log`, this stays small for a long session.
+    Status,
 }
 
 pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
@@ -215,6 +219,24 @@ pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
                 .collect(),
         ),
         ChangesCommand::Gc => serde_json::to_value(graph.gc()?)?,
+        ChangesCommand::Status => {
+            let state = graph.state()?;
+            // A head key containing '/' is an imported remote head: the local
+            // thread name never contains one.
+            let remote_heads: Vec<&String> =
+                state.heads.keys().filter(|key| key.contains('/')).collect();
+            serde_json::json!({
+                "thread": graph.thread(),
+                "workspace": graph.workspace(),
+                "sparse": graph.sparse(),
+                "nodes": state.nodes.len(),
+                "heads": state.heads,
+                "remote_heads": remote_heads,
+                "needs_reconcile": !remote_heads.is_empty(),
+                "checkpoints": state.checkpoints,
+                "workspace_heads": state.workspace_heads.len(),
+            })
+        }
     };
     serde_json::to_writer_pretty(std::io::stdout().lock(), &value)?;
     println!();
