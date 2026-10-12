@@ -1,9 +1,11 @@
 //! Headless session orchestration. The agent loop and provider layer have no UI dependency.
 //! Behavioral reference: oh-my-pi 579da1d6; upstream attribution is in licenses/OMP-MIT.txt.
 
+pub mod change_graph;
 pub mod config;
 pub mod context;
 mod contextual;
+pub mod git_transfer;
 pub mod orchestrator;
 pub mod peers;
 pub mod session;
@@ -50,6 +52,8 @@ pub use subagents::{
     SubagentStatus, SubagentSummary, TaskSpec,
 };
 pub use workspace::{GpuLockGuard, ResourceLimits, SubagentWorkspace, WorkspaceError};
+
+use crate::change_graph::{ChangeGraph, EditProvenance};
 
 #[async_trait]
 pub trait ApprovalHandler: Send + Sync {
@@ -488,6 +492,50 @@ struct ChildFactory {
     runtime: Runtime,
     depth: usize,
 }
+
+impl ChildFactory {
+    /// Build a child runtime rooted at a fresh native fork of the parent's
+    /// current live point.
+    ///
+    /// The parent's live source is captured on the parent's assigned native
+    /// thread (or `main`), then materialized into an independent directory that
+    /// shares only the Git object store. All blocking Git/file work runs on a
+    /// blocking thread.
+    async fn isolated_runtime(&self, id: &str) -> Result<Runtime> {
+        let parent_cwd = self.runtime.inner.cwd.clone();
+        let data_dir = self.runtime.inner.data_dir.clone();
+        let child_path = data_dir.join("workspaces").join(id);
+        let source = {
+            let parent_cwd = parent_cwd.clone();
+            tokio::task::spawn_blocking(move || -> Result<String> {
+                let graph = ChangeGraph::open(&parent_cwd)?;
+                let thread = graph.thread().unwrap_or("main").to_owned();
+                let provenance = EditProvenance {
+                    session_id: "workspace-provision".to_string(),
+                    tool: "fork".to_string(),
+                    selection_mode: None,
+                    path: None,
+                };
+                Ok(graph.capture(&thread, provenance, None)?.id)
+            })
+            .await
+            .context("workspace capture task failed")??
+        };
+        let workspace =
+            SubagentWorkspace::provision_in(&parent_cwd, &child_path, &source, id).await?;
+        let cwd = workspace.path.clone();
+        let config = self.runtime.inner.config.clone();
+        let credentials = self.runtime.inner.credentials.clone();
+        let provider = self.runtime.inner.provider.clone();
+        let approval = self.runtime.inner.approval.clone();
+        tokio::task::spawn_blocking(move || {
+            Runtime::with_provider(cwd, data_dir, config, credentials, provider, approval)
+        })
+        .await
+        .context("child runtime construction task failed")?
+    }
+}
+
 #[async_trait]
 impl subagents::SubagentFactory for ChildFactory {
     async fn run(
@@ -498,15 +546,20 @@ impl subagents::SubagentFactory for ChildFactory {
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<SubagentResult, String> {
         let result: Result<SubagentResult> = async {
-            let mut session = Session::create(&self.runtime.inner.data_dir.join("sessions/subagents"), &self.runtime.inner.cwd)?;
-            let selector = spec.model.as_deref().or_else(|| self.runtime.inner.config.model_roles.get("task").map(String::as_str)).unwrap_or(&self.runtime.inner.config.model);
-            self.runtime.switch_model(&mut session, selector)?;
+            let runtime = if spec.isolated_workspace {
+                self.isolated_runtime(id).await?
+            } else {
+                self.runtime.clone()
+            };
+            let mut session = Session::create(&runtime.inner.data_dir.join("sessions/subagents"), &runtime.inner.cwd)?;
+            let selector = spec.model.as_deref().or_else(|| runtime.inner.config.model_roles.get("task").map(String::as_str)).unwrap_or(&runtime.inner.config.model);
+            runtime.switch_model(&mut session, selector)?;
             let mut prompt = spec.task;
             if let Some(schema) = spec.output_schema {
                 prompt.push_str("\n\nReturn a single JSON value validating against this JSON Schema, without surrounding prose:\n");
                 prompt.push_str(&serde_json::to_string(&schema)?);
             }
-            let outcome = self.runtime.run_depth(&mut session, prompt, events, control, self.depth, spec.read_only).await?;
+            let outcome = runtime.run_depth(&mut session, prompt, events, control, self.depth, spec.read_only).await?;
             if outcome.stop_reason == StopReason::Aborted { bail!("subagent cancelled"); }
             if outcome.stop_reason != StopReason::Stop { bail!("subagent did not complete: {:?}", outcome.stop_reason); }
             let output = session.messages()?.iter().rev().find_map(|message| match message {Message::Assistant(message) if message.stop_reason == StopReason::Stop => Some(message.text()), _ => None}).context("subagent completed without an assistant message")?;

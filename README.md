@@ -30,8 +30,14 @@ routing (`builder`, `reviewer`, `scout`, `sonic`), sequential verification quali
 (`format`, `build`, `test`, `smoke`), adversarial peer review handoff, bounded remediation
 retry loops, cooperative cancellation safety, and real-time lifecycle event broadcasting.
 
-**Contextual agent edits through jj.** The `edit` tool selects a unique tree-sitter
-AST capture, an inclusive line range/chunk, or exact text. Agents should prefer
+**Native live-change DAG and Git transfer.** Juto tracks live agent edits in its own
+version control DAG rather than synthesizing premature Git commits or depending on
+jj at runtime. Edits capture immutable trees with session/thread provenance,
+independent threads fork isolated workspaces without Git worktrees, and named
+checkpoints (e.g. verified-working states) project into deterministic Git commits
+that can be safely published to a feature branch.
+
+The `edit` tool selects a unique tree-sitter
 AST selection for Rust, Python, JavaScript, TypeScript, and TSX; unsupported
 languages, invalid queries, parse errors, and ambiguous captures fail explicitly
 rather than silently switching modes. The default capture is `@edit`.

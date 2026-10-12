@@ -1,8 +1,10 @@
 //! Workspace isolation and resource governance for Juto subagents.
 //!
-//! Provides isolated Jujutsu (`jj`) workspaces per subagent task and enforces
-//! resource caps (CPU, memory, swap) via systemd user scopes (`agents.slice`)
-//! and serialized GPU access via advisory file locks (`flock`).
+//! Provides an isolated native Juto workspace per subagent task (an independent
+//! directory forked from an immutable live change-graph point, sharing only the
+//! Git object store) and enforces resource caps (CPU, memory, swap) via systemd
+//! user scopes (`agents.slice`) and serialized GPU access via advisory file
+//! locks (`flock`).
 //!
 //! Architectural reference: `docs/orchestration-plan.md` §4 and `scripts/agent-scope.sh`.
 
@@ -14,8 +16,27 @@ use std::{
 };
 
 use fs2::FileExt;
+use serde::Deserialize;
 use thiserror::Error;
 pub use tokio::process::Command;
+
+use crate::change_graph::ChangeGraph;
+use crate::git_transfer::GitRepository;
+
+/// Name of the native fork link marker written at the root of every fork workspace.
+const WORKSPACE_MARKER: &str = ".juto-workspace.json";
+
+/// The subset of the native link marker needed to validate workspace ownership.
+#[derive(Debug, Deserialize)]
+struct WorkspaceMarker {
+    git_dir: PathBuf,
+    thread: String,
+}
+
+/// Wrap a native VCS failure with its full context chain.
+fn vcs_error(error: anyhow::Error) -> WorkspaceError {
+    WorkspaceError::Vcs(format!("{error:#}"))
+}
 
 /// Default CPU quota assigned to a single subagent scope.
 pub const DEFAULT_CPU_QUOTA: &str = "400%";
@@ -38,22 +59,11 @@ pub const DEFAULT_SLICE_MEMORY_MAX: &str = "16G";
 /// Errors that can occur during workspace lifecycle and resource-scoped execution.
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
-    #[error("jujutsu command `{command}` failed (exit code {code:?}): {stderr}")]
-    JjCommandFailed {
-        command: String,
-        code: Option<i32>,
-        stderr: String,
-    },
+    #[error("native VCS error: {0}")]
+    Vcs(String),
 
-    #[error("failed to spawn jujutsu command `{command}`: {source}")]
-    JjSpawnFailed {
-        command: String,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("directory is not inside a Jujutsu repository: {0}")]
-    NotInJjRepo(PathBuf),
+    #[error("directory is not inside a native Juto repository: {0}")]
+    NotInRepo(PathBuf),
 
     #[error("command working directory `{cwd}` is outside assigned workspace `{workspace}`")]
     CwdEscapedWorkspace { cwd: PathBuf, workspace: PathBuf },
@@ -219,25 +229,30 @@ impl Drop for GpuLockGuard {
     }
 }
 
-/// An isolated Jujutsu (`jj`) workspace dedicated to a single subagent task.
+/// An isolated native Juto workspace dedicated to a single subagent task.
+///
+/// The workspace is an independent directory forked from an immutable live
+/// change-graph point. It shares only the parent repository's Git object store
+/// through the native link marker, so its edits never touch the parent working
+/// copy and its history stays in the shared DAG.
 #[derive(Debug, Clone)]
 pub struct SubagentWorkspace {
     /// Filesystem path to the subagent's dedicated working copy directory.
     pub path: PathBuf,
-    /// Jujutsu change ID of the working copy commit (`@`).
-    pub change_id: String,
-    /// Jujutsu workspace name (typically basename of `path`).
-    pub workspace_name: String,
-    /// Root path of the parent Jujutsu repository.
+    /// Native change-graph node ID this workspace was forked from.
+    pub node_id: String,
+    /// Native thread name assigned to this workspace (the exact subagent id).
+    pub thread: String,
+    /// Root path of the parent native repository.
     pub repo_root: PathBuf,
     /// Subagent identifier.
     pub subagent_id: String,
 }
 
 impl SubagentWorkspace {
-    /// Provision an isolated Jujutsu workspace from `base_change` for `subagent_id`.
+    /// Provision an isolated native workspace from `base_change` for `subagent_id`.
     ///
-    /// Locates the enclosing Jujutsu repository from the current directory (or
+    /// Locates the enclosing native repository from the current directory (or
     /// `JUTO_REPO_ROOT` if set) and creates `~/workspaces/juto-<subagent-id>` (or
     /// under `JUTO_WORKSPACES_DIR` if set).
     pub async fn provision(base_change: &str, subagent_id: &str) -> Result<Self, WorkspaceError> {
@@ -248,7 +263,7 @@ impl SubagentWorkspace {
                 path: PathBuf::from("."),
                 source,
             })?;
-            find_jj_root(&cwd).ok_or(WorkspaceError::NotInJjRepo(cwd))?
+            find_repo_root(&cwd).ok_or(WorkspaceError::NotInRepo(cwd))?
         };
 
         let workspaces_dir = default_workspaces_dir();
@@ -258,234 +273,105 @@ impl SubagentWorkspace {
         Self::provision_in(&repo_root, &workspace_path, base_change, subagent_id).await
     }
 
-    /// Provision an isolated Jujutsu workspace at an explicit filesystem path.
+    /// Provision an isolated native workspace at an explicit filesystem path.
+    ///
+    /// `base_change` is a native change-graph node ID or checkpoint name. The
+    /// fork materializes that immutable tree into a brand-new directory and
+    /// links it back to the shared object store; no Git branch, worktree, or
+    /// commit is created. All Git work runs on a blocking thread.
     pub async fn provision_in(
         repo_root: &Path,
         workspace_path: &Path,
         base_change: &str,
         subagent_id: &str,
     ) -> Result<Self, WorkspaceError> {
-        if let Some(parent) = workspace_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|source| WorkspaceError::Io {
-                path: parent.to_path_buf(),
-                source,
-            })?;
-        }
-
-        let workspace_name = workspace_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(subagent_id)
-            .to_string();
-
-        // Run `jj workspace add <path> -r <base_change>` inside the repository
-        let add_output = tokio::process::Command::new("jj")
-            .arg("workspace")
-            .arg("add")
-            .arg(workspace_path)
-            .arg("-r")
-            .arg(base_change)
-            .current_dir(repo_root)
-            .output()
-            .await
-            .map_err(|source| WorkspaceError::JjSpawnFailed {
-                command: format!(
-                    "jj workspace add {} -r {}",
-                    workspace_path.display(),
-                    base_change
-                ),
-                source,
-            })?;
-
-        if !add_output.status.success() {
-            return Err(WorkspaceError::JjCommandFailed {
-                command: format!(
-                    "jj workspace add {} -r {}",
-                    workspace_path.display(),
-                    base_change
-                ),
-                code: add_output.status.code(),
-                stderr: String::from_utf8_lossy(&add_output.stderr).into_owned(),
-            });
-        }
-
-        // Query the change_id of the working copy commit in the new workspace
-        let change_id = query_change_id(workspace_path).await?;
-
-        Ok(Self {
-            path: workspace_path.to_path_buf(),
-            change_id,
-            workspace_name,
-            repo_root: repo_root.to_path_buf(),
-            subagent_id: subagent_id.to_string(),
+        let repo_root = repo_root.to_path_buf();
+        let workspace_path = workspace_path.to_path_buf();
+        let base_change = base_change.to_owned();
+        let subagent_id = subagent_id.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<Self, WorkspaceError> {
+            let graph = ChangeGraph::open(&repo_root).map_err(vcs_error)?;
+            let state = graph
+                .fork(&subagent_id, &base_change, &workspace_path)
+                .map_err(vcs_error)?;
+            let node_id = state
+                .heads
+                .get(&subagent_id)
+                .cloned()
+                .unwrap_or_else(|| base_change.clone());
+            Ok(Self {
+                path: workspace_path,
+                node_id,
+                thread: subagent_id.clone(),
+                repo_root,
+                subagent_id,
+            })
         })
+        .await
+        .map_err(|source| {
+            WorkspaceError::Other(format!("workspace provisioning task failed: {source}"))
+        })?
     }
 
-    /// Query the working copy's current Jujutsu commit ID.
-    pub async fn commit_id(&self) -> Result<String, WorkspaceError> {
-        query_commit_id(&self.path).await
-    }
-
-    /// Query the workspace's status (`jj status --no-pager`).
-    pub async fn status(&self) -> Result<String, WorkspaceError> {
-        let output = tokio::process::Command::new("jj")
-            .arg("status")
-            .arg("--no-pager")
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|source| WorkspaceError::JjSpawnFailed {
-                command: "jj status --no-pager".to_string(),
-                source,
-            })?;
-
-        if !output.status.success() {
-            return Err(WorkspaceError::JjCommandFailed {
-                command: "jj status --no-pager".to_string(),
-                code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    }
-
-    /// Query the workspace's diff (`jj diff --no-pager`).
-    pub async fn diff(&self) -> Result<String, WorkspaceError> {
-        let output = tokio::process::Command::new("jj")
-            .arg("diff")
-            .arg("--no-pager")
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|source| WorkspaceError::JjSpawnFailed {
-                command: "jj diff --no-pager".to_string(),
-                source,
-            })?;
-
-        if !output.status.success() {
-            return Err(WorkspaceError::JjCommandFailed {
-                command: "jj diff --no-pager".to_string(),
-                code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    }
-
-    /// Rebase this workspace's change ID into a target destination change or branch.
+    /// Remove this workspace's owned directory after verifying its native link
+    /// marker still names this thread and repository.
     ///
-    /// Executes `jj rebase -s <change_id> -d <target_dest>` and returns the
-    /// resulting commit ID upon success.
-    pub async fn rebase_into(&self, target_dest: &str) -> Result<String, WorkspaceError> {
-        let output = tokio::process::Command::new("jj")
-            .arg("rebase")
-            .arg("-s")
-            .arg(&self.change_id)
-            .arg("-d")
-            .arg(target_dest)
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|source| WorkspaceError::JjSpawnFailed {
-                command: format!("jj rebase -s {} -d {}", self.change_id, target_dest),
+    /// The shared DAG keeps every node this workspace produced: cleanup only
+    /// deletes the fork directory, never history. A missing or foreign marker
+    /// (different thread or repository) is refused so a directory this
+    /// workspace does not own is never removed.
+    pub async fn cleanup(self) -> Result<(), WorkspaceError> {
+        let path = self.path.clone();
+        let thread = self.thread.clone();
+        let repo_root = self.repo_root.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), WorkspaceError> {
+            let marker_path = path.join(WORKSPACE_MARKER);
+            let raw = std::fs::read(&marker_path).map_err(|source| WorkspaceError::Io {
+                path: marker_path.clone(),
                 source,
             })?;
-
-        if !output.status.success() {
-            return Err(WorkspaceError::JjCommandFailed {
-                command: format!("jj rebase -s {} -d {}", self.change_id, target_dest),
-                code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            });
-        }
-
-        // Query the new commit ID of our change after rebase
-        let commit_output = tokio::process::Command::new("jj")
-            .arg("log")
-            .arg("--no-graph")
-            .arg("-r")
-            .arg(&self.change_id)
-            .arg("-T")
-            .arg("commit_id")
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|source| WorkspaceError::JjSpawnFailed {
-                command: format!("jj log -r {} -T commit_id", self.change_id),
-                source,
+            let marker: WorkspaceMarker = serde_json::from_slice(&raw).map_err(|error| {
+                WorkspaceError::Other(format!(
+                    "invalid native workspace marker {}: {error}",
+                    marker_path.display()
+                ))
             })?;
-
-        if !commit_output.status.success() {
-            return Err(WorkspaceError::JjCommandFailed {
-                command: format!("jj log -r {} -T commit_id", self.change_id),
-                code: commit_output.status.code(),
-                stderr: String::from_utf8_lossy(&commit_output.stderr).into_owned(),
-            });
-        }
-
-        let commit_id = String::from_utf8_lossy(&commit_output.stdout)
-            .trim()
-            .to_string();
-        Ok(commit_id)
-    }
-
-    /// Forget this workspace from Jujutsu tracking without removing its disk contents.
-    pub async fn forget(&mut self) -> Result<(), WorkspaceError> {
-        let output = tokio::process::Command::new("jj")
-            .arg("workspace")
-            .arg("forget")
-            .current_dir(&self.path)
-            .output()
-            .await
-            .map_err(|source| WorkspaceError::JjSpawnFailed {
-                command: "jj workspace forget".to_string(),
-                source,
-            })?;
-
-        if !output.status.success() {
-            // Also attempt from repo_root specifying workspace name
-            let retry = tokio::process::Command::new("jj")
-                .arg("workspace")
-                .arg("forget")
-                .arg(&self.workspace_name)
-                .arg("-R")
-                .arg(&self.repo_root)
-                .output()
-                .await
-                .map_err(|source| WorkspaceError::JjSpawnFailed {
-                    command: format!("jj workspace forget {}", self.workspace_name),
+            if marker.thread != thread {
+                return Err(WorkspaceError::Other(format!(
+                    "workspace marker thread {:?} does not match {:?}",
+                    marker.thread, thread
+                )));
+            }
+            let expected = GitRepository::open(&repo_root)
+                .map_err(vcs_error)?
+                .git_dir()
+                .to_path_buf();
+            let actual = marker
+                .git_dir
+                .canonicalize()
+                .map_err(|source| WorkspaceError::Io {
+                    path: marker.git_dir.clone(),
                     source,
                 })?;
-
-            if !retry.status.success() {
-                return Err(WorkspaceError::JjCommandFailed {
-                    command: format!("jj workspace forget {}", self.workspace_name),
-                    code: retry.status.code(),
-                    stderr: String::from_utf8_lossy(&retry.stderr).into_owned(),
-                });
+            if actual != expected {
+                return Err(WorkspaceError::Other(format!(
+                    "workspace marker repository {} does not match {}",
+                    actual.display(),
+                    expected.display()
+                )));
             }
-        }
-
-        Ok(())
-    }
-
-    /// Clean up this workspace: forgets it from Jujutsu tracking and removes its directory from disk.
-    ///
-    /// If `forget` fails, directory deletion is skipped so that human and automated review artifacts
-    /// are preserved for diagnosis.
-    pub async fn cleanup(mut self) -> Result<(), WorkspaceError> {
-        self.forget().await?;
-
-        if self.path.exists() {
-            std::fs::remove_dir_all(&self.path).map_err(|source| WorkspaceError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
-
-        Ok(())
+            if path.exists() {
+                std::fs::remove_dir_all(&path).map_err(|source| WorkspaceError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|source| {
+            WorkspaceError::Other(format!("workspace cleanup task failed: {source}"))
+        })?
     }
 
     /// Run a command inside this workspace under resource governance.
@@ -680,14 +566,17 @@ pub fn is_systemd_run_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Locate the nearest parent directory containing a `.jj` directory.
-pub fn find_jj_root(start_dir: &Path) -> Option<PathBuf> {
+/// Locate the nearest ancestor that is a native Juto workspace root.
+///
+/// A root is either an ordinary Git worktree (`.git` present) or an independent
+/// native fork directory (`.juto-workspace.json` marker present).
+pub fn find_repo_root(start_dir: &Path) -> Option<PathBuf> {
     let mut curr = start_dir
         .canonicalize()
         .ok()
         .or_else(|| Some(start_dir.to_path_buf()))?;
     loop {
-        if curr.join(".jj").exists() {
+        if curr.join(".git").exists() || curr.join(WORKSPACE_MARKER).exists() {
             return Some(curr);
         }
         if !curr.pop() {
@@ -780,64 +669,6 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-/// Query the working copy's change ID inside a workspace.
-async fn query_change_id(workspace_path: &Path) -> Result<String, WorkspaceError> {
-    let output = tokio::process::Command::new("jj")
-        .arg("log")
-        .arg("--no-graph")
-        .arg("-r")
-        .arg("@")
-        .arg("-T")
-        .arg("change_id")
-        .current_dir(workspace_path)
-        .output()
-        .await
-        .map_err(|source| WorkspaceError::JjSpawnFailed {
-            command: "jj log -r @ -T change_id".to_string(),
-            source,
-        })?;
-
-    if !output.status.success() {
-        return Err(WorkspaceError::JjCommandFailed {
-            command: "jj log -r @ -T change_id".to_string(),
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
-    }
-
-    let change_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(change_id)
-}
-
-/// Query the working copy's commit ID inside a workspace.
-async fn query_commit_id(workspace_path: &Path) -> Result<String, WorkspaceError> {
-    let output = tokio::process::Command::new("jj")
-        .arg("log")
-        .arg("--no-graph")
-        .arg("-r")
-        .arg("@")
-        .arg("-T")
-        .arg("commit_id")
-        .current_dir(workspace_path)
-        .output()
-        .await
-        .map_err(|source| WorkspaceError::JjSpawnFailed {
-            command: "jj log -r @ -T commit_id".to_string(),
-            source,
-        })?;
-
-    if !output.status.success() {
-        return Err(WorkspaceError::JjCommandFailed {
-            command: "jj log -r @ -T commit_id".to_string(),
-            code: output.status.code(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
-    }
-
-    let commit_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok(commit_id)
-}
-
 /// Best-effort systemd slice property initialization matching `scripts/agent-scope.sh`.
 fn configure_slice_properties(slice: &str, cpu_quota: &str, mem_max: &str) {
     let mut props: Vec<String> = Vec::new();
@@ -887,6 +718,7 @@ fn configure_slice_properties(slice: &str, cpu_quota: &str, mem_max: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change_graph::{ChangeGraph, EditProvenance};
     use tempfile::tempdir;
 
     #[test]
@@ -935,6 +767,23 @@ mod tests {
     }
 
     #[test]
+    fn test_find_repo_root_detects_git_and_native_markers() {
+        let dir = tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join("nested/deep")).expect("create dirs");
+        std::fs::create_dir_all(repo.join(".git")).expect("create .git");
+        assert_eq!(
+            find_repo_root(&repo.join("nested/deep")),
+            Some(repo.canonicalize().unwrap())
+        );
+
+        let fork = dir.path().join("fork");
+        std::fs::create_dir_all(&fork).expect("create fork");
+        std::fs::write(fork.join(".juto-workspace.json"), "{}").expect("write marker");
+        assert_eq!(find_repo_root(&fork), Some(fork.canonicalize().unwrap()));
+    }
+
+    #[test]
     fn test_gpu_flock_lock_mutual_exclusion() {
         let dir = tempdir().expect("tempdir");
         let lock_file = dir.path().join("gpu.lock");
@@ -965,8 +814,8 @@ mod tests {
     fn test_scoped_command_construction() {
         let ws = SubagentWorkspace {
             path: PathBuf::from("/tmp/test-ws"),
-            change_id: "test-change".to_string(),
-            workspace_name: "test-ws".to_string(),
+            node_id: "test-node".to_string(),
+            thread: "test-ws".to_string(),
             repo_root: PathBuf::from("/tmp/test-repo"),
             subagent_id: "test-agent".to_string(),
         };
@@ -1009,8 +858,8 @@ mod tests {
     fn test_scoped_command_with_gpu_construction() {
         let ws = SubagentWorkspace {
             path: PathBuf::from("/tmp/test-ws"),
-            change_id: "test-change".to_string(),
-            workspace_name: "test-ws".to_string(),
+            node_id: "test-node".to_string(),
+            thread: "test-ws".to_string(),
             repo_root: PathBuf::from("/tmp/test-repo"),
             subagent_id: "test-agent".to_string(),
         };
@@ -1041,8 +890,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let ws = SubagentWorkspace {
             path: dir.path().to_path_buf(),
-            change_id: "test-change".to_string(),
-            workspace_name: "test-ws".to_string(),
+            node_id: "test-node".to_string(),
+            thread: "test-ws".to_string(),
             repo_root: dir.path().to_path_buf(),
             subagent_id: "test-agent".to_string(),
         };
@@ -1058,143 +907,96 @@ mod tests {
         assert!(status.success());
     }
 
-    #[tokio::test]
-    async fn test_jj_workspace_lifecycle_end_to_end() {
-        let test_root = tempdir().expect("tempdir");
-        let repo_dir = test_root.path().join("repo");
-        std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+    /// Initialize a plain Git repository with a deterministic identity and one
+    /// base commit.
+    fn native_repo(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.name", "Workspace Test"]);
+        git(dir, &["config", "user.email", "workspace@example.test"]);
+        std::fs::write(dir.join("README.md"), "# Initial\n").expect("write base file");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "initial"]);
+    }
 
-        // Initialize a clean test repo
-        let init_status = std::process::Command::new("jj")
-            .arg("git")
-            .arg("init")
-            .current_dir(&repo_dir)
-            .status()
-            .expect("init jj repo");
-        assert!(init_status.success());
-
-        // Create initial base file and commit
-        std::fs::write(repo_dir.join("README.md"), "# Initial\n").expect("write file");
-        let desc_status = std::process::Command::new("jj")
-            .arg("describe")
-            .arg("-m")
-            .arg("initial commit")
-            .current_dir(&repo_dir)
-            .status()
-            .expect("describe initial commit");
-        assert!(desc_status.success());
-
-        let ws_dir = test_root.path().join("subagent-ws");
-
-        // 1. Provision workspace
-        let ws = SubagentWorkspace::provision_in(&repo_dir, &ws_dir, "@", "test-subagent")
-            .await
-            .expect("provision workspace");
-
-        assert!(ws.path.exists());
-        assert_eq!(ws.path, ws_dir);
-        assert!(!ws.change_id.is_empty());
-        assert_eq!(ws.subagent_id, "test-subagent");
-
-        // 2. Query status
-        let status_out = ws.status().await.expect("status");
-        assert!(status_out.contains("Working copy") || status_out.contains("The working copy"));
-
-        // 3. Make change inside workspace
-        std::fs::write(ws.path.join("README.md"), "# Modified by subagent\n").expect("modify file");
-
-        // 4. Query diff
-        let diff_out = ws.diff().await.expect("diff");
-        assert!(diff_out.contains("Modified by subagent") || diff_out.contains("README.md"));
-
-        // 5. Run scoped command inside the workspace
-        let limits = ResourceLimits::default().with_cpu_quota("200%");
-        let mut test_cmd = Command::new("sh");
-        test_cmd.arg("-c").arg("test -f README.md");
-        let run_status = ws
-            .run_scoped(&mut test_cmd, limits)
-            .await
-            .expect("scoped command");
-        assert!(run_status.success());
-
-        // 6. Query commit id
-        let commit_id = ws.commit_id().await.expect("commit_id");
-        assert!(!commit_id.is_empty());
-
-        // 7. Cleanup
-        ws.cleanup().await.expect("cleanup");
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
         assert!(
-            !ws_dir.exists(),
-            "workspace directory should be removed on cleanup"
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 
     #[tokio::test]
-    async fn test_rebase_into_success() {
+    async fn test_native_workspace_lifecycle_end_to_end() {
         let test_root = tempdir().expect("tempdir");
         let repo_dir = test_root.path().join("repo");
         std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+        native_repo(&repo_dir);
 
-        // Init repo and create initial commit
-        let init_status = std::process::Command::new("jj")
-            .arg("git")
-            .arg("init")
-            .current_dir(&repo_dir)
-            .status()
-            .expect("init jj repo");
-        assert!(init_status.success());
+        // Capture an immutable live point on the main thread.
+        let graph = ChangeGraph::open(&repo_dir).expect("open graph");
+        let source = graph
+            .capture(
+                "main",
+                EditProvenance {
+                    session_id: "workspace-test".to_string(),
+                    tool: "fork".to_string(),
+                    selection_mode: None,
+                    path: None,
+                },
+                None,
+            )
+            .expect("capture source point");
 
-        std::fs::write(repo_dir.join("base.txt"), "base content\n").expect("write base");
-        let desc_status = std::process::Command::new("jj")
-            .arg("describe")
-            .arg("-m")
-            .arg("base commit")
-            .current_dir(&repo_dir)
-            .status()
-            .expect("describe base");
-        assert!(desc_status.success());
-
-        // Advance parent with a new commit
-        let commit_status = std::process::Command::new("jj")
-            .arg("commit")
-            .arg("-m")
-            .arg("head commit")
-            .current_dir(&repo_dir)
-            .status()
-            .expect("commit head");
-        assert!(commit_status.success());
-        // Query the change id of the head commit in repo_dir
-        let head_change_out = std::process::Command::new("jj")
-            .arg("log")
-            .arg("--no-graph")
-            .arg("-r")
-            .arg("@")
-            .arg("-T")
-            .arg("change_id")
-            .current_dir(&repo_dir)
-            .output()
-            .expect("query head change_id");
-        let target_dest = String::from_utf8_lossy(&head_change_out.stdout)
-            .trim()
-            .to_string();
-        assert!(!target_dest.is_empty());
-
-        // Provision subagent workspace from the base commit (@-)
-        let ws_dir = test_root.path().join("subagent-rebase-ws");
-        let ws = SubagentWorkspace::provision_in(&repo_dir, &ws_dir, "@-", "rebase-agent")
+        let ws_dir = test_root.path().join("subagent-ws");
+        let ws = SubagentWorkspace::provision_in(&repo_dir, &ws_dir, &source.id, "test-subagent")
             .await
             .expect("provision workspace");
 
-        // Subagent modifies a distinct file
-        std::fs::write(ws.path.join("feature.txt"), "feature content\n").expect("write feature");
+        // The fork materialized the source tree and linked back to the store.
+        assert!(ws.path.exists());
+        assert_eq!(ws.path, ws_dir);
+        assert_eq!(ws.node_id, source.id);
+        assert_eq!(ws.thread, "test-subagent");
+        assert_eq!(ws.subagent_id, "test-subagent");
+        assert_eq!(
+            std::fs::read_to_string(ws_dir.join("README.md")).unwrap(),
+            "# Initial\n"
+        );
+        assert!(ws_dir.join(".juto-workspace.json").exists());
 
-        // Rebase into target commit from repo
-        let new_commit_id = ws
-            .rebase_into(&target_dest)
-            .await
-            .expect("rebase into target");
-        assert!(!new_commit_id.is_empty());
+        // The fork is independent: editing it never touches the parent.
+        std::fs::write(ws.path.join("README.md"), "# Modified by subagent\n").expect("modify");
+        assert_eq!(
+            std::fs::read_to_string(repo_dir.join("README.md")).unwrap(),
+            "# Initial\n"
+        );
+
+        // Run a scoped command inside the workspace.
+        let limits = ResourceLimits::default().with_cpu_quota("200%");
+        let mut test_cmd = Command::new("sh");
+        test_cmd.arg("-c").arg("test -f README.md");
+        assert!(
+            ws.run_scoped(&mut test_cmd, limits)
+                .await
+                .expect("scoped command")
+                .success()
+        );
+
+        // Cleanup removes the owned directory; the shared DAG keeps its history.
         ws.cleanup().await.expect("cleanup");
+        assert!(!ws_dir.exists(), "workspace directory should be removed");
+        let state = ChangeGraph::open(&repo_dir)
+            .expect("reopen graph")
+            .state()
+            .expect("state");
+        assert!(state.heads.contains_key("test-subagent"));
+        assert!(state.nodes.iter().any(|node| node.id == source.id));
     }
 
     #[tokio::test]
@@ -1202,8 +1004,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let ws = SubagentWorkspace {
             path: dir.path().to_path_buf(),
-            change_id: "test-change".to_string(),
-            workspace_name: "test-ws".to_string(),
+            node_id: "test-node".to_string(),
+            thread: "test-ws".to_string(),
             repo_root: dir.path().to_path_buf(),
             subagent_id: "test-agent".to_string(),
         };
@@ -1224,8 +1026,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let ws = SubagentWorkspace {
             path: dir.path().to_path_buf(),
-            change_id: "test-change".to_string(),
-            workspace_name: "test-ws".to_string(),
+            node_id: "test-node".to_string(),
+            thread: "test-ws".to_string(),
             repo_root: dir.path().to_path_buf(),
             subagent_id: "test-agent".to_string(),
         };
@@ -1242,20 +1044,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_workspace_not_in_jj_repo_error() {
+    async fn test_workspace_not_in_repo_error() {
         let non_repo = tempdir().expect("tempdir");
         let ws_dir = non_repo.path().join("ws");
 
-        let result =
-            SubagentWorkspace::provision_in(non_repo.path(), &ws_dir, "@", "agent-fail").await;
+        let result = SubagentWorkspace::provision_in(
+            non_repo.path(),
+            &ws_dir,
+            "0".repeat(40).as_str(),
+            "agent-fail",
+        )
+        .await;
         assert!(result.is_err());
         match result.unwrap_err() {
-            WorkspaceError::JjCommandFailed { stderr, .. } => {
-                let lower = stderr.to_lowercase();
-                assert!(lower.contains("no jujutsu repo") || lower.contains("error"));
+            WorkspaceError::Vcs(message) => {
+                assert!(!message.is_empty(), "native VCS failure must be honest");
             }
-            other => panic!("expected JjCommandFailed, got {:?}", other),
+            other => panic!("expected Vcs error, got {other:?}"),
         }
+        assert!(!ws_dir.exists(), "a failed fork must not leave a directory");
     }
 
     #[test]
@@ -1266,8 +1073,8 @@ mod tests {
 
         let ws = SubagentWorkspace {
             path: ws_path.clone(),
-            change_id: "test-change".to_string(),
-            workspace_name: "subagent-ws".to_string(),
+            node_id: "test-node".to_string(),
+            thread: "subagent-ws".to_string(),
             repo_root: dir.path().to_path_buf(),
             subagent_id: "test-agent".to_string(),
         };
@@ -1302,31 +1109,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cleanup_preserves_directory_on_forget_failure() {
+    async fn test_cleanup_rejects_foreign_marker_and_preserves_directory() {
         let dir = tempdir().expect("tempdir");
         let ws_path = dir.path().join("untracked-ws");
         std::fs::create_dir_all(&ws_path).expect("create dir");
         std::fs::write(ws_path.join("critical_work.rs"), "fn review() {}").expect("write artifact");
+        // A marker naming a different thread than the workspace claims.
+        std::fs::write(
+            ws_path.join(".juto-workspace.json"),
+            r#"{"git_dir":"/nonexistent","thread":"other"}"#,
+        )
+        .expect("write marker");
 
-        // SubagentWorkspace with bogus repo root and workspace name where `jj workspace forget` will fail
         let ws = SubagentWorkspace {
             path: ws_path.clone(),
-            change_id: "nonexistent".to_string(),
-            workspace_name: "bogus-ws".to_string(),
+            node_id: "nonexistent".to_string(),
+            thread: "agent-1".to_string(),
             repo_root: dir.path().join("nonexistent-repo"),
             subagent_id: "agent-1".to_string(),
         };
 
         let cleanup_res = ws.cleanup().await;
-        assert!(cleanup_res.is_err(), "cleanup must fail if forget fails");
+        assert!(
+            cleanup_res.is_err(),
+            "cleanup must refuse a directory it does not own"
+        );
         assert!(
             ws_path.exists(),
-            "workspace directory must be preserved on disk for human review when forget fails"
+            "workspace directory must be preserved when ownership cannot be proven"
         );
         assert!(
             ws_path.join("critical_work.rs").exists(),
             "review artifacts must remain intact"
         );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_removes_owned_directory() {
+        let test_root = tempdir().expect("tempdir");
+        let repo_dir = test_root.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).expect("create repo dir");
+        native_repo(&repo_dir);
+
+        let graph = ChangeGraph::open(&repo_dir).expect("open graph");
+        let source = graph
+            .capture(
+                "main",
+                EditProvenance {
+                    session_id: "workspace-test".to_string(),
+                    tool: "fork".to_string(),
+                    selection_mode: None,
+                    path: None,
+                },
+                None,
+            )
+            .expect("capture source point");
+
+        let ws_dir = test_root.path().join("owned-ws");
+        let ws = SubagentWorkspace::provision_in(&repo_dir, &ws_dir, &source.id, "owned-agent")
+            .await
+            .expect("provision workspace");
+        assert!(ws_dir.exists());
+        ws.cleanup().await.expect("cleanup");
+        assert!(!ws_dir.exists(), "owned workspace directory is removed");
     }
 
     #[tokio::test]
@@ -1338,8 +1183,8 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let ws = SubagentWorkspace {
             path: dir.path().to_path_buf(),
-            change_id: "test-change".to_string(),
-            workspace_name: "test-ws".to_string(),
+            node_id: "test-node".to_string(),
+            thread: "test-ws".to_string(),
             repo_root: dir.path().to_path_buf(),
             subagent_id: "test-agent".to_string(),
         };
