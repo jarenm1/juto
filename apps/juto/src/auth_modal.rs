@@ -344,9 +344,8 @@ impl AuthModal {
         });
 
         let obs_search = cx.observe(&search_input, |_, _, cx| cx.notify());
-        // Providers surface when the catalog carries chat models for them —
-        // even ones whose transport is still pending, like devin — so login
-        // can be configured before the wire protocol lands.
+        // Providers surface when the catalog carries chat models for them, so
+        // login can be configured for every transport juto ships.
         let supported: BTreeSet<&str> = runtime
             .catalog()
             .iter()
