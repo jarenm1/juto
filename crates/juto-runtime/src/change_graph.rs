@@ -273,15 +273,21 @@ impl ChangeGraph {
 
     /// Caller holds the native workspace mutation lock while capturing.
     pub fn snapshot_tree(&self) -> Result<String> {
+        let baseline = self.capture_baseline()?;
+        self.repository.capture_tree(&baseline)
+    }
+
+    /// The tree a workspace capture is layered on: this workspace's head, the
+    /// thread head, or the base tree.
+    fn capture_baseline(&self) -> Result<String> {
         let state = self.state()?;
-        let baseline = state
+        Ok(state
             .workspace_heads
             .get(&self.workspace_key())
             .or_else(|| self.repository.thread().and_then(|t| state.heads.get(t)))
             .and_then(|id| state.nodes.iter().find(|n| &n.id == id))
-            .map(|n| n.tree.as_str())
-            .unwrap_or(&state.base_tree);
-        self.repository.capture_tree(baseline)
+            .map(|n| n.tree.clone())
+            .unwrap_or_else(|| state.base_tree.clone()))
     }
 
     pub fn path_tracked(&self, tree: &str, path: &[u8]) -> Result<bool> {
@@ -780,8 +786,14 @@ impl ChangeGraph {
         Ok(outcomes)
     }
 
-    /// Record a resolved merge: capture the workspace as a two-parent node and
-    /// retire any imported remote head it folded in.
+    /// Record a resolved merge as a two-parent node, and retire any imported
+    /// remote head it folded in.
+    ///
+    /// The node's tree is the merge result with the *conflicted* paths replaced
+    /// by the workspace's version. Every other path comes from the merge, so a
+    /// workspace that never materialized a path (a sparse fork) or holds a
+    /// stale copy of one cannot silently revert the other side's changes. The
+    /// resolved tree is then materialized, so the workspace matches the node.
     ///
     /// A conflicting [`ChangeGraph::reconcile`] changes nothing, so the remote
     /// head stays and `needs_reconcile` keeps reporting it. Once the caller has
@@ -796,17 +808,60 @@ impl ChangeGraph {
         right: &str,
         provenance: EditProvenance,
     ) -> Result<ChangeNode> {
+        validate_thread_name(thread)?;
         let state = self.state()?;
-        let left = resolve_node(&state, left)?.id.clone();
-        let right = resolve_node(&state, right)?.id.clone();
-        let node = self.capture(thread, provenance, Some(vec![left.clone(), right.clone()]))?;
+        let left_node = resolve_node(&state, left)?;
+        let right_node = resolve_node(&state, right)?;
+        let left_id = left_node.id.clone();
+        let right_id = right_node.id.clone();
+        let base_tree = match merge_base(&state, &left_node.id, &right_node.id)? {
+            MergeBase::Node(id) => state
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .context("missing merge base")?
+                .tree
+                .clone(),
+            MergeBase::Base => state.base_tree.clone(),
+        };
+        ensure!(
+            self.repository.supports_tree_merge()?,
+            "this Git does not support three-way tree merges (needs git >= 2.45)"
+        );
+        let merged = self
+            .repository
+            .merge_trees(&base_tree, &left_node.tree, &right_node.tree)?;
+        let tree = {
+            let _lock =
+                crate::vcs::MutationLock::acquire(self.workspace()).map_err(anyhow::Error::msg)?;
+            let baseline = self.capture_baseline()?;
+            let tree = self.repository.resolve_conflicts(
+                &merged.tree,
+                &merged.conflicts,
+                self.workspace(),
+                &baseline,
+            )?;
+            // Materialize the resolved tree so the workspace matches the node.
+            // Otherwise the next capture would record the workspace's stale copy
+            // of every path the merge changed and silently revert it.
+            let current = self.snapshot_tree()?;
+            self.repository
+                .restore_tree(&current, &tree, self.workspace())?;
+            tree
+        };
+        let node = self.append_explicit_tree(
+            thread,
+            tree,
+            vec![left_id.clone(), right_id.clone()],
+            provenance,
+        )?;
         let suffix = format!("/{thread}");
         let retired: Vec<String> = self
             .state()?
             .heads
             .iter()
             .filter(|(key, head)| {
-                key.ends_with(&suffix) && (head.as_str() == left || head.as_str() == right)
+                key.ends_with(&suffix) && (head.as_str() == left_id || head.as_str() == right_id)
             })
             .map(|(key, _)| key.clone())
             .collect();

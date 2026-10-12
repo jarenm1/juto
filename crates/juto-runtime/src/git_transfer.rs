@@ -345,6 +345,100 @@ impl GitRepository {
         Ok(!output.stdout.is_empty())
     }
 
+    /// Look up one entry in `tree` by exact path.
+    fn tree_entry(&self, tree: &str, path: &[u8]) -> Result<Option<(String, String)>> {
+        let tree = self.resolve_tree(tree)?;
+        let args: [&OsStr; 7] = [
+            OsStr::new("--literal-pathspecs"),
+            OsStr::new("ls-tree"),
+            OsStr::new("-z"),
+            OsStr::new("--full-tree"),
+            OsStr::new(tree.as_str()),
+            OsStr::new("--"),
+            OsStr::from_bytes(path),
+        ];
+        let output = self
+            .git_os(&args)
+            .output()
+            .context("failed to run `git ls-tree`")?;
+        if !output.status.success() {
+            bail!("`git ls-tree` failed: {}", describe_failure(&output));
+        }
+        let record = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .next()
+            .unwrap_or_default();
+        if record.is_empty() {
+            return Ok(None);
+        }
+        // `<mode> SP <type> SP <oid> TAB <path>`
+        let tab = record
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("malformed `git ls-tree` record")?;
+        let mut fields = record[..tab].split(|byte| *byte == b' ');
+        let mode = fields.next().context("missing mode")?;
+        let _kind = fields.next().context("missing type")?;
+        let oid = fields.next().context("missing oid")?;
+        Ok(Some((
+            String::from_utf8(mode.to_vec()).context("`git ls-tree` produced a non-UTF-8 mode")?,
+            String::from_utf8(oid.to_vec()).context("`git ls-tree` produced a non-UTF-8 oid")?,
+        )))
+    }
+
+    /// Replace each conflicted path in `merged_tree` with the workspace's
+    /// version, so a hand-resolved merge records the agent's resolutions on top
+    /// of the merge result.
+    ///
+    /// Only the conflicted paths are taken from the workspace. Every other path
+    /// comes from the merge, so a workspace that never materialized a path (a
+    /// sparse fork) or holds a stale copy of one cannot silently revert the
+    /// other side's changes. A conflicted path the workspace no longer has is
+    /// removed when `baseline` tracked it — the agent deleted it — and left at
+    /// the merge's version otherwise.
+    pub fn resolve_conflicts(
+        &self,
+        merged_tree: &str,
+        conflicts: &[String],
+        workspace: &Path,
+        baseline: &str,
+    ) -> Result<String> {
+        let mut tree = merged_tree.to_string();
+        for conflict in conflicts {
+            let path = conflict.as_bytes();
+            let file = workspace.join(conflict);
+            match fs::symlink_metadata(&file) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let link = fs::read_link(&file)
+                        .with_context(|| format!("cannot read symlink {}", file.display()))?;
+                    let blob = self.hash_bytes(link.as_os_str().as_bytes())?;
+                    tree = self.update_tree_entry(&tree, path, "120000", &blob)?;
+                }
+                Ok(metadata) if metadata.is_file() => {
+                    let blob = self
+                        .hash_files(&[path.to_vec()])?
+                        .into_iter()
+                        .next()
+                        .context("`git hash-object` produced no blob")?;
+                    let mode = if metadata.permissions().mode() & 0o111 != 0 {
+                        "100755"
+                    } else {
+                        "100644"
+                    };
+                    tree = self.update_tree_entry(&tree, path, mode, &blob)?;
+                }
+                _ => {
+                    let deleted = self.path_tracked(baseline, path)?;
+                    if deleted && let Some((_, oid)) = self.tree_entry(&tree, path)? {
+                        tree = self.update_tree_entry(&tree, path, "0", &oid)?;
+                    }
+                }
+            }
+        }
+        Ok(tree)
+    }
+
     /// Whether `path` matches the repository's ignore rules.
     ///
     /// `path` is the workspace-relative path as raw bytes. The check uses
