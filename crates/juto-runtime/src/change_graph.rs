@@ -132,6 +132,9 @@ pub struct GcReport {
     /// Snapshot refs actually deleted by the sweep. A pruned node whose ref was
     /// already gone does not count.
     pub released_refs: usize,
+    /// `refs/juto/nodes/<id>` refs actually deleted by the sweep, so a pruned
+    /// node leaves no replication ref behind.
+    pub released_node_refs: usize,
 }
 
 pub struct ChangeGraph {
@@ -659,12 +662,22 @@ impl ChangeGraph {
                 pruned_nodes: 0,
                 retained_nodes: retained.len(),
                 released_refs: 0,
+                released_node_refs: 0,
             });
         }
         let mut released_refs = 0;
+        let mut released_node_refs = 0;
         for node in &pruned {
             if self.repository.release_snapshot(&node.id)? {
                 released_refs += 1;
+            }
+            // A replicated node also pins its metadata under `refs/juto/nodes`;
+            // releasing only the snapshot ref would leak that ref forever.
+            if self
+                .repository
+                .release_ref(&crate::replication::node_ref(&node.id))?
+            {
+                released_node_refs += 1;
             }
         }
         self.write_nodes(&retained)?;
@@ -673,6 +686,7 @@ impl ChangeGraph {
             pruned_nodes: pruned.len(),
             retained_nodes: retained.len(),
             released_refs,
+            released_node_refs,
         })
     }
 
