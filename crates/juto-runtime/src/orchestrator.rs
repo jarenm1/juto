@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use crate::change_graph::ChangeGraph;
 use crate::subagents::{SubagentError, SubagentManager, SubagentResult, TaskSpec};
+use crate::workspace::{ResourceLimits, ScopedChild, ScopedStdio, SubagentWorkspace};
 
 /// Intent route classified by discrete triage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,8 +324,16 @@ pub trait QualityGateRunner: Send + Sync + fmt::Debug {
 }
 
 /// Real process runner executing quality gates via `tokio::process::Command` with cancellation safety.
+///
+/// When `limits` is set, a gate runs inside a systemd user scope so the CPU and
+/// memory caps apply to the whole process tree — gates are the heaviest commands
+/// the orchestrator runs. `enforce_scope` is left to the caller: with it off, a
+/// host without `systemd-run` degrades to a bare spawn rather than failing the
+/// gate.
 #[derive(Debug, Default, Clone)]
-pub struct CommandGateRunner;
+pub struct CommandGateRunner {
+    pub limits: Option<ResourceLimits>,
+}
 
 #[async_trait]
 impl QualityGateRunner for CommandGateRunner {
@@ -343,12 +352,51 @@ impl QualityGateRunner for CommandGateRunner {
         cmd.stderr(std::process::Stdio::piped());
         cmd.kill_on_drop(true);
 
-        let child = cmd.spawn().map_err(|err| {
-            OrchestratorError::Verification(format!(
-                "failed to spawn gate '{}' ({}): {err}",
-                spec.name, spec.command
-            ))
-        })?;
+        let child = match &self.limits {
+            Some(limits) => {
+                // A gate without an explicit cwd runs in the process's own
+                // directory, and the scope builder needs a real workspace path.
+                let cwd = match &spec.cwd {
+                    Some(cwd) => cwd.clone(),
+                    None => std::env::current_dir().map_err(|err| {
+                        OrchestratorError::Verification(format!(
+                            "gate '{}' has no cwd and the process directory is unavailable: {err}",
+                            spec.name
+                        ))
+                    })?,
+                };
+                let workspace = SubagentWorkspace {
+                    path: cwd.clone(),
+                    node_id: String::new(),
+                    thread: String::new(),
+                    repo_root: cwd,
+                    subagent_id: String::new(),
+                };
+                workspace
+                    .spawn_scoped(
+                        &mut cmd,
+                        limits.clone(),
+                        ScopedStdio {
+                            stdin: std::process::Stdio::null(),
+                            stdout: std::process::Stdio::piped(),
+                            stderr: std::process::Stdio::piped(),
+                        },
+                    )
+                    .await
+                    .map_err(|err| {
+                        OrchestratorError::Verification(format!(
+                            "failed to spawn gate '{}' ({}): {err}",
+                            spec.name, spec.command
+                        ))
+                    })?
+            }
+            None => ScopedChild::unscoped(cmd.spawn().map_err(|err| {
+                OrchestratorError::Verification(format!(
+                    "failed to spawn gate '{}' ({}): {err}",
+                    spec.name, spec.command
+                ))
+            })?),
+        };
 
         let timeout_duration = Duration::from_secs(spec.timeout_secs);
         let run_future = child.wait_with_output();
@@ -569,6 +617,9 @@ pub struct OrchestratorConfig {
     /// Repository whose change graph records a verified checkpoint when a task
     /// is approved. `None` disables the checkpoint.
     pub repo_root: Option<PathBuf>,
+    /// Resource governance for the quality gates. `None` runs them as bare
+    /// spawns; gates are the heaviest commands the orchestrator runs.
+    pub gate_limits: Option<ResourceLimits>,
 }
 
 impl Default for OrchestratorConfig {
@@ -587,6 +638,7 @@ impl Default for OrchestratorConfig {
             default_model: None,
             reviewer_model: None,
             repo_root: None,
+            gate_limits: None,
         }
     }
 }
@@ -665,7 +717,11 @@ impl OrchestratorBuilder {
 
     pub fn build(self) -> Result<Orchestrator, OrchestratorError> {
         let judge = self.judge.unwrap_or_else(|| Arc::new(RuleBasedJudge));
-        let verifier = self.verifier.unwrap_or_else(|| Arc::new(CommandGateRunner));
+        let verifier = self.verifier.unwrap_or_else(|| {
+            Arc::new(CommandGateRunner {
+                limits: self.config.gate_limits.clone(),
+            })
+        });
         let subagents = self
             .subagents
             .ok_or_else(|| OrchestratorError::Config("subagents manager is required".into()))?;
@@ -1709,7 +1765,7 @@ pub mod tests {
 
     #[tokio::test]
     async fn test_command_gate_runner_real_process() {
-        let runner = CommandGateRunner;
+        let runner = CommandGateRunner { limits: None };
         let cancel = CancellationToken::new();
 
         // Successful command
@@ -1723,6 +1779,31 @@ pub mod tests {
         let spec_fail = QualityGateSpec::new(QualityGateKind::Test, "false-test", "false");
         let res_fail = runner.execute_gate(&spec_fail, &cancel).await.unwrap();
         assert!(!res_fail.passed);
+    }
+
+    /// Live proof that a governed gate runs inside a systemd user scope.
+    ///
+    /// Gates are the heaviest commands the orchestrator runs, so an uncapped gate
+    /// can exhaust the host.
+    #[tokio::test]
+    async fn a_governed_gate_runs_under_a_systemd_scope() {
+        if !crate::workspace::is_systemd_run_available() {
+            eprintln!("skipping governed-gate test: systemd-run unavailable");
+            return;
+        }
+        let runner = CommandGateRunner {
+            limits: Some(ResourceLimits::default().with_enforce_scope(false)),
+        };
+        let cancel = CancellationToken::new();
+        let spec = QualityGateSpec::new(QualityGateKind::Build, "cgroup", "cat")
+            .with_args(["/proc/self/cgroup"]);
+        let result = runner.execute_gate(&spec, &cancel).await.expect("gate");
+        assert!(result.passed, "{result:?}");
+        assert!(
+            result.stdout.contains(".scope"),
+            "expected a systemd scope cgroup, got: {}",
+            result.stdout
+        );
     }
 
     #[tokio::test]

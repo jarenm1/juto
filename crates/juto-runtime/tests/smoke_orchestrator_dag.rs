@@ -91,7 +91,7 @@ async fn smoke_e2e_dag_with_real_command_gates_and_subagents() {
     let orchestrator = Orchestrator::builder()
         .with_judge(Arc::new(ScriptedJudge::single("end_to_end_task")))
         .with_subagents(subagents)
-        .with_verifier(Arc::new(CommandGateRunner))
+        .with_verifier(Arc::new(CommandGateRunner { limits: None }))
         .with_gates(gates)
         .with_max_remediation_attempts(3)
         .build()
@@ -307,7 +307,7 @@ async fn an_approved_task_records_a_verified_checkpoint() {
     let orchestrator = Orchestrator::builder()
         .with_judge(Arc::new(ScriptedJudge::single("end_to_end_task")))
         .with_subagents(subagents)
-        .with_verifier(Arc::new(CommandGateRunner))
+        .with_verifier(Arc::new(CommandGateRunner { limits: None }))
         .with_config(config)
         .build()
         .expect("orchestrator should build");
