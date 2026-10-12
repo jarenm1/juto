@@ -886,17 +886,37 @@ impl ChangeGraph {
 
     /// Move `remote`'s head onto `thread`, retiring the owner-qualified key.
     ///
+    /// The adopted tree is materialized into this workspace, so a later capture
+    /// cannot record the workspace's stale copy of every path the adopted work
+    /// changed and silently revert it.
+    ///
     /// Public so a caller that knows a thread's work belongs on another thread
     /// — the orchestrator folding a builder's approved thread back — can adopt
     /// it when the target has no history yet.
     pub fn adopt_head(&self, thread: &str, remote: &str) -> Result<()> {
-        let _lock = self.lock()?;
-        let mut state = self.load_locked()?;
-        let Some(head) = state.heads.remove(remote) else {
-            return Ok(());
+        let tree = {
+            let _lock = self.lock()?;
+            let mut state = self.load_locked()?;
+            let Some(head) = state.heads.remove(remote) else {
+                return Ok(());
+            };
+            let tree = state
+                .nodes
+                .iter()
+                .find(|n| n.id == head)
+                .with_context(|| format!("adopted head {remote} names an unknown node {head}"))?
+                .tree
+                .clone();
+            state.heads.insert(thread.to_string(), head);
+            self.save_locked(&state)?;
+            tree
         };
-        state.heads.insert(thread.to_string(), head);
-        self.save_locked(&state)?;
+        // Materialize outside the graph lock: `restore_tree` shells out to git.
+        let _workspace_lock =
+            crate::vcs::MutationLock::acquire(self.workspace()).map_err(anyhow::Error::msg)?;
+        let current = self.snapshot_tree()?;
+        self.repository
+            .restore_tree(&current, &tree, self.workspace())?;
         Ok(())
     }
 

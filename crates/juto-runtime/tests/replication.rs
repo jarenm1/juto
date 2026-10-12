@@ -550,6 +550,21 @@ fn reconcile_adopts_a_remote_head_when_the_thread_has_no_local_head() {
         b.pending_reconcile_threads().unwrap().is_empty(),
         "a reconciled thread must no longer be pending"
     );
+
+    // The adopted tree is materialized, so a later capture cannot record the
+    // workspace's stale copy and silently revert the adopted work.
+    assert_eq!(
+        fs::read_to_string(fixture.b.join("a.txt")).unwrap(),
+        "a\n",
+        "adoption must materialize the adopted tree"
+    );
+    fs::write(fixture.b.join("later.txt"), "later\n").unwrap();
+    let later = b.capture("main", provenance("b"), None).unwrap();
+    assert_eq!(
+        git(&fixture.b, &["show", &format!("{}:a.txt", later.tree)]),
+        "a",
+        "a capture after adoption must not revert the adopted work"
+    );
 }
 
 #[test]
