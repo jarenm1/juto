@@ -1136,7 +1136,8 @@ impl DesktopSupervisor {
     /// Kills orphan environment scopes and removes stale runtime directories
     /// left behind by a previous supervisor process.
     ///
-    /// Live environments owned by this supervisor are left untouched.
+    /// Live environments owned by this supervisor are left untouched, and so are
+    /// environments whose owning supervisor process is still alive.
     pub fn reconcile(&self) -> ReconcileReport {
         let mut report = ReconcileReport::default();
         let live: Vec<String> = self
@@ -1146,47 +1147,37 @@ impl DesktopSupervisor {
             .map(|id| sanitize(id))
             .collect();
 
-        if let Ok(output) = Command::new("systemctl")
-            .args([
-                "--user",
-                "list-units",
-                "--all",
-                "--no-legend",
-                "--plain",
-                "juto-desktop-*.scope",
-            ])
-            .output()
-        {
-            for line in String::from_utf8_lossy(&output.stdout).lines() {
-                let Some(unit) = line.split_whitespace().next() else {
-                    continue;
-                };
-                if !unit.starts_with("juto-desktop-") {
-                    continue;
-                }
-                if live.iter().any(|id| unit.contains(id.as_str())) {
-                    continue;
-                }
+        let root = desktop_runtime_root();
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return report;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if live.contains(&name) {
+                continue;
+            }
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            // Only reclaim an environment whose owning supervisor is gone;
+            // another live supervisor's environments must be left alone.
+            let owner = std::fs::read_to_string(path.join("owner"))
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok());
+            if owner.map(process_alive).unwrap_or(false) {
+                continue;
+            }
+            for unit in scopes_for_environment(&name) {
                 let _ = Command::new("systemctl")
-                    .args(["--user", "stop", unit])
+                    .args(["--user", "stop", &unit])
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status();
-                report.stopped_units.push(unit.to_string());
+                report.stopped_units.push(unit);
             }
-        }
-
-        let root = desktop_runtime_root();
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if live.contains(&name) {
-                    continue;
-                }
-                let path = entry.path();
-                if path.is_dir() && std::fs::remove_dir_all(&path).is_ok() {
-                    report.removed_directories.push(path);
-                }
+            if std::fs::remove_dir_all(&path).is_ok() {
+                report.removed_directories.push(path);
             }
         }
         report

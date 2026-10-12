@@ -40,13 +40,17 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   decodes the same stream.
 - Hardening: effective scope properties are verified after launch and creation
   fails closed when they do not match; control leases and grants expire and are
-  swept; orphan scopes and stale runtime directories are reconciled at startup.
+  swept; orphan scopes and stale runtime directories are reconciled at startup,
+  scoped to environments whose owning supervisor process is gone.
+- Same-host viewer transport: `Attach` returns the sealed frame pool as an
+  `SCM_RIGHTS` descriptor with negotiated metadata, and the control socket
+  authenticates callers by `SO_PEERCRED`.
 
 Not implemented: audio (private PipeWire sink plus Opus), Xwayland,
 text-input-v3, the hardware render-node profile, DMA-BUF export/import, TURN
-relay configuration, descriptor passing (SCM_RIGHTS) to an out-of-process
-viewer, and deployment provisioning (TLS termination, public reachability).
-Sections describing those remain design.
+relay configuration, running the compositor in a separate worker process inside
+the environment cgroup, and deployment provisioning (TLS termination, public
+reachability). Sections describing those remain design.
 
 ## 1. Decision and scope
 

@@ -199,6 +199,14 @@ reports connection state and errors instead of showing a stale frame as live.
 `juto --desktop <command> [args...]` opens the same viewer directly for
 development.
 
+**Same-host viewer transport.** The daemon's `Attach` command returns the
+environment's sealed frame pool as an `SCM_RIGHTS` descriptor alongside
+negotiated metadata (pool id, dimensions, stride, format, slot count, slot
+size); `ViewerClient` maps it read-only and reads composed frames with no codec
+on the path. The control socket authenticates callers by `SO_PEERCRED`, so only
+the daemon's own user may drive its environments. A viewer cannot alter desktop
+content: the pool is sealed against future writable mappings.
+
 **Remote across-device viewing.** `desktop attach` issues a one-time attach
 token (60-second expiry, consumed on use) and returns a loopback viewer URL. The
 signaling server serves the browser viewer page and relays SDP/ICE over a
@@ -222,8 +230,8 @@ previous process; the daemon and the runtime call it at startup.
 **Not yet shipped: audio and the remaining profiles.** Audio (private PipeWire
 sink plus Opus), Xwayland, text-input-v3, the hardware render-node profile,
 DMA-BUF export/import, and TURN relay configuration are not implemented.
-Descriptor passing (SCM_RIGHTS) to an out-of-process viewer is not wired; the
-embedded viewer reads the pool in-process. A compile pass is not evidence of
+The embedded GPUI viewer still reads the pool in-process; wiring it to the
+daemon's `SCM_RIGHTS` attach path is a follow-up. A compile pass is not evidence of
 streaming; the shipped behavior is verified by the integration tests and the
 smokes described below.
 
