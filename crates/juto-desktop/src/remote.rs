@@ -53,6 +53,30 @@ fn with_ice_credentials(url: &str, username: &str, credential: &str) -> String {
     }
 }
 
+/// Splits configured ICE servers into STUN URIs (in configured order) and
+/// TURN URIs, embedding supplied credentials.
+///
+/// webrtcbin's `stun-server` property accepts exactly one URI, so callers must
+/// apply only the first entry; `add-turn-server` accepts every TURN URI.
+fn split_ice_servers(servers: &[IceServer]) -> (Vec<String>, Vec<String>) {
+    let mut stun = Vec::new();
+    let mut turn = Vec::new();
+    for server in servers {
+        let url = match (&server.username, &server.credential) {
+            (Some(username), Some(credential)) => {
+                with_ice_credentials(&server.url, username, credential)
+            }
+            _ => server.url.clone(),
+        };
+        if url.starts_with("turn:") || url.starts_with("turns:") {
+            turn.push(url);
+        } else {
+            stun.push(url);
+        }
+    }
+    (stun, turn)
+}
+
 /// A STUN/TURN server used for ICE.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -268,22 +292,25 @@ impl PresentationWorker {
             .property_from_str("bundle-policy", "max-bundle")
             .build()
             .map_err(|e| DesktopError::TransportUnavailable(format!("webrtcbin: {e}")))?;
-        // Every configured ICE server is applied: STUN through the property and
-        // TURN through the `add-turn-server` signal, with credentials embedded
-        // in the URL when the deployment supplies them (spec section 7).
-        for server in &config.ice_servers {
-            let url = match (&server.username, &server.credential) {
-                (Some(username), Some(credential)) => {
-                    with_ice_credentials(&server.url, username, credential)
-                }
-                _ => server.url.clone(),
-            };
-            if url.starts_with("turn:") || url.starts_with("turns:") {
-                // `add-turn-server` returns a boolean success flag.
-                let _ = webrtc.emit_by_name::<bool>("add-turn-server", &[&url]);
-            } else {
-                webrtc.set_property("stun-server", url.as_str());
+        // webrtcbin's `stun-server` property is single-valued, so only the
+        // first configured STUN server is applied; each extra one is reported
+        // instead of silently overwriting the previous entry. Every TURN
+        // server is applied through the `add-turn-server` signal, with
+        // credentials embedded in the URL when the deployment supplies them
+        // (spec section 7).
+        let (stun_servers, turn_servers) = split_ice_servers(&config.ice_servers);
+        if let Some((stun, rest)) = stun_servers.split_first() {
+            webrtc.set_property("stun-server", stun.as_str());
+            for ignored in rest {
+                tracing::warn!(
+                    server = %ignored,
+                    "webrtcbin accepts one STUN server; ignoring additional entry"
+                );
             }
+        }
+        for turn in &turn_servers {
+            // `add-turn-server` returns a boolean success flag.
+            let _ = webrtc.emit_by_name::<bool>("add-turn-server", &[&turn.as_str()]);
         }
 
         let appsrc_element: gst::Element = appsrc.clone().upcast();
@@ -1057,4 +1084,32 @@ fn apply_remote_input(env: &DesktopEnvironment, text: &str) {
         events,
     };
     let _ = env.dispatch_input(&owner, lease.epoch, env.generation(), batch);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IceServer, split_ice_servers};
+
+    fn server(url: &str, username: Option<&str>, credential: Option<&str>) -> IceServer {
+        IceServer {
+            url: url.to_string(),
+            username: username.map(str::to_string),
+            credential: credential.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn split_ice_servers_preserves_every_turn_and_stun_in_order() {
+        let servers = vec![
+            server("stun:a.example", None, None),
+            server("turn:b.example", Some("u"), Some("p")),
+            server("stun:c.example", None, None),
+            server("turns:d.example:443", None, None),
+        ];
+        let (stun, turn) = split_ice_servers(&servers);
+        // STUN order is preserved so the first configured server wins; the
+        // property is single-valued, so extras must not silently win.
+        assert_eq!(stun, vec!["stun:a.example", "stun:c.example"]);
+        assert_eq!(turn, vec!["turn:u:p@b.example", "turns:d.example:443"]);
+    }
 }

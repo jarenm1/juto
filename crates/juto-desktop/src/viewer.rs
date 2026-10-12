@@ -39,6 +39,7 @@ pub struct ViewerClient {
     stream: UnixStream,
     reader: ShmReader,
     info: AttachInfo,
+    env_id: String,
     epoch: Option<u64>,
     seq: u64,
 }
@@ -115,6 +116,7 @@ impl ViewerClient {
             stream,
             reader,
             info,
+            env_id: env_id.to_string(),
             epoch: None,
             seq: 0,
         })
@@ -143,7 +145,7 @@ impl ViewerClient {
         timeout: Duration,
     ) -> Result<(ShmSlotHeader, Vec<u8>), DesktopError> {
         let command = DesktopCommand::Observe {
-            env_id: self.info.pool_id.clone(),
+            env_id: self.env_id.clone(),
             generation,
             after_frame: None,
             timeout_ms: timeout.as_millis() as u64,
@@ -167,10 +169,34 @@ impl ViewerClient {
             .ok_or_else(|| DesktopError::Compositor("no frame after observe".to_string()))
     }
 
+    /// Reports that this viewer presented a frame of `generation`, unlocking
+    /// input gated by a resize. The daemon only accepts the acknowledgement
+    /// over the connection that owns the viewer.
+    pub fn geometry_ready(&mut self, generation: u64) -> Result<(), DesktopError> {
+        let command = DesktopCommand::GeometryReady {
+            env_id: self.env_id.clone(),
+            viewer_id: self.info.viewer_id.clone(),
+            generation,
+            track_or_pool_id: self.info.pool_id.clone(),
+        };
+        let payload = serde_json::to_vec(&DesktopRequest::new(command))
+            .map_err(|e| DesktopError::Protocol(format!("encode geometry-ready: {e}")))?;
+        write_frame(&self.stream, &payload)?;
+        match self.read_response()? {
+            DesktopResponse::GeometryAcknowledged { .. } => Ok(()),
+            DesktopResponse::Error { code, message } => {
+                Err(DesktopError::Protocol(format!("{code}: {message}")))
+            }
+            other => Err(DesktopError::Protocol(format!(
+                "unexpected geometry-ready response: {other:?}"
+            ))),
+        }
+    }
+
     /// Acquires the human control lease for this viewer.
-    pub fn take_control(&mut self, env_id: &str) -> Result<u64, DesktopError> {
+    pub fn take_control(&mut self) -> Result<u64, DesktopError> {
         let command = DesktopCommand::Control {
-            env_id: env_id.to_string(),
+            env_id: self.env_id.clone(),
             action: "acquire".to_string(),
             is_human: true,
         };
@@ -198,18 +224,17 @@ impl ViewerClient {
     /// Sends input for the held lease.
     pub fn send_input(
         &mut self,
-        env_id: &str,
         generation: u64,
         events: Vec<InputEvent>,
     ) -> Result<(), DesktopError> {
         let epoch = self.epoch.ok_or_else(|| DesktopError::Unauthorized {
             caller: self.info.viewer_id.clone(),
             role: "Control".to_string(),
-            environment: env_id.to_string(),
+            environment: self.env_id.clone(),
         })?;
         self.seq = self.seq.wrapping_add(1);
         let command = DesktopCommand::Input {
-            env_id: env_id.to_string(),
+            env_id: self.env_id.clone(),
             epoch,
             generation,
             events: InputBatch {

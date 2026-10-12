@@ -396,6 +396,12 @@ impl DesktopEnvironment {
         } else {
             None
         };
+        // Until `InnerEnvironment` takes ownership of the slice, the guard
+        // stops it on every early return so a failed create cannot leave a
+        // running slice behind.
+        let mut slice_guard = slice.as_ref().map(|name| SliceGuard {
+            slice: Some(name.clone()),
+        });
 
         let runtime_dir = environment_runtime_dir(&config.env_id);
         prepare_runtime_dir(&runtime_dir)?;
@@ -440,13 +446,7 @@ impl DesktopEnvironment {
                         (CompositorHandle::Worker(Arc::new(compositor)), reader)
                     }
                     Err(err) => {
-                        if let Some(slice) = slice.as_ref() {
-                            let _ = Command::new("systemctl")
-                                .args(["--user", "stop", slice])
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .status();
-                        }
+                        drop(slice_guard);
                         let _ = std::fs::remove_dir_all(&runtime_dir);
                         return Err(err);
                     }
@@ -488,6 +488,12 @@ impl DesktopEnvironment {
             }
         };
 
+        // `InnerEnvironment` owns the slice from here; disarm the guard so a
+        // later failure (for example, audio spawn) is covered by `Drop` rather
+        // than a double stop.
+        if let Some(guard) = slice_guard.as_mut() {
+            guard.disarm();
+        }
         let inner = Arc::new(InnerEnvironment {
             config: config.clone(),
             runtime_dir,
@@ -957,15 +963,24 @@ impl DesktopEnvironment {
                 received: generation,
             });
         }
-        // After a resize, pointer input resumes only once a viewer has presented
-        // a frame of the new generation (spec section 6). There is exactly one
-        // active control lease, so the acknowledging viewer is the one whose
-        // input is gated; the acknowledgement is tracked per environment.
-        if current_gen > 1 && self.inner.geometry_ready.lock().is_empty() {
-            return Err(DesktopError::StaleGeneration {
-                expected: current_gen,
-                received: generation,
-            });
+        // After a resize, pointer input resumes only once every active viewer
+        // has presented a frame of the new generation (spec section 6): a
+        // viewer still looking at a stale frame could otherwise misplace a
+        // click at the same encoded size.
+        if current_gen > 1 {
+            let ready = self.inner.geometry_ready.lock();
+            let all_ready = self
+                .inner
+                .viewers
+                .lock()
+                .keys()
+                .all(|viewer| ready.get(viewer) == Some(&current_gen));
+            if !all_ready {
+                return Err(DesktopError::StaleGeneration {
+                    expected: current_gen,
+                    received: generation,
+                });
+            }
         }
         drop(lease);
 
@@ -994,9 +1009,12 @@ impl DesktopEnvironment {
                     role: "Control".to_string(),
                     environment: self.env_id().to_string(),
                 })?;
-                if let Some(epoch) = epoch
-                    && epoch != current.epoch
-                {
+                let epoch = epoch.ok_or_else(|| {
+                    DesktopError::Protocol(
+                        "a lease heartbeat must carry the current epoch".to_string(),
+                    )
+                })?;
+                if epoch != current.epoch {
                     return Err(DesktopError::StaleLease {
                         expected: current.epoch,
                         received: epoch,
@@ -1063,6 +1081,15 @@ impl DesktopEnvironment {
                 received: generation,
             });
         }
+        // Only an admitted viewer may acknowledge: a caller-supplied identity
+        // must not stand in for a viewer that never presented the frame.
+        if !self.inner.viewers.lock().contains_key(viewer) {
+            return Err(DesktopError::Unauthorized {
+                caller: viewer.to_string(),
+                role: "View".to_string(),
+                environment: self.env_id().to_string(),
+            });
+        }
         self.inner
             .geometry_ready
             .lock()
@@ -1092,8 +1119,12 @@ impl DesktopEnvironment {
     }
 
     /// Releases a viewer slot when its connection ends.
+    ///
+    /// The released viewer's geometry acknowledgement is dropped as well, so a
+    /// reconnecting viewer must present the current generation again.
     pub fn release_viewer(&self, viewer_id: &str) {
         self.inner.viewers.lock().remove(viewer_id);
+        self.inner.geometry_ready.lock().remove(viewer_id);
     }
 
     /// GStreamer description of the environment's private audio source.
@@ -1822,30 +1853,29 @@ impl DesktopSupervisor {
             }
             requests.insert(key, env_id.clone());
         }
-        // Host-wide admission: the sum of admitted pixel rates must stay within
-        // the host policy (spec section 6).
-        {
-            let environments = self.environments.lock();
-            let admitted: u64 = environments
-                .values()
-                .filter(|env| !env.is_destroyed())
-                .map(|env| {
-                    let output = env.output();
-                    output.width as u64 * output.height as u64 * output.fps as u64
-                })
-                .sum();
-            let requested =
-                config.output.width as u64 * config.output.height as u64 * config.output.fps as u64;
-            if admitted + requested > self.host_policy.max_aggregate_pixel_rate {
-                return Err(DesktopError::LimitExceeded(format!(
-                    "host aggregate pixel rate {} px/s plus {} px/s exceeds the admitted {} px/s",
-                    admitted, requested, self.host_policy.max_aggregate_pixel_rate
-                )));
-            }
+        // Host-wide admission and insertion must stay under one lock
+        // acquisition: the admitted pixel-rate sum is otherwise a snapshot and
+        // two concurrent creates could both pass it (spec section 6).
+        let mut environments = self.environments.lock();
+        let admitted: u64 = environments
+            .values()
+            .filter(|env| !env.is_destroyed())
+            .map(|env| {
+                let output = env.output();
+                output.width as u64 * output.height as u64 * output.fps as u64
+            })
+            .sum();
+        let requested =
+            config.output.width as u64 * config.output.height as u64 * config.output.fps as u64;
+        if admitted + requested > self.host_policy.max_aggregate_pixel_rate {
+            return Err(DesktopError::LimitExceeded(format!(
+                "host aggregate pixel rate {} px/s plus {} px/s exceeds the admitted {} px/s",
+                admitted, requested, self.host_policy.max_aggregate_pixel_rate
+            )));
         }
 
         let env = DesktopEnvironment::new(config)?;
-        self.environments.lock().insert(env_id, env.clone());
+        environments.insert(env_id, env.clone());
         Ok(env)
     }
 
@@ -1861,8 +1891,10 @@ impl DesktopSupervisor {
         let env = self.environments.lock().remove(env_id);
         match env {
             Some(env) => {
-                let status = env.get_status();
                 env.destroy();
+                // The retained terminal status is captured after destruction:
+                // `destroy` is what clears readiness.
+                let status = env.get_status();
                 self.retired.lock().insert(
                     env_id.to_string(),
                     RetiredEnvironment {
@@ -2072,6 +2104,30 @@ fn sanitize(value: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Stops an environment slice if construction fails before `InnerEnvironment`
+/// takes ownership of it.
+struct SliceGuard {
+    slice: Option<String>,
+}
+
+impl SliceGuard {
+    fn disarm(&mut self) {
+        self.slice = None;
+    }
+}
+
+impl Drop for SliceGuard {
+    fn drop(&mut self) {
+        if let Some(slice) = self.slice.take() {
+            let _ = Command::new("systemctl")
+                .args(["--user", "stop", &slice])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
 }
 
 /// The transient slice that aggregates an environment's cgroup limits.

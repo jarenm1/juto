@@ -24,6 +24,10 @@ const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// Control lease renewal interval (spec section 8: heartbeat 2s, expiry 6s).
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(2);
 
+/// The authenticated principal this interactive session acts as: the local
+/// human viewing the desktop. Grants and artifact resolution are bound to it.
+pub(crate) const SESSION_PRINCIPAL: &str = "human:viewer";
+
 /// An embedded viewer for one agent-owned desktop environment.
 pub struct DesktopViewer {
     env: DesktopEnvironment,
@@ -119,7 +123,7 @@ impl DesktopViewer {
 
     /// Acquires (or renews) the human control lease.
     pub fn take_control(&mut self, cx: &mut Context<Self>) {
-        match self.env.set_control("human:viewer", "acquire", true) {
+        match self.env.set_control(SESSION_PRINCIPAL, "acquire", true) {
             Ok(Some(lease)) => {
                 self.has_control = true;
                 self.error = None;
@@ -141,7 +145,7 @@ impl DesktopViewer {
     /// Releases the human control lease.
     pub fn release_control(&mut self, cx: &mut Context<Self>) {
         self.heartbeat_task = None;
-        match self.env.set_control("human:viewer", "release", true) {
+        match self.env.set_control(SESSION_PRINCIPAL, "release", true) {
             Ok(_) => {
                 self.has_control = false;
                 self.status = "control released".to_string();
@@ -164,7 +168,7 @@ impl DesktopViewer {
                 // environment is not retired as abandoned.
                 let _ = env.heartbeat("owner", None);
                 let renewed = env
-                    .set_control("human:viewer", "acquire", true)
+                    .set_control(SESSION_PRINCIPAL, "acquire", true)
                     .ok()
                     .flatten()
                     .is_some();
@@ -193,8 +197,8 @@ impl DesktopViewer {
         }
         let owner = self.env.get_status().owner_principal;
         let lease = match self.env.get_status().active_control_lease {
-            Some(lease) if lease.holder == "human:viewer" => lease,
-            _ => match self.env.set_control("human:viewer", "acquire", true) {
+            Some(lease) if lease.holder == SESSION_PRINCIPAL => lease,
+            _ => match self.env.set_control(SESSION_PRINCIPAL, "acquire", true) {
                 Ok(Some(lease)) => {
                     self.has_control = true;
                     self.start_heartbeat(cx);
@@ -217,7 +221,7 @@ impl DesktopViewer {
         };
         match self
             .env
-            .dispatch_input("human:viewer", lease.epoch, self.env.generation(), batch)
+            .dispatch_input(SESSION_PRINCIPAL, lease.epoch, self.env.generation(), batch)
         {
             Ok(_) => self.error = None,
             Err(err) => self.error = Some(err.to_string()),

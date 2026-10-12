@@ -405,6 +405,48 @@ fn host_aggregate_pixel_rate_is_admitted() {
 }
 
 #[test]
+fn concurrent_environment_creation_respects_aggregate_pixel_rate() {
+    let supervisor = std::sync::Arc::new(DesktopSupervisor::with_host_policy(HostPolicy {
+        max_aggregate_pixel_rate: 10_000_000,
+    }));
+    let configs = [
+        test_config(&unique_env_id("concurrent-agg")),
+        test_config(&unique_env_id("concurrent-agg")),
+    ];
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(configs.len()));
+    let handles: Vec<_> = configs
+        .into_iter()
+        .map(|config| {
+            let supervisor = supervisor.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                let result = supervisor.create_environment(config, &unique_env_id("req"));
+                barrier.wait();
+                match result {
+                    Ok(env) => {
+                        env.destroy();
+                        true
+                    }
+                    Err(DesktopError::LimitExceeded(_)) => false,
+                    Err(err) => panic!("unexpected environment creation error: {err}"),
+                }
+            })
+        })
+        .collect();
+
+    let admitted = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("creation thread"))
+        .filter(|admitted| *admitted)
+        .count();
+    assert_eq!(
+        admitted, 1,
+        "only one creation fits the host pixel-rate cap"
+    );
+}
+
+#[test]
 fn xwayland_maps_an_x11_client_into_the_desktop() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor
@@ -944,6 +986,7 @@ fn input_requires_a_geometry_acknowledgement_after_resize() {
     };
 
     // The initial generation accepts input without an acknowledgement.
+    env.admit_viewer("viewer-1").expect("admit viewer");
     assert!(
         env.dispatch_input("agent:test", lease.epoch, 1, batch.clone())
             .is_ok()
@@ -968,7 +1011,12 @@ fn input_requires_a_geometry_acknowledgement_after_resize() {
         Err(juto_desktop::DesktopError::StaleGeneration { .. })
     ));
 
-    // A stale acknowledgement is rejected; the current one resumes input.
+    // An unadmitted identity cannot stand in for the viewer, and a stale
+    // acknowledgement is rejected; the current one resumes input.
+    assert!(matches!(
+        env.acknowledge_geometry("viewer-2", 2),
+        Err(juto_desktop::DesktopError::Unauthorized { .. })
+    ));
     assert!(env.acknowledge_geometry("viewer-1", 1).is_err());
     env.acknowledge_geometry("viewer-1", 2)
         .expect("acknowledge the current generation");
@@ -978,7 +1026,10 @@ fn input_requires_a_geometry_acknowledgement_after_resize() {
             .is_ok()
     );
 
-    // A further resize gates input again.
+    // A further resize gates input again. With two active viewers both must
+    // acknowledge before input resumes: an acknowledged stranger can no
+    // longer unlock input for a viewer still on a stale frame.
+    env.admit_viewer("viewer-2").expect("admit second viewer");
     env.configure_output(
         2,
         OutputConfig {
@@ -989,10 +1040,18 @@ fn input_requires_a_geometry_acknowledgement_after_resize() {
         },
     )
     .expect("resize");
+    env.acknowledge_geometry("viewer-2", 3)
+        .expect("second viewer acknowledges");
     assert!(matches!(
-        env.dispatch_input("agent:test", lease.epoch, 3, batch),
+        env.dispatch_input("agent:test", lease.epoch, 3, batch.clone()),
         Err(juto_desktop::DesktopError::StaleGeneration { .. })
     ));
+    env.acknowledge_geometry("viewer-1", 3)
+        .expect("first viewer acknowledges");
+    assert!(
+        env.dispatch_input("agent:test", lease.epoch, 3, batch)
+            .is_ok()
+    );
 
     env.destroy();
 }
@@ -1110,6 +1169,12 @@ fn heartbeat_renews_and_retention_keeps_an_environment_alive() {
         .unwrap()
         .unwrap();
     assert!(env.heartbeat("lease", Some(lease.epoch)).is_ok());
+    // A lease heartbeat without the current epoch is refused rather than
+    // renewing whoever happens to hold the lease.
+    assert!(matches!(
+        env.heartbeat("lease", None),
+        Err(juto_desktop::DesktopError::Protocol(_))
+    ));
     assert!(matches!(
         env.heartbeat("lease", Some(lease.epoch + 7)),
         Err(juto_desktop::DesktopError::StaleLease { .. })

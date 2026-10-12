@@ -171,9 +171,13 @@ fn parse_socket_path() -> PathBuf {
 
 fn serve(mut stream: UnixStream, supervisor: Arc<DesktopSupervisor>) -> std::io::Result<()> {
     // Local attachment is authenticated by peer credentials: only the daemon's
-    // own user may drive its environments (spec section 3).
-    match juto_desktop::scm::peer_credentials(&stream) {
-        Ok(creds) if creds.uid == unsafe { libc::geteuid() } => {}
+    // own user may drive its environments (spec section 3). The peer principal
+    // is the kernel-authenticated identity used wherever a command otherwise
+    // accepts a self-asserted one (for example `Retain`'s human owner).
+    let peer_principal = match juto_desktop::scm::peer_credentials(&stream) {
+        Ok(creds) if creds.uid == unsafe { libc::geteuid() } => {
+            format!("user:{}", creds.uid)
+        }
         Ok(creds) => {
             let _ = write_response(
                 &mut stream,
@@ -188,7 +192,7 @@ fn serve(mut stream: UnixStream, supervisor: Arc<DesktopSupervisor>) -> std::io:
             eprintln!("juto-desktop: cannot read peer credentials: {err}");
             return Ok(());
         }
-    }
+    };
 
     let mut _viewer: Option<ViewerGuard> = None;
     loop {
@@ -237,7 +241,28 @@ fn serve(mut stream: UnixStream, supervisor: Arc<DesktopSupervisor>) -> std::io:
             DesktopCommand::Attach { env_id, .. } => Some(env_id.clone()),
             _ => None,
         };
-        let (response, fd) = handle(command, &supervisor);
+        // `GeometryReady` unlocks input, so it is bound to the viewer this
+        // connection authenticated as at `Attach`; a connection cannot answer
+        // for a viewer it does not own.
+        if let DesktopCommand::GeometryReady {
+            env_id, viewer_id, ..
+        } = &command
+        {
+            let owns_viewer = _viewer
+                .as_ref()
+                .is_some_and(|guard| guard.env_id == *env_id && guard.viewer_id == *viewer_id);
+            if !owns_viewer {
+                write_response(
+                    &mut stream,
+                    &DesktopResponse::Error {
+                        code: "Unauthorized".to_string(),
+                        message: format!("this connection does not own viewer `{viewer_id}`"),
+                    },
+                )?;
+                continue;
+            }
+        }
+        let (response, fd) = handle(command, &supervisor, &peer_principal);
         if let (Some(env_id), DesktopResponse::Attached { viewer_id, .. }) = (attach_env, &response)
         {
             // `Destroy` closes viewers: watch the environment's events and shut
@@ -327,6 +352,7 @@ fn stream_events(
 fn handle(
     command: DesktopCommand,
     supervisor: &DesktopSupervisor,
+    peer_principal: &str,
 ) -> (DesktopResponse, Option<std::os::fd::RawFd>) {
     let response = match command {
         DesktopCommand::Create { spec, request_id } => {
@@ -497,10 +523,13 @@ fn handle(
         },
         DesktopCommand::Retain {
             env_id,
-            human_owner,
             deadline_seconds,
+            ..
         } => match supervisor.get_environment(&env_id) {
-            Ok(env) => match env.retain(&human_owner, deadline_seconds) {
+            // Retention transfers lifetime responsibility to an authenticated
+            // human session: the recorded owner is the kernel-authenticated
+            // peer, not a self-asserted name in the request (spec section 4).
+            Ok(env) => match env.retain(peer_principal, deadline_seconds) {
                 Ok(retention) => DesktopResponse::Retained {
                     human_owner: retention.human_owner,
                     expires_at: retention.expires_at,
@@ -519,6 +548,7 @@ fn handle(
                 let output = env.output();
                 let fd = unsafe { libc::dup(pool.raw_fd()) };
                 if fd < 0 {
+                    env.release_viewer(&viewer_id);
                     return (
                         DesktopResponse::Error {
                             code: "Shm".to_string(),

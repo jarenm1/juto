@@ -38,17 +38,20 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Protocol versioning: control requests carry a protocol version
   (`PROTOCOL_VERSION = 1`); a request with any other version is rejected with a
   `Protocol` error before dispatch.
-- Remote transport limits: every configured ICE server is applied to
-  `webrtcbin` (STUN through the property, TURN through `add-turn-server`, with
-  credentials embedded when supplied), and the requested stream bitrate is
-  clamped to the environment's total-media ceiling with the effective value
-  reported.
+- Remote transport limits: the first configured STUN server is applied to
+  `webrtcbin` (the `stun-server` property is single-valued; extra STUN entries
+  are reported and ignored), every TURN server is applied through
+  `add-turn-server` (with credentials embedded when supplied), and the
+  requested stream bitrate is clamped to the environment's total-media
+  ceiling with the effective value reported.
 - Xwayland: one private X11 server per environment, spawned and supervised by
   the compositor. Smithay's X11 window manager handles map/configure/focus,
-  X11 surfaces are composed alongside Wayland toplevels, and the environment
-  gets `DISPLAY` plus an `MIT-MAGIC-COOKIE-1` `XAUTHORITY` file written into its
-  private runtime directory. Sockets are filesystem-only (no abstract socket,
-  no TCP listener).
+  interactive move/resize grabs, and maximize/fullscreen; X11 surfaces are
+  composed alongside Wayland toplevels, and the environment gets `DISPLAY`
+  plus an `MIT-MAGIC-COOKIE-1` `XAUTHORITY` file written into its private
+  runtime directory. Sockets are filesystem-only (no abstract socket, no TCP
+  listener). Selections are intentionally not bridged to the Wayland
+  clipboard (the clipboard stays environment-local).
 - Terminal state retention: a destroyed environment's final status stays
   queryable through `Describe` for a bounded period (default 10 minutes), so a
   client can learn why an environment stopped instead of receiving
@@ -112,7 +115,8 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   otherwise reports `Unsupported`, `Unauthorized`, `Expired`, `Stopped`, or
   `Unavailable`.
 - Resize gating: a new geometry generation clears viewer acknowledgements and
-  input is rejected until `GeometryReady` reports the new generation.
+  input is rejected until every active viewer reports `GeometryReady` for the
+  new generation, over the connection that owns the viewer.
 
 Not implemented: the local PCM path to a viewer, DMA-BUF export/import, and
 deployment provisioning (TLS termination, public reachability). Sections
