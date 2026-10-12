@@ -188,6 +188,7 @@ fn serve(mut stream: UnixStream, supervisor: Arc<DesktopSupervisor>) -> std::io:
         }
     }
 
+    let mut _viewer: Option<ViewerGuard> = None;
     loop {
         let Some(frame) = read_frame(&mut stream)? else {
             return Ok(());
@@ -216,8 +217,35 @@ fn serve(mut stream: UnixStream, supervisor: Arc<DesktopSupervisor>) -> std::io:
             return stream_events(stream, supervisor, env_id);
         }
 
+        let attach_env = match &command {
+            DesktopCommand::Attach { env_id, .. } => Some(env_id.clone()),
+            _ => None,
+        };
         let (response, fd) = handle(command, &supervisor);
+        if let (Some(env_id), DesktopResponse::Attached { viewer_id, .. }) = (attach_env, &response)
+        {
+            _viewer = Some(ViewerGuard {
+                supervisor: supervisor.clone(),
+                env_id,
+                viewer_id: viewer_id.clone(),
+            });
+        }
         write_response_with_fd(&mut stream, &response, fd)?;
+    }
+}
+
+/// Releases an attached viewer's slot when its control connection ends.
+struct ViewerGuard {
+    supervisor: Arc<DesktopSupervisor>,
+    env_id: String,
+    viewer_id: String,
+}
+
+impl Drop for ViewerGuard {
+    fn drop(&mut self) {
+        if let Ok(env) = self.supervisor.get_environment(&self.env_id) {
+            env.release_viewer(&self.viewer_id);
+        }
     }
 }
 
@@ -437,6 +465,10 @@ fn handle(
         },
         DesktopCommand::Attach { env_id, .. } => match supervisor.get_environment(&env_id) {
             Ok(env) => {
+                let viewer_id = format!("local-{}", uuid::Uuid::now_v7());
+                if let Err(err) = env.admit_viewer(&viewer_id) {
+                    return (error_response(&err), None);
+                }
                 let pool = env.frame_pool();
                 let output = env.output();
                 let fd = unsafe { libc::dup(pool.raw_fd()) };
@@ -451,7 +483,7 @@ fn handle(
                 }
                 return (
                     DesktopResponse::Attached {
-                        viewer_id: format!("local-{}", uuid::Uuid::now_v7()),
+                        viewer_id,
                         negotiated_transport: "shm".to_string(),
                         pool_id: pool.pool_id().to_string(),
                         width: output.width,
