@@ -1427,6 +1427,8 @@ enum VcsAction {
     Dirty,
     /// Capture the workspace as a new point on a thread.
     Capture,
+    /// Print the change graph: nodes, heads, and checkpoints.
+    Log,
 }
 
 #[derive(Deserialize)]
@@ -1449,6 +1451,8 @@ struct VcsParams {
     /// Left and right points for `join`: node ids or checkpoint names.
     left: Option<String>,
     right: Option<String>,
+    /// How many of the most recent nodes `log` returns; 0 means all.
+    limit: Option<usize>,
 }
 
 #[async_trait]
@@ -1457,7 +1461,8 @@ impl Tool for VcsTool {
         juto_ai::ToolDefinition {
             name: "vcs".to_string(),
             description: "Inspect and synchronize Juto's native change graph. `status` reports \
-                counts, heads, and whether an imported head still needs reconciling; `dirty` \
+                counts, heads, and whether an imported head still needs reconciling; `log` \
+                prints the nodes, heads, and checkpoints; `dirty` \
                 lists paths edited outside the capture tools, since a `bash` command is not \
                 captured automatically, and `capture` records them as a new point; `fetch` \
                 imports another machine's graph; `reconcile` \
@@ -1488,7 +1493,8 @@ impl Tool for VcsTool {
                             "join",
                             "resolve",
                             "dirty",
-                            "capture"
+                            "capture",
+                            "log"
                         ],
                         "description": "Which change-graph operation to run."
                     },
@@ -1523,6 +1529,10 @@ impl Tool for VcsTool {
                     "right": {
                         "type": "string",
                         "description": "Right point for `join`: a node id or checkpoint name."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many of the most recent nodes `log` returns; 0 means all. Defaults to 20."
                     }
                 },
                 "required": ["action"],
@@ -1550,6 +1560,7 @@ impl Tool for VcsTool {
             branch,
             left,
             right,
+            limit,
         } = serde_json::from_value(arguments).map_err(|e| format!("invalid vcs arguments: {e}"))?;
         check_cancel(&ctx.cancel)?;
         let cwd = effective_cwd(&self.cwd, &ctx).to_path_buf();
@@ -1745,6 +1756,22 @@ impl Tool for VcsTool {
                         .map_err(|e| format!("{e:#}"))?;
                     serde_json::to_value(node).map_err(|e| e.to_string())
                 }
+                VcsAction::Log => {
+                    let state = graph.state().map_err(|e| format!("{e:#}"))?;
+                    let total = state.nodes.len();
+                    let limit = limit.unwrap_or(20);
+                    let nodes: Vec<&_> = if limit == 0 || limit >= total {
+                        state.nodes.iter().collect()
+                    } else {
+                        state.nodes[total - limit..].iter().collect()
+                    };
+                    Ok(json!({
+                        "nodes": nodes,
+                        "total": total,
+                        "heads": state.heads,
+                        "checkpoints": state.checkpoints,
+                    }))
+                }
             }
         })
         .await
@@ -1772,6 +1799,7 @@ fn action_label(action: &VcsAction) -> &'static str {
         VcsAction::Resolve => "resolve",
         VcsAction::Dirty => "dirty",
         VcsAction::Capture => "capture",
+        VcsAction::Log => "log",
     }
 }
 
@@ -2670,6 +2698,7 @@ mod tests {
             "resolve",
             "dirty",
             "capture",
+            "log",
         ] {
             assert!(
                 description.contains(action),
@@ -2839,6 +2868,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.details["dirty"], false, "{:?}", out.details);
+
+        // `log` prints the graph, bounded by `limit`.
+        let out = tool
+            .execute(json!({"action": "log", "limit": 1}), ctx(dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.details["nodes"].as_array().map(Vec::len),
+            Some(1),
+            "{:?}",
+            out.details
+        );
+        assert!(
+            out.details["total"].as_u64().is_some_and(|total| total > 1),
+            "{:?}",
+            out.details
+        );
+        assert!(
+            out.details["heads"].as_object().is_some(),
+            "{:?}",
+            out.details
+        );
 
         // An unknown action is rejected rather than silently ignored.
         assert!(
