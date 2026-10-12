@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use juto_runtime::change_graph::{ChangeGraph, ChangeNode, EditProvenance};
+use juto_runtime::change_graph::{ChangeGraph, ChangeNode, EditProvenance, ReconcileOutcome};
 use juto_runtime::git_transfer::GitRepository;
 use tempfile::TempDir;
 
@@ -68,7 +68,14 @@ impl SharedRemote {
         let remote = temp.path().join("remote.git");
         run(
             "git",
-            &["init", "--bare", "-q", remote.to_str().unwrap()],
+            &[
+                "init",
+                "--bare",
+                "-q",
+                "-b",
+                "main",
+                remote.to_str().unwrap(),
+            ],
             temp.path(),
         );
         let a = temp.path().join("a");
@@ -380,5 +387,86 @@ fn a_failed_import_leaves_no_staging_refs() {
     assert!(
         staging.is_empty(),
         "a failed import must clean its staging refs, got:\n{staging}"
+    );
+}
+
+#[test]
+fn reconcile_joins_a_conflicting_imported_head() {
+    let fixture = SharedRemote::new();
+    let a = ChangeGraph::open(&fixture.a).unwrap();
+    let b = ChangeGraph::open(&fixture.b).unwrap();
+
+    // Both machines advance "main" from the shared base, touching different
+    // files, so the two heads merge cleanly.
+    fs::write(fixture.a.join("a.txt"), "a\n").unwrap();
+    let a_head = a.capture("main", provenance("a"), None).unwrap();
+    a.push_graph(fixture.remote()).unwrap();
+
+    fs::write(fixture.b.join("b.txt"), "b\n").unwrap();
+    let b_head = b.capture("main", provenance("b"), None).unwrap();
+
+    let imported = b.fetch_graph(fixture.remote()).unwrap();
+    assert_eq!(imported.heads_imported, 1);
+    let remote_head = format!("{}/main", a.machine_id().unwrap());
+    let state = b.state().unwrap();
+    assert_eq!(state.heads[&remote_head], a_head.id);
+    assert_eq!(state.heads["main"], b_head.id);
+
+    let outcomes = b.reconcile("main").unwrap();
+    assert_eq!(outcomes.len(), 1);
+    let ReconcileOutcome::Joined { remote, node, .. } = &outcomes[0] else {
+        panic!("expected a clean join, got {:?}", outcomes[0]);
+    };
+    assert_eq!(remote, &remote_head);
+    assert_eq!(node.parents.len(), 2);
+    assert!(node.parents.contains(&a_head.id));
+    assert!(node.parents.contains(&b_head.id));
+
+    let state = b.state().unwrap();
+    assert!(
+        !state.heads.contains_key(&remote_head),
+        "a clean reconcile must retire the imported head"
+    );
+    assert_eq!(state.heads["main"], node.id);
+    // Both machines' work is present in the reconciled workspace.
+    assert!(fixture.b.join("a.txt").exists());
+    assert!(fixture.b.join("b.txt").exists());
+}
+
+#[test]
+fn reconcile_reports_a_conflicting_merge_and_changes_nothing() {
+    let fixture = SharedRemote::new();
+    let a = ChangeGraph::open(&fixture.a).unwrap();
+    let b = ChangeGraph::open(&fixture.b).unwrap();
+
+    // Both machines edit the same file differently: the merge must conflict.
+    fs::write(fixture.a.join("shared"), "from a\n").unwrap();
+    let a_head = a.capture("main", provenance("a"), None).unwrap();
+    a.push_graph(fixture.remote()).unwrap();
+
+    fs::write(fixture.b.join("shared"), "from b\n").unwrap();
+    let b_head = b.capture("main", provenance("b"), None).unwrap();
+
+    b.fetch_graph(fixture.remote()).unwrap();
+    let remote_head = format!("{}/main", a.machine_id().unwrap());
+
+    let outcomes = b.reconcile("main").unwrap();
+    assert_eq!(outcomes.len(), 1);
+    let ReconcileOutcome::Conflicted {
+        remote, conflicts, ..
+    } = &outcomes[0]
+    else {
+        panic!("expected a conflict, got {:?}", outcomes[0]);
+    };
+    assert_eq!(remote, &remote_head);
+    assert_eq!(conflicts, &vec!["shared".to_string()]);
+
+    // Nothing changed: both heads survive and the workspace is untouched.
+    let state = b.state().unwrap();
+    assert_eq!(state.heads[&remote_head], a_head.id);
+    assert_eq!(state.heads["main"], b_head.id);
+    assert_eq!(
+        fs::read_to_string(fixture.b.join("shared")).unwrap(),
+        "from b\n"
     );
 }

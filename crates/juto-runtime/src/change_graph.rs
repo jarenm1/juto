@@ -60,6 +60,10 @@ pub struct ChangeNode {
 /// node with both sides as parents. A conflicted join changes nothing: the
 /// caller resolves the listed paths and retries.
 ///
+/// `base` is the merge base: the id of the maximal common ancestor node, or the
+/// graph's base tree id when the two sides share no node ancestor (both were
+/// captured directly from the base).
+///
 /// The `Joined` variant carries the whole node by value because callers consume
 /// it directly; boxing it would only add indirection to a cold path.
 #[allow(clippy::large_enum_variant)]
@@ -71,6 +75,30 @@ pub enum JoinOutcome {
         tree: String,
     },
     Conflicted {
+        base: String,
+        conflicts: Vec<String>,
+    },
+}
+
+/// What [`ChangeGraph::reconcile`] did with one imported remote head.
+///
+/// The `Joined` variant carries the whole node by value, matching
+/// [`JoinOutcome`]; boxing it would only add indirection to a cold path.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    /// The remote head merged cleanly into the local thread; the remote head was
+    /// retired and the thread advanced to `node`.
+    Joined {
+        remote: String,
+        node: ChangeNode,
+        base: String,
+        tree: String,
+    },
+    /// The remote head conflicts with the local thread. Nothing changed; both
+    /// heads are still present and the conflicting paths are reported.
+    Conflicted {
+        remote: String,
         base: String,
         conflicts: Vec<String>,
     },
@@ -491,19 +519,28 @@ impl ChangeGraph {
         let state = self.state()?;
         let left_node = resolve_node(&state, left)?;
         let right_node = resolve_node(&state, right)?;
-        let base_id = merge_base(&state, &left_node.id, &right_node.id)?;
-        let base = state
-            .nodes
-            .iter()
-            .find(|n| n.id == base_id)
-            .context("missing merge base")?;
+        let (base_id, base_tree) = match merge_base(&state, &left_node.id, &right_node.id)? {
+            MergeBase::Node(id) => {
+                let tree = state
+                    .nodes
+                    .iter()
+                    .find(|n| n.id == id)
+                    .context("missing merge base")?
+                    .tree
+                    .clone();
+                (id, tree)
+            }
+            // Both sides were captured straight from the base, so the base tree
+            // is the three-way merge base.
+            MergeBase::Base => (state.base_tree.clone(), state.base_tree.clone()),
+        };
         ensure!(
             self.repository.supports_tree_merge()?,
             "this Git does not support three-way tree merges (needs git >= 2.45)"
         );
         let merged = self
             .repository
-            .merge_trees(&base.tree, &left_node.tree, &right_node.tree)?;
+            .merge_trees(&base_tree, &left_node.tree, &right_node.tree)?;
         if !merged.conflicts.is_empty() {
             return Ok(JoinOutcome::Conflicted {
                 base: base_id,
@@ -542,6 +579,72 @@ impl ChangeGraph {
             base: base_id,
             tree: merged_tree,
         })
+    }
+
+    /// Retire a thread head, reporting whether it existed.
+    ///
+    /// Only the head pointer is dropped; no node is deleted. Used to retire the
+    /// `<owner>/<thread>` head an import creates once its history has been
+    /// joined into the local thread.
+    pub fn drop_head(&self, head: &str) -> Result<bool> {
+        validate_head_name(head)?;
+        let _lock = self.lock()?;
+        let mut state = self.load_locked()?;
+        if state.heads.remove(head).is_none() {
+            return Ok(false);
+        }
+        self.save_locked(&state)?;
+        Ok(true)
+    }
+
+    /// Join every imported `<owner>/<thread>` head back into `thread`.
+    ///
+    /// When two machines advance the same thread, [`ChangeGraph::fetch_graph`]
+    /// keeps the local head under `<thread>` and the remote head under
+    /// `<owner>/<thread>` rather than overwriting either. This joins each such
+    /// remote head into the local thread: a clean merge advances the thread and
+    /// retires the remote head, a conflicting merge changes nothing and is
+    /// reported. Returns one outcome per remote head, in head-name order.
+    pub fn reconcile(&self, thread: &str) -> Result<Vec<ReconcileOutcome>> {
+        validate_thread_name(thread)?;
+        let suffix = format!("/{thread}");
+        let remotes: Vec<String> = self
+            .state()?
+            .heads
+            .keys()
+            .filter(|key| key.ends_with(&suffix))
+            .cloned()
+            .collect();
+        let mut outcomes = Vec::new();
+        for remote in remotes {
+            // Re-read each round: a clean join advances the local head.
+            let state = self.state()?;
+            let Some(local) = state.heads.get(thread).cloned() else {
+                break;
+            };
+            let Some(remote_head) = state.heads.get(&remote).cloned() else {
+                continue;
+            };
+            match self.join(thread, &local, &remote_head)? {
+                JoinOutcome::Joined { node, base, tree } => {
+                    self.drop_head(&remote)?;
+                    outcomes.push(ReconcileOutcome::Joined {
+                        remote,
+                        node,
+                        base,
+                        tree,
+                    });
+                }
+                JoinOutcome::Conflicted { base, conflicts } => {
+                    outcomes.push(ReconcileOutcome::Conflicted {
+                        remote,
+                        base,
+                        conflicts,
+                    });
+                }
+            }
+        }
+        Ok(outcomes)
     }
 
     /// Revert `thread` to an earlier point by materializing its tree.
@@ -939,6 +1042,24 @@ fn validate_thread_name(thread: &str) -> Result<()> {
     Ok(())
 }
 
+/// Validate a head key, which may be owner-qualified (`<owner>/<thread>`).
+///
+/// A local thread name never contains `/`, so a head key carries at most one
+/// separator: the one an import inserts between the owning machine and the
+/// thread it advanced.
+fn validate_head_name(head: &str) -> Result<()> {
+    ensure!(!head.trim().is_empty(), "head name must not be empty");
+    ensure!(
+        !head.starts_with('/') && !head.ends_with('/'),
+        "head name must not start or end with '/': {head:?}"
+    );
+    ensure!(
+        head.matches('/').count() <= 1,
+        "head name must be a thread or an owner-qualified thread: {head:?}"
+    );
+    Ok(())
+}
+
 /// Resolve a node id or checkpoint name to its node.
 fn resolve_node<'a>(state: &'a GraphState, spec: &str) -> Result<&'a ChangeNode> {
     let id = state
@@ -975,12 +1096,20 @@ fn ancestor_closure(state: &GraphState, id: &str) -> BTreeSet<String> {
 /// Exactly one maximal ancestor is the usual case. Several (a criss-cross
 /// merge) resolve to the one with the greatest index in `state.nodes`, which is
 /// the most recently appended and therefore the most conservative choice.
-fn merge_base(state: &GraphState, left: &str, right: &str) -> Result<String> {
+/// When the two nodes share no node ancestor, the graph base tree is the base.
+enum MergeBase {
+    Node(String),
+    Base,
+}
+
+fn merge_base(state: &GraphState, left: &str, right: &str) -> Result<MergeBase> {
     let common: BTreeSet<String> = ancestor_closure(state, left)
         .intersection(&ancestor_closure(state, right))
         .cloned()
         .collect();
-    ensure!(!common.is_empty(), "cannot join unrelated histories");
+    if common.is_empty() {
+        return Ok(MergeBase::Base);
+    }
     let mut dominated: BTreeSet<String> = BTreeSet::new();
     for id in &common {
         for ancestor in ancestor_closure(state, id) {
@@ -1009,7 +1138,7 @@ fn merge_base(state: &GraphState, left: &str, right: &str) -> Result<String> {
             maximal.len()
         );
     }
-    Ok(base)
+    Ok(MergeBase::Node(base))
 }
 
 fn validate_parents(state: &GraphState, parents: &[String]) -> Result<()> {
