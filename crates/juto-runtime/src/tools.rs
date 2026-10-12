@@ -1429,6 +1429,8 @@ enum VcsAction {
     Capture,
     /// Print the change graph: nodes, heads, and checkpoints.
     Log,
+    /// Reclaim unreachable nodes, release their refs, and pack loose refs.
+    Gc,
 }
 
 #[derive(Deserialize)]
@@ -1475,7 +1477,8 @@ impl Tool for VcsTool {
                 point; `export` projects marked points into Git commits on a branch; `publish` \
                 and `fetch_branch` move that branch to and from a remote; `join` merges two \
                 threads into a two-parent node; `resolve` records a conflict resolved by hand \
-                the same way, taking the conflicted paths from the workspace."
+                the same way, taking the conflicted paths from the workspace; `gc` reclaims \
+                unreachable nodes, releases their refs, and packs loose refs."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -1497,7 +1500,8 @@ impl Tool for VcsTool {
                             "resolve",
                             "dirty",
                             "capture",
-                            "log"
+                            "log",
+                            "gc"
                         ],
                         "description": "Which change-graph operation to run."
                     },
@@ -1780,6 +1784,10 @@ impl Tool for VcsTool {
                         "checkpoints": state.checkpoints,
                     }))
                 }
+                VcsAction::Gc => {
+                    let report = graph.gc().map_err(|e| format!("{e:#}"))?;
+                    serde_json::to_value(report).map_err(|e| e.to_string())
+                }
             }
         })
         .await
@@ -1808,6 +1816,7 @@ fn action_label(action: &VcsAction) -> &'static str {
         VcsAction::Dirty => "dirty",
         VcsAction::Capture => "capture",
         VcsAction::Log => "log",
+        VcsAction::Gc => "gc",
     }
 }
 
@@ -2707,6 +2716,7 @@ mod tests {
             "dirty",
             "capture",
             "log",
+            "gc",
         ] {
             assert!(
                 description.contains(action),
@@ -2903,6 +2913,17 @@ mod tests {
         );
         assert!(
             out.details["heads"].as_object().is_some(),
+            "{:?}",
+            out.details
+        );
+
+        // `gc` reclaims and reports what it kept.
+        let out = tool
+            .execute(json!({"action": "gc"}), ctx(dir.path()))
+            .await
+            .unwrap();
+        assert!(
+            out.details["retained_nodes"].as_u64().is_some(),
             "{:?}",
             out.details
         );
