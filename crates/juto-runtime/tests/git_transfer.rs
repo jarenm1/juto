@@ -1636,6 +1636,47 @@ fn update_tree_entry_matches_a_full_capture() {
 }
 
 #[test]
+fn update_refs_applies_a_batch_and_enforces_compare_and_swap() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"a\n");
+    commit(&dir, "base");
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+
+    let one = repository.write_blob(b"one\n").unwrap();
+    let two = repository.write_blob(b"two\n").unwrap();
+
+    repository
+        .update_refs(&[
+            ("refs/juto/nodes/n1".to_string(), one.clone(), None),
+            ("refs/juto/nodes/n2".to_string(), two.clone(), None),
+        ])
+        .unwrap();
+    assert_eq!(git_at(&git_dir, &["rev-parse", "refs/juto/nodes/n1"]), one);
+    assert_eq!(git_at(&git_dir, &["rev-parse", "refs/juto/nodes/n2"]), two);
+
+    // A create-only update on an existing ref fails, and leaves it alone.
+    assert!(
+        repository
+            .update_refs(&[("refs/juto/nodes/n1".to_string(), two.clone(), None)])
+            .is_err(),
+        "create-only must refuse an existing ref"
+    );
+    assert_eq!(git_at(&git_dir, &["rev-parse", "refs/juto/nodes/n1"]), one);
+
+    // A compare-and-swap with the right old value moves it.
+    repository
+        .update_refs(&[(
+            "refs/juto/nodes/n1".to_string(),
+            two.clone(),
+            Some(one.clone()),
+        )])
+        .unwrap();
+    assert_eq!(git_at(&git_dir, &["rev-parse", "refs/juto/nodes/n1"]), two);
+}
+
+#[test]
 fn refs_transport_blobs_and_trees_over_a_bare_remote() {
     let temp = tempfile::tempdir().unwrap();
     let dir = repo(&temp, "repo");

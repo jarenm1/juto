@@ -665,6 +665,28 @@ impl GitRepository {
         self.release_ref(&format!("refs/juto/snapshots/{id}"))
     }
 
+    /// Apply many ref updates through one `git update-ref --stdin` child.
+    ///
+    /// Each entry is `(refname, new_object, expected)`: `expected` of `None`
+    /// means create-only, `Some(old)` is a compare-and-swap. A process per ref
+    /// dominates an operation that pins thousands of nodes, which is exactly
+    /// what an import does.
+    pub fn update_refs(&self, updates: &[(String, String, Option<String>)]) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut input = String::new();
+        for (refname, object, expected) in updates {
+            self.validate_ref(refname)?;
+            match expected {
+                None => input.push_str(&format!("create {refname} {object}\n")),
+                Some(old) => input.push_str(&format!("update {refname} {object} {old}\n")),
+            }
+        }
+        self.run_with_stdin(&["update-ref", "--stdin"], input.as_bytes())?;
+        Ok(())
+    }
+
     /// Delete `refname` if it exists, reporting whether it was removed.
     ///
     /// The name is validated with `git check-ref-format`, so only a well-formed
@@ -724,6 +746,20 @@ impl GitRepository {
             );
         }
         Ok(output.stdout)
+    }
+
+    /// Read many blobs through one `git cat-file --batch` child.
+    ///
+    /// [`GitRepository::read_blob`] spawns a process per object, which dominates
+    /// an import that decodes thousands of node blobs. The contents are returned
+    /// in the order requested.
+    pub fn read_blobs(&self, oids: &[String]) -> Result<Vec<Vec<u8>>> {
+        let mut batch = BatchCatFile::spawn(self)?;
+        let mut blobs = Vec::with_capacity(oids.len());
+        for oid in oids {
+            blobs.push(batch.read_blob(oid)?);
+        }
+        Ok(blobs)
     }
 
     /// Create or update `refname` to point at `object` with compare-and-swap
