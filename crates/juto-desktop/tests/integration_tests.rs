@@ -523,6 +523,112 @@ fn virtual_clock_paces_without_catch_up_bursts() {
 }
 
 #[test]
+fn environment_slice_aggregates_limits_and_contains_apps() {
+    let supervisor = DesktopSupervisor::new();
+    let env_id = unique_env_id("slice");
+    let env = supervisor
+        .create_environment(test_config(&env_id))
+        .expect("create environment");
+
+    let slice = env.slice().expect("environment slice").to_string();
+    assert!(slice.ends_with(".slice"), "{slice}");
+    // systemd treats `-` as a path separator, so the slice name must not contain
+    // the environment id's dashes.
+    let suffix = slice
+        .trim_start_matches("juto-desktop-")
+        .trim_end_matches(".slice");
+    assert!(
+        !suffix.contains('-'),
+        "slice name must escape dashes: {slice}"
+    );
+    assert!(unit_is_active(&slice), "slice must be active");
+
+    let properties = systemctl_show(&slice, &["MemoryMax", "TasksMax", "CPUQuotaPerSecUSec"]);
+    assert!(
+        properties.contains("MemoryMax=8589934592"),
+        "slice limits: {properties}"
+    );
+    assert!(
+        properties.contains("TasksMax=512"),
+        "slice limits: {properties}"
+    );
+    assert!(
+        !properties.contains("CPUQuotaPerSecUSec=infinity"),
+        "slice limits: {properties}"
+    );
+
+    // Applications run inside the slice, not beside it.
+    let handle = env
+        .launch(
+            "sleeper",
+            &["sleep".to_string(), "60".to_string()],
+            None,
+            &[],
+        )
+        .expect("launch");
+    let unit = handle.unit.clone().expect("scope unit");
+    // The scope's cgroup path is populated asynchronously.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut scope = String::new();
+    while Instant::now() < deadline {
+        scope = systemctl_show(&unit, &["ControlGroup"]);
+        if scope.contains(&slice) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        scope.contains(&slice),
+        "scope {unit} is not inside {slice}: {scope}"
+    );
+
+    env.destroy();
+    assert!(!unit_is_active(&slice), "slice must be stopped on destroy");
+}
+
+#[test]
+fn memory_pressure_emits_limit_pressure() {
+    let supervisor = DesktopSupervisor::new();
+    let mut config = test_config(&unique_env_id("pressure"));
+    config.limits.memory_max = "64M".to_string();
+    let env = supervisor
+        .create_environment(config)
+        .expect("create environment");
+    let mut events = env.subscribe();
+
+    env.launch(
+        "hog",
+        &[
+            "perl".to_string(),
+            "-e".to_string(),
+            "my $x = 'a' x (60 * 1024 * 1024); sleep 20;".to_string(),
+        ],
+        None,
+        &[],
+    )
+    .expect("launch memory hog");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut observed = false;
+    while Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(DesktopEvent::LimitPressure { metric, .. }) if metric == "memory" => {
+                observed = true;
+                break;
+            }
+            Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    assert!(observed, "no memory LimitPressure event was emitted");
+
+    env.destroy();
+}
+
+#[test]
 fn launch_rejects_missing_executable() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor
@@ -557,6 +663,20 @@ fn read_pixel(pool: &ShmFramePool, slot: usize, x: u32, y: u32, width: u32) -> [
         pixels[idx + 2],
         pixels[idx + 3],
     ]
+}
+
+fn systemctl_show(unit: &str, properties: &[&str]) -> String {
+    let mut args = vec!["--user", "show", unit, "--no-pager"];
+    let flags: Vec<String> = properties
+        .iter()
+        .map(|p| format!("--property={p}"))
+        .collect();
+    args.extend(flags.iter().map(|f| f.as_str()));
+    std::process::Command::new("systemctl")
+        .args(&args)
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 fn unit_is_active(unit: &str) -> bool {

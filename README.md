@@ -199,6 +199,14 @@ reports connection state and errors instead of showing a stale frame as live.
 `juto --desktop <command> [args...]` opens the same viewer directly for
 development.
 
+**Aggregate environment cgroup.** Each environment owns a transient
+`juto-desktop-<env>.slice` carrying the configured `CPUQuota`, `MemoryMax`,
+`MemorySwapMax`, and `TasksMax`; applications run as scopes inside that slice, so
+the limits bound the whole environment rather than each process. `Destroy` stops
+the slice, retiring every scope inside it. A monitor samples the slice's cgroup
+and emits `LimitPressure` when memory crosses 90% of the limit or the CPU
+throttle counter advances.
+
 **Pacing and statistics.** The compositor runs a virtual clock at the effective
 FPS and never renders twice inside one interval or bursts to catch up. `Observe`
 reports the tick count, frames composed, frames dropped because every pool slot
