@@ -237,6 +237,7 @@ pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
                 "heads": state.heads,
                 "remote_heads": remote_heads,
                 "needs_reconcile": !remote_heads.is_empty(),
+                "pending_threads": graph.pending_reconcile_threads()?,
                 "checkpoints": state.checkpoints,
                 "workspace_heads": state.workspace_heads.len(),
             })

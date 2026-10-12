@@ -488,6 +488,11 @@ fn reconcile_adopts_a_remote_head_when_the_thread_has_no_local_head() {
     let state = b.state().unwrap();
     assert!(state.heads.contains_key(&remote_head));
     assert!(!state.heads.contains_key("main"));
+    assert_eq!(
+        b.pending_reconcile_threads().unwrap(),
+        vec!["main".to_string()],
+        "the imported head must be reported as a pending thread"
+    );
 
     let outcomes = b.reconcile("main").unwrap();
     assert_eq!(outcomes.len(), 1);
@@ -501,6 +506,10 @@ fn reconcile_adopts_a_remote_head_when_the_thread_has_no_local_head() {
     let state = b.state().unwrap();
     assert_eq!(state.heads["main"], a_head.id);
     assert!(!state.heads.contains_key(&remote_head));
+    assert!(
+        b.pending_reconcile_threads().unwrap().is_empty(),
+        "a reconciled thread must no longer be pending"
+    );
 }
 
 #[test]

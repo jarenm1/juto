@@ -966,6 +966,27 @@ impl ChangeGraph {
         })
     }
 
+    /// The thread names that have an imported remote head awaiting reconcile.
+    ///
+    /// A head key containing `/` is an owner-qualified remote head, since a
+    /// local thread name never contains one. The collision suffix an import may
+    /// add (`<owner>/<thread>@<n>`) is stripped, so the result names threads a
+    /// caller can pass straight to [`ChangeGraph::reconcile`].
+    pub fn pending_reconcile_threads(&self) -> Result<Vec<String>> {
+        let mut threads: BTreeSet<String> = BTreeSet::new();
+        for key in self.state()?.heads.keys() {
+            let Some((_, thread)) = key.rsplit_once('/') else {
+                continue;
+            };
+            let thread = match thread.rsplit_once('@') {
+                Some((base, suffix)) if suffix.chars().all(|c| c.is_ascii_digit()) => base,
+                _ => thread,
+            };
+            threads.insert(thread.to_string());
+        }
+        Ok(threads.into_iter().collect())
+    }
+
     /// Check that every node's refs exist and resolve to its tree.
     ///
     /// `load` validates the journal's internal consistency; this additionally
