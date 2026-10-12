@@ -8,7 +8,7 @@ use gpui::{
     SharedString, Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*,
     px, rgb, uniform_list,
 };
-use juto_ai::HttpProvider;
+use juto_ai::{HttpProvider, TRANSPORT_PENDING_PROVIDERS};
 use juto_catalog::{Model, Registry};
 use juto_runtime::{Runtime, RuntimeConfig};
 
@@ -146,8 +146,12 @@ impl PickerData {
         let mut models = registry
             .iter()
             .filter(|model| {
+                // Providers with a ported login but a pending wire transport
+                // still appear once connected; selection surfaces the runtime's
+                // unsupported-transport error rather than hiding the models.
                 matches!(model.kind.as_str(), "chat" | "tiny")
-                    && HttpProvider::supports_model(model)
+                    && (HttpProvider::supports_model(model)
+                        || TRANSPORT_PENDING_PROVIDERS.contains(&model.provider.as_str()))
             })
             .map(ModelEntry::from_catalog)
             .collect::<Vec<_>>();
@@ -872,5 +876,21 @@ mod tests {
         let mut data = PickerData::new(&RuntimeConfig::default(), &registry);
         data.connect(BTreeSet::from(["openai".into()]), "");
         assert_eq!(data.available, BTreeSet::from(["openai/chat".into()]));
+    }
+
+    #[test]
+    fn transport_pending_provider_models_are_offered_once_connected() {
+        let mut registry = Registry::empty();
+        let model = Registry::bundled()
+            .unwrap()
+            .get("devin", "swe-1-6")
+            .unwrap()
+            .clone();
+        registry.upsert(model);
+        let mut data = PickerData::new(&RuntimeConfig::default(), &registry);
+        data.connect(BTreeSet::new(), "");
+        assert!(data.available.is_empty());
+        data.connect(BTreeSet::from(["devin".into()]), "");
+        assert_eq!(data.available, BTreeSet::from(["devin/swe-1-6".into()]));
     }
 }

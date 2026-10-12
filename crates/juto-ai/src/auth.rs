@@ -348,48 +348,78 @@ enum TokenBody {
     Form,
 }
 
+/// Expiry derivation for a mapped credential (KDL `expires` modes).
+#[derive(Debug, Clone, Copy)]
+enum Expiry {
+    /// `expires_in`-style field: `path` holds seconds from now, minus `skew_ms`.
+    Seconds { path: &'static str, skew_ms: i64 },
+    /// The access token is a JWT: `exp` claim minus `skew_ms`, falling back to
+    /// `fallback_ms` from now when the token carries no usable claim.
+    Jwt { skew_ms: i64, fallback_ms: i64 },
+}
+
 /// Credential-field dot paths read from the token response body.
 #[derive(Debug, Clone, Copy)]
 struct CredentialMap {
     access: &'static str,
-    refresh: &'static str,
-    /// `(path, skew_ms)` on the `expires_in`-style field.
-    expires: (&'static str, i64),
+    /// Optional path; `None` when the provider grants no refresh token
+    /// (`refresh "none"`), so expiry means re-login.
+    refresh: Option<&'static str>,
+    expires: Expiry,
     account_id: Option<&'static str>,
     email: Option<&'static str>,
     org_id: Option<&'static str>,
     org_name: Option<&'static str>,
 }
 
+/// State parameter format (KDL `state` attr): `hex` is the 16-byte default,
+/// `uuid` emits a random v4 UUID.
+#[derive(Debug, Clone, Copy)]
+enum StateKind {
+    Hex,
+    Uuid,
+}
+
 struct OAuthPolicy {
     id: &'static str,
     /// Client id, either literal or base64-wrapped per the KDL `encoding` attr.
-    client_id: &'static str,
+    /// `None` when the rule defines no client (devin).
+    client_id: Option<&'static str>,
     client_id_base64: bool,
     authorize_url: &'static str,
     scopes: &'static [&'static str],
     /// Extra `authorize-params` entries appended after the standard set.
     authorize_params: &'static [(&'static str, &'static str)],
+    state_kind: StateKind,
     callback_port: u16,
     callback_path: &'static str,
+    /// Host interpolated into the derived redirect URI (`callback hostname`).
+    callback_host: &'static str,
     /// Pinned redirect URI; `None` derives one from the bound port.
     redirect_uri: Option<&'static str>,
     /// `port-fallback`: providers with an allowlisted redirect must not redraw.
     port_fallback: bool,
     token_url: &'static str,
     token_body: TokenBody,
+    /// `standard`: when false, only the templated `params` are sent, not the
+    /// standard grant fields (grant_type, client_id, redirect_uri, ...).
+    token_standard: bool,
     token_timeout: Option<Duration>,
     /// Extra templated `params` merged into the exchange body.
     token_params: &'static [(&'static str, &'static str)],
+    /// Literal headers on the exchange request (`headers` block).
+    token_headers: &'static [(&'static str, &'static str)],
     /// Extra refresh headers (`anthropic-beta`, User-Agent template).
     refresh_headers: &'static [(&'static str, &'static str)],
+    /// `refresh "none"`: the grant stores no refresh token.
+    has_refresh: bool,
     login_map: CredentialMap,
     refresh_map: CredentialMap,
 }
 
 const CODEX: OAuthPolicy = OAuthPolicy {
     id: "openai-codex",
-    client_id: "app_EMoamEEZ73f0CkXaXp7hrann",
+    client_id: Some("app_EMoamEEZ73f0CkXaXp7hrann"),
     client_id_base64: false,
     authorize_url: "https://auth.openai.com/oauth/authorize",
     scopes: &[
@@ -405,19 +435,27 @@ const CODEX: OAuthPolicy = OAuthPolicy {
         ("codex_cli_simplified_flow", "true"),
         ("originator", "omp"),
     ],
+    state_kind: StateKind::Hex,
     callback_port: 1455,
     callback_path: "/auth/callback",
+    callback_host: "localhost",
     redirect_uri: Some("http://localhost:1455/auth/callback"),
     port_fallback: false,
     token_url: "https://auth.openai.com/oauth/token",
     token_body: TokenBody::Form,
+    token_standard: true,
     token_timeout: Some(Duration::from_millis(15_000)),
     token_params: &[],
+    token_headers: &[],
     refresh_headers: &[],
+    has_refresh: true,
     login_map: CredentialMap {
         access: "access_token",
-        refresh: "refresh_token",
-        expires: ("expires_in", 0),
+        refresh: Some("refresh_token"),
+        expires: Expiry::Seconds {
+            path: "expires_in",
+            skew_ms: 0,
+        },
         account_id: None,
         email: None,
         org_id: None,
@@ -425,8 +463,11 @@ const CODEX: OAuthPolicy = OAuthPolicy {
     },
     refresh_map: CredentialMap {
         access: "access_token",
-        refresh: "refresh_token",
-        expires: ("expires_in", 0),
+        refresh: Some("refresh_token"),
+        expires: Expiry::Seconds {
+            path: "expires_in",
+            skew_ms: 0,
+        },
         account_id: None,
         email: None,
         org_id: None,
@@ -437,7 +478,7 @@ const CODEX: OAuthPolicy = OAuthPolicy {
 const ANTHROPIC: OAuthPolicy = OAuthPolicy {
     id: "anthropic",
     // Public OAuth client id, stored base64 so secret scanners stay quiet.
-    client_id: "OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl",
+    client_id: Some("OWQxYzI1MGEtZTYxYi00NGQ5LTg4ZWQtNTk0NGQxOTYyZjVl"),
     client_id_base64: true,
     authorize_url: "https://claude.ai/oauth/authorize",
     scopes: &[
@@ -449,14 +490,18 @@ const ANTHROPIC: OAuthPolicy = OAuthPolicy {
         "user:file_upload",
     ],
     authorize_params: &[("code", "true")],
+    state_kind: StateKind::Hex,
     callback_port: 54545,
     callback_path: "/callback",
+    callback_host: "localhost",
     redirect_uri: None,
     port_fallback: true,
     token_url: "https://api.anthropic.com/v1/oauth/token",
     token_body: TokenBody::Json,
+    token_standard: true,
     token_timeout: None,
     token_params: &[("state", "{state}")],
+    token_headers: &[],
     refresh_headers: &[
         ("anthropic-beta", "oauth-2025-04-20"),
         (
@@ -464,10 +509,14 @@ const ANTHROPIC: OAuthPolicy = OAuthPolicy {
             "anthropic-sdk-typescript/{claude_code_sdk_version} userOAuthProvider",
         ),
     ],
+    has_refresh: true,
     login_map: CredentialMap {
         access: "access_token",
-        refresh: "refresh_token",
-        expires: ("expires_in", 300_000),
+        refresh: Some("refresh_token"),
+        expires: Expiry::Seconds {
+            path: "expires_in",
+            skew_ms: 300_000,
+        },
         account_id: Some("account.uuid"),
         email: Some("account.email_address"),
         org_id: Some("organization.uuid"),
@@ -475,10 +524,65 @@ const ANTHROPIC: OAuthPolicy = OAuthPolicy {
     },
     refresh_map: CredentialMap {
         access: "access_token",
-        refresh: "refresh_token",
-        expires: ("expires_in", 300_000),
+        refresh: Some("refresh_token"),
+        expires: Expiry::Seconds {
+            path: "expires_in",
+            skew_ms: 300_000,
+        },
         account_id: Some("account.uuid"),
         email: Some("account.email_address"),
+        org_id: None,
+        org_name: None,
+    },
+};
+
+/// Devin CLI login (`compat/rules/auth/devin.kdl`): a clientless
+/// authorization-code + PKCE flow against app.devin.ai. The exchange posts
+/// only `code` and `code_verifier` (standard=#false) and yields a JWT whose
+/// `exp` claim drives expiry (one-year fallback). `refresh "none"`: no refresh
+/// grant exists, so expiry requires a fresh login.
+const DEVIN: OAuthPolicy = OAuthPolicy {
+    id: "devin",
+    client_id: None,
+    client_id_base64: false,
+    authorize_url: "https://app.devin.ai/auth/cli/continue",
+    scopes: &[],
+    authorize_params: &[("prompt", "select_account")],
+    state_kind: StateKind::Uuid,
+    callback_port: 59653,
+    callback_path: "/callback",
+    callback_host: "127.0.0.1",
+    redirect_uri: None,
+    port_fallback: true,
+    token_url: "https://api.devin.ai/auth/cli/token",
+    token_body: TokenBody::Json,
+    token_standard: false,
+    token_timeout: None,
+    token_params: &[("code", "{code}"), ("code_verifier", "{code_verifier}")],
+    token_headers: &[("Accept", "application/json")],
+    refresh_headers: &[],
+    has_refresh: false,
+    login_map: CredentialMap {
+        access: "token",
+        refresh: Some("token"),
+        expires: Expiry::Jwt {
+            skew_ms: 300_000,
+            fallback_ms: 31_536_000_000,
+        },
+        account_id: None,
+        email: None,
+        org_id: None,
+        org_name: None,
+    },
+    refresh_map: CredentialMap {
+        access: "token",
+        refresh: None,
+        expires: Expiry::Jwt {
+            skew_ms: 300_000,
+            fallback_ms: 31_536_000_000,
+        },
+        account_id: None,
+        email: None,
         org_id: None,
         org_name: None,
     },
@@ -488,21 +592,35 @@ fn oauth_policy(provider: &str) -> Option<&'static OAuthPolicy> {
     match provider {
         "openai-codex" => Some(&CODEX),
         "anthropic" => Some(&ANTHROPIC),
+        "devin" => Some(&DEVIN),
         _ => None,
     }
 }
 
 impl OAuthPolicy {
-    fn client_id(&self) -> Result<String, AuthError> {
+    /// Resolved client id, or `None` for clientless rules.
+    fn client_id(&self) -> Result<Option<String>, AuthError> {
+        let Some(client_id) = self.client_id else {
+            return Ok(None);
+        };
         if self.client_id_base64 {
             let bytes = B64
-                .decode(self.client_id)
+                .decode(client_id)
                 .map_err(|e| AuthError::Corrupt(format!("{} client id: {e}", self.id)))?;
             String::from_utf8(bytes)
+                .map(Some)
                 .map_err(|e| AuthError::Corrupt(format!("{} client id: {e}", self.id)))
         } else {
-            Ok(self.client_id.to_string())
+            Ok(Some(client_id.to_string()))
         }
+    }
+
+    /// Redirect URI for a bound callback port when the rule pins none.
+    fn derived_redirect_uri(&self, port: u16) -> String {
+        format!(
+            "http://{}:{}{}",
+            self.callback_host, port, self.callback_path
+        )
     }
 }
 
@@ -519,11 +637,17 @@ fn generate_pkce() -> (String, String) {
     (verifier, challenge)
 }
 
-/// 16 random bytes hex-encoded (source default `generateState`).
-fn generate_state() -> String {
-    let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// `state` nonce per the rule's `state` attr: the default 16-byte hex string
+/// or a random UUID (`crypto.randomUUID` in the source).
+fn generate_state(kind: StateKind) -> String {
+    match kind {
+        StateKind::Hex => {
+            let mut bytes = [0u8; 16];
+            rand::rng().fill_bytes(&mut bytes);
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        }
+        StateKind::Uuid => uuid::Uuid::new_v4().to_string(),
+    }
 }
 
 /// `{name}` placeholder substitution; unknown names become empty (source `template`).
@@ -627,6 +751,12 @@ struct MappedCredential {
     org_name: Option<String>,
 }
 
+/// Epoch ms of a JWT `exp` claim minus `skew_ms` (source `jwtExpiryMs`).
+fn jwt_expiry_ms(token: &str, skew_ms: i64) -> Option<u64> {
+    let exp = decode_jwt_payload(token)?.get("exp")?.as_f64()?;
+    Some(((exp * 1000.0) as i64 - skew_ms).max(0) as u64)
+}
+
 fn map_credentials(
     map: &CredentialMap,
     body: &Value,
@@ -639,16 +769,24 @@ fn map_credentials(
             &excerpt[..excerpt.len().min(500)]
         ))
     })?;
-    let (expires_path, skew_ms) = map.expires;
-    let seconds = json_path(body, expires_path)
-        .and_then(Value::as_f64)
-        .ok_or_else(|| {
-            AuthError::Protocol(format!("{provider} token response missing {expires_path}"))
-        })?;
-    let expires = (timestamp_ms() as i64 + (seconds * 1000.0) as i64 - skew_ms).max(0) as u64;
+    let expires = match map.expires {
+        Expiry::Seconds { path, skew_ms } => {
+            let seconds = json_path(body, path)
+                .and_then(Value::as_f64)
+                .ok_or_else(|| {
+                    AuthError::Protocol(format!("{provider} token response missing {path}"))
+                })?;
+            (timestamp_ms() as i64 + (seconds * 1000.0) as i64 - skew_ms).max(0) as u64
+        }
+        Expiry::Jwt {
+            skew_ms,
+            fallback_ms,
+        } => jwt_expiry_ms(&access, skew_ms)
+            .unwrap_or((timestamp_ms() as i64 + fallback_ms).max(0) as u64),
+    };
     Ok(MappedCredential {
         access,
-        refresh: scalar_string(json_path(body, map.refresh)),
+        refresh: map.refresh.and_then(|p| scalar_string(json_path(body, p))),
         expires,
         account_id: map
             .account_id
@@ -1145,14 +1283,12 @@ impl CredentialStore {
     pub fn begin_login(&self, provider: &str) -> Result<OAuthLogin, AuthError> {
         let policy = oauth_policy(provider)
             .ok_or_else(|| AuthError::UnsupportedProvider(provider.to_string()))?;
-        let state = generate_state();
+        let state = generate_state(policy.state_kind);
         let (verifier, challenge) = generate_pkce();
-        let redirect_uri = policy.redirect_uri.map(str::to_string).unwrap_or_else(|| {
-            format!(
-                "http://localhost:{}{}",
-                policy.callback_port, policy.callback_path
-            )
-        });
+        let redirect_uri = policy
+            .redirect_uri
+            .map(str::to_string)
+            .unwrap_or_else(|| policy.derived_redirect_uri(policy.callback_port));
         let authorization_url =
             self.authorization_url(policy, &state, &redirect_uri, &challenge)?;
         Ok(OAuthLogin {
@@ -1225,7 +1361,7 @@ impl CredentialStore {
         if cancel.is_cancelled() {
             return Err(AuthError::Cancelled);
         }
-        let state = generate_state();
+        let state = generate_state(policy.state_kind);
         let (verifier, challenge) = generate_pkce();
 
         // Bind first so a busy pinned port fails before the browser opens.
@@ -1252,7 +1388,7 @@ impl CredentialStore {
         let redirect_uri = policy
             .redirect_uri
             .map(str::to_string)
-            .unwrap_or_else(|| format!("http://localhost:{bound_port}{}", policy.callback_path));
+            .unwrap_or_else(|| policy.derived_redirect_uri(bound_port));
         let authorization_url =
             self.authorization_url(policy, &state, &redirect_uri, &challenge)?;
         on_url(&authorization_url);
@@ -1320,7 +1456,7 @@ impl CredentialStore {
         let client_id = policy.client_id()?;
         let scope = policy.scopes.join(" ");
         let vars: Vec<(&str, &str)> = vec![
-            ("client_id", client_id.as_str()),
+            ("client_id", client_id.as_deref().unwrap_or("")),
             ("redirect_uri", redirect_uri),
             ("scope", scope.as_str()),
             ("state", state),
@@ -1332,15 +1468,18 @@ impl CredentialStore {
             .iter()
             .map(|(key, value)| (key.to_string(), template(value, &vars)))
             .collect();
-        let mut params: Vec<(String, String)> = vec![
-            ("client_id".into(), client_id),
-            ("response_type".into(), "code".into()),
-            ("redirect_uri".into(), redirect_uri.to_string()),
-            ("scope".into(), scope),
-            ("code_challenge".into(), challenge.to_string()),
-            ("code_challenge_method".into(), "S256".into()),
-            ("state".into(), state.to_string()),
-        ];
+        let mut params: Vec<(String, String)> = Vec::new();
+        if let Some(client_id) = client_id {
+            params.push(("client_id".into(), client_id));
+        }
+        params.push(("response_type".into(), "code".into()));
+        params.push(("redirect_uri".into(), redirect_uri.to_string()));
+        if !scope.is_empty() {
+            params.push(("scope".into(), scope));
+        }
+        params.push(("code_challenge".into(), challenge.to_string()));
+        params.push(("code_challenge_method".into(), "S256".into()));
+        params.push(("state".into(), state.to_string()));
         params.extend(extra);
         Ok(format!("{}?{}", policy.authorize_url, form_encode(&params)))
     }
@@ -1370,7 +1509,7 @@ impl CredentialStore {
             ("state", state),
             ("redirect_uri", redirect_uri),
             ("code_verifier", verifier),
-            ("client_id", client_id.as_str()),
+            ("client_id", client_id.as_deref().unwrap_or("")),
         ];
         // Template the extras first so the vars borrows end before the moves.
         let extra: Vec<(String, String)> = policy
@@ -1378,13 +1517,19 @@ impl CredentialStore {
             .iter()
             .map(|(key, value)| (key.to_string(), template(value, &vars)))
             .collect();
-        let mut params: Vec<(String, String)> = vec![
-            ("grant_type".into(), "authorization_code".into()),
-            ("client_id".into(), client_id),
-            ("code".into(), code.to_string()),
-            ("redirect_uri".into(), redirect_uri.to_string()),
-            ("code_verifier".into(), verifier.to_string()),
-        ];
+        // `standard=#false` (devin) posts only the rule's declared params.
+        let mut params: Vec<(String, String)> = if policy.token_standard {
+            let mut base = vec![("grant_type".into(), "authorization_code".into())];
+            if let Some(client_id) = client_id {
+                base.push(("client_id".into(), client_id));
+            }
+            base.push(("code".into(), code.to_string()));
+            base.push(("redirect_uri".into(), redirect_uri.to_string()));
+            base.push(("code_verifier".into(), verifier.to_string()));
+            base
+        } else {
+            Vec::new()
+        };
         params.extend(extra);
         let url = self.token_url(policy);
         let timeout = policy.token_timeout.unwrap_or(DEFAULT_TOKEN_TIMEOUT);
@@ -1402,6 +1547,10 @@ impl CredentialStore {
                 .header("content-type", "application/x-www-form-urlencoded")
                 .body(form_encode(&params)),
         };
+        let mut request = request;
+        for (key, value) in policy.token_headers {
+            request = request.header(*key, *value);
+        }
         let response = request.send().await.map_err(|e| AuthError::Exchange {
             provider: policy.id,
             message: format!("{url}: {e}"),
@@ -1418,6 +1567,10 @@ impl CredentialStore {
             AuthError::Protocol(format!("{} token response was not JSON", policy.id))
         })?;
         let mut mapped = map_credentials(&policy.login_map, &body, policy.id)?;
+        // `refresh "none"`: discard any mapped token so expiry forces re-login.
+        if !policy.has_refresh {
+            mapped.refresh = None;
+        }
         // after-exchange hooks
         match policy.id {
             "openai-codex" => apply_codex_profile(&mut mapped, &body, None, true)?,
@@ -1450,18 +1603,18 @@ impl CredentialStore {
             ));
         };
         let client_id = policy.client_id()?;
-        let params: Vec<(String, String)> = vec![
-            ("grant_type".into(), "refresh_token".into()),
-            ("client_id".into(), client_id.clone()),
-            ("refresh_token".into(), refresh.clone()),
-        ];
+        let mut params: Vec<(String, String)> = vec![("grant_type".into(), "refresh_token".into())];
+        if let Some(client_id) = &client_id {
+            params.push(("client_id".into(), client_id.clone()));
+        }
+        params.push(("refresh_token".into(), refresh.clone()));
         // The source also forwards `organization_id` for WorkOS-scoped grants;
         // neither ported policy mints one, so none is added.
         let url = self.token_url(policy);
         let timeout = policy.token_timeout.unwrap_or(DEFAULT_TOKEN_TIMEOUT);
         let vars: Vec<(&str, &str)> = vec![
             ("refresh_token", refresh.as_str()),
-            ("client_id", client_id.as_str()),
+            ("client_id", client_id.as_deref().unwrap_or("")),
             ("claude_code_sdk_version", CLAUDE_CODE_SDK_VERSION),
         ];
         let request = match policy.token_body {
@@ -1620,6 +1773,7 @@ fn policy_id(provider: &str) -> &'static str {
     match provider {
         "openai-codex" => "openai-codex",
         "anthropic" => "anthropic",
+        "devin" => "devin",
         _ => "oauth",
     }
 }
@@ -2257,6 +2411,130 @@ mod tests {
         assert_eq!(list[0].kind, CredentialKind::OAuth);
         assert_eq!(list[0].account_id.as_deref(), Some("acct-9"));
         assert_eq!(list[0].org_name.as_deref(), Some("pro"));
+    }
+
+    #[test]
+    fn begin_login_builds_devin_url() {
+        let dir = tempdir();
+        let store = CredentialStore::open(dir.path().join("auth.json")).unwrap();
+        let login = store.begin_login("devin").unwrap();
+        // The rule's callback hostname is a literal loopback IP, not localhost.
+        assert_eq!(login.redirect_uri, "http://127.0.0.1:59653/callback");
+        assert!(
+            login
+                .authorization_url
+                .starts_with("https://app.devin.ai/auth/cli/continue?")
+        );
+        assert!(login.authorization_url.contains("prompt=select_account"));
+        assert!(login.authorization_url.contains("code_challenge="));
+        assert!(
+            login
+                .authorization_url
+                .contains("code_challenge_method=S256")
+        );
+        assert!(
+            login
+                .authorization_url
+                .contains(&format!("state={}", login.state))
+        );
+        // `state "uuid"` produces a parseable v4 UUID, not the hex default.
+        assert!(uuid::Uuid::parse_str(&login.state).is_ok());
+        // The rule declares no client and no scopes.
+        assert!(!login.authorization_url.contains("client_id="));
+        assert!(!login.authorization_url.contains("scope="));
+    }
+
+    /// A JWT access token with an `exp` claim `seconds` from now.
+    fn devin_jwt(seconds_from_now: i64) -> String {
+        let header = B64URL.encode(r#"{"alg":"none"}"#);
+        let payload = B64URL.encode(format!(
+            r#"{{"exp":{}}}"#,
+            timestamp_ms() as i64 / 1000 + seconds_from_now
+        ));
+        format!("{header}.{payload}.sig")
+    }
+
+    #[tokio::test]
+    async fn complete_login_stores_devin_jwt_credential() {
+        let token = devin_jwt(3600);
+        let body = format!(r#"{{"token":"{token}"}}"#);
+        let (url, requests) = spawn_token_stub(body).await;
+        let dir = tempdir();
+        let path = dir.path().join("auth.json");
+        let mut store = CredentialStore::open(&path).unwrap();
+        store.override_token_endpoint("devin", url);
+        let login = store.begin_login("devin").unwrap();
+        let callback = format!("{}?code=thecode&state={}", login.redirect_uri, login.state);
+        store.complete_login(login, &callback).await.unwrap();
+
+        // `standard=#false`: the exchange posts only code + code_verifier.
+        {
+            let sent = requests.lock().unwrap();
+            assert_eq!(sent.len(), 1);
+            assert!(sent[0].contains(r#""code":"thecode""#));
+            assert!(sent[0].contains(r#""code_verifier":"#));
+            assert!(!sent[0].contains("grant_type"));
+            assert!(!sent[0].contains("client_id"));
+            assert!(!sent[0].contains("redirect_uri"));
+            assert!(sent[0].to_lowercase().contains("accept: application/json"));
+        }
+
+        let expires = {
+            let list = store.list().unwrap();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].provider, "devin");
+            assert_eq!(list[0].kind, CredentialKind::OAuth);
+            // JWT `exp` skewed by 300 s, not the one-year fallback.
+            list[0].expires.unwrap() as i64
+        };
+        let expected = timestamp_ms() as i64 + 3_600_000 - 300_000;
+        assert!(
+            (expires - expected).abs() < 10_000,
+            "{expires} ~ {expected}"
+        );
+        // `refresh "none"`: nothing was stored for refresh.
+        match store
+            .read_store()
+            .unwrap()
+            .credentials
+            .get("devin")
+            .unwrap()
+        {
+            StoredSecret::OAuth { refresh, .. } => assert!(refresh.is_empty()),
+            _ => panic!("expected oauth"),
+        }
+        // A live credential resolves without a refresh round-trip.
+        let cred = store.resolve(&model("devin")).await.unwrap().unwrap();
+        assert_eq!(cred.expose_secret(), token);
+    }
+
+    #[tokio::test]
+    async fn expired_devin_credential_requires_relogin() {
+        let dir = tempdir();
+        let path = dir.path().join("auth.json");
+        let store = CredentialStore::open(&path).unwrap();
+        {
+            let mut file = StoreFile::default();
+            file.credentials.insert(
+                "devin".into(),
+                StoredSecret::OAuth {
+                    access: devin_jwt(-600),
+                    refresh: String::new(),
+                    expires: 1,
+                    account_id: None,
+                    email: None,
+                    org_id: None,
+                    org_name: None,
+                    authorized_at: None,
+                },
+            );
+            write_store_atomic(&path, &file).unwrap();
+        }
+        // No refresh grant exists upstream: expiry is a re-login, not a POST.
+        assert!(matches!(
+            store.resolve(&model("devin")).await,
+            Err(AuthError::Refresh { .. })
+        ));
     }
 
     #[tokio::test]

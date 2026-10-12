@@ -164,7 +164,11 @@ method. OpenAI has one entry with **ChatGPT / Codex OAuth** and **OpenAI API Key
 tabs: subscription credentials enable `openai-codex` models, while a Platform
 API key enables `openai` models. These credentials can coexist and are removed
 independently. Anthropic offers browser login and API-key entry under one
-provider; those methods replace the same stored Anthropic credential.
+provider; those methods replace the same stored Anthropic credential. Devin
+follows the same shape — browser OAuth sign-in against app.devin.ai and a
+`DEVIN_API_KEY` service credential — but its `devin-agent` wire transport is
+not ported yet: swe-1-6 models appear in the picker once connected and fail at
+inference with an unsupported-API error.
 
 API keys are masked by default. Saving/removing credentials and reading
 connection status run in the background, not during GPUI rendering. Browser
@@ -175,7 +179,8 @@ The provider list and login details scroll independently in compact windows.
 
 The model picker (Ctrl-M) and `juto-cli models` show only chat models with an
 implemented transport and a stored or nonempty environment credential for their
-provider. Role selections cannot bypass this filter. Unauthenticated
+provider — plus catalog models for providers whose login is ported but whose
+transport is still pending (devin).
 local models are not included in this connected-only view; explicit CLI/session
 model selectors remain available. With no connections, the picker offers
 **Manage providers…** rather than fabricated fallback models.
