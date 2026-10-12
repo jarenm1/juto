@@ -392,7 +392,9 @@ pub(crate) struct MutationLock {
 
 impl MutationLock {
     /// Acquire the workspace mutation lock, creating `.juto-mutation.lock` in
-    /// `root` if needed. The lock file is excluded from every native snapshot.
+    /// `root` if needed. The lock file is excluded from every native snapshot,
+    /// and from Git's view of a colocated workspace, so it never appears as an
+    /// untracked file.
     pub(crate) fn acquire(root: &Path) -> Result<Self, String> {
         let path = root.join(LOCK_FILE_NAME);
         let file = std::fs::OpenOptions::new()
@@ -404,8 +406,32 @@ impl MutationLock {
             .map_err(|e| format!("cannot open mutation lock {}: {e}", path.display()))?;
         file.lock_exclusive()
             .map_err(|e| format!("cannot lock {}: {e}", path.display()))?;
+        exclude_from_git(root);
         Ok(Self { file })
     }
+}
+
+/// Add the lock file to the workspace's local Git exclude, so it never appears
+/// as an untracked file.
+///
+/// Best-effort: a native fork has no `.git` to exclude it from, and a failure
+/// here must not fail the mutation. `.git/info/exclude` is used rather than
+/// `.gitignore` so the user's tracked files are never touched.
+fn exclude_from_git(root: &Path) {
+    let exclude = root.join(".git").join("info").join("exclude");
+    let Ok(existing) = std::fs::read_to_string(&exclude) else {
+        return;
+    };
+    if existing.lines().any(|line| line.trim() == LOCK_FILE_NAME) {
+        return;
+    }
+    let mut text = existing;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(LOCK_FILE_NAME);
+    text.push('\n');
+    let _ = std::fs::write(&exclude, text);
 }
 
 impl Drop for MutationLock {
