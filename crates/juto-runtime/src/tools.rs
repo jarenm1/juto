@@ -30,6 +30,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
+use crate::change_graph::{ChangeGraph, ReconcileOutcome};
 use crate::workspace::{ResourceLimits, ScopedChild, ScopedStdio, SubagentWorkspace};
 
 // ---------------------------------------------------------------------------
@@ -1383,6 +1384,193 @@ impl Tool for DesktopArtifactTool {
 /// Registers `read`, `write`, `edit`, `glob`, `grep`, and `bash`. Approval
 /// policy is enforced by agent hooks via each tool's [`Tool::tier`]; these
 /// tools perform real filesystem/process work and return true errors.
+/// The change-graph operations an agent needs to work across machines.
+///
+/// The same operations exist in `juto-cli changes`, but an agent cannot rely on
+/// that binary being installed, so the cross-machine workflow — fetch another
+/// machine's work, reconcile it, publish your own — would otherwise be
+/// unreachable from a tool call.
+struct VcsTool {
+    cwd: PathBuf,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum VcsAction {
+    /// Counts, heads, and whether a reconcile is pending.
+    Status,
+    /// Import another machine's graph.
+    Fetch,
+    /// Fold imported heads into the local thread.
+    Reconcile,
+    /// Publish the local graph.
+    Push,
+    /// Check that every node's snapshot ref is present and correct.
+    Verify,
+}
+
+#[derive(Deserialize)]
+struct VcsParams {
+    action: VcsAction,
+    /// Remote name or path; defaults to `origin`.
+    remote: Option<String>,
+    /// Thread for `reconcile`; defaults to `main`.
+    thread: Option<String>,
+}
+
+#[async_trait]
+impl Tool for VcsTool {
+    fn definition(&self) -> juto_ai::ToolDefinition {
+        juto_ai::ToolDefinition {
+            name: "vcs".to_string(),
+            description: "Inspect and synchronize Juto's native change graph. `status` reports \
+                counts, heads, and whether an imported head still needs reconciling; `fetch` \
+                imports another machine's graph; `reconcile` folds imported heads into the local \
+                thread; `push` publishes the local graph; `verify` checks that every node's \
+                snapshot ref is present and correct."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "fetch", "reconcile", "push", "verify"],
+                        "description": "Which change-graph operation to run."
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name or path for `fetch` and `push`; defaults to `origin`."
+                    },
+                    "thread": {
+                        "type": "string",
+                        "description": "Thread for `reconcile`; defaults to `main`."
+                    }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Write
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Exclusive
+    }
+
+    async fn execute(&self, arguments: Value, ctx: ToolContext) -> Result<ToolOutput, String> {
+        let params: VcsParams =
+            serde_json::from_value(arguments).map_err(|e| format!("invalid vcs arguments: {e}"))?;
+        check_cancel(&ctx.cancel)?;
+        let cwd = effective_cwd(&self.cwd, &ctx).to_path_buf();
+        let remote = params.remote.unwrap_or_else(|| "origin".to_string());
+        let thread = params.thread.unwrap_or_else(|| "main".to_string());
+        let action = params.action;
+        let label = action_label(&action);
+
+        // The graph shells out to git, so keep it off the async runtime.
+        let details = tokio::task::spawn_blocking(move || -> Result<Value, String> {
+            let graph = ChangeGraph::open(&cwd).map_err(|e| format!("{e:#}"))?;
+            match action {
+                VcsAction::Status => {
+                    let state = graph.state().map_err(|e| format!("{e:#}"))?;
+                    // A head key containing '/' is an imported remote head: a
+                    // local thread name never contains one.
+                    let remote_heads: Vec<&String> =
+                        state.heads.keys().filter(|key| key.contains('/')).collect();
+                    Ok(json!({
+                        "thread": graph.thread(),
+                        "sparse": graph.sparse(),
+                        "nodes": state.nodes.len(),
+                        "heads": state.heads,
+                        "remote_heads": remote_heads,
+                        "needs_reconcile": !remote_heads.is_empty(),
+                        "checkpoints": state.checkpoints,
+                    }))
+                }
+                VcsAction::Fetch => {
+                    let report = graph.fetch_graph(&remote).map_err(|e| format!("{e:#}"))?;
+                    serde_json::to_value(report).map_err(|e| e.to_string())
+                }
+                VcsAction::Push => {
+                    let report = graph.push_graph(&remote).map_err(|e| format!("{e:#}"))?;
+                    serde_json::to_value(report).map_err(|e| e.to_string())
+                }
+                VcsAction::Verify => {
+                    let report = graph.verify().map_err(|e| format!("{e:#}"))?;
+                    let ok = report.is_ok();
+                    let mut value = serde_json::to_value(&report).map_err(|e| e.to_string())?;
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("ok".to_string(), Value::Bool(ok));
+                    }
+                    Ok(value)
+                }
+                VcsAction::Reconcile => {
+                    let outcomes = graph.reconcile(&thread).map_err(|e| format!("{e:#}"))?;
+                    // `ReconcileOutcome` carries a `ChangeNode`, so map it rather
+                    // than deriving a wire shape for an internal type.
+                    Ok(Value::Array(
+                        outcomes
+                            .into_iter()
+                            .map(|outcome| match outcome {
+                                ReconcileOutcome::Joined {
+                                    remote,
+                                    node,
+                                    base,
+                                    tree,
+                                } => json!({
+                                    "status": "joined",
+                                    "remote": remote,
+                                    "node": node,
+                                    "base": base,
+                                    "tree": tree,
+                                }),
+                                ReconcileOutcome::Adopted { remote, node } => json!({
+                                    "status": "adopted",
+                                    "remote": remote,
+                                    "node": node,
+                                }),
+                                ReconcileOutcome::Conflicted {
+                                    remote,
+                                    base,
+                                    conflicts,
+                                } => json!({
+                                    "status": "conflicted",
+                                    "remote": remote,
+                                    "base": base,
+                                    "conflicts": conflicts,
+                                }),
+                            })
+                            .collect(),
+                    ))
+                }
+            }
+        })
+        .await
+        .map_err(|e| format!("vcs task failed: {e}"))??;
+
+        let summary = format!("vcs {label}: {details}");
+        Ok(output(summary, details))
+    }
+}
+
+/// A short label for a [`VcsAction`], for the tool's human-readable summary.
+fn action_label(action: &VcsAction) -> &'static str {
+    match action {
+        VcsAction::Status => "status",
+        VcsAction::Fetch => "fetch",
+        VcsAction::Reconcile => "reconcile",
+        VcsAction::Push => "push",
+        VcsAction::Verify => "verify",
+    }
+}
+
+/// Build the builtin tool registry with no resource governance.
+///
+/// Approval policy is enforced by agent hooks via each tool's [`Tool::tier`];
+/// these tools perform real filesystem/process work and return true errors.
 pub fn builtin_tools(cwd: &Path) -> Result<ToolRegistry, AgentError> {
     builtin_tools_with_limits(cwd, None)
 }
@@ -1415,6 +1603,9 @@ pub fn builtin_tools_with_limits(
     registry.register(Arc::new(BashTool {
         cwd: cwd.to_path_buf(),
         limits,
+    }))?;
+    registry.register(Arc::new(VcsTool {
+        cwd: cwd.to_path_buf(),
     }))?;
     registry.register(Arc::new(DesktopArtifactTool))?;
     Ok(registry)
@@ -1465,6 +1656,7 @@ mod tests {
                 "glob",
                 "grep",
                 "read",
+                "vcs",
                 "write"
             ]
         );
@@ -2245,6 +2437,36 @@ mod tests {
         assert!(
             leftover.is_empty(),
             "a timed-out sandboxed command must not survive: {leftover}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vcs_tool_reports_status_and_verifies() {
+        let dir = git_dir();
+        ChangeGraph::open(dir.path()).expect("init graph");
+        let tool = VcsTool {
+            cwd: dir.path().to_path_buf(),
+        };
+
+        let out = tool
+            .execute(json!({"action": "status"}), ctx(dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(out.details["nodes"], 0, "{:?}", out.details);
+        assert_eq!(out.details["needs_reconcile"], false);
+        assert!(!out.is_error);
+
+        let out = tool
+            .execute(json!({"action": "verify"}), ctx(dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(out.details["ok"], true, "{:?}", out.details);
+
+        // An unknown action is rejected rather than silently ignored.
+        assert!(
+            tool.execute(json!({"action": "nope"}), ctx(dir.path()))
+                .await
+                .is_err()
         );
     }
 
