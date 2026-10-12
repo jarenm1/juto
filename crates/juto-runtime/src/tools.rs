@@ -1415,6 +1415,8 @@ enum VcsAction {
     Export,
     /// Push an exported branch to a remote.
     Publish,
+    /// Fetch an exported branch from a remote into a local branch.
+    FetchBranch,
     /// Merge two threads' trees into one node with two parents.
     Join,
 }
@@ -1467,6 +1469,7 @@ impl Tool for VcsTool {
                             "rewind",
                             "export",
                             "publish",
+                            "fetch_branch",
                             "join"
                         ],
                         "description": "Which change-graph operation to run."
@@ -1653,6 +1656,14 @@ impl Tool for VcsTool {
                     graph.push(&branch, &remote).map_err(|e| format!("{e:#}"))?;
                     Ok(json!({ "branch": branch, "remote": remote, "pushed": true }))
                 }
+                VcsAction::FetchBranch => {
+                    let branch =
+                        branch.ok_or_else(|| "`fetch_branch` needs a `branch`".to_string())?;
+                    graph
+                        .fetch_branch(&branch, &remote)
+                        .map_err(|e| format!("{e:#}"))?;
+                    Ok(json!({ "branch": branch, "remote": remote, "fetched": true }))
+                }
                 VcsAction::Join => {
                     let left = left.ok_or_else(|| "`join` needs a `left`".to_string())?;
                     let right = right.ok_or_else(|| "`join` needs a `right`".to_string())?;
@@ -1695,6 +1706,7 @@ fn action_label(action: &VcsAction) -> &'static str {
         VcsAction::Rewind => "rewind",
         VcsAction::Export => "export",
         VcsAction::Publish => "publish",
+        VcsAction::FetchBranch => "fetch_branch",
         VcsAction::Join => "join",
     }
 }

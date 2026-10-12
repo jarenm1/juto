@@ -1260,6 +1260,34 @@ impl GitRepository {
         Ok(())
     }
 
+    /// Fetch `branch` from `remote` into a local branch of the same name.
+    ///
+    /// The mirror of [`GitRepository::push`]. A non-fast-forward update is
+    /// refused rather than clobbering local work, and Git refuses to update a
+    /// branch that is checked out, so a caller reconciles a diverged branch
+    /// explicitly instead of silently losing it.
+    pub fn fetch_branch(&self, branch: &str, remote: &str) -> Result<()> {
+        self.validate_branch(branch)?;
+        if remote.is_empty() {
+            bail!("remote is empty");
+        }
+        if remote.starts_with('-') {
+            bail!("remote must not start with '-': {remote:?}");
+        }
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let output = self
+            .git(&["fetch", "--no-tags", remote, refspec.as_str()])
+            .output()
+            .context("failed to run `git fetch`")?;
+        if !output.status.success() {
+            bail!(
+                "`git fetch {remote} {refspec}` failed: {}",
+                describe_failure(&output)
+            );
+        }
+        Ok(())
+    }
+
     /// Stage the workspace into `index` on top of `baseline_tree` and write it.
     ///
     /// The snapshot is built from raw bytes: every path is enumerated from the
