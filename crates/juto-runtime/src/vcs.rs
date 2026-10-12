@@ -618,7 +618,7 @@ mod tests {
 
         // Wait until the mutation has opened the change graph (which happens
         // before its pre-lock validation), then let that validation finish.
-        let state = cwd.join(".git/juto/change-graph.json");
+        let state = cwd.join(".git/juto/graph.json");
         for _ in 0..500 {
             if state.exists() {
                 break;
