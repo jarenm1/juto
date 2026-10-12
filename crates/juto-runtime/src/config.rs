@@ -195,17 +195,6 @@ impl RuntimeConfig {
         Ok(config)
     }
 
-    /// Merge one already-parsed YAML overlay on top of `self`. Used by the
-    /// parent for `--config` overlays; arrays replace, maps merge deeply,
-    /// `null` tombstones delete a key.
-    pub fn apply_overlay(&mut self, overlay: serde_yaml::Value) -> Result<()> {
-        let mut base =
-            serde_yaml::to_value(&*self).map_err(|e| ConfigError::Validation(e.to_string()))?;
-        merge_value(&mut base, overlay);
-        *self = serde_yaml::from_value(base).map_err(|e| ConfigError::Validation(e.to_string()))?;
-        self.validate()
-    }
-
     pub fn validate(&self) -> Result<()> {
         if self.max_concurrency == 0 {
             return Err(ConfigError::Validation(
