@@ -57,6 +57,11 @@ recovers forks interrupted mid-provision, and skips gitlink (submodule) entries 
 a baseline gitlink is preserved by capture, so a fork that omits the submodule
 still captures a tree identical to the base.
 
+The `changes fork --sparse <prefix>` option materializes only selected subtrees
+while capture preserves the complete base tree; runtime edits outside the
+declared prefixes are rejected before writing.
+
+
 The `edit` tool selects a unique tree-sitter
 AST selection for Rust, Python, JavaScript, TypeScript, and TSX; unsupported
 languages, invalid queries, parse errors, and ambiguous captures fail explicitly
