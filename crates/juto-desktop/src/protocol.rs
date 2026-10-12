@@ -225,12 +225,37 @@ pub struct InputBatch {
     rename_all_fields = "camelCase"
 )]
 pub enum InputEvent {
-    PointerMoveAbs { x: u32, y: u32 },
-    PointerDelta { dx: i32, dy: i32 },
-    PointerButton { button: u32, pressed: bool },
-    PointerScroll { axis: u32, value: i32 },
-    Key { keycode: u32, pressed: bool },
-    TextCommit { text: String, focus_epoch: u64 },
+    PointerMoveAbs {
+        x: u32,
+        y: u32,
+    },
+    PointerDelta {
+        dx: i32,
+        dy: i32,
+    },
+    PointerButton {
+        button: u32,
+        pressed: bool,
+    },
+    PointerScroll {
+        axis: u32,
+        value: i32,
+    },
+    Key {
+        keycode: u32,
+        pressed: bool,
+    },
+    TextCommit {
+        text: String,
+        focus_epoch: u64,
+    },
+    /// Pre-edit (composing) text for the focused text-input instance.
+    TextPreedit {
+        text: String,
+        cursor_begin: i32,
+        cursor_end: i32,
+        focus_epoch: u64,
+    },
 }
 
 /// Metadata about a window mapped inside the compositor.

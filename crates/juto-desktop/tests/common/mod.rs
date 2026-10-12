@@ -10,9 +10,12 @@ use std::time::{Duration, Instant};
 
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
+use wayland_protocols::wp::text_input::zv3::client::{
+    zwp_text_input_manager_v3, zwp_text_input_v3,
+};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
 /// Width of the test client's toplevel in pixels.
@@ -32,6 +35,9 @@ struct State {
     configured: bool,
     frames: u32,
     shm_format: Option<wl_shm::Format>,
+    /// Text committed to the focused text-input instance.
+    committed_text: String,
+    text_enabled: bool,
 }
 
 macro_rules! ignore_events {
@@ -60,6 +66,8 @@ ignore_events! {
     xdg_wm_base::XdgWmBase => (),
     xdg_toplevel::XdgToplevel => (),
     wl_callback::WlCallback => (),
+    wl_seat::WlSeat => (),
+    zwp_text_input_manager_v3::ZwpTextInputManagerV3 => (),
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -71,6 +79,49 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+    }
+}
+
+impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &zwp_text_input_v3::ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_text_input_v3::Event::Enter { .. } => {
+                // Enable the instance and commit the state so the compositor
+                // may send preedit/commit events.
+                proxy.enable();
+                proxy.set_content_type(
+                    zwp_text_input_v3::ContentHint::None,
+                    zwp_text_input_v3::ContentPurpose::Normal,
+                );
+                proxy.commit();
+                state.text_enabled = true;
+                if let Ok(path) = std::env::var("JUTO_TEST_CLIENT_TEXT_FILE") {
+                    let _ = std::fs::write(&path, "ENTER");
+                }
+            }
+            zwp_text_input_v3::Event::Leave { .. } => {
+                proxy.disable();
+                proxy.commit();
+                state.text_enabled = false;
+            }
+            zwp_text_input_v3::Event::CommitString { text: Some(text) } => {
+                state.committed_text.push_str(&text);
+                if let Ok(path) = std::env::var("JUTO_TEST_CLIENT_TEXT_FILE") {
+                    let _ = std::fs::write(&path, &state.committed_text);
+                }
+            }
+            zwp_text_input_v3::Event::PreeditString { .. }
+            | zwp_text_input_v3::Event::DeleteSurroundingText { .. }
+            | zwp_text_input_v3::Event::Done { .. } => {}
+            _ => {}
+        }
     }
 }
 
@@ -159,6 +210,10 @@ pub fn run(socket: &str, seconds: u64) -> Result<u32, Box<dyn std::error::Error 
     let compositor: wl_compositor::WlCompositor = globals.bind(&qh, 4..=6, ())?;
     let shm: wl_shm::WlShm = globals.bind(&qh, 1..=1, ())?;
     let wm_base: xdg_wm_base::XdgWmBase = globals.bind(&qh, 1..=6, ())?;
+    let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=9, ())?;
+    let text_input_manager: zwp_text_input_manager_v3::ZwpTextInputManagerV3 =
+        globals.bind(&qh, 1..=1, ())?;
+    let text_input = text_input_manager.get_text_input(&seat, &qh, ());
 
     let surface = compositor.create_surface(&qh, ());
     let xdg_surface = wm_base.get_xdg_surface(&surface, &qh, ());
@@ -169,6 +224,9 @@ pub fn run(socket: &str, seconds: u64) -> Result<u32, Box<dyn std::error::Error 
 
     let mut state = State::default();
     event_queue.roundtrip(&mut state)?;
+    // Request text input for the surface we are about to map.
+    text_input.set_cursor_rectangle(0, 0, 1, 1);
+    text_input.commit();
 
     let stride = WIDTH * 4;
     let size = (stride * HEIGHT) as usize;

@@ -179,7 +179,8 @@ fn input_dispatch_validation() {
         .expect("input accepted");
     assert_eq!(watermark, 1);
 
-    // Text input is explicitly unavailable rather than silently dropped.
+    // Text input is forwarded to the focused text-input instance; with no
+    // focused client it is accepted and applied to nothing.
     let text_batch = InputBatch {
         seq: 2,
         client_timestamp_us: 0,
@@ -188,10 +189,10 @@ fn input_dispatch_validation() {
             focus_epoch: 1,
         }],
     };
-    assert!(matches!(
-        env.dispatch_input("agent:test", lease.epoch, 1, text_batch),
-        Err(juto_desktop::DesktopError::TextUnavailable(_))
-    ));
+    assert!(
+        env.dispatch_input("agent:test", lease.epoch, 1, text_batch)
+            .is_ok()
+    );
 
     env.destroy();
 }
@@ -403,6 +404,79 @@ fn reconcile_stops_orphan_scopes_and_removes_stale_directories() {
 
     let _ = orphan_child.kill();
     let _ = orphan_child.wait();
+    env.destroy();
+}
+
+#[test]
+fn text_input_v3_receives_committed_text() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("text")))
+        .expect("create environment");
+
+    let text_file = std::env::temp_dir().join(format!("juto-text-{}.txt", uuid::Uuid::now_v7()));
+    let socket = env.socket_path().to_string_lossy().to_string();
+    let text_path = text_file.to_string_lossy().to_string();
+    let client = std::thread::spawn(move || {
+        // The client writes committed text to this file.
+        unsafe { std::env::set_var("JUTO_TEST_CLIENT_TEXT_FILE", &text_path) };
+        common::run(&socket, 8)
+    });
+
+    // Wait until the client's window is mapped and focused.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut focused = false;
+    while Instant::now() < deadline {
+        if let Ok(info) = env.observe(Duration::from_secs(2)) {
+            let pool = env.frame_pool();
+            pool.acquire_slot(info.slot);
+            let mut pixels = Vec::new();
+            let header = pool.read_pixels(info.slot, &mut pixels);
+            pool.release_slot(info.slot);
+            if let Ok(header) = header
+                && header.width > 0
+                && pixels.len() >= 4
+                && pixels[0..4] == common::RED
+            {
+                focused = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(focused, "the client never rendered");
+
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
+    let batch = InputBatch {
+        seq: 1,
+        client_timestamp_us: 0,
+        events: vec![InputEvent::TextCommit {
+            text: "hello".to_string(),
+            focus_epoch: 1,
+        }],
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut received = String::new();
+    while Instant::now() < deadline {
+        let _ = env.dispatch_input("agent:test", lease.epoch, 1, batch.clone());
+        if let Ok(text) = std::fs::read_to_string(&text_file) {
+            received = text;
+            if received.contains("hello") {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        received.contains("hello"),
+        "client did not receive the committed text: {received:?}"
+    );
+
+    let _ = client.join();
+    let _ = std::fs::remove_file(&text_file);
     env.destroy();
 }
 

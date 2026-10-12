@@ -12,6 +12,7 @@ pub mod scm;
 pub mod shm;
 pub mod signaling;
 pub mod supervisor;
+pub mod text_input;
 pub mod viewer;
 
 pub use compositor::{

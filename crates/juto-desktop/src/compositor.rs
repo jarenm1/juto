@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::text_input::{TextInputManagerState, TextInputUserData};
 use smithay::backend::input::{Axis, ButtonState, KeyState};
 use smithay::backend::renderer::pixman::PixmanRenderer;
 use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_handler};
@@ -31,11 +32,17 @@ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{
     EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction,
 };
+use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::{
+    zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
+    zwp_text_input_v3::{self, ZwpTextInputV3},
+};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::{Client, Display, ListeningSocket};
+use smithay::reexports::wayland_server::{
+    Client, DataInit, Dispatch, Display, GlobalDispatch, ListeningSocket, New, Resource,
+};
 use smithay::utils::{
     Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform,
 };
@@ -239,6 +246,7 @@ struct DesktopState {
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
     output_manager_state: OutputManagerState,
+    text_input_manager_state: TextInputManagerState,
 
     space: Space<Window>,
     output: Output,
@@ -521,6 +529,21 @@ impl DesktopState {
         }
         self.flush_snapshots();
         self.send_frame_callbacks();
+        self.flush();
+    }
+
+    /// Pushes queued events to clients.
+    ///
+    /// The display socket only becomes readable when a client sends something,
+    /// so events addressed to an idle client (frame callbacks, text input) must
+    /// be flushed explicitly rather than waiting for the next request.
+    fn flush(&mut self) {
+        if let Some(mut display) = self.display.take() {
+            if let Err(err) = display.flush_clients() {
+                tracing::warn!(error = %err, "wayland flush failed");
+            }
+            self.display = Some(display);
+        }
     }
 
     fn apply_input(&mut self, event: InputEvent) {
@@ -617,9 +640,19 @@ impl DesktopState {
                 );
                 self.dirty = true;
             }
-            InputEvent::TextCommit { .. } => {
-                // Text input (text-input-v3) is not advertised yet; the caller
-                // receives an explicit rejection instead of fake key synthesis.
+            InputEvent::TextCommit { text, .. } => {
+                self.text_input_manager_state.commit_string(&text);
+                self.dirty = true;
+            }
+            InputEvent::TextPreedit {
+                text,
+                cursor_begin,
+                cursor_end,
+                ..
+            } => {
+                self.text_input_manager_state
+                    .preedit_string(&text, cursor_begin, cursor_end);
+                self.dirty = true;
             }
         }
     }
@@ -708,7 +741,9 @@ impl SeatHandler for DesktopState {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        self.text_input_manager_state.set_focus(focused.cloned());
+    }
     fn cursor_image(
         &mut self,
         _seat: &Seat<Self>,
@@ -845,6 +880,59 @@ smithay::delegate_seat!(DesktopState);
 smithay::delegate_xdg_shell!(DesktopState);
 smithay::delegate_data_device!(DesktopState);
 smithay::delegate_output!(DesktopState);
+impl GlobalDispatch<ZwpTextInputManagerV3, (), DesktopState> for DesktopState {
+    fn bind(
+        _state: &mut DesktopState,
+        _handle: &smithay::reexports::wayland_server::DisplayHandle,
+        _client: &Client,
+        resource: New<ZwpTextInputManagerV3>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, DesktopState>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<ZwpTextInputManagerV3, (), DesktopState> for DesktopState {
+    fn request(
+        state: &mut DesktopState,
+        _client: &Client,
+        _resource: &ZwpTextInputManagerV3,
+        request: zwp_text_input_manager_v3::Request,
+        _data: &(),
+        _handle: &smithay::reexports::wayland_server::DisplayHandle,
+        data_init: &mut DataInit<'_, DesktopState>,
+    ) {
+        if let zwp_text_input_manager_v3::Request::GetTextInput { id, .. } = request {
+            let instance = data_init.init(id, TextInputUserData::default());
+            state.text_input_manager_state.add_instance(instance);
+        }
+    }
+}
+
+impl Dispatch<ZwpTextInputV3, TextInputUserData, DesktopState> for DesktopState {
+    fn request(
+        _state: &mut DesktopState,
+        _client: &Client,
+        resource: &ZwpTextInputV3,
+        request: zwp_text_input_v3::Request,
+        _data: &TextInputUserData,
+        _handle: &smithay::reexports::wayland_server::DisplayHandle,
+        _data_init: &mut DataInit<'_, DesktopState>,
+    ) {
+        let Some(data) = resource.data::<TextInputUserData>() else {
+            return;
+        };
+        match request {
+            zwp_text_input_v3::Request::Enable => data.set_enabled(true),
+            zwp_text_input_v3::Request::Disable => data.set_enabled(false),
+            zwp_text_input_v3::Request::Commit => {
+                data.next_serial();
+            }
+            _ => {}
+        }
+    }
+}
 
 impl AsMut<CompositorState> for DesktopState {
     fn as_mut(&mut self) -> &mut CompositorState {
@@ -876,6 +964,12 @@ impl AsMut<OutputManagerState> for DesktopState {
     }
 }
 
+impl AsMut<TextInputManagerState> for DesktopState {
+    fn as_mut(&mut self) -> &mut TextInputManagerState {
+        &mut self.text_input_manager_state
+    }
+}
+
 impl AsMut<SeatState<DesktopState>> for DesktopState {
     fn as_mut(&mut self) -> &mut SeatState<DesktopState> {
         &mut self.seat_state
@@ -898,6 +992,8 @@ fn run_compositor(
     let shm_state = ShmState::new::<DesktopState>(&dh, vec![]);
     let data_device_state = DataDeviceState::new::<DesktopState>(&dh);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<DesktopState>(&dh);
+    let text_input_manager_state = TextInputManagerState::default();
+    dh.create_global::<DesktopState, ZwpTextInputManagerV3, _>(1, ());
 
     let mut seat_state = SeatState::new();
     let mut seat = seat_state.new_wl_seat(&dh, "juto-seat");
@@ -957,6 +1053,7 @@ fn run_compositor(
         seat_state,
         data_device_state,
         output_manager_state,
+        text_input_manager_state,
         space,
         output,
         _seat: seat,
@@ -1050,7 +1147,10 @@ fn run_compositor(
         .insert_source(cmd_rx, |event, _, state: &mut DesktopState| {
             if let ChannelEvent::Msg(command) = event {
                 match command {
-                    CompositorCommand::Input(input) => state.apply_input(input),
+                    CompositorCommand::Input(input) => {
+                        state.apply_input(input);
+                        state.flush();
+                    }
                     CompositorCommand::Configure {
                         width,
                         height,

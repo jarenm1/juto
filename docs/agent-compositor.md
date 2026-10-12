@@ -45,12 +45,15 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Same-host viewer transport: `Attach` returns the sealed frame pool as an
   `SCM_RIGHTS` descriptor with negotiated metadata, and the control socket
   authenticates callers by `SO_PEERCRED`.
+- Text input: `zwp_text_input_manager_v3` is advertised and the compositor acts
+  as the input method for its own clients, delivering committed and pre-edit
+  text to enabled instances for the focused surface.
 
-Not implemented: audio (private PipeWire sink plus Opus), Xwayland,
-text-input-v3, the hardware render-node profile, DMA-BUF export/import, TURN
-relay configuration, running the compositor in a separate worker process inside
-the environment cgroup, and deployment provisioning (TLS termination, public
-reachability). Sections describing those remain design.
+Not implemented: audio (private PipeWire sink plus Opus), Xwayland, the hardware
+render-node profile, DMA-BUF export/import, TURN relay configuration, running the
+compositor in a separate worker process inside the environment cgroup, and
+deployment provisioning (TLS termination, public reachability). Sections
+describing those remain design.
 
 ## 1. Decision and scope
 
