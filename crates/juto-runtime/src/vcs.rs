@@ -415,10 +415,16 @@ impl MutationLock {
 /// as an untracked file.
 ///
 /// Best-effort: a native fork has no `.git` to exclude it from, and a failure
-/// here must not fail the mutation. `.git/info/exclude` is used rather than
-/// `.gitignore` so the user's tracked files are never touched.
+/// here must not fail the mutation. `info/exclude` is used rather than
+/// `.gitignore` so the user's tracked files are never touched. `info/exclude`
+/// lives in the *common* git directory: a linked worktree has a `.git` file
+/// (not a directory) pointing at its own gitdir, which records the common
+/// directory in `commondir`.
 fn exclude_from_git(root: &Path) {
-    let exclude = root.join(".git").join("info").join("exclude");
+    let Some(git_dir) = common_git_dir(root) else {
+        return;
+    };
+    let exclude = git_dir.join("info").join("exclude");
     let Ok(existing) = std::fs::read_to_string(&exclude) else {
         return;
     };
@@ -432,6 +438,39 @@ fn exclude_from_git(root: &Path) {
     text.push_str(LOCK_FILE_NAME);
     text.push('\n');
     let _ = std::fs::write(&exclude, text);
+}
+
+/// Resolve the common Git directory for the worktree at `root`.
+///
+/// An ordinary worktree has a `.git` directory, which is its own common
+/// directory. A linked worktree (or submodule) has a `.git` file containing
+/// `gitdir: <path>`; that path's `commondir` file names the shared directory
+/// (relative to itself when not absolute), and an absent `commondir` means the
+/// gitdir is already the common directory. `None` when there is no `.git`.
+fn common_git_dir(root: &Path) -> Option<PathBuf> {
+    let dotgit = root.join(".git");
+    let metadata = std::fs::metadata(&dotgit).ok()?;
+    let mut git_dir = if metadata.is_dir() {
+        dotgit
+    } else {
+        let contents = std::fs::read_to_string(&dotgit).ok()?;
+        let path = contents.trim().strip_prefix("gitdir:")?.trim();
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        }
+    };
+    if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir")) {
+        let common = PathBuf::from(common.trim());
+        git_dir = if common.is_absolute() {
+            common
+        } else {
+            git_dir.join(common)
+        };
+    }
+    Some(git_dir)
 }
 
 impl Drop for MutationLock {
@@ -761,5 +800,36 @@ mod tests {
             !left_dir.join("crates/bar/b.txt").exists(),
             "a refused edit must not create the file"
         );
+    }
+
+    #[test]
+    fn mutation_lock_excludes_itself_in_a_linked_worktree() {
+        let directory = repo();
+        let main = directory.path();
+        let linked = directory.path().parent().unwrap().join("linked-worktree");
+        // A linked worktree's `.git` is a file, not a directory: the exclude
+        // lives in the common git directory's `info/exclude`.
+        git(
+            main,
+            &["worktree", "add", linked.to_str().unwrap(), "-b", "linked"],
+        );
+        assert!(linked.join(".git").is_file());
+        let common_exclude = main.join(".git/info/exclude");
+
+        let receipt = apply(&linked, Path::new("edited.txt"), "edited\n").unwrap();
+        assert!(receipt["graph_node"].is_string(), "{receipt}");
+        assert_eq!(
+            std::fs::read_to_string(linked.join("edited.txt")).unwrap(),
+            "edited\n"
+        );
+        assert!(
+            std::fs::read_to_string(&common_exclude)
+                .unwrap()
+                .lines()
+                .any(|line| line.trim() == LOCK_FILE_NAME),
+            "the lock file must be excluded in the common gitdir"
+        );
+        // The lock file itself lives at the linked worktree root.
+        assert!(linked.join(LOCK_FILE_NAME).exists());
     }
 }
