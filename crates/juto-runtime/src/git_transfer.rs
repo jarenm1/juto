@@ -550,15 +550,25 @@ impl GitRepository {
         if id.contains('/') {
             bail!("snapshot id must be a single ref component: {id:?}");
         }
-        let refname = format!("refs/juto/snapshots/{id}");
-        self.validate_ref(&refname)?;
+        self.release_ref(&format!("refs/juto/snapshots/{id}"))
+    }
+
+    /// Delete `refname` if it exists, reporting whether it was removed.
+    ///
+    /// The name is validated with `git check-ref-format`, so only a well-formed
+    /// ref can be deleted. Returns `true` when the ref existed and was removed,
+    /// `false` when it was already absent. This is the generic primitive behind
+    /// [`GitRepository::release_snapshot`] and the release of the
+    /// `refs/juto/nodes/<id>` refs a pruned change-graph node leaves behind.
+    pub fn release_ref(&self, refname: &str) -> Result<bool> {
+        self.validate_ref(refname)?;
         if self
-            .run_opt(&["rev-parse", "--verify", "--quiet", refname.as_str()])?
+            .run_opt(&["rev-parse", "--verify", "--quiet", refname])?
             .is_none()
         {
             return Ok(false);
         }
-        self.run_trimmed(&["update-ref", "-d", refname.as_str()])?;
+        self.run_trimmed(&["update-ref", "-d", refname])?;
         Ok(true)
     }
 
