@@ -150,6 +150,11 @@ impl ShmFramePool {
         self.size
     }
 
+    /// Byte size of one slot (header plus pixel payload, page aligned).
+    pub fn slot_size(&self) -> usize {
+        self.slot_size
+    }
+
     /// Renders or copies new desktop content into the next available slot.
     pub fn write_frame(
         &self,

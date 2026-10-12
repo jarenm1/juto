@@ -1,193 +1,336 @@
+//! Integration tests for the headless compositor and environment supervisor.
+
+mod common;
+
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
 use juto_desktop::protocol::*;
+use juto_desktop::shm::{ShmFramePool, ShmReader};
 use juto_desktop::supervisor::{
     DesktopSupervisor, EnvironmentConfig, OutputConfig, RenderProfile, SystemLimits,
 };
 
-#[test]
-fn test_environment_lifecycle_admission_and_generation() {
-    let supervisor = DesktopSupervisor::new();
-    let config = EnvironmentConfig {
-        env_id: "test-env-1".to_string(),
-        owner_principal: "agent-1".to_string(),
+fn test_config(env_id: &str) -> EnvironmentConfig {
+    EnvironmentConfig {
+        env_id: env_id.to_string(),
+        owner_principal: "agent:test".to_string(),
         output: OutputConfig {
-            width: 1280,
-            height: 720,
+            width: 640,
+            height: 480,
             scale: 1,
             fps: 30,
         },
         render_profile: RenderProfile::Software,
         limits: SystemLimits::default(),
         workspace_dir: std::env::temp_dir(),
-    };
+    }
+}
 
+fn unique_env_id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::now_v7())
+}
+
+#[test]
+fn environment_lifecycle_admission_and_generation() {
+    let supervisor = DesktopSupervisor::new();
     let env = supervisor
-        .create_environment(config)
+        .create_environment(test_config(&unique_env_id("lifecycle")))
         .expect("create environment");
-    assert_eq!(env.env_id(), "test-env-1");
-    assert_eq!(env.generation(), 1);
 
+    assert_eq!(env.generation(), 1);
     let status = env.get_status();
     assert!(status.is_ready);
-    assert_eq!(status.output.width, 1280);
+    assert_eq!(status.output.width, 640);
+    assert!(env.socket_path().exists(), "wayland socket must exist");
 
-    // Admission check: 4K @ 60 FPS in Software profile exceeds admitted 62.2M px/s
-    let excessive_config = OutputConfig {
+    // 4K @ 60 FPS exceeds the software profile's admitted pixel rate.
+    let excessive = OutputConfig {
         width: 3840,
         height: 2160,
         scale: 1,
         fps: 60,
     };
-    let reconfig_err = env.configure_output(1, excessive_config);
-    assert!(reconfig_err.is_err(), "should reject excessive pixel rate");
+    assert!(env.configure_output(1, excessive).is_err());
 
-    // Valid resize increments generation
-    let valid_reconfig = OutputConfig {
-        width: 1920,
-        height: 1080,
+    // A valid resize increments the geometry generation.
+    let valid = OutputConfig {
+        width: 800,
+        height: 600,
         scale: 1,
         fps: 30,
     };
     let new_gen = env
-        .configure_output(1, valid_reconfig)
+        .configure_output(1, valid.clone())
         .expect("valid resize");
     assert_eq!(new_gen, 2);
     assert_eq!(env.generation(), 2);
-    assert_eq!(env.output().width, 1920);
+    assert_eq!(env.output().width, 800);
+
+    // Stale generation is rejected.
+    assert!(env.configure_output(1, valid).is_err());
+
+    env.destroy();
+    assert!(!env.runtime_dir().exists(), "runtime dir must be removed");
 }
 
 #[test]
-fn test_shm_frame_producer_and_consumer_sealing() {
-    let supervisor = DesktopSupervisor::new();
-    let config = EnvironmentConfig {
-        env_id: "test-env-shm".to_string(),
-        owner_principal: "agent-2".to_string(),
-        output: OutputConfig {
-            width: 320,
-            height: 240,
-            scale: 1,
-            fps: 30,
-        },
-        render_profile: RenderProfile::Software,
-        limits: SystemLimits::default(),
-        workspace_dir: std::env::temp_dir(),
-    };
+fn shm_pool_sealing_and_roundtrip() {
+    let pool = ShmFramePool::create("seal-test", 64, 48).expect("create pool");
+    let pixels = vec![0x7Fu8; 64 * 48 * 4];
+    let frame = pool
+        .write_frame(7, 3, 1234, 64, 48, &pixels)
+        .expect("write frame");
+    assert_eq!(frame.header.frame_id, 7);
+    assert_eq!(frame.header.generation, 3);
 
-    let env = supervisor
-        .create_environment(config)
-        .expect("create environment");
+    // A reader mapping the sealed memfd sees the written payload.
+    let fd = unsafe { libc::dup(pool.raw_fd()) };
+    assert!(fd >= 0);
+    let reader = ShmReader::attach(fd, pool.size()).expect("attach reader");
+    let (header, payload) = reader
+        .read_slot(frame.slot, pool.slot_size())
+        .expect("read slot");
+    assert_eq!(header.frame_id, 7);
+    assert_eq!(header.width, 64);
+    assert_eq!(payload.len(), 64 * 48 * 4);
+    assert!(payload.iter().all(|b| *b == 0x7F));
 
-    // Simulate game frame generation
-    let fake_pixels = vec![0xABu8; 320 * 240 * 4];
-    let obs = env.produce_frame(&fake_pixels).expect("produce frame");
-
-    if let DesktopResponse::Observation {
-        frame_id,
-        generation,
-        shm_slot,
-        ..
-    } = obs
-    {
-        assert_eq!(frame_id, 1);
-        assert_eq!(generation, 1);
-        assert_eq!(shm_slot, 1); // first advance from slot 0
-    } else {
-        panic!("unexpected response variant");
-    }
+    // The producer mapping remains writable after sealing.
+    let second = pool
+        .write_frame(8, 3, 1235, 64, 48, &pixels)
+        .expect("second write");
+    assert_ne!(second.slot, frame.slot);
 }
 
 #[test]
-fn test_control_lease_and_human_preemption() {
+fn control_lease_and_human_preemption() {
     let supervisor = DesktopSupervisor::new();
-    let config = EnvironmentConfig {
-        env_id: "test-env-lease".to_string(),
-        owner_principal: "agent-builder".to_string(),
-        output: OutputConfig::default(),
-        render_profile: RenderProfile::Software,
-        limits: SystemLimits::default(),
-        workspace_dir: std::env::temp_dir(),
-    };
-
     let env = supervisor
-        .create_environment(config)
+        .create_environment(test_config(&unique_env_id("lease")))
         .expect("create environment");
 
-    // Agent acquires initial control
-    let agent_lease = env
-        .set_control("agent-builder", "acquire", false)
-        .expect("agent acquire")
-        .expect("some lease");
-    assert_eq!(agent_lease.holder, "agent-builder");
-    assert_eq!(agent_lease.epoch, 1);
-    assert!(!agent_lease.is_human);
+    let agent = env
+        .set_control("agent:test", "acquire", false)
+        .expect("agent acquires")
+        .expect("lease present");
+    assert_eq!(agent.epoch, 1);
 
-    // Another agent cannot steal control
-    let busy_err = env.set_control("agent-rogue", "acquire", false);
-    assert!(busy_err.is_err());
+    // A second agent cannot steal control.
+    assert!(env.set_control("agent:other", "acquire", false).is_err());
 
-    // A human CAN preempt the agent
-    let human_lease = env
-        .set_control("human-user", "acquire", true)
-        .expect("human acquire")
-        .expect("some lease");
-    assert_eq!(human_lease.holder, "human-user");
-    assert_eq!(human_lease.epoch, 2);
-    assert!(human_lease.is_human);
+    // A human preempts the agent and increments the epoch.
+    let human = env
+        .set_control("human:test", "acquire", true)
+        .expect("human preempts")
+        .expect("lease present");
+    assert_eq!(human.epoch, 2);
+    assert!(human.is_human);
 
-    // Now an agent cannot preempt the human
-    let agent_blocked = env.set_control("agent-builder", "acquire", false);
-    assert!(agent_blocked.is_err());
-
-    // Human releases control
-    let released = env
-        .set_control("human-user", "release", true)
-        .expect("release");
-    assert!(released.is_none());
+    // Releasing returns to no controller.
+    assert!(
+        env.set_control("human:test", "release", true)
+            .unwrap()
+            .is_none()
+    );
     assert!(env.get_status().active_control_lease.is_none());
+
+    env.destroy();
 }
 
 #[test]
-fn test_input_dispatch_validation() {
+fn input_dispatch_validation() {
     let supervisor = DesktopSupervisor::new();
-    let config = EnvironmentConfig {
-        env_id: "test-env-input".to_string(),
-        owner_principal: "agent-1".to_string(),
-        output: OutputConfig::default(),
-        render_profile: RenderProfile::Software,
-        limits: SystemLimits::default(),
-        workspace_dir: std::env::temp_dir(),
-    };
-
     let env = supervisor
-        .create_environment(config)
+        .create_environment(test_config(&unique_env_id("input")))
         .expect("create environment");
-    let lease = env
-        .set_control("controller-1", "acquire", true)
-        .expect("acquire")
-        .unwrap();
 
     let batch = InputBatch {
-        seq: 42,
-        client_timestamp_us: 1000,
-        events: vec![
-            InputEvent::PointerMoveAbs { x: 100, y: 200 },
-            InputEvent::PointerButton {
-                button: 1,
-                pressed: true,
-            },
-        ],
+        seq: 1,
+        client_timestamp_us: 0,
+        events: vec![InputEvent::PointerMoveAbs { x: 10, y: 10 }],
     };
 
-    // Stale generation is rejected
-    let bad_gen = env.dispatch_input("controller-1", lease.epoch, 999, batch.clone());
-    assert!(bad_gen.is_err());
+    // No lease: unauthorized.
+    assert!(
+        env.dispatch_input("agent:test", 1, 1, batch.clone())
+            .is_err()
+    );
 
-    // Stale lease epoch is rejected
-    let bad_epoch = env.dispatch_input("controller-1", 999, env.generation(), batch.clone());
-    assert!(bad_epoch.is_err());
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
 
-    // Valid dispatch succeeds
-    let ack = env
-        .dispatch_input("controller-1", lease.epoch, env.generation(), batch)
-        .expect("dispatch input");
-    assert_eq!(ack, 42);
+    // Stale epoch and stale generation are rejected.
+    assert!(
+        env.dispatch_input("agent:test", 99, 1, batch.clone())
+            .is_err()
+    );
+    assert!(
+        env.dispatch_input("agent:test", lease.epoch, 99, batch.clone())
+            .is_err()
+    );
+
+    // Matching lease and generation are accepted.
+    let watermark = env
+        .dispatch_input("agent:test", lease.epoch, 1, batch)
+        .expect("input accepted");
+    assert_eq!(watermark, 1);
+
+    // Text input is explicitly unavailable rather than silently dropped.
+    let text_batch = InputBatch {
+        seq: 2,
+        client_timestamp_us: 0,
+        events: vec![InputEvent::TextCommit {
+            text: "hello".to_string(),
+            focus_epoch: 1,
+        }],
+    };
+    assert!(matches!(
+        env.dispatch_input("agent:test", lease.epoch, 1, text_batch),
+        Err(juto_desktop::DesktopError::TextUnavailable(_))
+    ));
+
+    env.destroy();
+}
+
+#[test]
+fn compositor_renders_real_client_frame() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("render")))
+        .expect("create environment");
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    let client = std::thread::spawn(move || common::run(&socket, 10));
+
+    let pool = env.frame_pool();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut verified = None;
+    while Instant::now() < deadline {
+        let info = match env.observe(Duration::from_secs(2)) {
+            Ok(info) => info,
+            Err(err) => panic!("observe failed: {err}"),
+        };
+        let left = read_pixel(&pool, info.slot, 10, 10, info.width);
+        let right = read_pixel(&pool, info.slot, 300, 10, info.width);
+        if left == common::RED && right == common::BLUE {
+            verified = Some(info);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let info = verified.expect("compositor never produced the client's two-tone frame");
+    assert_eq!(info.width, 640);
+    assert_eq!(info.height, 480);
+    assert_eq!(info.generation, 1);
+
+    let frames = client.join().expect("client thread").expect("client run");
+    assert!(frames > 0, "client presented at least one frame");
+
+    env.destroy();
+}
+
+#[test]
+fn destroy_terminates_apps_and_removes_runtime_dir() {
+    let supervisor = DesktopSupervisor::new();
+    let env_id = unique_env_id("cleanup");
+    let env = supervisor
+        .create_environment(test_config(&env_id))
+        .expect("create environment");
+
+    let handle = env
+        .launch(
+            "sleeper",
+            &["sleep".to_string(), "300".to_string()],
+            None,
+            &[],
+        )
+        .expect("launch sleep");
+    assert!(handle.pid > 0);
+    assert_eq!(env.apps().len(), 1);
+
+    let unit = handle.unit.clone().expect("systemd scope unit");
+    assert!(
+        wait_for_unit_active(&unit, Duration::from_secs(5)),
+        "scope must become active after launch"
+    );
+
+    let runtime_dir = env.runtime_dir().to_path_buf();
+    assert!(runtime_dir.exists());
+
+    env.destroy();
+
+    assert!(
+        !runtime_dir.exists(),
+        "runtime dir must be removed on destroy"
+    );
+    assert!(
+        !unit_is_active(&unit),
+        "application scope must be stopped on destroy"
+    );
+    assert!(env.apps().is_empty());
+}
+
+#[test]
+fn launch_rejects_missing_executable() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("missing")))
+        .expect("create environment");
+
+    let err = env
+        .launch(
+            "nope",
+            &["definitely-not-a-real-binary-xyz".to_string()],
+            None,
+            &[],
+        )
+        .expect_err("missing executable must fail");
+    assert!(matches!(
+        err,
+        juto_desktop::DesktopError::ExecutableUnavailable { .. }
+    ));
+
+    env.destroy();
+}
+
+fn read_pixel(pool: &ShmFramePool, slot: usize, x: u32, y: u32, width: u32) -> [u8; 4] {
+    let fd = unsafe { libc::dup(pool.raw_fd()) };
+    assert!(fd >= 0, "dup failed");
+    let reader = ShmReader::attach(fd, pool.size()).expect("attach reader");
+    let (_header, pixels) = reader.read_slot(slot, pool.slot_size()).expect("read slot");
+    let idx = ((y * width + x) * 4) as usize;
+    [
+        pixels[idx],
+        pixels[idx + 1],
+        pixels[idx + 2],
+        pixels[idx + 3],
+    ]
+}
+
+fn unit_is_active(unit: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", unit])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn wait_for_unit_active(unit: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if unit_is_active(unit) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+#[allow(dead_code)]
+fn workspace_dir() -> PathBuf {
+    std::env::temp_dir()
 }

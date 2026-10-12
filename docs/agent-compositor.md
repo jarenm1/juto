@@ -1,11 +1,35 @@
 # Agent-owned headless desktop compositor
 
-**Status: proposed design, not an implemented capability.** This document owns
-compositor design end to end, including environment supervision and presentation
-interfaces. It does not implement the compositor, runtime tools, GPUI viewer,
-browser viewer, or deployment provisioning. Existing Juto capabilities are
-reported in [README](../README.md); the [runtime inventory](omp-runtime.md) is
-historical port context, not a current implementation inventory.
+**Status: partially implemented.** This document owns compositor design end to
+end, including environment supervision and presentation interfaces. The headless
+compositor, environment supervisor, and control daemon are implemented in
+`crates/juto-desktop`; the viewers, remote transport, and runtime tool adapters
+are not. Existing Juto capabilities are reported in [README](../README.md); the
+[runtime inventory](omp-runtime.md) is historical port context, not a current
+implementation inventory.
+
+### Implementation status
+
+Implemented (verified by `cargo test -p juto-desktop` and the daemon smoke):
+
+- Headless Smithay compositor: one virtual output, one virtual seat, xdg-shell
+  toplevels, `wl_shm` buffers, software (pixman) composition, frame callbacks on
+  a virtual clock, and programmatic pointer/keyboard injection. No host display,
+  KMS, libinput, or physical vblank.
+- Environment supervisor: admission checks, private `XDG_RUNTIME_DIR` and Wayland
+  socket, argv application launch inside a per-environment systemd scope
+  (`CPUQuota`, `MemoryMax`, `MemorySwapMax`, `TasksMax`), an approved environment
+  allowlist, window/geometry reporting, grants, control leases, and idempotent
+  destroy that terminates the application tree and removes the runtime directory.
+- Sealed shared-memory frame pool (`F_SEAL_GROW | F_SEAL_SHRINK |
+  F_SEAL_FUTURE_WRITE | F_SEAL_SEAL`) with three slots and reader backpressure.
+- `juto-desktop` daemon: length-prefixed JSON control protocol over a private
+  Unix socket, including event subscription.
+
+Not implemented: same-host viewer and descriptor passing (SCM_RIGHTS), GPUI
+embedded viewer, runtime `desktop_*` tools, WebRTC/remote presentation, audio,
+Xwayland, text-input-v3, the hardware render-node profile, DMA-BUF export/import,
+and deployment provisioning. Sections describing those remain design.
 
 ## 1. Decision and scope
 

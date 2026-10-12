@@ -46,7 +46,12 @@ pub struct AutomationBarrier {
 
 /// Top-level command dispatched to the desktop supervisor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "command", content = "payload", rename_all = "camelCase")]
+#[serde(
+    tag = "command",
+    content = "payload",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum DesktopCommand {
     Create {
         spec: crate::supervisor::EnvironmentConfig,
@@ -54,8 +59,11 @@ pub enum DesktopCommand {
     },
     Launch {
         env_id: String,
+        app_id: String,
         argv: Vec<String>,
         cwd: PathBuf,
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
         grants: Vec<String>,
         request_id: String,
     },
@@ -124,11 +132,20 @@ pub enum DesktopCommand {
     Destroy {
         env_id: String,
     },
+    /// Switch this connection to a stream of length-prefixed `DesktopEvent` frames.
+    Subscribe {
+        env_id: String,
+    },
 }
 
 /// Responses to synchronous desktop commands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", content = "data", rename_all = "camelCase")]
+#[serde(
+    tag = "status",
+    content = "data",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum DesktopResponse {
     Created {
         env_id: String,
@@ -172,6 +189,9 @@ pub enum DesktopResponse {
         applied_watermark: u64,
     },
     Destroyed,
+    Subscribed {
+        env_id: String,
+    },
     Error {
         code: String,
         message: String,
@@ -189,7 +209,11 @@ pub struct InputBatch {
 
 /// Discrete input event targeting the virtual seat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum InputEvent {
     PointerMoveAbs { x: u32, y: u32 },
     PointerDelta { dx: i32, dy: i32 },
@@ -200,7 +224,7 @@ pub enum InputEvent {
 }
 
 /// Metadata about a window mapped inside the compositor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowInfo {
     pub window_id: u32,
@@ -215,7 +239,12 @@ pub struct WindowInfo {
 
 /// Real-time asynchronous lifecycle event broadcast by the desktop supervisor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "event", content = "payload", rename_all = "camelCase")]
+#[serde(
+    tag = "event",
+    content = "payload",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum DesktopEvent {
     Ready {
         env_id: String,
@@ -226,6 +255,10 @@ pub enum DesktopEvent {
         exit_code: Option<i32>,
     },
     WindowMapped {
+        env_id: String,
+        window: WindowInfo,
+    },
+    WindowChanged {
         env_id: String,
         window: WindowInfo,
     },
