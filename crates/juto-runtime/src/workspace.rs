@@ -183,6 +183,35 @@ impl Default for Sandbox {
     }
 }
 
+impl Sandbox {
+    /// The default sandbox plus the toolchain directories a build must write.
+    ///
+    /// `ProtectSystem=strict` makes the whole hierarchy read-only and
+    /// `ProtectHome=read-only` makes `$HOME` read-only, so a build tool that
+    /// keeps state there fails unless those directories are granted. Cargo
+    /// writes to `CARGO_HOME` even for a read-only metadata query, so it is
+    /// always granted (defaulting to `$HOME/.cargo`); `RUSTUP_HOME` and
+    /// `XDG_CACHE_HOME` are granted when set. Without this, enabling the
+    /// sandbox breaks every build.
+    pub fn for_agent_workspace() -> Self {
+        let mut sandbox = Self::default();
+        for key in ["CARGO_HOME", "RUSTUP_HOME", "XDG_CACHE_HOME"] {
+            let path = match std::env::var_os(key) {
+                Some(value) => PathBuf::from(value),
+                None if key == "CARGO_HOME" => match std::env::var_os("HOME") {
+                    Some(home) => PathBuf::from(home).join(".cargo"),
+                    None => continue,
+                },
+                None => continue,
+            };
+            if path.is_absolute() && !sandbox.write_paths.contains(&path) {
+                sandbox.write_paths.push(path);
+            }
+        }
+        sandbox
+    }
+}
+
 /// Resource constraints and governance parameters for subagent execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLimits {
@@ -226,7 +255,7 @@ impl Default for ResourceLimits {
             .or_else(|| Some(default_gpu_lock_path()));
         let sandbox = env_var_nonempty("AGENT_SANDBOX")
             .filter(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .map(|_| Sandbox::default());
+            .map(|_| Sandbox::for_agent_workspace());
 
         Self {
             cpu_quota,
@@ -665,6 +694,7 @@ impl SubagentWorkspace {
                 if let Some(sandbox) = &limits.sandbox {
                     emit_sandbox_properties(&mut cmd, sandbox, &self.path);
                 }
+                emit_service_environment(&mut cmd, original, limits.sandbox.is_some());
 
                 cmd.arg("--");
                 cmd.arg(&program);
@@ -691,6 +721,7 @@ impl SubagentWorkspace {
             if let Some(sandbox) = &limits.sandbox {
                 emit_sandbox_properties(&mut cmd, sandbox, &self.path);
             }
+            emit_service_environment(&mut cmd, original, limits.sandbox.is_some());
 
             cmd.arg("--");
             cmd.arg(&program);
@@ -762,6 +793,33 @@ fn append_systemd_unit_mode(cmd: &mut std::process::Command, sandboxed: bool) {
         cmd.arg("-d");
     } else {
         cmd.arg("--scope");
+    }
+}
+
+/// Forward the caller's environment to a transient *service*.
+///
+/// A scope wraps the calling process and inherits its environment, but a
+/// service runs in the user manager's environment: without this a sandboxed
+/// command loses `PATH` and every build fails with ``linker `clang` not found``.
+/// `--setenv` is the only way to reach a service's environment; setting the
+/// variables on the `systemd-run` process itself does not propagate.
+fn emit_service_environment(
+    cmd: &mut std::process::Command,
+    original: &std::process::Command,
+    sandboxed: bool,
+) {
+    if !sandboxed {
+        return;
+    }
+    for (key, value) in original.get_envs() {
+        let Some(value) = value else {
+            continue;
+        };
+        let mut arg = OsString::from("--setenv=");
+        arg.push(key);
+        arg.push("=");
+        arg.push(value);
+        cmd.arg(arg);
     }
 }
 
