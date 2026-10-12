@@ -294,6 +294,8 @@ struct InnerEnvironment {
     gpu_lock: Mutex<Option<std::fs::File>>,
     /// Attached viewers, keyed by viewer id (spec section 6: two active viewers).
     viewers: Mutex<HashMap<String, Instant>>,
+    /// Launched applications keyed by request id, so a retry cannot double-launch.
+    launch_requests: Mutex<HashMap<String, AppHandle>>,
 }
 
 /// An active, isolated agent desktop environment.
@@ -455,6 +457,7 @@ impl DesktopEnvironment {
             slice,
             gpu_lock: Mutex::new(gpu_lock),
             viewers: Mutex::new(HashMap::new()),
+            launch_requests: Mutex::new(HashMap::new()),
         });
 
         spawn_event_forwarder(inner.clone(), comp_rx);
@@ -638,7 +641,14 @@ impl DesktopEnvironment {
         argv: &[String],
         cwd: Option<&Path>,
         env_overrides: &[(String, String)],
+        request_id: &str,
     ) -> Result<AppHandle, DesktopError> {
+        // A repeated request must not launch a second copy (spec section 4).
+        if !request_id.is_empty()
+            && let Some(handle) = self.inner.launch_requests.lock().get(request_id)
+        {
+            return Ok(handle.clone());
+        }
         if self.inner.destroyed.load(Ordering::SeqCst) {
             return Err(DesktopError::EnvironmentFailed(
                 self.env_id().to_string(),
@@ -803,6 +813,12 @@ impl DesktopEnvironment {
             return Err(err);
         }
 
+        if !request_id.is_empty() {
+            self.inner
+                .launch_requests
+                .lock()
+                .insert(request_id.to_string(), handle.clone());
+        }
         spawn_app_waiter(Arc::downgrade(&self.inner), app_id.to_string(), unit, child);
         Ok(handle)
     }
@@ -1574,6 +1590,8 @@ fn in_process_command(request: WorkerRequest) -> CompositorCommand {
 /// Central supervisor managing multiple isolated desktop environments.
 pub struct DesktopSupervisor {
     environments: Mutex<HashMap<String, DesktopEnvironment>>,
+    /// Environment ids keyed by `owner:request_id` for idempotent `Create`.
+    create_requests: Mutex<HashMap<String, String>>,
 }
 
 impl Default for DesktopSupervisor {
@@ -1586,14 +1604,30 @@ impl DesktopSupervisor {
     pub fn new() -> Self {
         Self {
             environments: Mutex::new(HashMap::new()),
+            create_requests: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Creates an environment, idempotent for a repeated owner request id.
+    ///
+    /// A retried `Create` with the same owner and request id returns the existing
+    /// environment instead of allocating a second one (spec section 4).
     pub fn create_environment(
         &self,
         config: EnvironmentConfig,
+        request_id: &str,
     ) -> Result<DesktopEnvironment, DesktopError> {
         let env_id = config.env_id.clone();
+        let key = format!("{}:{request_id}", config.owner_principal);
+        if !request_id.is_empty() {
+            let mut requests = self.create_requests.lock();
+            if let Some(existing) = requests.get(&key)
+                && let Some(env) = self.environments.lock().get(existing)
+            {
+                return Ok(env.clone());
+            }
+            requests.insert(key, env_id.clone());
+        }
         let env = DesktopEnvironment::new(config)?;
         self.environments.lock().insert(env_id, env.clone());
         Ok(env)

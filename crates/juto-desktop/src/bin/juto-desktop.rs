@@ -291,25 +291,28 @@ fn handle(
     supervisor: &DesktopSupervisor,
 ) -> (DesktopResponse, Option<std::os::fd::RawFd>) {
     let response = match command {
-        DesktopCommand::Create { spec, .. } => match supervisor.create_environment(spec) {
-            Ok(env) => DesktopResponse::Created {
-                env_id: env.env_id().to_string(),
-                effective_output: env.output(),
-                effective_limits: env.limits(),
-            },
-            Err(err) => error_response(&err),
-        },
+        DesktopCommand::Create { spec, request_id } => {
+            match supervisor.create_environment(spec, &request_id) {
+                Ok(env) => DesktopResponse::Created {
+                    env_id: env.env_id().to_string(),
+                    effective_output: env.output(),
+                    effective_limits: env.limits(),
+                },
+                Err(err) => error_response(&err),
+            }
+        }
         DesktopCommand::Launch {
             env_id,
             app_id,
             argv,
             cwd,
             env,
+            request_id,
             ..
         } => match supervisor.get_environment(&env_id) {
             Ok(env_handle) => {
                 let overrides: Vec<(String, String)> = env.into_iter().collect();
-                match env_handle.launch(&app_id, &argv, Some(&cwd), &overrides) {
+                match env_handle.launch(&app_id, &argv, Some(&cwd), &overrides, &request_id) {
                     Ok(handle) => DesktopResponse::Launched {
                         app_id: handle.app_id,
                         pid: handle.pid,

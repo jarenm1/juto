@@ -537,7 +537,8 @@ impl ChatView {
             compositor_mode: juto_runtime::CompositorMode::Worker,
             owner_heartbeat_timeout_secs: 60,
         };
-        let env = match supervisor.create_environment(config) {
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let env = match supervisor.create_environment(config, &request_id) {
             Ok(env) => env,
             Err(err) => {
                 self.artifact_notice = Some(format!("cannot create desktop: {err}").into());
@@ -545,7 +546,7 @@ impl ChatView {
                 return;
             }
         };
-        if let Err(err) = env.launch("desktop-app", &argv, None, &[]) {
+        if let Err(err) = env.launch("desktop-app", &argv, None, &[], &request_id) {
             self.artifact_notice = Some(format!("cannot launch desktop application: {err}").into());
             env.destroy();
             cx.notify();

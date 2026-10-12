@@ -17,6 +17,10 @@ fn worker_binary() -> &'static str {
     env!("CARGO_BIN_EXE_juto-desktop")
 }
 
+fn unique_env_id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::now_v7())
+}
+
 fn test_config(env_id: &str) -> EnvironmentConfig {
     // SAFETY: every test sets the same value, and it is read before spawning.
     unsafe { std::env::set_var("JUTO_DESKTOP_WORKER", worker_binary()) };
@@ -43,7 +47,7 @@ fn webrtc_streams_composed_frames_to_a_native_receiver() {
     let supervisor = DesktopSupervisor::new();
     let env_id = format!("remote-{}", uuid::Uuid::now_v7());
     let env = supervisor
-        .create_environment(test_config(&env_id))
+        .create_environment(test_config(&env_id), &unique_env_id("req"))
         .expect("create environment");
 
     let socket = env.socket_path().to_string_lossy().to_string();

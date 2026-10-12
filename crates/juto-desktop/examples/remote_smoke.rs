@@ -19,6 +19,10 @@ use juto_desktop::supervisor::{
     DesktopSupervisor, EnvironmentConfig, OutputConfig, RenderProfile, SystemLimits,
 };
 
+fn unique_env_id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::now_v7())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client_binary = std::env::args()
         .nth(1)
@@ -30,28 +34,32 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // The compositor worker is the daemon binary; JUTO_DESKTOP_WORKER names it.
     let supervisor = Arc::new(DesktopSupervisor::new());
-    let env = supervisor.create_environment(EnvironmentConfig {
-        env_id: format!("remote-smoke-{}", uuid::Uuid::now_v7()),
-        owner_principal: "agent:smoke".to_string(),
-        output: OutputConfig {
-            width: 640,
-            height: 480,
-            scale: 1,
-            fps: 30,
+    let env = supervisor.create_environment(
+        EnvironmentConfig {
+            env_id: format!("remote-smoke-{}", uuid::Uuid::now_v7()),
+            owner_principal: "agent:smoke".to_string(),
+            output: OutputConfig {
+                width: 640,
+                height: 480,
+                scale: 1,
+                fps: 30,
+            },
+            render_profile: RenderProfile::Software,
+            limits: SystemLimits::default(),
+            workspace_dir: std::env::temp_dir(),
+            lease_ttl_secs: 6,
+            compositor_mode: juto_desktop::CompositorMode::Worker,
+            owner_heartbeat_timeout_secs: 60,
         },
-        render_profile: RenderProfile::Software,
-        limits: SystemLimits::default(),
-        workspace_dir: std::env::temp_dir(),
-        lease_ttl_secs: 6,
-        compositor_mode: juto_desktop::CompositorMode::Worker,
-        owner_heartbeat_timeout_secs: 60,
-    })?;
+        &unique_env_id("req"),
+    )?;
 
     env.launch(
         "test-client",
         &[client_binary, "120".to_string()],
         None,
         &[],
+        &unique_env_id("req"),
     )?;
 
     // Wait for the client's two-tone frame before offering the stream.
