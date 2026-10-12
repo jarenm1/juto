@@ -299,6 +299,56 @@ fn hardware_profile_renders_and_serializes_on_the_shared_device() {
 }
 
 #[test]
+fn the_environment_has_a_private_audio_server() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("audio")), &unique_env_id("req"))
+        .expect("create environment");
+
+    // The environment's own PulseAudio socket must appear.
+    let socket = env.runtime_dir().join("pulse/native");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !socket.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        socket.exists(),
+        "the environment's private audio socket never appeared"
+    );
+
+    // The private server must expose the environment's own sink, which is what
+    // the remote encoder captures; the host graph is never involved.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut sink = false;
+    while Instant::now() < deadline {
+        let nodes = std::process::Command::new("pw-cli")
+            .args(["ls", "Node"])
+            .env("PIPEWIRE_RUNTIME_DIR", env.runtime_dir())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        if nodes.contains(juto_desktop::supervisor::AUDIO_SINK_NAME) && nodes.contains("Audio/Sink")
+        {
+            sink = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(sink, "the environment's private audio sink never appeared");
+
+    // The encoder is pointed at the environment's sink monitor.
+    assert_eq!(
+        env.audio_source(),
+        format!(
+            "pulsesrc device={}.monitor",
+            juto_desktop::supervisor::AUDIO_SINK_NAME
+        )
+    );
+
+    env.destroy();
+}
+
+#[test]
 fn host_aggregate_pixel_rate_is_admitted() {
     // 640x480@30 is 9,216,000 px/s, so two fit and a third does not.
     let supervisor = DesktopSupervisor::with_host_policy(HostPolicy {
