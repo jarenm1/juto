@@ -128,6 +128,13 @@ pub struct EnvironmentConfig {
     pub render_profile: RenderProfile,
     pub limits: SystemLimits,
     pub workspace_dir: PathBuf,
+    /// Control-lease lifetime in seconds (spec section 8: heartbeat 2s, expiry 6s).
+    #[serde(default = "default_lease_ttl")]
+    pub lease_ttl_secs: u64,
+}
+
+fn default_lease_ttl() -> u64 {
+    6
 }
 
 /// Live status reported by the supervisor.
@@ -274,6 +281,7 @@ impl DesktopEnvironment {
         });
 
         spawn_event_forwarder(inner.clone(), comp_rx);
+        spawn_lease_reaper(Arc::downgrade(&inner));
 
         let _ = events.send(DesktopEvent::Ready {
             env_id: config.env_id.clone(),
@@ -373,20 +381,31 @@ impl DesktopEnvironment {
         let mut lease = self.inner.lease.lock();
         match action {
             "acquire" => {
-                if let Some(current) = lease.as_ref()
-                    && ((!is_human && current.is_human)
-                        || (!is_human && !current.is_human && current.holder != caller))
-                {
-                    return Err(DesktopError::ControlBusy {
-                        holder: current.holder.clone(),
-                        epoch: current.epoch,
-                    });
+                if let Some(current) = lease.as_ref() {
+                    if current.holder == caller && current.is_human == is_human {
+                        // Renewal: same holder keeps its epoch and extends the
+                        // deadline, so a heartbeat cannot invalidate its own lease.
+                        let renewed = ControlLease {
+                            expires_at: now_secs() + self.inner.config.lease_ttl_secs.max(1),
+                            ..current.clone()
+                        };
+                        *lease = Some(renewed.clone());
+                        return Ok(Some(renewed));
+                    }
+                    if (!is_human && current.is_human)
+                        || (!is_human && !current.is_human && current.holder != caller)
+                    {
+                        return Err(DesktopError::ControlBusy {
+                            holder: current.holder.clone(),
+                            epoch: current.epoch,
+                        });
+                    }
                 }
                 let new_epoch = lease.as_ref().map(|l| l.epoch + 1).unwrap_or(1);
                 let new_lease = ControlLease {
                     holder: caller.to_string(),
                     epoch: new_epoch,
-                    expires_at: now_secs() + 6,
+                    expires_at: now_secs() + self.inner.config.lease_ttl_secs.max(1),
                     is_human,
                 };
                 *lease = Some(new_lease.clone());
@@ -577,6 +596,18 @@ impl DesktopEnvironment {
             .lock()
             .insert(app_id.to_string(), handle.clone());
 
+        if let Some(unit) = unit.as_ref()
+            && let Err(err) = verify_scope(unit, &self.inner.config.limits)
+        {
+            let _ = Command::new("systemctl")
+                .args(["--user", "stop", unit])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            self.inner.apps.lock().remove(app_id);
+            return Err(err);
+        }
+
         spawn_app_waiter(Arc::downgrade(&self.inner), app_id.to_string(), unit, child);
         Ok(handle)
     }
@@ -612,6 +643,12 @@ impl DesktopEnvironment {
             environment: self.env_id().to_string(),
         })?;
         if current_lease.epoch != epoch || current_lease.holder != caller {
+            return Err(DesktopError::StaleLease {
+                expected: current_lease.epoch,
+                received: epoch,
+            });
+        }
+        if current_lease.expires_at <= now_secs() {
             return Err(DesktopError::StaleLease {
                 expected: current_lease.epoch,
                 received: epoch,
@@ -730,15 +767,47 @@ impl DesktopEnvironment {
     }
 
     pub fn get_status(&self) -> EnvironmentStatus {
+        let now = now_secs();
+        let lease = self
+            .inner
+            .lease
+            .lock()
+            .clone()
+            .filter(|lease| lease.expires_at > now);
+        let grants = self
+            .inner
+            .grants
+            .lock()
+            .values()
+            .filter(|grant| grant.expires_at > now)
+            .cloned()
+            .collect();
         EnvironmentStatus {
             env_id: self.env_id().to_string(),
             owner_principal: self.inner.config.owner_principal.clone(),
             output: self.output(),
             generation: self.generation(),
             is_ready: *self.inner.is_ready.lock(),
-            active_control_lease: self.inner.lease.lock().clone(),
+            active_control_lease: lease,
             mapped_windows: self.inner.windows.lock().values().cloned().collect(),
-            active_grants: self.inner.grants.lock().values().cloned().collect(),
+            active_grants: grants,
+        }
+    }
+
+    /// Clears an expired control lease and reports the change.
+    fn expire_lease_if_stale(&self) {
+        let mut lease = self.inner.lease.lock();
+        let expired = lease
+            .as_ref()
+            .map(|lease| lease.expires_at <= now_secs())
+            .unwrap_or(false);
+        if expired {
+            *lease = None;
+            drop(lease);
+            let _ = self.inner.events.send(DesktopEvent::ControlChanged {
+                env_id: self.env_id().to_string(),
+                lease: None,
+            });
         }
     }
 
@@ -820,6 +889,26 @@ fn spawn_event_forwarder(inner: Arc<InnerEnvironment>, rx: std_mpsc::Receiver<De
     });
 }
 
+/// Periodically clears expired control leases so a stale holder cannot keep
+/// control after its heartbeat stops.
+fn spawn_lease_reaper(inner: std::sync::Weak<InnerEnvironment>) {
+    let _ = std::thread::Builder::new()
+        .name("juto-desktop-lease-reaper".to_string())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                if inner.destroyed.load(Ordering::SeqCst) {
+                    return;
+                }
+                let env = DesktopEnvironment { inner };
+                env.expire_lease_if_stale();
+            }
+        });
+}
+
 fn spawn_app_waiter(
     inner: std::sync::Weak<InnerEnvironment>,
     app_id: String,
@@ -889,6 +978,114 @@ fn terminate_app(app: &AppHandle) {
     }
 }
 
+/// Verifies that a launched scope actually enforces the configured limits.
+///
+/// Returns `IsolationUnavailable` when the effective properties do not match,
+/// so a silently uncapped application is never reported as isolated.
+fn verify_scope(unit: &str, limits: &SystemLimits) -> Result<(), DesktopError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut last = String::new();
+    loop {
+        let output = Command::new("systemctl")
+            .args([
+                "--user",
+                "show",
+                unit,
+                "--property=CPUQuotaPerSecUSec",
+                "--property=MemoryMax",
+                "--property=TasksMax",
+                "--no-pager",
+            ])
+            .output();
+        if let Ok(output) = output {
+            let text = String::from_utf8_lossy(&output.stdout).to_string();
+            if let Some(problem) = scope_mismatch(&text, limits) {
+                last = problem;
+            } else {
+                return Ok(());
+            }
+        } else if let Err(err) = output {
+            last = format!("systemctl show failed: {err}");
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(DesktopError::IsolationUnavailable(format!(
+                "scope `{unit}` did not enforce the requested limits: {last}"
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn scope_mismatch(properties: &str, limits: &SystemLimits) -> Option<String> {
+    let mut cpu_quota = None;
+    let mut memory_max = None;
+    let mut tasks_max = None;
+    for line in properties.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        match key {
+            "CPUQuotaPerSecUSec" => cpu_quota = Some(value.trim().to_string()),
+            "MemoryMax" => memory_max = Some(value.trim().to_string()),
+            "TasksMax" => tasks_max = Some(value.trim().to_string()),
+            _ => {}
+        }
+    }
+
+    let quota = cpu_quota.unwrap_or_default();
+    if quota.is_empty() || quota == "infinity" || quota.starts_with('0') {
+        return Some(format!("CPUQuotaPerSecUSec={quota}"));
+    }
+    let expected_memory = parse_size(&limits.memory_max);
+    let actual_memory = memory_max.as_deref().and_then(parse_size);
+    if let (Some(expected), Some(actual)) = (expected_memory, actual_memory)
+        && actual != expected
+    {
+        return Some(format!("MemoryMax={actual} (expected {expected})"));
+    }
+    if actual_memory.is_none() {
+        return Some(format!(
+            "MemoryMax={}",
+            memory_max.unwrap_or_else(|| "unset".to_string())
+        ));
+    }
+    let expected_tasks = u64::from(limits.tasks_max);
+    let actual_tasks = tasks_max
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok());
+    if actual_tasks != Some(expected_tasks) {
+        return Some(format!(
+            "TasksMax={} (expected {expected_tasks})",
+            tasks_max.unwrap_or_else(|| "unset".to_string())
+        ));
+    }
+    None
+}
+
+/// Parses a systemd size string such as `8G` or `8589934592`.
+fn parse_size(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || value == "infinity" {
+        return None;
+    }
+    let (digits, multiplier) = match value.chars().last()? {
+        'K' => (&value[..value.len() - 1], 1024u64),
+        'M' => (&value[..value.len() - 1], 1024 * 1024),
+        'G' => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        'T' => (&value[..value.len() - 1], 1024 * 1024 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    digits.trim().parse::<u64>().ok().map(|n| n * multiplier)
+}
+
+/// What a reconciliation pass cleaned up.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReconcileReport {
+    pub stopped_units: Vec<String>,
+    pub removed_directories: Vec<PathBuf>,
+}
+
 /// Central supervisor managing multiple isolated desktop environments.
 pub struct DesktopSupervisor {
     environments: Mutex<HashMap<String, DesktopEnvironment>>,
@@ -934,6 +1131,65 @@ impl DesktopSupervisor {
             }
             None => Err(DesktopError::EnvironmentNotFound(env_id.to_string())),
         }
+    }
+
+    /// Kills orphan environment scopes and removes stale runtime directories
+    /// left behind by a previous supervisor process.
+    ///
+    /// Live environments owned by this supervisor are left untouched.
+    pub fn reconcile(&self) -> ReconcileReport {
+        let mut report = ReconcileReport::default();
+        let live: Vec<String> = self
+            .environments
+            .lock()
+            .keys()
+            .map(|id| sanitize(id))
+            .collect();
+
+        if let Ok(output) = Command::new("systemctl")
+            .args([
+                "--user",
+                "list-units",
+                "--all",
+                "--no-legend",
+                "--plain",
+                "juto-desktop-*.scope",
+            ])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let Some(unit) = line.split_whitespace().next() else {
+                    continue;
+                };
+                if !unit.starts_with("juto-desktop-") {
+                    continue;
+                }
+                if live.iter().any(|id| unit.contains(id.as_str())) {
+                    continue;
+                }
+                let _ = Command::new("systemctl")
+                    .args(["--user", "stop", unit])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                report.stopped_units.push(unit.to_string());
+            }
+        }
+
+        let root = desktop_runtime_root();
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if live.contains(&name) {
+                    continue;
+                }
+                let path = entry.path();
+                if path.is_dir() && std::fs::remove_dir_all(&path).is_ok() {
+                    report.removed_directories.push(path);
+                }
+            }
+        }
+        report
     }
 
     /// Destroys every environment. Used on supervisor shutdown.
@@ -983,12 +1239,16 @@ fn scope_enforced() -> Result<bool, DesktopError> {
     ))
 }
 
-fn environment_runtime_dir(env_id: &str) -> PathBuf {
+fn desktop_runtime_root() -> PathBuf {
     let base = std::env::var_os("JUTO_DESKTOP_RUNTIME_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("/tmp"));
-    base.join("juto-desktop").join(sanitize(env_id))
+    base.join("juto-desktop")
+}
+
+fn environment_runtime_dir(env_id: &str) -> PathBuf {
+    desktop_runtime_root().join(sanitize(env_id))
 }
 
 fn prepare_runtime_dir(dir: &Path) -> Result<(), DesktopError> {

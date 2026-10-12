@@ -38,6 +38,9 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   serves a browser viewer page and relays SDP/ICE over a WebSocket, pointer and
   keyboard input over a reliable ordered data channel, and a native receiver that
   decodes the same stream.
+- Hardening: effective scope properties are verified after launch and creation
+  fails closed when they do not match; control leases and grants expire and are
+  swept; orphan scopes and stale runtime directories are reconciled at startup.
 
 Not implemented: audio (private PipeWire sink plus Opus), Xwayland,
 text-input-v3, the hardware render-node profile, DMA-BUF export/import, TURN

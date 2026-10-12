@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         render_profile: RenderProfile::Software,
         limits: SystemLimits::default(),
         workspace_dir: std::env::temp_dir(),
+        lease_ttl_secs: 6,
     })?;
 
     env.launch(

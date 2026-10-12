@@ -24,6 +24,7 @@ fn test_config(env_id: &str) -> EnvironmentConfig {
         render_profile: RenderProfile::Software,
         limits: SystemLimits::default(),
         workspace_dir: std::env::temp_dir(),
+        lease_ttl_secs: 6,
     }
 }
 
@@ -272,6 +273,134 @@ fn destroy_terminates_apps_and_removes_runtime_dir() {
         "application scope must be stopped on destroy"
     );
     assert!(env.apps().is_empty());
+}
+
+#[test]
+fn expired_control_lease_is_released_and_rejected() {
+    let supervisor = DesktopSupervisor::new();
+    let mut config = test_config(&unique_env_id("expiry"));
+    config.lease_ttl_secs = 1;
+    let env = supervisor
+        .create_environment(config)
+        .expect("create environment");
+
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.epoch, 1);
+
+    // Renewal by the same holder keeps the epoch.
+    let renewed = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(renewed.epoch, 1);
+
+    // Wait past the TTL: the lease is reported gone and input is rejected.
+    std::thread::sleep(Duration::from_millis(2200));
+    assert!(env.get_status().active_control_lease.is_none());
+    let batch = InputBatch {
+        seq: 1,
+        client_timestamp_us: 0,
+        events: vec![InputEvent::PointerMoveAbs { x: 1, y: 1 }],
+    };
+    // The reaper clears the lease, so the call is unauthorized; a lease that is
+    // still present but past its deadline is rejected as stale.
+    assert!(matches!(
+        env.dispatch_input("agent:test", lease.epoch, 1, batch),
+        Err(juto_desktop::DesktopError::StaleLease { .. })
+            | Err(juto_desktop::DesktopError::Unauthorized { .. })
+    ));
+
+    env.destroy();
+}
+
+#[test]
+fn expired_grants_are_not_reported() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("grants")))
+        .expect("create environment");
+
+    let live = env.issue_grant(
+        "human:test".to_string(),
+        vec![GrantRole::View],
+        "session".to_string(),
+        60,
+    );
+    let expired = env.issue_grant(
+        "human:other".to_string(),
+        vec![GrantRole::View],
+        "session".to_string(),
+        0,
+    );
+    let grants = env.get_status().active_grants;
+    assert!(grants.iter().any(|grant| grant.grant_id == live.grant_id));
+    assert!(
+        !grants
+            .iter()
+            .any(|grant| grant.grant_id == expired.grant_id)
+    );
+
+    env.destroy();
+}
+
+#[test]
+fn reconcile_stops_orphan_scopes_and_removes_stale_directories() {
+    let supervisor = DesktopSupervisor::new();
+    let env_id = unique_env_id("orphan");
+    let env = supervisor
+        .create_environment(test_config(&env_id))
+        .expect("create environment");
+
+    // A live environment is left alone.
+    let report = supervisor.reconcile();
+    assert!(env.runtime_dir().exists());
+    assert!(
+        !report
+            .stopped_units
+            .iter()
+            .any(|unit| unit.contains(&env_id.replace('-', "_")) || unit.contains(&env_id))
+    );
+
+    // An orphan scope and a stale directory are cleaned up.
+    let orphan = format!("juto-desktop-orphan-{}.scope", uuid::Uuid::now_v7());
+    let mut orphan_child = std::process::Command::new("systemd-run")
+        .args([
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            &format!("--unit={orphan}"),
+            "--",
+            "sleep",
+            "60",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the orphan scope");
+    assert!(
+        wait_for_unit_active(&orphan, Duration::from_secs(5)),
+        "orphan scope never became active"
+    );
+
+    let stale = env.runtime_dir().parent().unwrap().join("stale-env-dir");
+    std::fs::create_dir_all(&stale).unwrap();
+
+    let report = supervisor.reconcile();
+    assert!(
+        report.stopped_units.iter().any(|unit| unit == &orphan),
+        "orphan scope was not stopped: {:?}",
+        report.stopped_units
+    );
+    assert!(!stale.exists(), "stale directory was not removed");
+    assert!(env.runtime_dir().exists(), "live environment was removed");
+
+    let _ = orphan_child.kill();
+    let _ = orphan_child.wait();
+    env.destroy();
 }
 
 #[test]
