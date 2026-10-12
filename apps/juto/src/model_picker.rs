@@ -177,6 +177,25 @@ impl PickerData {
         }
     }
 
+    /// Reflect a persisted `role -> selector` binding: updates the role row
+    /// and the role badges shown on each model row.
+    fn record_assignment(&mut self, role: &str, selector: &str) {
+        if let Some(entry) = self.roles.iter_mut().find(|entry| entry.role == role) {
+            entry.resolved = Some(selector.to_string());
+        } else {
+            self.roles.push(RoleEntry {
+                role: role.to_string(),
+                resolved: Some(selector.to_string()),
+            });
+        }
+        for model in &mut self.models {
+            model.roles.retain(|name| name != role);
+            if model.selector == selector {
+                model.roles.push(role.to_string());
+            }
+        }
+    }
+
     fn connect(&mut self, providers: BTreeSet<String>, query: &str) {
         self.connected = providers;
         self.available = self
@@ -210,7 +229,7 @@ impl PickerData {
 
 #[derive(Clone, Debug)]
 pub enum ModelPickerEvent {
-    SelectModel(String),
+    AssignRole { role: String, selector: String },
     Close,
     ManageProviders,
 }
@@ -219,6 +238,7 @@ pub struct ModelPicker {
     focus_handle: FocusHandle,
     search_input: Entity<TextInput>,
     active_model: String,
+    assign_role: String,
     data: PickerData,
     selected: usize,
     scroll_handle: UniformListScrollHandle,
@@ -254,6 +274,7 @@ impl ModelPicker {
             focus_handle: cx.focus_handle(),
             search_input,
             active_model,
+            assign_role: "default".into(),
             data: PickerData::new(config, registry),
             selected: 0,
             scroll_handle: UniformListScrollHandle::new(),
@@ -312,35 +333,27 @@ impl ModelPicker {
         self.search_input.read(cx).focus_handle(cx).focus(window);
     }
 
-    pub fn set_active_model(&mut self, model: impl Into<String>, cx: &mut Context<Self>) {
-        let model = model.into();
-        self.active_model = model.clone();
-        for entry in &mut self.data.models {
-            entry.roles.retain(|role| role != "default");
+    /// Persisted bindings arrive through this after `Runtime::set_model_role`
+    /// succeeds; the picker never mutates role state on its own so a failed
+    /// write can't desync the display from config.yml.
+    pub fn apply_assignment(&mut self, role: &str, selector: &str, cx: &mut Context<Self>) {
+        if role == "default" {
+            self.active_model = selector.to_string();
         }
-        if let Some(entry) = self
-            .data
-            .models
-            .iter_mut()
-            .find(|entry| entry.selector == model)
-        {
-            entry.roles.push("default".into());
-        }
-        if let Some(role) = self
-            .data
-            .roles
-            .iter_mut()
-            .find(|role| role.role == "default")
-        {
-            role.resolved = Some(model);
-        }
+        self.data.record_assignment(role, selector);
+        cx.notify();
+    }
+
+    pub fn set_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
+        self.error = error;
         cx.notify();
     }
 
     fn select_model(&mut self, selector: String, cx: &mut Context<Self>) {
-        self.set_active_model(selector.clone(), cx);
-        cx.emit(ModelPickerEvent::SelectModel(selector));
-        cx.emit(ModelPickerEvent::Close);
+        cx.emit(ModelPickerEvent::AssignRole {
+            role: self.assign_role.clone(),
+            selector,
+        });
     }
 
     fn close(&mut self, _: &CloseModelPicker, _: &mut Window, cx: &mut Context<Self>) {
@@ -559,7 +572,9 @@ impl ModelPicker {
                         })
                         .map(|model| model.name.to_string())
                         .unwrap_or_else(|| target.clone().unwrap_or_else(|| "Unassigned".into()));
-                    let row = div()
+                    let is_target = self.assign_role == role.role;
+                    let role_name = role.role.clone();
+                    div()
                         .id(SharedString::from(role.role.clone()))
                         .flex()
                         .items_center()
@@ -568,13 +583,38 @@ impl ModelPicker {
                         .px_2()
                         .py_1()
                         .border_t_1()
-                        .border_color(rgb(0x303030))
+                        .border_color(if is_target {
+                            rgb(0x4c5f9e)
+                        } else {
+                            rgb(0x303030)
+                        })
+                        .bg(if is_target {
+                            rgb(0x1d2438)
+                        } else {
+                            rgb(0x191919)
+                        })
                         .text_xs()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgb(0x232c44)))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.assign_role = role_name.clone();
+                            this.error = None;
+                            cx.notify();
+                        }))
                         .child(
                             div()
                                 .w(px(88.))
                                 .flex_none()
-                                .text_color(rgb(0xd4d4d8))
+                                .text_color(if is_target {
+                                    rgb(0xa5b8f3)
+                                } else {
+                                    rgb(0xd4d4d8)
+                                })
+                                .font_weight(if is_target {
+                                    gpui::FontWeight::SEMIBOLD
+                                } else {
+                                    gpui::FontWeight::NORMAL
+                                })
                                 .child(provider_label(&role.role)),
                         )
                         .child(
@@ -588,18 +628,19 @@ impl ModelPicker {
                                 })
                                 .truncate()
                                 .child(model_name),
-                        );
-                    if let Some(target) =
-                        target.filter(|target| self.data.available.contains(target))
-                    {
-                        row.cursor_pointer()
-                            .hover(|style| style.bg(rgb(0x292929)))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.select_model(target.clone(), cx)
-                            }))
-                    } else {
-                        row
-                    }
+                        )
+                        .when(is_target, |row| {
+                            row.child(
+                                div()
+                                    .px_1p5()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .bg(rgb(0x2c3a63))
+                                    .text_size(px(10.))
+                                    .text_color(rgb(0xc7d4ff))
+                                    .child("target"),
+                            )
+                        })
                 }))
         };
         div()
@@ -613,9 +654,21 @@ impl ModelPicker {
             .child(
                 div()
                     .pb_1()
-                    .text_sm()
-                    .text_color(rgb(0xe4e4e7))
-                    .child("Role assignments"),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(rgb(0xe4e4e7))
+                            .child("Role assignments"),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(0x888888))
+                            .child(format!("Assigning to @{}", self.assign_role)),
+                    ),
             )
             .child(
                 div()
@@ -664,133 +717,120 @@ impl Render for ModelPicker {
             .on_action(cx.listener(Self::next))
             .on_action(cx.listener(Self::confirm))
             .flex()
-            .items_center()
-            .justify_center()
-            .size_full()
-            .p_6()
-            .when(compact, |view| view.p_3())
-            .bg(rgb(0x0d0d0d))
+            .flex_col()
+            .w(px(900.))
+            .max_w(window.viewport_size().width - px(48.))
+            .h(px(660.))
+            .max_h(window.viewport_size().height - px(48.))
+            .min_w_0()
+            .min_h_0()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(0x4a4a4a))
+            .bg(rgb(0x191919))
+            .shadow_xl()
             .text_color(rgb(0xe4e4e7))
             .child(
                 div()
+                    .flex_none()
                     .flex()
-                    .flex_col()
-                    .w_full()
-                    .max_w(px(900.))
-                    .h_full()
-                    .max_h(px(660.))
-                    .min_w_0()
+                    .items_center()
+                    .justify_between()
+                    .px_4()
+                    .py_3()
+                    .border_b_1()
+                    .border_color(rgb(0x333333))
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .text_color(rgb(0xffffff))
+                            .child("Select Model or Role"),
+                    )
+                    .child(
+                        div()
+                            .id("close-picker-btn")
+                            .px_2()
+                            .py_1()
+                            .text_size(px(20.))
+                            .text_color(rgb(0xaaaaaa))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgb(0xffffff)))
+                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                cx.emit(ModelPickerEvent::Close)
+                            }))
+                            .child("×"),
+                    ),
+            )
+            .child(div().flex_none().p_3().child(self.search_input.clone()))
+            .child(self.columns_header(compact, name_width))
+            .child(
+                div()
+                    .pb_2()
+                    .flex_1()
                     .min_h_0()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(0x4a4a4a))
-                    .bg(rgb(0x191919))
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .px_4()
-                            .py_3()
-                            .border_b_1()
-                            .border_color(rgb(0x333333))
-                            .child(
-                                div()
-                                    .text_size(px(20.))
-                                    .text_color(rgb(0xffffff))
-                                    .child("Select Model or Role"),
+                    .when(message.is_some(), |list| {
+                        list.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h_full()
+                                .text_sm()
+                                .text_color(rgb(0xaaaaaa))
+                                .child(message.clone().unwrap_or_default()),
+                        )
+                    })
+                    .when(!self.data.filtered.is_empty(), |list| {
+                        list.child(
+                            uniform_list(
+                                "model-list",
+                                self.data.filtered.len(),
+                                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                                    range
+                                        .map(|row| {
+                                            this.model_row(
+                                                row,
+                                                this.data.filtered[row],
+                                                compact,
+                                                name_width,
+                                                cx,
+                                            )
+                                        })
+                                        .collect()
+                                }),
                             )
-                            .child(
-                                div()
-                                    .id("close-picker-btn")
-                                    .px_2()
-                                    .py_1()
-                                    .text_size(px(20.))
-                                    .text_color(rgb(0xaaaaaa))
-                                    .cursor_pointer()
-                                    .hover(|style| style.text_color(rgb(0xffffff)))
-                                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                        cx.emit(ModelPickerEvent::Close)
-                                    }))
-                                    .child("×"),
-                            ),
-                    )
-                    .child(div().flex_none().p_3().child(self.search_input.clone()))
-                    .child(self.columns_header(compact, name_width))
+                            .track_scroll(self.scroll_handle.clone())
+                            .w_full()
+                            .h_full(),
+                        )
+                    }),
+            )
+            .child(self.assignments(cx))
+            .child(
+                div()
+                    .flex_none()
+                    .px_4()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(rgb(0x333333))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(div().text_xs().text_color(rgb(0x888888)).child(format!(
+                        "↑ ↓ Navigate · Enter assigns to @{}",
+                        self.assign_role
+                    )))
                     .child(
                         div()
-                            .pb_2()
-                            .flex_1()
-                            .min_h_0()
-                            .when(message.is_some(), |list| {
-                                list.child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .h_full()
-                                        .text_sm()
-                                        .text_color(rgb(0xaaaaaa))
-                                        .child(message.clone().unwrap_or_default()),
-                                )
-                            })
-                            .when(!self.data.filtered.is_empty(), |list| {
-                                list.child(
-                                    uniform_list(
-                                        "model-list",
-                                        self.data.filtered.len(),
-                                        cx.processor(
-                                            move |this, range: std::ops::Range<usize>, _, cx| {
-                                                range
-                                                    .map(|row| {
-                                                        this.model_row(
-                                                            row,
-                                                            this.data.filtered[row],
-                                                            compact,
-                                                            name_width,
-                                                            cx,
-                                                        )
-                                                    })
-                                                    .collect()
-                                            },
-                                        ),
-                                    )
-                                    .track_scroll(self.scroll_handle.clone())
-                                    .w_full()
-                                    .h_full(),
-                                )
-                            }),
-                    )
-                    .child(self.assignments(cx))
-                    .child(
-                        div()
-                            .flex_none()
-                            .px_4()
-                            .py_2()
-                            .border_t_1()
-                            .border_color(rgb(0x333333))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(0x888888))
-                                    .child("↑ ↓ Navigate · Enter Select"),
-                            )
-                            .child(
-                                div()
-                                    .id("picker-manage-providers")
-                                    .text_xs()
-                                    .text_color(rgb(0xd4d4d8))
-                                    .cursor_pointer()
-                                    .hover(|style| style.text_color(rgb(0xffffff)))
-                                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                        cx.emit(ModelPickerEvent::ManageProviders)
-                                    }))
-                                    .child("Manage providers…"),
-                            ),
+                            .id("picker-manage-providers")
+                            .text_xs()
+                            .text_color(rgb(0xd4d4d8))
+                            .cursor_pointer()
+                            .hover(|style| style.text_color(rgb(0xffffff)))
+                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                cx.emit(ModelPickerEvent::ManageProviders)
+                            }))
+                            .child("Manage providers…"),
                     ),
             )
     }

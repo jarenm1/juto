@@ -3197,6 +3197,7 @@ dependencies = [
  "juto-ai",
  "juto-catalog",
  "libc",
+ "parking_lot",
  "regex",
  "serde",
  "serde_json",
