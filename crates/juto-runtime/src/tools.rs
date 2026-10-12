@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::change_graph::{ChangeGraph, ReconcileOutcome};
+use crate::change_graph::{ChangeGraph, JoinOutcome, ReconcileOutcome};
 use crate::workspace::{ResourceLimits, ScopedChild, ScopedStdio, SubagentWorkspace};
 
 // ---------------------------------------------------------------------------
@@ -1415,6 +1415,8 @@ enum VcsAction {
     Export,
     /// Push an exported branch to a remote.
     Publish,
+    /// Merge two threads' trees into one node with two parents.
+    Join,
 }
 
 #[derive(Deserialize)]
@@ -1434,6 +1436,9 @@ struct VcsParams {
     verified: Option<bool>,
     /// Git branch for `export` and `publish`.
     branch: Option<String>,
+    /// Left and right points for `join`: node ids or checkpoint names.
+    left: Option<String>,
+    right: Option<String>,
 }
 
 #[async_trait]
@@ -1461,7 +1466,8 @@ impl Tool for VcsTool {
                             "mark",
                             "rewind",
                             "export",
-                            "publish"
+                            "publish",
+                            "join"
                         ],
                         "description": "Which change-graph operation to run."
                     },
@@ -1488,6 +1494,14 @@ impl Tool for VcsTool {
                     "branch": {
                         "type": "string",
                         "description": "Git branch for `export` and `publish`."
+                    },
+                    "left": {
+                        "type": "string",
+                        "description": "Left point for `join`: a node id or checkpoint name."
+                    },
+                    "right": {
+                        "type": "string",
+                        "description": "Right point for `join`: a node id or checkpoint name."
                     }
                 },
                 "required": ["action"],
@@ -1513,6 +1527,8 @@ impl Tool for VcsTool {
             name,
             verified,
             branch,
+            left,
+            right,
         } = serde_json::from_value(arguments).map_err(|e| format!("invalid vcs arguments: {e}"))?;
         check_cancel(&ctx.cancel)?;
         let cwd = effective_cwd(&self.cwd, &ctx).to_path_buf();
@@ -1637,6 +1653,26 @@ impl Tool for VcsTool {
                     graph.push(&branch, &remote).map_err(|e| format!("{e:#}"))?;
                     Ok(json!({ "branch": branch, "remote": remote, "pushed": true }))
                 }
+                VcsAction::Join => {
+                    let left = left.ok_or_else(|| "`join` needs a `left`".to_string())?;
+                    let right = right.ok_or_else(|| "`join` needs a `right`".to_string())?;
+                    match graph
+                        .join(&thread, &left, &right)
+                        .map_err(|e| format!("{e:#}"))?
+                    {
+                        JoinOutcome::Joined { node, base, tree } => Ok(json!({
+                            "status": "joined",
+                            "node": node,
+                            "base": base,
+                            "tree": tree,
+                        })),
+                        JoinOutcome::Conflicted { base, conflicts } => Ok(json!({
+                            "status": "conflicted",
+                            "base": base,
+                            "conflicts": conflicts,
+                        })),
+                    }
+                }
             }
         })
         .await
@@ -1659,6 +1695,7 @@ fn action_label(action: &VcsAction) -> &'static str {
         VcsAction::Rewind => "rewind",
         VcsAction::Export => "export",
         VcsAction::Publish => "publish",
+        VcsAction::Join => "join",
     }
 }
 
@@ -2600,6 +2637,45 @@ mod tests {
             out.details["commits"]
                 .as_object()
                 .is_some_and(|commits| !commits.is_empty()),
+            "{:?}",
+            out.details
+        );
+
+        // `join` merges two threads into a two-parent node. Each capture must
+        // change the workspace: capturing an unchanged one is a no-op that does
+        // not create a thread head.
+        for (thread, content) in [("left", "left\n"), ("right", "right\n")] {
+            std::fs::write(dir.path().join(format!("{thread}.txt")), content).expect("write");
+            graph
+                .capture(
+                    thread,
+                    EditProvenance {
+                        session_id: "test".into(),
+                        tool: "test".into(),
+                        selection_mode: None,
+                        path: None,
+                    },
+                    None,
+                )
+                .expect("capture thread");
+        }
+        let heads = graph.state().expect("state").heads;
+        let out = tool
+            .execute(
+                json!({
+                    "action": "join",
+                    "thread": "integration",
+                    "left": heads["left"],
+                    "right": heads["right"],
+                }),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.details["status"], "joined", "{:?}", out.details);
+        assert_eq!(
+            out.details["node"]["parents"].as_array().map(Vec::len),
+            Some(2),
             "{:?}",
             out.details
         );
