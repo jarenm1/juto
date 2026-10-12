@@ -27,6 +27,10 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   (`LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`, `MESA_LOADER_DRIVER_OVERRIDE`), and
   otherwise composes with pixman. A GLES renderer that resolves to a
   non-software device is discarded before any frame is composed.
+- Viewer admission: at most two active viewers per environment (spec section 6).
+  A third attach is rejected with `LimitExceeded` before any frame pool
+  descriptor is handed out, and the slot is released when the viewer's control
+  connection ends.
 - Environment supervisor: admission checks, private `XDG_RUNTIME_DIR` and Wayland
   socket, argv application launch inside a per-environment systemd scope
   (`CPUQuota`, `MemoryMax`, `MemorySwapMax`, `TasksMax`), an approved environment

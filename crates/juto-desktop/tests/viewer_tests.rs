@@ -95,6 +95,56 @@ fn environment_config(env_id: &str) -> serde_json::Value {
 }
 
 #[test]
+fn viewer_admission_is_bounded_and_released_on_disconnect() {
+    let daemon = Daemon::start();
+    let env_id = format!("a-{}", &uuid::Uuid::now_v7().to_string()[24..]);
+    let created = daemon.call(DesktopCommand::Create {
+        spec: serde_json::from_value(environment_config(&env_id)).expect("config"),
+        request_id: "create".to_string(),
+    });
+    assert!(
+        matches!(created, DesktopResponse::Created { .. }),
+        "create failed: {created:?}"
+    );
+
+    let first = ViewerClient::attach(&daemon.socket, &env_id).expect("first viewer");
+    let second = ViewerClient::attach(&daemon.socket, &env_id).expect("second viewer");
+    let third = ViewerClient::attach(&daemon.socket, &env_id);
+    assert!(
+        third.is_err(),
+        "a third viewer must be rejected while two are attached"
+    );
+
+    // Closing a viewer connection releases its slot.
+    drop(first);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut admitted = None;
+    while Instant::now() < deadline {
+        match ViewerClient::attach(&daemon.socket, &env_id) {
+            Ok(viewer) => {
+                admitted = Some(viewer);
+                break;
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    assert!(
+        admitted.is_some(),
+        "the viewer slot was not released after the connection closed"
+    );
+
+    drop(second);
+    drop(admitted);
+    let destroyed = daemon.call(DesktopCommand::Destroy {
+        env_id: env_id.clone(),
+    });
+    assert!(
+        matches!(destroyed, DesktopResponse::Destroyed { .. }),
+        "destroy failed: {destroyed:?}"
+    );
+}
+
+#[test]
 fn viewer_attaches_over_scm_rights_and_reads_composed_frames() {
     let daemon = Daemon::start();
     let env_id = format!("v-{}", &uuid::Uuid::now_v7().to_string()[24..]);

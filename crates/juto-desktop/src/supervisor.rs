@@ -185,6 +185,9 @@ fn default_owner_timeout() -> u64 {
 /// Bounded wait for the shared GPU lock before reporting the device busy.
 const GPU_LOCK_WAIT_SECS: u64 = 5;
 
+/// Active viewers admitted per environment (spec section 6).
+pub const MAX_ACTIVE_VIEWERS: usize = 2;
+
 /// Path of the repository's shared advisory GPU lock, shared with `jtech`.
 fn gpu_lock_path() -> PathBuf {
     if let Some(path) = std::env::var_os("AGENT_GPU_LOCK") {
@@ -289,6 +292,8 @@ struct InnerEnvironment {
     slice: Option<String>,
     /// Shared advisory GPU lock held for a hardware environment's lifetime.
     gpu_lock: Mutex<Option<std::fs::File>>,
+    /// Attached viewers, keyed by viewer id (spec section 6: two active viewers).
+    viewers: Mutex<HashMap<String, Instant>>,
 }
 
 /// An active, isolated agent desktop environment.
@@ -449,6 +454,7 @@ impl DesktopEnvironment {
             use_scope,
             slice,
             gpu_lock: Mutex::new(gpu_lock),
+            viewers: Mutex::new(HashMap::new()),
         });
 
         spawn_event_forwarder(inner.clone(), comp_rx);
@@ -966,6 +972,32 @@ impl DesktopEnvironment {
     /// Forces a fresh composition and returns the resulting frame metadata.
     pub fn observe(&self, timeout: Duration) -> Result<SnapshotInfo, DesktopError> {
         self.compositor()?.snapshot(timeout)
+    }
+
+    /// Admits a viewer, enforcing the per-environment active-viewer ceiling.
+    ///
+    /// A rejected viewer receives no frame pool descriptor, so it cannot read
+    /// composed pixels (spec section 6).
+    pub fn admit_viewer(&self, viewer_id: &str) -> Result<(), DesktopError> {
+        let mut viewers = self.inner.viewers.lock();
+        if viewers.len() >= MAX_ACTIVE_VIEWERS {
+            return Err(DesktopError::LimitExceeded(format!(
+                "environment `{}` already has {MAX_ACTIVE_VIEWERS} active viewers",
+                self.inner.config.env_id
+            )));
+        }
+        viewers.insert(viewer_id.to_string(), Instant::now());
+        Ok(())
+    }
+
+    /// Releases a viewer slot when its connection ends.
+    pub fn release_viewer(&self, viewer_id: &str) {
+        self.inner.viewers.lock().remove(viewer_id);
+    }
+
+    /// Number of viewers currently admitted to the environment.
+    pub fn active_viewers(&self) -> usize {
+        self.inner.viewers.lock().len()
     }
 
     /// Observes a fresh frame and encodes it as a lossless PNG.
