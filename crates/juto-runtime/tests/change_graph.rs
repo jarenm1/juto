@@ -749,6 +749,39 @@ fn rewind_in_a_sparse_workspace_records_the_target_tree() {
 }
 
 #[test]
+fn gc_packs_loose_refs() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    graph.capture("main", provenance("root"), None).unwrap();
+
+    let git_dir = GitRepository::open(cwd).unwrap().git_dir().to_path_buf();
+    let node = graph.state().unwrap().nodes.last().unwrap().clone();
+    let loose = git_dir.join("refs/juto/snapshots").join(&node.id);
+    assert!(
+        loose.exists(),
+        "a fresh capture must leave a loose snapshot ref"
+    );
+
+    graph.gc().unwrap();
+
+    // The loose file is gone, packed-refs exists, and the ref still resolves.
+    assert!(!loose.exists(), "gc must pack the loose ref away");
+    assert!(
+        git_dir.join("packed-refs").exists(),
+        "gc must write packed-refs"
+    );
+    assert_eq!(
+        command(
+            cwd,
+            "git",
+            &["rev-parse", &format!("refs/juto/snapshots/{}", node.id)]
+        ),
+        node.tree
+    );
+}
+
+#[test]
 fn fork_survives_a_stale_pending_fork_entry() {
     let directory = fixture();
     let cwd = directory.path();

@@ -154,7 +154,7 @@ impl From<&GraphState> for GraphHeader {
 }
 
 /// What a [`ChangeGraph::gc`] pass pruned and retained.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcReport {
     /// Nodes swept out of the journal because no head, workspace head, or
     /// checkpoint reaches them.
@@ -908,6 +908,11 @@ impl ChangeGraph {
             .iter()
             .cloned()
             .partition(|node| keep.contains(node.id.as_str()));
+        // Two refs per node means a long-lived graph accumulates thousands of
+        // loose ref files that every later `for-each-ref` — and therefore every
+        // publish and import — has to walk. Packing is transparent and
+        // idempotent, so do it on every sweep.
+        self.repository.pack_refs()?;
         if pruned.is_empty() && dropped_workspace_heads == 0 {
             return Ok(GcReport {
                 pruned_nodes: 0,
