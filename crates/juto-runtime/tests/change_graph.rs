@@ -573,6 +573,7 @@ fn gc_prunes_abandoned_thread_nodes_and_releases_their_snapshot_refs() {
             retained_nodes: 2,
             released_refs: 1,
             released_node_refs: 0,
+            dropped_workspace_heads: 0,
         }
     );
 
@@ -617,6 +618,7 @@ fn gc_is_a_no_op_when_every_node_is_reachable() {
             retained_nodes: 2,
             released_refs: 0,
             released_node_refs: 0,
+            dropped_workspace_heads: 0,
         }
     );
     assert_eq!(
@@ -626,6 +628,36 @@ fn gc_is_a_no_op_when_every_node_is_reachable() {
     );
     assert_eq!(graph.state().unwrap().nodes.len(), 2);
     assert!(snapshot_refs(cwd).contains(&format!("refs/juto/snapshots/{}", next.id)));
+}
+
+#[test]
+fn gc_drops_workspace_heads_whose_directory_is_gone() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+
+    let workspaces = tempfile::tempdir().unwrap();
+    let side_dir = workspaces.path().join("side");
+    graph.fork("side", &root.id, &side_dir).unwrap();
+    let side = ChangeGraph::open(&side_dir).unwrap();
+    fs::write(side_dir.join("side"), "side\n").unwrap();
+    side.capture("side", provenance("side"), None).unwrap();
+
+    let key = side_dir
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(graph.state().unwrap().workspace_heads.contains_key(&key));
+
+    // The subagent workspace is cleaned up: its directory is gone, so its head
+    // can never advance again and must not pin the thread's nodes forever.
+    fs::remove_dir_all(&side_dir).unwrap();
+
+    let report = graph.gc().unwrap();
+    assert_eq!(report.dropped_workspace_heads, 1);
+    assert!(!graph.state().unwrap().workspace_heads.contains_key(&key));
 }
 
 #[test]
