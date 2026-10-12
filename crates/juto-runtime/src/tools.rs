@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::change_graph::{ChangeGraph, JoinOutcome, ReconcileOutcome};
+use crate::change_graph::{ChangeGraph, EditProvenance, JoinOutcome, ReconcileOutcome};
 use crate::workspace::{ResourceLimits, ScopedChild, ScopedStdio, SubagentWorkspace};
 
 // ---------------------------------------------------------------------------
@@ -1419,6 +1419,8 @@ enum VcsAction {
     FetchBranch,
     /// Merge two threads' trees into one node with two parents.
     Join,
+    /// Record a resolved merge: capture the workspace as a two-parent node.
+    Resolve,
 }
 
 #[derive(Deserialize)]
@@ -1470,7 +1472,8 @@ impl Tool for VcsTool {
                             "export",
                             "publish",
                             "fetch_branch",
-                            "join"
+                            "join",
+                            "resolve"
                         ],
                         "description": "Which change-graph operation to run."
                     },
@@ -1537,6 +1540,7 @@ impl Tool for VcsTool {
         let cwd = effective_cwd(&self.cwd, &ctx).to_path_buf();
         let remote = remote.unwrap_or_else(|| "origin".to_string());
         let thread = thread.unwrap_or_else(|| "main".to_string());
+        let session_id = ctx.session_id;
         let label = action_label(&action);
 
         // The graph shells out to git, so keep it off the async runtime.
@@ -1684,6 +1688,23 @@ impl Tool for VcsTool {
                         })),
                     }
                 }
+                VcsAction::Resolve => {
+                    let left = left.ok_or_else(|| "`resolve` needs a `left`".to_string())?;
+                    let right = right.ok_or_else(|| "`resolve` needs a `right`".to_string())?;
+                    let node = graph
+                        .capture(
+                            &thread,
+                            EditProvenance {
+                                session_id,
+                                tool: "vcs".to_string(),
+                                selection_mode: None,
+                                path: None,
+                            },
+                            Some(vec![left, right]),
+                        )
+                        .map_err(|e| format!("{e:#}"))?;
+                    serde_json::to_value(node).map_err(|e| e.to_string())
+                }
             }
         })
         .await
@@ -1708,6 +1729,7 @@ fn action_label(action: &VcsAction) -> &'static str {
         VcsAction::Publish => "publish",
         VcsAction::FetchBranch => "fetch_branch",
         VcsAction::Join => "join",
+        VcsAction::Resolve => "resolve",
     }
 }
 
@@ -2687,6 +2709,28 @@ mod tests {
         assert_eq!(out.details["status"], "joined", "{:?}", out.details);
         assert_eq!(
             out.details["node"]["parents"].as_array().map(Vec::len),
+            Some(2),
+            "{:?}",
+            out.details
+        );
+
+        // `resolve` records the workspace as a two-parent node, the way an
+        // agent records a conflict it resolved by hand.
+        std::fs::write(dir.path().join("resolved.txt"), "resolved\n").expect("write");
+        let out = tool
+            .execute(
+                json!({
+                    "action": "resolve",
+                    "thread": "integration",
+                    "left": heads["left"],
+                    "right": heads["right"],
+                }),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out.details["parents"].as_array().map(Vec::len),
             Some(2),
             "{:?}",
             out.details
