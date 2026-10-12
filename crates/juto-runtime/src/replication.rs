@@ -130,40 +130,55 @@ pub(crate) fn publish(graph: &ChangeGraph, remote: &str) -> Result<PublishReport
         ] {
             existing.extend(repository.list_refs(prefix)?);
         }
+        // Every ref write is collected and applied in one `update-ref --stdin`
+        // child: a process per node dominates a publish of thousands of nodes.
+        let mut updates: Vec<(String, String, Option<String>)> = Vec::new();
         for node in &state.nodes {
-            let blob = repository.write_blob(&encode_node(node)?)?;
             let refname = node_ref(&node.id);
-            ensure_ref(
-                repository,
-                &refname,
-                &blob,
-                existing.get(&refname).map(String::as_str),
-            )?;
-            repository.retain_snapshot(&node.id, &node.tree)?;
+            // The blob already exists when the ref does, so reuse that object
+            // instead of re-hashing the node.
+            let blob = match existing.get(&refname) {
+                Some(current) => current.clone(),
+                None => repository.write_blob(&encode_node(node)?)?,
+            };
+            match existing.get(&refname) {
+                Some(current) if current == &blob => {}
+                Some(current) => updates.push((refname, blob, Some(current.clone()))),
+                None => updates.push((refname, blob, None)),
+            }
+            // The tree came from the validated graph state, so the snapshot ref
+            // can be written directly.
+            let snapshot_ref = format!("{SNAPSHOTS_PREFIX}/{}", node.id);
+            match existing.get(&snapshot_ref) {
+                Some(current) if current == &node.tree => {}
+                Some(current) => {
+                    updates.push((snapshot_ref, node.tree.clone(), Some(current.clone())));
+                }
+                None => updates.push((snapshot_ref, node.tree.clone(), None)),
+            }
             report.nodes += 1;
         }
         for (thread, head) in &state.heads {
             let blob = repository.write_blob(head.as_bytes())?;
             let refname = head_ref(&owner, thread);
-            ensure_ref(
-                repository,
-                &refname,
-                &blob,
-                existing.get(&refname).map(String::as_str),
-            )?;
+            match existing.get(&refname) {
+                Some(current) if current == &blob => {}
+                Some(current) => updates.push((refname, blob, Some(current.clone()))),
+                None => updates.push((refname, blob, None)),
+            }
             report.heads += 1;
         }
         for (name, id) in &state.checkpoints {
             let blob = repository.write_blob(id.as_bytes())?;
             let refname = checkpoint_ref(name);
-            ensure_ref(
-                repository,
-                &refname,
-                &blob,
-                existing.get(&refname).map(String::as_str),
-            )?;
+            match existing.get(&refname) {
+                Some(current) if current == &blob => {}
+                Some(current) => updates.push((refname, blob, Some(current.clone()))),
+                None => updates.push((refname, blob, None)),
+            }
             report.checkpoints += 1;
         }
+        repository.update_refs(&updates)?;
         // A wildcard refspec that matches nothing is a hard error for
         // `git push`, so only populated namespaces are pushed.
         let mut refspecs = Vec::new();
@@ -539,31 +554,6 @@ fn order_new_nodes(local: &[ChangeNode], new: &[ChangeNode]) -> Result<Vec<Strin
 /// Strip the staging prefix and its separating slash from a ref name.
 fn strip_staging<'a>(refname: &'a str, staging: &str) -> Option<&'a str> {
     refname.strip_prefix(staging)?.strip_prefix('/')
-}
-
-/// Ensure `refname` holds `object`, tolerating an existing identical value.
-///
-/// `current` is the value observed for `refname` (`None` when absent). The
-/// update is a compare-and-swap against it, so a concurrent writer is detected
-/// instead of silently overwritten, and re-writing an identical value is a
-/// no-op rather than an error.
-fn ensure_ref(
-    repository: &GitRepository,
-    refname: &str,
-    object: &str,
-    current: Option<&str>,
-) -> Result<()> {
-    match current {
-        Some(existing) if existing == object => Ok(()),
-        Some(existing) => {
-            repository.update_ref(refname, object, Some(existing))?;
-            Ok(())
-        }
-        None => {
-            repository.update_ref(refname, object, None)?;
-            Ok(())
-        }
-    }
 }
 
 pub(crate) fn node_ref(id: &str) -> String {
