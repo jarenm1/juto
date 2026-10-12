@@ -285,6 +285,9 @@ pub struct Retention {
 /// Maximum retention a host grants without further approval (spec section 4).
 const MAX_RETENTION_SECS: u64 = 1800;
 
+/// Host-bounded lifetime of a role grant (spec section 10: default 30 minutes).
+pub const MAX_GRANT_SECS: u64 = 1800;
+
 fn default_lease_ttl() -> u64 {
     6
 }
@@ -584,12 +587,14 @@ impl DesktopEnvironment {
     ) -> Grant {
         let now_s = now_secs();
         let grant_id = format!("grant-{}", uuid::Uuid::now_v7());
+        // The host bounds every grant lifetime; a caller cannot mint a
+        // long-lived capability (spec section 10).
         let grant = Grant {
             grant_id: grant_id.clone(),
             principal,
             roles,
             audience,
-            expires_at: now_s + expiry_seconds,
+            expires_at: now_s + expiry_seconds.min(MAX_GRANT_SECS),
         };
         self.inner.grants.lock().insert(grant_id, grant.clone());
         grant

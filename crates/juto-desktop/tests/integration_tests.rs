@@ -299,6 +299,36 @@ fn hardware_profile_renders_and_serializes_on_the_shared_device() {
 }
 
 #[test]
+fn grant_lifetimes_are_host_bounded() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(
+            test_config(&unique_env_id("grantttl")),
+            &unique_env_id("req"),
+        )
+        .expect("create environment");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // A caller asking for a decade gets the host's bounded lifetime.
+    let grant = env.issue_grant(
+        "human:test".to_string(),
+        vec![juto_desktop::protocol::GrantRole::View],
+        "viewer".to_string(),
+        10 * 365 * 24 * 3600,
+    );
+    assert!(
+        grant.expires_at <= now + juto_desktop::supervisor::MAX_GRANT_SECS + 1,
+        "grant lifetime {} exceeds the host bound",
+        grant.expires_at - now
+    );
+
+    env.destroy();
+}
+
+#[test]
 fn the_environment_has_a_private_audio_server() {
     let supervisor = DesktopSupervisor::new();
     let env = supervisor

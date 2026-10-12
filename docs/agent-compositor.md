@@ -27,6 +27,9 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   (`LIBGL_ALWAYS_SOFTWARE`, `GALLIUM_DRIVER`, `MESA_LOADER_DRIVER_OVERRIDE`), and
   otherwise composes with pixman. A GLES renderer that resolves to a
   non-software device is discarded before any frame is composed.
+- Grant lifetimes: every role grant is bounded by the host
+  (`MAX_GRANT_SECS`, 30 minutes); a caller cannot mint a longer-lived
+  capability, and an already-expired grant stays expired.
 - Host aggregate admission: `HostPolicy::max_aggregate_pixel_rate` (default
   497,664,000 px/s, the hardware profile's per-environment ceiling) bounds the
   sum of admitted pixel rates across live environments; a create that would
