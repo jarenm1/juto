@@ -257,9 +257,13 @@ Traditional PRs lose the reasoning behind changes. Inspired by Zed Delta:
    Reviewers (human or AI) can attach comments directly to hunks while the agent is
    still working.
 3. **Replay & Auditability**:
-   Anyone inspecting a completed change can jump directly from a line of code into the
    exact thoughts and tool executions that created it.
-
+4. **Native Live DAG to Git Transfer**:
+   Instead of generating premature Git commits or depending on external VCS wrappers
+   during live tool loops, Juto tracks atomic edit trees and thread branches natively.
+   Named checkpoints (such as points verified working) freeze immutable snapshots,
+   and `juto changes export/push` projects only named points onto Git feature branches
+   using compare-and-swap ref updates and raw byte tree capture.
 ---
 
 ## 6. Future Extensibility: Headless Daemon, Mobile & Automations

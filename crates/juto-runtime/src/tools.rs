@@ -366,9 +366,9 @@ impl Tool for WriteTool {
     fn definition(&self) -> juto_ai::ToolDefinition {
         juto_ai::ToolDefinition {
             name: "write".to_string(),
-            description: "Write a UTF-8 file through the jj working copy, creating parents. \
-                Requires a path inside the session's jj workspace. Returns before/after \
-                revisions and the operation's diff; does not create a new change."
+            description: "Write a UTF-8 file through the native Git workspace, creating parents. \
+                Requires a path inside the session's workspace. Returns before/after \
+                snapshot trees and the operation's diff; records a durable change-graph node."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -396,7 +396,7 @@ impl Tool for WriteTool {
         let cwd = effective_cwd(&self.cwd, &ctx).to_path_buf();
         let path = resolve_path(&cwd, &params.path);
         let cancel = ctx.cancel.clone();
-        let provenance = crate::vcs::EditProvenance {
+        let provenance = crate::change_graph::EditProvenance {
             session_id: ctx.session_id,
             tool: "write".to_string(),
             selection_mode: None,
@@ -406,7 +406,7 @@ impl Tool for WriteTool {
             let details =
                 crate::vcs::mutate(&cwd, &path, &cancel, &provenance, |_| Ok(params.content))?;
             Ok(output(
-                format!("Wrote {} through jj", display_path(&cwd, &path)),
+                format!("Wrote {}", display_path(&cwd, &path)),
                 details,
             ))
         })
@@ -436,11 +436,11 @@ impl Tool for EditTool {
     fn definition(&self) -> juto_ai::ToolDefinition {
         juto_ai::ToolDefinition {
             name: "edit".to_string(),
-            description: "Contextual edit through jj. Prefer AST queries for supported Rust, \
-                Python, JavaScript and TypeScript files; use inclusive line ranges or exact \
-                text otherwise. AST query must uniquely capture @edit (or the supplied \
-                capture). Replacement is verbatim, including newlines. Returns revisions \
-                and the operation's diff; never silently falls back between modes."
+            description: "Contextual edit through the native Git workspace. Prefer AST queries \
+                for supported Rust, Python, JavaScript and TypeScript files; use inclusive line \
+                ranges or exact text otherwise. AST query must uniquely capture @edit (or the \
+                supplied capture). Replacement is verbatim, including newlines. Returns snapshot \
+                trees and the operation's diff; never silently falls back between modes."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -490,7 +490,7 @@ impl Tool for EditTool {
             crate::contextual::Selection::Range { .. } => "range",
             crate::contextual::Selection::Text { .. } => "text",
         };
-        let provenance = crate::vcs::EditProvenance {
+        let provenance = crate::change_graph::EditProvenance {
             session_id: ctx.session_id,
             tool: "edit".to_string(),
             selection_mode: Some(mode.to_string()),
@@ -515,7 +515,7 @@ impl Tool for EditTool {
             details["replacements"] = json!(replacements);
             Ok(output(
                 format!(
-                    "Edited {} through jj ({replacements} replacements)",
+                    "Edited {} ({replacements} replacements)",
                     display_path(&cwd, &path)
                 ),
                 details,
@@ -1392,34 +1392,33 @@ mod tests {
         assert!(err.contains("binary"), "{err}");
     }
 
-    fn jj_dir() -> tempfile::TempDir {
+    /// A plain Git repository with a deterministic identity and one base commit.
+    fn git_dir() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        let result = std::process::Command::new("jj")
-            .args(["git", "init", "--colocate"])
-            .arg(dir.path())
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        let result = std::process::Command::new("jj")
-            .arg("new")
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.name", "Tool Test"]);
+        git(&["config", "user.email", "tools@example.test"]);
+        std::fs::write(dir.path().join(".gitignore"), "").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
         dir
     }
 
     #[tokio::test]
     async fn write_creates_parents_and_overwrites() {
-        let dir = jj_dir();
+        let dir = git_dir();
         let tool = WriteTool {
             cwd: dir.path().to_path_buf(),
         };
@@ -1454,7 +1453,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_requires_unique_match_unless_replace_all() {
-        let dir = jj_dir();
+        let dir = git_dir();
         std::fs::write(dir.path().join("f.txt"), "foo bar foo").unwrap();
         let tool = EditTool {
             cwd: dir.path().to_path_buf(),
@@ -1501,7 +1500,7 @@ mod tests {
 
     #[tokio::test]
     async fn contextual_edits_preserve_other_code_and_report_only_the_operation() {
-        let dir = jj_dir();
+        let dir = git_dir();
         let tool = EditTool {
             cwd: dir.path().to_path_buf(),
         };
@@ -1521,7 +1520,7 @@ mod tests {
             std::fs::read_to_string(dir.path().join("unrelated.txt")).unwrap(),
             "human edit\n"
         );
-        assert_ne!(ast.details["before_commit"], ast.details["after_commit"]);
+        assert_ne!(ast.details["before_tree"], ast.details["after_tree"]);
         let diff = ast.details["diff"].as_str().unwrap();
         assert!(diff.contains("-fn second() { 2; }"), "{diff}");
         assert!(diff.contains("+fn second() { 3; }"), "{diff}");
@@ -1540,7 +1539,44 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "fn first() { 4; }\nfn second() { 3; }\n"
         );
-        assert_eq!(range.details["change_id"], ast.details["change_id"]);
+        // Each edit records its own durable node; the earlier receipt still
+        // identifies the exact tree it produced.
+        assert_ne!(range.details["graph_node"], ast.details["graph_node"]);
+        assert!(ast.details["graph_node"].is_string());
+        assert!(range.details["graph_node"].is_string());
+        // Selecting the earlier tool receipt must publish that exact edit, not
+        // the later workspace state, and preserve the pre-existing human file.
+        for (key, value) in [
+            ("user.name", "Edit Graph Test"),
+            ("user.email", "edit-graph@example.test"),
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(["config", key, value])
+                    .current_dir(dir.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let graph = crate::change_graph::ChangeGraph::open(dir.path()).unwrap();
+        let node = ast.details["graph_node"].as_str().unwrap();
+        graph
+            .mark(node, "checkpoint", "feat: selected AST edit", true)
+            .unwrap();
+        let exported = graph.export(node, "feature/selected-edit").unwrap();
+        for (file, expected) in [
+            ("f.rs", "fn first() { 1; }\nfn second() { 3; }\n"),
+            ("unrelated.txt", "human edit\n"),
+        ] {
+            let shown = std::process::Command::new("git")
+                .args(["show", &format!("{}:{file}", exported.tip)])
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(shown.status.success());
+            assert_eq!(String::from_utf8(shown.stdout).unwrap(), expected);
+        }
         let err = tool
             .execute(
                 json!({
@@ -1562,7 +1598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutations_fail_closed_without_jj_and_outside_workspace() {
+    async fn mutations_fail_closed_without_git_and_outside_workspace() {
         let plain = tempfile::tempdir().unwrap();
         let tool = WriteTool {
             cwd: plain.path().to_path_buf(),
@@ -1576,7 +1612,7 @@ mod tests {
             .is_err()
         );
         assert!(!plain.path().join("f.txt").exists());
-        let repo = jj_dir();
+        let repo = git_dir();
         let tool = WriteTool {
             cwd: repo.path().to_path_buf(),
         };
@@ -1589,7 +1625,7 @@ mod tests {
         assert!(!outside.exists());
         assert!(
             tool.execute(
-                json!({"path": ".jj/config.toml", "content": "bad"}),
+                json!({"path": ".git/config", "content": "bad"}),
                 ctx(repo.path())
             )
             .await
@@ -1599,7 +1635,7 @@ mod tests {
 
     #[tokio::test]
     async fn range_edits_preserve_utf8_crlf_and_reject_phantom_lines() {
-        let dir = jj_dir();
+        let dir = git_dir();
         let path = dir.path().join("f.txt");
         std::fs::write(&path, "α\r\nβ\r\nlast").unwrap();
         let tool = EditTool {
@@ -1617,7 +1653,7 @@ mod tests {
 
     #[tokio::test]
     async fn ast_edits_use_each_language_grammar_and_fail_without_fallback() {
-        let dir = jj_dir();
+        let dir = git_dir();
         let tool = EditTool {
             cwd: dir.path().to_path_buf(),
         };
@@ -1676,7 +1712,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_noop_and_cancellation_do_not_create_edits() {
-        let dir = jj_dir();
+        let dir = git_dir();
         let tool = WriteTool {
             cwd: dir.path().to_path_buf(),
         };
@@ -1689,7 +1725,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(noop.details["no_op"], true);
-        assert_eq!(noop.details["after_commit"], first.details["after_commit"]);
+        assert_eq!(noop.details["after_tree"], first.details["after_tree"]);
         let context = ctx(dir.path());
         context.cancel.cancel();
         assert!(
@@ -1707,7 +1743,7 @@ mod tests {
     #[tokio::test]
     async fn edits_preserve_executable_mode_and_reject_symlinks() {
         use std::os::unix::fs::{PermissionsExt, symlink};
-        let dir = jj_dir();
+        let dir = git_dir();
         let path = dir.path().join("script");
         std::fs::write(&path, "echo old\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();

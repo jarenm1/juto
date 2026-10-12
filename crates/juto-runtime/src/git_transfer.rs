@@ -1,0 +1,1257 @@
+//! Git transfer: native Git-object snapshots, workspace forks, and safe export.
+//!
+//! The change graph (`change_graph`) owns the semantics of which native nodes
+//! are marked and how unmarked nodes collapse. This module owns the Git side:
+//! capturing immutable tree snapshots of a workspace, materializing an
+//! independent fork directory from a snapshot, and turning an [`ExportPlan`] of
+//! marked snapshots into real Git commits published with compare-and-swap
+//! semantics.
+//!
+//! Live snapshots are trees and blobs only; no commit object is created until
+//! [`GitRepository::export`] runs. Every Git invocation runs through
+//! [`std::process::Command`] against an explicit `--git-dir` and `--work-tree`
+//! with a sanitized environment, so the user's index, worktree, and `HEAD` are
+//! never touched and no command ever checks out, stages, or force-pushes. The
+//! only index this module writes is a private temporary one under
+//! `<git-dir>/juto`. The methods are blocking, so callers run them off the GPUI
+//! foreground thread (CLI or `spawn_blocking`).
+
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsStr;
+use std::fs;
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Environment variables that would silently redirect Git at a different
+/// index, worktree, or object store. The repository is always addressed with an
+/// explicit `--git-dir` and `--work-tree`, so these must not leak in from the
+/// caller. Author and committer identity is removed as well so
+/// [`GitRepository::signature`] reads configuration deterministically and
+/// [`GitRepository::export`] sets its own.
+const SANITIZED_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_QUARANTINE_PATH",
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_DATE",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_DATE",
+];
+
+/// Name of the native fork link marker written at the root of every fork
+/// workspace. It records the shared Git directory and the fork's thread name so
+/// [`GitRepository::open`] can rediscover the repository without a `.git`.
+const WORKSPACE_MARKER: &str = ".juto-workspace.json";
+
+/// Author/committer identity for a marked commit.
+///
+/// The timestamp is a Unix epoch second and is reused for both the author and
+/// the committer so that re-exporting the same plan produces byte-identical
+/// commit objects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Signature {
+    pub name: String,
+    pub email: String,
+    pub timestamp: i64,
+}
+
+/// One marked point in the export plan: an immutable snapshot tree plus the
+/// marked parents it descends from.
+///
+/// `parents` holds marked point IDs only; an empty list means the point
+/// descends directly from [`ExportPlan::base_commit`]. Unmarked nodes between
+/// marked points have already been collapsed by the change graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportPoint {
+    pub id: String,
+    pub tree: String,
+    pub parents: Vec<String>,
+    pub message: String,
+    pub signature: Signature,
+}
+
+/// A complete, immutable export request.
+///
+/// `points` is in topological order: every parent referenced by a point must
+/// appear earlier in the list (or be `base_commit`). `tip` names the marked
+/// point that the feature branch should end up at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportPlan {
+    pub base_commit: String,
+    pub points: Vec<ExportPoint>,
+    pub tip: String,
+}
+
+/// The outcome of a successful export.
+///
+/// `commits` maps every marked point ID to the Git commit object created for
+/// it. `tip` is the Git commit the feature branch now points at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportResult {
+    pub branch: String,
+    pub tip: String,
+    pub commits: BTreeMap<String, String>,
+}
+
+/// The on-disk contents of [`WORKSPACE_MARKER`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceLink {
+    git_dir: PathBuf,
+    thread: String,
+}
+
+/// A handle to the Git repository backing a workspace.
+///
+/// The repository is discovered with `git rev-parse` for ordinary worktrees, or
+/// from a native fork link marker ([`WORKSPACE_MARKER`]) for independent fork
+/// directories that share the same object store without a `.git` of their own.
+#[derive(Debug, Clone)]
+pub struct GitRepository {
+    workspace: PathBuf,
+    git_dir: PathBuf,
+    thread: Option<String>,
+}
+
+impl GitRepository {
+    /// Open the Git repository backing the workspace at `workspace`.
+    ///
+    /// A native fork link marker in `workspace` or one of its ancestors wins:
+    /// the marker's parent is the workspace root and the marker records the
+    /// shared Git directory and thread name. Otherwise the repository is
+    /// discovered with `git rev-parse --show-toplevel --absolute-git-dir`.
+    pub fn open(workspace: &Path) -> Result<Self> {
+        if let Some((root, link)) = find_workspace_link(workspace)? {
+            let workspace = root
+                .canonicalize()
+                .with_context(|| format!("workspace {} does not exist", root.display()))?;
+            let git_dir = link.git_dir.canonicalize().with_context(|| {
+                format!(
+                    "workspace link {} points at a missing git directory {}",
+                    workspace.join(WORKSPACE_MARKER).display(),
+                    link.git_dir.display()
+                )
+            })?;
+            return Ok(Self {
+                workspace,
+                git_dir,
+                thread: Some(link.thread),
+            });
+        }
+        let (workspace, git_dir) = discover(workspace)?;
+        Ok(Self {
+            workspace,
+            git_dir,
+            thread: None,
+        })
+    }
+
+    /// The workspace root every command runs against.
+    pub fn workspace(&self) -> &Path {
+        &self.workspace
+    }
+
+    /// The native fork thread name, when this workspace was created by
+    /// [`GitRepository::fork_workspace`].
+    pub fn thread(&self) -> Option<&str> {
+        self.thread.as_deref()
+    }
+
+    /// The resolved Git directory used for every plumbing command.
+    pub fn git_dir(&self) -> &Path {
+        &self.git_dir
+    }
+
+    /// The current `HEAD` commit, or `None` when the repository is unborn.
+    pub fn head_commit(&self) -> Result<Option<String>> {
+        match self.run_opt(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"])? {
+            Some(id) if !id.is_empty() => Ok(Some(id)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Resolve `object` to its tree object ID.
+    ///
+    /// Accepts a full commit or tree ID. An all-zero ID is the virtual root and
+    /// resolves to the empty tree, which lets a brand-new repository export a
+    /// parentless first commit.
+    pub fn snapshot_tree(&self, object: &str) -> Result<String> {
+        validate_object_id(object, "object")?;
+        if object.bytes().all(|byte| byte == b'0') {
+            return self.empty_tree();
+        }
+        let rev = format!("{object}^{{tree}}");
+        self.run_trimmed(&["rev-parse", "--verify", "--end-of-options", rev.as_str()])
+            .with_context(|| format!("cannot resolve the tree of {object}"))
+    }
+
+    /// Capture the workspace as an immutable tree on top of `baseline`.
+    ///
+    /// The capture uses a private temporary index under `<git-dir>/juto`, never
+    /// the user's index: `baseline` is read into it, the worktree is enumerated
+    /// and hashed from raw bytes, and the result is written with `git
+    /// write-tree`. No clean filter, `text`/`autocrlf` normalization, or
+    /// external filter is ever applied, so the snapshot is byte-exact. Normal
+    /// Git ignores apply, but files already tracked by `baseline` are preserved
+    /// even when they are now ignored. The workspace marker, the mutation lock,
+    /// `.git`, and `.jj` are always excluded. `baseline` may be an all-zero ID
+    /// for an empty starting tree.
+    pub fn capture_tree(&self, baseline: &str) -> Result<String> {
+        let baseline_tree = if baseline.is_empty() {
+            bail!("baseline tree is empty");
+        } else if baseline.bytes().all(|byte| byte == b'0') {
+            self.empty_tree()?
+        } else {
+            self.resolve_tree(baseline)?
+        };
+        let directory = self
+            .git_dir
+            .join("juto")
+            .join(format!("capture-{}", Uuid::now_v7()));
+        fs::create_dir_all(&directory).with_context(|| {
+            format!(
+                "failed to create the capture index directory {}",
+                directory.display()
+            )
+        })?;
+        let index = directory.join("index");
+        let captured = self.capture_into(&baseline_tree, &index);
+        let _ = fs::remove_dir_all(&directory);
+        captured
+    }
+
+    /// Whether `path` exists in `tree`.
+    ///
+    /// `path` is workspace-relative with forward slashes.
+    pub fn path_tracked(&self, tree: &str, path: &str) -> Result<bool> {
+        if path.is_empty() {
+            bail!("path is empty");
+        }
+        let tree = self.resolve_tree(tree)?;
+        let output = self
+            .git(&[
+                "--literal-pathspecs",
+                "ls-tree",
+                "-z",
+                "--full-tree",
+                tree.as_str(),
+                "--",
+                path,
+            ])
+            .output()
+            .context("failed to run `git ls-tree`")?;
+        if !output.status.success() {
+            bail!("`git ls-tree` failed: {}", describe_failure(&output));
+        }
+        Ok(!output.stdout.is_empty())
+    }
+
+    /// Whether `path` matches the repository's ignore rules.
+    ///
+    /// `path` is workspace-relative with forward slashes. The check uses
+    /// `git check-ignore --no-index`, so it reports the ignore rules alone and
+    /// never consults the index: a path that is already tracked still reports
+    /// as ignored when a rule matches it. The expected "not ignored" exit (1)
+    /// is a plain `false`; any other failure is surfaced as an error.
+    pub fn path_ignored(&self, path: &str) -> Result<bool> {
+        if path.is_empty() {
+            bail!("path is empty");
+        }
+        Ok(self
+            .run_opt(&["check-ignore", "-q", "--no-index", "--", path])?
+            .is_some())
+    }
+
+    /// Render the patch that turns `before` into `after` for `path`.
+    ///
+    /// Both arguments are full commit or tree IDs; `path` is workspace-relative
+    /// with forward slashes and is matched literally, so a file named `*.txt`
+    /// is never attributed to another file. External diff drivers and textconv
+    /// filters are disabled so the patch is deterministic.
+    pub fn diff_trees(&self, before: &str, after: &str, path: &str) -> Result<String> {
+        let before = self.resolve_tree(before)?;
+        let after = self.resolve_tree(after)?;
+        self.run(&[
+            "--literal-pathspecs",
+            "diff-tree",
+            "-r",
+            "-p",
+            "--no-commit-id",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            before.as_str(),
+            after.as_str(),
+            "--",
+            path,
+        ])
+    }
+
+    /// Materialize `tree` into a brand-new independent workspace at
+    /// `destination` and link it back to this repository.
+    ///
+    /// The tree is walked with `git ls-tree -r -z` and every blob is written
+    /// directly with `git cat-file`, preserving binary contents, executable
+    /// bits, and symlinks. No checkout, index, or branch is created; the fork
+    /// shares this repository's object store through the marker. `destination`
+    /// must not exist: it is created atomically with `create_dir` (which fails
+    /// if anything is already there), so a preexisting directory is never
+    /// touched or removed. A gitlink (submodule) entry is refused rather than
+    /// faked.
+    pub fn fork_workspace(&self, tree: &str, destination: &Path, thread: &str) -> Result<()> {
+        if thread.is_empty() {
+            bail!("fork thread name is empty");
+        }
+        let tree = self.resolve_tree(tree)?;
+        let listing = self
+            .git(&["ls-tree", "-r", "-z", tree.as_str()])
+            .output()
+            .context("failed to run `git ls-tree`")?;
+        if !listing.status.success() {
+            bail!("`git ls-tree` failed: {}", describe_failure(&listing));
+        }
+        if let Some(parent) = destination
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        // Atomic: fails with `AlreadyExists` instead of racing an `exists` check.
+        fs::create_dir(destination).with_context(|| {
+            format!(
+                "failed to create the fork directory {} (it must not already exist)",
+                destination.display()
+            )
+        })?;
+        let materialized = self.materialize_tree(&listing.stdout, destination, thread);
+        if materialized.is_err() {
+            // Only ever removes the directory this call just created.
+            let _ = fs::remove_dir_all(destination);
+        }
+        materialized
+    }
+
+    /// Write every `git ls-tree -r -z` entry into `destination` and add the
+    /// workspace marker.
+    fn materialize_tree(&self, listing: &[u8], destination: &Path, thread: &str) -> Result<()> {
+        for entry in listing.split(|byte| *byte == 0) {
+            if entry.is_empty() {
+                continue;
+            }
+            self.materialize_entry(entry, destination)?;
+        }
+        let link = WorkspaceLink {
+            git_dir: self.git_dir.clone(),
+            thread: thread.to_string(),
+        };
+        let marker =
+            serde_json::to_vec_pretty(&link).context("failed to encode the workspace link")?;
+        fs::write(destination.join(WORKSPACE_MARKER), marker).with_context(|| {
+            format!(
+                "failed to write the workspace marker in {}",
+                destination.display()
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Read the configured Git identity and stamp it with the current Unix time.
+    pub fn signature(&self) -> Result<Signature> {
+        let ident = self.run_trimmed(&["var", "GIT_AUTHOR_IDENT"])?;
+        let (name, email) = parse_ident(&ident)?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_secs() as i64;
+        Ok(Signature {
+            name,
+            email,
+            timestamp,
+        })
+    }
+
+    /// Pin `object` under `refs/juto/snapshots/<id>` so Git garbage collection
+    /// cannot prune the snapshot before it is exported.
+    ///
+    /// `object` is a full commit or tree ID and is pinned exactly as given, so
+    /// the graph can retain a baseline commit and its tree under separate ids.
+    pub fn retain_snapshot(&self, id: &str, object: &str) -> Result<()> {
+        if id.is_empty() {
+            bail!("snapshot id is empty");
+        }
+        if id.contains('/') {
+            bail!("snapshot id must be a single ref component: {id:?}");
+        }
+        let refname = format!("refs/juto/snapshots/{id}");
+        self.validate_ref(&refname)?;
+        let full = self.resolve_object(object)?;
+        self.run_trimmed(&["update-ref", refname.as_str(), full.as_str()])?;
+        Ok(())
+    }
+
+    /// Materialize `plan` as Git commits and move `branch` to the plan tip.
+    ///
+    /// The plan is validated before any ref moves: the base must resolve to a
+    /// commit, point IDs must be unique, trees must resolve to trees, and every
+    /// parent must name an earlier point (topological order). The branch update
+    /// is a compare-and-swap that refuses non-fast-forward moves; an existing
+    /// branch already at the target tip is a no-op.
+    pub fn export(&self, plan: &ExportPlan, branch: &str) -> Result<ExportResult> {
+        self.validate_branch(branch)?;
+        if self
+            .checked_out_branches()?
+            .iter()
+            .any(|checked| checked == branch)
+        {
+            bail!("refusing to update branch {branch:?}: it is checked out in a worktree");
+        }
+
+        validate_object_id(&plan.base_commit, "base commit")?;
+        let base = if plan.base_commit.bytes().all(|byte| byte == b'0') {
+            None
+        } else {
+            Some(self.resolve_commit(&plan.base_commit)?)
+        };
+        let mut commits: BTreeMap<String, String> = BTreeMap::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+
+        for point in &plan.points {
+            if point.id.is_empty() {
+                bail!("export point has an empty id");
+            }
+            if !seen.insert(point.id.as_str()) {
+                bail!("duplicate export point id {:?}", point.id);
+            }
+            if point.signature.name.is_empty() || point.signature.email.is_empty() {
+                bail!(
+                    "export point {:?} has an empty signature name or email",
+                    point.id
+                );
+            }
+
+            let tree = self.resolve_tree(&point.tree)?;
+            let mut parents = Vec::with_capacity(point.parents.len().max(1));
+            if point.parents.is_empty() {
+                parents.extend(base.as_deref());
+            } else {
+                for parent in &point.parents {
+                    match commits.get(parent) {
+                        Some(commit) => parents.push(commit.as_str()),
+                        None => bail!(
+                            "export point {:?} references unknown or non-topological parent {:?}",
+                            point.id,
+                            parent
+                        ),
+                    }
+                }
+            }
+
+            let commit = self.create_commit(&tree, &parents, &point.message, &point.signature)?;
+            commits.insert(point.id.clone(), commit);
+        }
+
+        let tip = if plan.points.is_empty() {
+            let tip = self.resolve_commit(&plan.tip)?;
+            if Some(tip.as_str()) != base.as_deref() {
+                bail!("empty export plan tip does not match a real base commit");
+            }
+            tip
+        } else {
+            match commits.get(&plan.tip) {
+                Some(commit) => commit.clone(),
+                None => bail!("export plan tip {:?} is not a marked point id", plan.tip),
+            }
+        };
+
+        self.update_branch(branch, &tip)?;
+        Ok(ExportResult {
+            branch: branch.to_string(),
+            tip,
+            commits,
+        })
+    }
+
+    /// Push `refs/heads/<branch>` to the same ref on `remote`, never forcing.
+    ///
+    /// The remote is passed as an explicit argument (never an option) and the
+    /// refspec is fully qualified, so no `push.default` or `remote.*.push`
+    /// configuration can widen the update. Relative remotes resolve against the
+    /// workspace root, not the caller's process directory.
+    pub fn push(&self, branch: &str, remote: &str) -> Result<()> {
+        self.validate_branch(branch)?;
+        if remote.is_empty() {
+            bail!("remote is empty");
+        }
+        if remote.starts_with('-') {
+            bail!("remote must not start with '-': {remote:?}");
+        }
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        let output = self
+            .git(&[
+                "push",
+                "--no-force",
+                "--no-follow-tags",
+                remote,
+                refspec.as_str(),
+            ])
+            .output()
+            .context("failed to run `git push`")?;
+        if !output.status.success() {
+            bail!(
+                "`git push {remote} {refspec}` failed: {}",
+                describe_failure(&output)
+            );
+        }
+        Ok(())
+    }
+
+    /// Stage the workspace into `index` on top of `baseline_tree` and write it.
+    ///
+    /// The snapshot is built from raw bytes: every path is enumerated from the
+    /// private index (`--cached`) plus the worktree (`--others
+    /// --exclude-standard`), regular files are hashed with `hash-object
+    /// --no-filters` (so `.gitattributes` clean filters, `text`/`autocrlf`
+    /// normalization, and external filters never touch the snapshot), symlinks
+    /// are hashed from their link bytes, executable bits are preserved, and
+    /// baseline gitlinks are left untouched. Missing paths are removed from the
+    /// index. The result is written with `write-tree`; no commit is created.
+    fn capture_into(&self, baseline_tree: &str, index: &Path) -> Result<String> {
+        self.run_with_index(index, &["read-tree", baseline_tree])?;
+        let baseline = self.index_entries(index)?;
+        let listing = self.run_with_index_bytes(
+            index,
+            &[
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--deduplicate",
+                "-z",
+            ],
+        )?;
+
+        // Classify every enumerated path before touching the index.
+        let mut regular: Vec<(Vec<u8>, bool)> = Vec::new();
+        let mut symlinks: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut removals: Vec<Vec<u8>> = Vec::new();
+        for path in listing.split(|byte| *byte == 0) {
+            if path.is_empty() || is_metadata_path(path) {
+                continue;
+            }
+            if baseline.get(path).map(|(mode, _)| mode.as_str()) == Some("160000") {
+                // A baseline gitlink is preserved exactly; submodules are never
+                // materialized or faked.
+                continue;
+            }
+            let target = self.workspace.join(OsStr::from_bytes(path));
+            let metadata = match fs::symlink_metadata(&target) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    removals.push(path.to_vec());
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| format!("cannot stat {}", target.display()));
+                }
+            };
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                let link = fs::read_link(&target)
+                    .with_context(|| format!("cannot read symlink {}", target.display()))?;
+                symlinks.push((path.to_vec(), link.as_os_str().as_bytes().to_vec()));
+            } else if file_type.is_file() {
+                let executable = metadata.permissions().mode() & 0o111 != 0;
+                regular.push((path.to_vec(), executable));
+            } else {
+                // A directory or special file cannot be represented as a blob.
+                removals.push(path.to_vec());
+            }
+        }
+
+        let regular_paths: Vec<Vec<u8>> = regular.iter().map(|(path, _)| path.clone()).collect();
+        let regular_hashes = self.hash_files(&regular_paths)?;
+        let mut symlink_hashes = Vec::with_capacity(symlinks.len());
+        for (_, target) in &symlinks {
+            symlink_hashes.push(self.hash_bytes(target)?);
+        }
+
+        let mut info: Vec<u8> = Vec::new();
+        for ((path, executable), oid) in regular.iter().zip(&regular_hashes) {
+            let mode = if *executable { "100755" } else { "100644" };
+            push_index_entry(&mut info, mode, oid, path);
+        }
+        for ((path, _), oid) in symlinks.iter().zip(&symlink_hashes) {
+            push_index_entry(&mut info, "120000", oid, path);
+        }
+        for path in &removals {
+            let oid = baseline
+                .get(path.as_slice())
+                .map(|(_, oid)| oid.as_str())
+                .unwrap_or("");
+            info.extend_from_slice(b"0 ");
+            info.extend_from_slice(oid.as_bytes());
+            info.push(b'\t');
+            info.extend_from_slice(path);
+            info.push(0);
+        }
+
+        self.update_index_info(index, &info)?;
+        self.run_with_index(index, &["write-tree"])
+    }
+
+    /// Read `git ls-files --stage -z` from `index` into `path -> (mode, oid)`.
+    fn index_entries(&self, index: &Path) -> Result<BTreeMap<Vec<u8>, (String, String)>> {
+        let raw = self.run_with_index_bytes(index, &["ls-files", "--stage", "-z"])?;
+        let mut entries = BTreeMap::new();
+        for record in raw.split(|byte| *byte == 0) {
+            if record.is_empty() {
+                continue;
+            }
+            let tab = record
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .context("malformed `git ls-files` entry: missing tab")?;
+            let (meta, path) = record.split_at(tab);
+            let path = &path[1..];
+            let meta = std::str::from_utf8(meta).context("`git ls-files` metadata is not UTF-8")?;
+            let mut fields = meta.split_whitespace();
+            let mode = fields
+                .next()
+                .context("`git ls-files` entry is missing a mode")?;
+            let oid = fields
+                .next()
+                .context("`git ls-files` entry is missing an object id")?;
+            let _stage = fields
+                .next()
+                .context("`git ls-files` entry is missing a stage")?;
+            entries.insert(path.to_vec(), (mode.to_string(), oid.to_string()));
+        }
+        Ok(entries)
+    }
+
+    /// Hash regular files by path in batches, without any filters.
+    fn hash_files(&self, paths: &[Vec<u8>]) -> Result<Vec<String>> {
+        let mut hashes = Vec::with_capacity(paths.len());
+        for chunk in paths.chunks(256) {
+            let mut args: Vec<&OsStr> = Vec::with_capacity(chunk.len() + 4);
+            args.push(OsStr::new("hash-object"));
+            args.push(OsStr::new("--no-filters"));
+            args.push(OsStr::new("-w"));
+            args.push(OsStr::new("--"));
+            for path in chunk {
+                args.push(OsStr::from_bytes(path));
+            }
+            let output = self
+                .git_os(&args)
+                .output()
+                .context("failed to run `git hash-object`")?;
+            if !output.status.success() {
+                bail!("`git hash-object` failed: {}", describe_failure(&output));
+            }
+            let text = String::from_utf8(output.stdout)
+                .context("`git hash-object` produced non-UTF-8 output")?;
+            for line in text.lines() {
+                if !line.is_empty() {
+                    hashes.push(line.trim().to_string());
+                }
+            }
+        }
+        Ok(hashes)
+    }
+
+    /// Hash raw bytes as a blob, without any filters.
+    fn hash_bytes(&self, bytes: &[u8]) -> Result<String> {
+        self.run_with_stdin(&["hash-object", "--no-filters", "-w", "--stdin"], bytes)
+    }
+
+    /// Apply `git update-index -z --index-info` records to the private index.
+    fn update_index_info(&self, index: &Path, info: &[u8]) -> Result<()> {
+        let mut command = self.git(&["update-index", "-z", "--index-info"]);
+        command
+            .env("GIT_INDEX_FILE", index)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .context("failed to spawn `git update-index`")?;
+        child
+            .stdin
+            .take()
+            .context("`git update-index` stdin was not piped")?
+            .write_all(info)
+            .context("failed to write to `git update-index` stdin")?;
+        let output = child
+            .wait_with_output()
+            .context("failed to wait for `git update-index`")?;
+        if !output.status.success() {
+            bail!(
+                "`git update-index --index-info` failed: {}",
+                describe_failure(&output)
+            );
+        }
+        Ok(())
+    }
+
+    /// Write one `git ls-tree -r -z` entry into `destination`.
+    fn materialize_entry(&self, entry: &[u8], destination: &Path) -> Result<()> {
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .context("malformed `git ls-tree` entry: missing tab")?;
+        let (meta, path) = entry.split_at(tab);
+        let path = &path[1..];
+        let meta = std::str::from_utf8(meta).context("`git ls-tree` metadata is not UTF-8")?;
+        let mut fields = meta.split_whitespace();
+        let mode = fields
+            .next()
+            .context("`git ls-tree` entry is missing a mode")?;
+        let kind = fields
+            .next()
+            .context("`git ls-tree` entry is missing a type")?;
+        let oid = fields
+            .next()
+            .context("`git ls-tree` entry is missing an object id")?;
+        if fields.next().is_some() {
+            bail!("unexpected `git ls-tree` metadata: {meta:?}");
+        }
+
+        let relative = validate_tree_path(path)?;
+        let target = destination.join(&relative);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+
+        match mode {
+            "100644" | "100755" => {
+                if kind != "blob" {
+                    bail!(
+                        "tree entry {} has mode {mode} but type {kind}",
+                        relative.display()
+                    );
+                }
+                let bytes = self.read_blob(oid)?;
+                fs::write(&target, &bytes)
+                    .with_context(|| format!("failed to write {}", target.display()))?;
+                let permissions = if mode == "100755" { 0o755 } else { 0o644 };
+                fs::set_permissions(&target, fs::Permissions::from_mode(permissions))
+                    .with_context(|| format!("failed to chmod {}", target.display()))?;
+            }
+            "120000" => {
+                if kind != "blob" {
+                    bail!(
+                        "tree entry {} has mode {mode} but type {kind}",
+                        relative.display()
+                    );
+                }
+                let bytes = self.read_blob(oid)?;
+                std::os::unix::fs::symlink(OsStr::from_bytes(&bytes), &target)
+                    .with_context(|| format!("failed to create symlink {}", target.display()))?;
+            }
+            "160000" => bail!(
+                "cannot materialize gitlink {oid} at {}: submodules are not supported",
+                relative.display()
+            ),
+            other => bail!(
+                "unsupported tree entry mode {other} at {}",
+                relative.display()
+            ),
+        }
+        Ok(())
+    }
+
+    fn read_blob(&self, oid: &str) -> Result<Vec<u8>> {
+        let output = self
+            .git(&["cat-file", "blob", oid])
+            .output()
+            .context("failed to run `git cat-file`")?;
+        if !output.status.success() {
+            bail!(
+                "`git cat-file blob {oid}` failed: {}",
+                describe_failure(&output)
+            );
+        }
+        Ok(output.stdout)
+    }
+
+    /// Build a Git command addressed at this repository with a sanitized
+    /// environment and the workspace root as the working directory.
+    fn base_command(&self) -> Command {
+        let mut command = Command::new("git");
+        command.arg("--git-dir").arg(&self.git_dir);
+        command.arg("--work-tree").arg(&self.workspace);
+        command.current_dir(&self.workspace);
+        sanitize(&mut command);
+        command
+    }
+
+    fn git(&self, args: &[&str]) -> Command {
+        let mut command = self.base_command();
+        command.args(args);
+        command
+    }
+
+    /// Like [`GitRepository::git`], but for arguments that are raw path bytes.
+    fn git_os(&self, args: &[&OsStr]) -> Command {
+        let mut command = self.base_command();
+        command.args(args);
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Result<String> {
+        let output = self
+            .git(args)
+            .output()
+            .with_context(|| format!("failed to run `git {}`", args.join(" ")))?;
+        if !output.status.success() {
+            bail!(
+                "`git {}` failed: {}",
+                args.join(" "),
+                describe_failure(&output)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn run_trimmed(&self, args: &[&str]) -> Result<String> {
+        Ok(self.run(args)?.trim().to_string())
+    }
+
+    /// Run a command whose non-zero exit is an expected "no" answer.
+    fn run_opt(&self, args: &[&str]) -> Result<Option<String>> {
+        let output = self
+            .git(args)
+            .output()
+            .with_context(|| format!("failed to run `git {}`", args.join(" ")))?;
+        if output.status.success() {
+            Ok(Some(
+                String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            ))
+        } else if output.status.code() == Some(1) {
+            Ok(None)
+        } else {
+            bail!(
+                "`git {}` failed: {}",
+                args.join(" "),
+                describe_failure(&output)
+            );
+        }
+    }
+
+    fn run_with_stdin(&self, args: &[&str], input: &[u8]) -> Result<String> {
+        let mut command = self.git(args);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to spawn `git {}`", args.join(" ")))?;
+        child
+            .stdin
+            .take()
+            .context("`git` stdin was not piped")?
+            .write_all(input)
+            .context("failed to write to `git` stdin")?;
+        let output = child
+            .wait_with_output()
+            .with_context(|| format!("failed to wait for `git {}`", args.join(" ")))?;
+        if !output.status.success() {
+            bail!(
+                "`git {}` failed: {}",
+                args.join(" "),
+                describe_failure(&output)
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn run_with_index(&self, index: &Path, args: &[&str]) -> Result<String> {
+        Ok(
+            String::from_utf8_lossy(&self.run_with_index_bytes(index, args)?)
+                .trim()
+                .to_string(),
+        )
+    }
+
+    fn run_with_index_bytes(&self, index: &Path, args: &[&str]) -> Result<Vec<u8>> {
+        let output = self
+            .git(args)
+            .env("GIT_INDEX_FILE", index)
+            .output()
+            .with_context(|| format!("failed to run `git {}`", args.join(" ")))?;
+        if !output.status.success() {
+            bail!(
+                "`git {}` failed: {}",
+                args.join(" "),
+                describe_failure(&output)
+            );
+        }
+        Ok(output.stdout)
+    }
+
+    fn empty_tree(&self) -> Result<String> {
+        self.run_with_stdin(&["hash-object", "-t", "tree", "-w", "--stdin"], b"")
+    }
+
+    fn resolve_commit(&self, commit: &str) -> Result<String> {
+        validate_object_id(commit, "commit")?;
+        let rev = format!("{commit}^{{commit}}");
+        self.run_trimmed(&["rev-parse", "--verify", "--end-of-options", rev.as_str()])
+            .with_context(|| format!("cannot resolve commit {commit:?}"))
+    }
+
+    fn resolve_tree(&self, tree: &str) -> Result<String> {
+        validate_object_id(tree, "tree")?;
+        let rev = format!("{tree}^{{tree}}");
+        self.run_trimmed(&["rev-parse", "--verify", "--end-of-options", rev.as_str()])
+            .with_context(|| format!("cannot resolve tree {tree:?}"))
+    }
+
+    /// Confirm `object` is an existing commit or tree and return it unchanged.
+    fn resolve_object(&self, object: &str) -> Result<String> {
+        validate_object_id(object, "object")?;
+        let kind = self
+            .run_trimmed(&["cat-file", "-t", object])
+            .with_context(|| format!("cannot resolve object {object:?}"))?;
+        if kind != "commit" && kind != "tree" {
+            bail!("snapshot object must be a commit or tree, not {kind}: {object:?}");
+        }
+        Ok(object.to_string())
+    }
+
+    /// Create a commit object from an existing tree, preserving the tree's
+    /// exact binary, executable, and symlink entries.
+    fn create_commit(
+        &self,
+        tree: &str,
+        parents: &[&str],
+        message: &str,
+        signature: &Signature,
+    ) -> Result<String> {
+        let date = format!("{} +0000", signature.timestamp);
+        let mut command = self.git(&["commit-tree", "--no-gpg-sign", tree]);
+        for parent in parents {
+            command.arg("-p").arg(parent);
+        }
+        command
+            .env("GIT_AUTHOR_NAME", &signature.name)
+            .env("GIT_AUTHOR_EMAIL", &signature.email)
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_NAME", &signature.name)
+            .env("GIT_COMMITTER_EMAIL", &signature.email)
+            .env("GIT_COMMITTER_DATE", &date)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .context("failed to spawn `git commit-tree`")?;
+        child
+            .stdin
+            .take()
+            .context("`git commit-tree` stdin was not piped")?
+            .write_all(message.as_bytes())
+            .context("failed to write the commit message to `git commit-tree`")?;
+        let output = child
+            .wait_with_output()
+            .context("failed to wait for `git commit-tree`")?;
+        if !output.status.success() {
+            bail!("`git commit-tree` failed: {}", describe_failure(&output));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Move `refs/heads/<branch>` to `new` with a compare-and-swap, refusing
+    /// non-fast-forward moves and treating an identical tip as a no-op.
+    ///
+    /// A symbolic destination ref is refused outright and the update uses
+    /// `--no-deref`, so an alias can never move the branch it points at.
+    fn update_branch(&self, branch: &str, new: &str) -> Result<()> {
+        let refname = format!("refs/heads/{branch}");
+        if self
+            .run_opt(&["symbolic-ref", "-q", refname.as_str()])?
+            .is_some()
+        {
+            bail!("refusing to update {refname:?}: it is a symbolic ref");
+        }
+        let old = if self
+            .run_opt(&["show-ref", "--verify", "--quiet", refname.as_str()])?
+            .is_some()
+        {
+            Some(self.run_trimmed(&[
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                refname.as_str(),
+            ])?)
+        } else {
+            None
+        };
+        match old {
+            Some(old) if old == new => Ok(()),
+            Some(old) => {
+                let output = self
+                    .git(&["merge-base", "--is-ancestor", old.as_str(), new])
+                    .output()
+                    .context("failed to run `git merge-base --is-ancestor`")?;
+                match output.status.code() {
+                    Some(0) => {}
+                    Some(1) => bail!(
+                        "refusing to move branch {branch:?} from {old} to {new}: not a fast-forward"
+                    ),
+                    _ => bail!(
+                        "`git merge-base --is-ancestor` failed: {}",
+                        describe_failure(&output)
+                    ),
+                }
+                self.run_trimmed(&[
+                    "update-ref",
+                    "--no-deref",
+                    refname.as_str(),
+                    new,
+                    old.as_str(),
+                ])?;
+                Ok(())
+            }
+            None => {
+                let zero = "0".repeat(new.len());
+                self.run_trimmed(&[
+                    "update-ref",
+                    "--no-deref",
+                    refname.as_str(),
+                    new,
+                    zero.as_str(),
+                ])?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Branches currently checked out in this repository or any linked
+    /// worktree. Updating one of these would desynchronize a live worktree.
+    fn checked_out_branches(&self) -> Result<Vec<String>> {
+        let mut branches = Vec::new();
+        if let Some(head) = self.run_opt(&["symbolic-ref", "-q", "HEAD"])?
+            && let Some(branch) = head.strip_prefix("refs/heads/")
+        {
+            branches.push(branch.to_string());
+        }
+        let list = self.run(&["worktree", "list", "--porcelain"])?;
+        for line in list.lines() {
+            if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+                branches.push(branch.trim().to_string());
+            }
+        }
+        Ok(branches)
+    }
+
+    fn validate_branch(&self, branch: &str) -> Result<()> {
+        if branch.is_empty() {
+            bail!("branch name is empty");
+        }
+        if branch.starts_with('-') {
+            bail!("branch name must not start with '-': {branch:?}");
+        }
+        if branch == "@" {
+            bail!("branch name must not be the HEAD shorthand '@'");
+        }
+        let output = self
+            .git(&["check-ref-format", "--branch", branch])
+            .output()
+            .context("failed to run `git check-ref-format`")?;
+        if !output.status.success() {
+            bail!(
+                "invalid branch name {branch:?}: {}",
+                describe_failure(&output)
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_ref(&self, refname: &str) -> Result<()> {
+        let output = self
+            .git(&["check-ref-format", refname])
+            .output()
+            .context("failed to run `git check-ref-format`")?;
+        if !output.status.success() {
+            bail!(
+                "invalid ref name {refname:?}: {}",
+                describe_failure(&output)
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Remove every environment variable that could redirect Git.
+fn sanitize(command: &mut Command) {
+    for name in SANITIZED_ENV {
+        command.env_remove(name);
+    }
+}
+
+/// Discover an ordinary Git worktree with `git rev-parse`.
+fn discover(workspace: &Path) -> Result<(PathBuf, PathBuf)> {
+    let mut command = Command::new("git");
+    command
+        .args(["rev-parse", "--show-toplevel", "--absolute-git-dir"])
+        .current_dir(workspace);
+    sanitize(&mut command);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run `git rev-parse` in {}", workspace.display()))?;
+    if !output.status.success() {
+        bail!(
+            "{} is not a Git repository: {}",
+            workspace.display(),
+            describe_failure(&output)
+        );
+    }
+    let text =
+        String::from_utf8(output.stdout).context("`git rev-parse` produced non-UTF-8 output")?;
+    let mut lines = text.lines();
+    let top = lines
+        .next()
+        .context("`git rev-parse --show-toplevel` produced no output")?;
+    let git_dir = lines
+        .next()
+        .context("`git rev-parse --absolute-git-dir` produced no output")?;
+    let workspace = PathBuf::from(top)
+        .canonicalize()
+        .with_context(|| format!("worktree root {top} does not exist"))?;
+    let git_dir = PathBuf::from(git_dir)
+        .canonicalize()
+        .with_context(|| format!("git directory {git_dir} does not exist"))?;
+    Ok((workspace, git_dir))
+}
+
+/// Find the nearest [`WORKSPACE_MARKER`] at `start` or one of its ancestors.
+fn find_workspace_link(start: &Path) -> Result<Option<(PathBuf, WorkspaceLink)>> {
+    let start = start
+        .canonicalize()
+        .with_context(|| format!("workspace {} does not exist", start.display()))?;
+    let mut current: Option<&Path> = Some(start.as_path());
+    while let Some(directory) = current {
+        let marker = directory.join(WORKSPACE_MARKER);
+        if marker.is_file() {
+            let bytes = fs::read(&marker)
+                .with_context(|| format!("failed to read {}", marker.display()))?;
+            let link: WorkspaceLink = serde_json::from_slice(&bytes)
+                .with_context(|| format!("failed to parse {}", marker.display()))?;
+            if !link.git_dir.is_absolute() {
+                bail!(
+                    "workspace link {} has a relative git_dir: {}",
+                    marker.display(),
+                    link.git_dir.display()
+                );
+            }
+            if link.thread.is_empty() {
+                bail!("workspace link {} has an empty thread", marker.display());
+            }
+            return Ok(Some((directory.to_path_buf(), link)));
+        }
+        current = directory.parent();
+    }
+    Ok(None)
+}
+
+/// Whether any component of `path` is snapshot metadata that must never be
+/// captured (the Git directory, the Jujutsu directory, the fork marker, and the
+/// mutation lock).
+fn is_metadata_path(path: &[u8]) -> bool {
+    path.split(|byte| *byte == b'/').any(|component| {
+        component == b".git"
+            || component == b".jj"
+            || component == b".juto-workspace.json"
+            || component == b".juto-mutation.lock"
+    })
+}
+
+/// Append one `git update-index --index-info -z` record.
+fn push_index_entry(info: &mut Vec<u8>, mode: &str, oid: &str, path: &[u8]) {
+    info.extend_from_slice(mode.as_bytes());
+    info.push(b' ');
+    info.extend_from_slice(oid.as_bytes());
+    info.push(b'\t');
+    info.extend_from_slice(path);
+    info.push(0);
+}
+
+/// Validate a `git ls-tree` path and turn it into a relative [`PathBuf`].
+fn validate_tree_path(path: &[u8]) -> Result<PathBuf> {
+    if path.is_empty() {
+        bail!("tree entry has an empty path");
+    }
+    if path[0] == b'/' {
+        bail!("tree entry has an absolute path");
+    }
+    let mut result = PathBuf::new();
+    for component in path.split(|byte| *byte == b'/') {
+        if component.is_empty() {
+            bail!("tree entry path has an empty component");
+        }
+        if component == b"." || component == b".." {
+            bail!("tree entry path escapes the destination");
+        }
+        if component == b".git" {
+            bail!("tree entry path contains a .git component");
+        }
+        if component == WORKSPACE_MARKER.as_bytes() {
+            bail!("tree entry path collides with the workspace marker");
+        }
+        result.push(OsStr::from_bytes(component));
+    }
+    Ok(result)
+}
+
+fn validate_object_id(id: &str, kind: &str) -> Result<()> {
+    if !matches!(id.len(), 40 | 64) || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("{kind} must be a full immutable object ID: {id:?}");
+    }
+    Ok(())
+}
+
+/// Parse `Name <email> timestamp tz` from `git var GIT_AUTHOR_IDENT`.
+fn parse_ident(ident: &str) -> Result<(String, String)> {
+    let open = ident.find('<').context("git identity is missing '<'")?;
+    let close = ident[open..]
+        .find('>')
+        .map(|offset| offset + open)
+        .context("git identity is missing '>'")?;
+    let name = ident[..open].trim();
+    let email = ident[open + 1..close].trim();
+    if name.is_empty() || email.is_empty() {
+        bail!("git identity has an empty name or email: {ident:?}");
+    }
+    Ok((name.to_string(), email.to_string()))
+}
+
+/// Render a failed command's stderr, falling back to its exit status.
+fn describe_failure(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!("exit status {}", output.status)
+    } else {
+        stderr.to_string()
+    }
+}

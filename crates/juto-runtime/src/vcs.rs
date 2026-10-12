@@ -1,33 +1,33 @@
-//! Jujutsu-backed mutation path for file edits.
+//! Native Git-backed mutation path for file edits.
 //!
 //! [`mutate`] is the single write path shared by the `write`/`edit` tools and
 //! the contextual-edit tools. It runs synchronously (callers wrap it in
 //! `spawn_blocking`) and performs one transaction:
 //!
-//! 1. discover the workspace root with `jj root` from the caller's cwd;
+//! 1. discover the workspace root through the change graph (a plain Git
+//!    repository or a native linked fork directory);
 //! 2. reject targets outside the canonical workspace root, through symlinks,
-//!    or inside `.jj`/`.git` metadata;
-//! 3. take a cross-process advisory lock on a file under `.jj`;
-//! 4. snapshot the working copy and capture the working-copy commit/change id;
-//! 5. reject conflicted or ignored paths;
+//!    or inside `.git`/`.jj`/native metadata;
+//! 3. take a cross-process advisory lock (`.juto-mutation.lock`) in the
+//!    workspace root;
+//! 4. capture the workspace tree before the edit;
+//! 5. reject ignored paths;
 //! 6. run the caller's transform, then atomically replace the file while
 //!    preserving its permissions;
-//! 7. snapshot again and return a path-scoped `jj diff --git` between the two
-//!    snapshots.
+//! 7. capture the tree again, record a durable change-graph node, and return a
+//!    path-scoped diff between the two trees.
 //!
-//! No new change is created: the working-copy change id is retained and no
-//! `jj new`/`jj commit`/`jj rebase` is ever invoked. The path-scoped diff is
-//! computed from the two snapshots, so unrelated preexisting edits are never
-//! attributed to this operation.
+//! No Git commit is created: live snapshots are trees/blobs only, and the
+//! path-scoped diff is computed from the two trees, so unrelated preexisting
+//! edits are never attributed to this operation.
 //!
-//! Failures are honest: a jj failure is a true error, and an error after the
+//! Failures are honest: a Git failure is a true error, and an error after the
 //! file has been written explicitly reports that the file was applied and that
 //! bookkeeping failed. Nothing is rolled back and success is never fabricated.
 
 use std::{
     io::Write as _,
     path::{Component, Path, PathBuf},
-    process::Command,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -35,29 +35,26 @@ use fs2::FileExt;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-#[derive(serde::Serialize)]
-pub(crate) struct EditProvenance {
-    pub session_id: String,
-    pub tool: String,
-    pub selection_mode: Option<String>,
-    pub path: Option<String>,
-}
+use crate::change_graph::{ChangeGraph, EditProvenance};
 
-/// Maximum bytes of `jj diff` output returned inline; longer diffs are
-/// truncated at a char boundary and flagged.
+/// Maximum bytes of diff output returned inline; longer diffs are truncated at
+/// a char boundary and flagged.
 const DIFF_MAX_BYTES: usize = 64 * 1024;
 
-/// Name of the per-workspace advisory lock file, created under `.jj`.
+/// Name of the per-workspace advisory lock file, created in the workspace root.
 ///
-/// It lives in the workspace's own `.jj` directory (not the shared repository
-/// directory referenced by `.jj/repo`), so it serializes mutations within one
-/// working copy without ambiguously locking shared state.
-const LOCK_FILE_NAME: &str = "juto-mutation.lock";
+/// It lives at the workspace root (not inside `.git`/`.jj`) so it serializes
+/// mutations within one working copy while the native snapshot capture excludes
+/// it from every tree.
+const LOCK_FILE_NAME: &str = ".juto-mutation.lock";
+
+/// Native metadata names that must never be edited as ordinary files.
+const METADATA_NAMES: &[&str] = &[".git", ".jj", ".juto-workspace.json", LOCK_FILE_NAME];
 
 /// Monotonic counter for same-directory temporary file names.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Apply `transform` to `path` through a jj-backed, atomic, locked mutation.
+/// Apply `transform` to `path` through a native, atomic, locked mutation.
 ///
 /// `cwd` is the caller's working directory; a relative `path` resolves against
 /// it. `transform` receives the current file contents (`None` when the file
@@ -68,9 +65,9 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// ```json
 /// {
 ///   "path": "src/lib.rs",
-///   "before_commit": "<hex>",
-///   "after_commit": "<hex>",
-///   "change_id": "<change id>",
+///   "before_tree": "<hex tree id>",
+///   "after_tree": "<hex tree id>",
+///   "graph_node": "<change node id>",
 ///   "diff": "<git diff, possibly truncated>",
 ///   "diff_truncated": false,
 ///   "changed": true,
@@ -94,32 +91,41 @@ pub fn mutate(
         return Err("cancelled before mutation".to_string());
     }
 
-    let root = jj_root(cwd)?;
+    let graph = ChangeGraph::open(cwd)
+        .map_err(|e| format!("{}: cannot open change graph: {e:#}", cwd.display()))?;
+    // Canonicalize so containment checks compare like-for-like against the
+    // canonical working directory. The lock file resolves to the same inode as
+    // the graph's own workspace path, so mutual exclusion is unaffected.
+    let workspace = graph.workspace();
+    let root = std::fs::canonicalize(workspace)
+        .map_err(|e| format!("cannot resolve workspace {}: {e}", workspace.display()))?;
     let target = validate_target(&root, cwd, path)?;
     let rel = target
         .strip_prefix(&root)
         .map_err(|_| format!("{} is outside {}", target.display(), root.display()))?;
     let display = rel.to_string_lossy().replace('\\', "/");
-    let fileset = fileset_literal(&display);
 
     // The lock covers the entire transaction: read, transform, write, snapshot,
-    // and diff.
+    // and diff. It is held while the before/after trees are captured.
     let _lock = MutationLock::acquire(&root)?;
+    let mut provenance = provenance.clone();
+    provenance.path = Some(display.clone());
 
-    let before = jj_working_copy(&root)?;
+    let before_tree = graph.snapshot_tree().map_err(|e| {
+        format!("{display}: cannot capture the workspace tree before mutation: {e:#}")
+    })?;
     let before_text = read_optional(&target)?;
 
-    if jj_path_conflicted(&root, &fileset)? {
+    let tracked = graph
+        .path_tracked(&before_tree, &display)
+        .map_err(|e| format!("{display}: cannot check whether the path is tracked: {e:#}"))?;
+    if !tracked
+        && graph
+            .path_ignored(&display)
+            .map_err(|e| format!("{display}: cannot check ignore rules: {e:#}"))?
+    {
         return Err(format!(
-            "{display}: path has unresolved jujutsu conflicts; resolve them before editing"
-        ));
-    }
-
-    // An existing file that jj does not track is ignored; refuse rather than
-    // silently produce an untracked change.
-    if before_text.is_some() && !jj_path_tracked(&root, &fileset)? {
-        return Err(format!(
-            "{display}: path is ignored by jujutsu; refusing to edit an untracked path"
+            "{display}: path is ignored; refusing an untracked mutation"
         ));
     }
 
@@ -128,9 +134,9 @@ pub fn mutate(
     if before_text.as_deref() == Some(new_text.as_str()) {
         return Ok(json!({
             "path": display,
-            "before_commit": before.commit_id,
-            "after_commit": before.commit_id,
-            "change_id": before.change_id,
+            "before_tree": before_tree,
+            "after_tree": before_tree,
+            "graph_node": null,
             "diff": "",
             "diff_truncated": false,
             "changed": false,
@@ -151,28 +157,59 @@ pub fn mutate(
     // was requested in the meantime; we report the applied change rather than
     // claiming a clean cancellation.
 
-    let after = jj_working_copy(&root).map_err(|e| {
-        format!("{display}: file applied but jujutsu bookkeeping failed (before_commit={}, after_commit=unavailable): {e}", before.commit_id)
+    let after_tree = graph.snapshot_tree().map_err(|e| {
+        format!(
+            "{display}: file applied but the workspace snapshot failed (before_tree={before_tree}, after_tree=unavailable): {e:#}"
+        )
     })?;
-    let raw_diff = jj_path_diff(&root, &before.commit_id, &after.commit_id, &fileset).map_err(
-        |e| format!("{display}: file applied but jujutsu diff failed (before_commit={}, after_commit={}): {e}", before.commit_id, after.commit_id),
-    )?;
 
-    if raw_diff.trim().is_empty() {
+    // A newly created path may be ignored by Git; the capture silently omits it.
+    // Fail honestly rather than record a node for a change Git cannot see.
+    if !graph
+        .path_tracked(&after_tree, &display)
+        .map_err(|e| format!(
+            "{display}: file applied but the tracked-path check failed (before_tree={before_tree}, after_tree={after_tree}): {e:#}"
+        ))?
+    {
         return Err(format!(
-            "{display}: file applied but jujutsu reports no tracked change (path is ignored or untracked; before_commit={}, after_commit={})",
-            before.commit_id, after.commit_id
+            "{display}: file applied but the path is ignored by Git (before_tree={before_tree}, after_tree={after_tree})"
         ));
     }
 
+    let raw_diff = graph
+        .diff_trees(&before_tree, &after_tree, &display)
+        .map_err(|e| {
+            format!(
+                "{display}: file applied but the diff failed (before_tree={before_tree}, after_tree={after_tree}): {e:#}"
+            )
+        })?;
+
+    if raw_diff.trim().is_empty() {
+        return Err(format!(
+            "{display}: file applied but Git reports no tracked change (before_tree={before_tree}, after_tree={after_tree})"
+        ));
+    }
+
+    let node = graph
+        .record_edit(&before_tree, &after_tree, provenance.clone())
+        .map_err(|e| {
+            format!(
+                "{display}: file applied but change graph bookkeeping failed (before_tree={before_tree}, after_tree={after_tree}): {e:#}"
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "{display}: file applied but change graph reports no changed tree (before_tree={before_tree}, after_tree={after_tree})"
+            )
+        })?;
     let (diff, diff_truncated) = bound_text(raw_diff, DIFF_MAX_BYTES);
     let cancelled_after_apply = cancel.is_cancelled();
 
     Ok(json!({
         "path": display,
-        "before_commit": before.commit_id,
-        "after_commit": after.commit_id,
-        "change_id": after.change_id,
+        "before_tree": before_tree,
+        "after_tree": after_tree,
+        "graph_node": node.id,
         "diff": diff,
         "diff_truncated": diff_truncated,
         "changed": true,
@@ -187,27 +224,10 @@ pub fn mutate(
 // Workspace discovery and target validation
 // ---------------------------------------------------------------------------
 
-/// Locate the canonical workspace root by running `jj root` in `cwd`.
-fn jj_root(cwd: &Path) -> Result<PathBuf, String> {
-    let out = run_jj(cwd, &["root", "--ignore-working-copy"])?;
-    if !out.status.success() {
-        return Err(format!(
-            "not inside a jujutsu workspace ({}): {}",
-            cwd.display(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if raw.is_empty() {
-        return Err("`jj root` returned an empty path".to_string());
-    }
-    std::fs::canonicalize(&raw).map_err(|e| format!("cannot canonicalize jujutsu root {raw}: {e}"))
-}
-
 /// Resolve `path` against `cwd` and require it to be a writable file inside the
 /// canonical workspace `root`.
 ///
-/// Rejects lexical traversal outside the root, `.jj`/`.git` metadata
+/// Rejects lexical traversal outside the root, `.git`/`.jj`/native metadata
 /// components, symlinked components, and directories. For a new file, the
 /// nearest existing ancestor is validated and must canonicalize inside `root`.
 fn validate_target(root: &Path, cwd: &Path, path: &Path) -> Result<PathBuf, String> {
@@ -222,10 +242,10 @@ fn validate_target(root: &Path, cwd: &Path, path: &Path) -> Result<PathBuf, Stri
 
     for comp in lex.components() {
         if let Component::Normal(name) = comp
-            && (name == ".jj" || name == ".git")
+            && METADATA_NAMES.iter().any(|meta| name == *meta)
         {
             return Err(format!(
-                "refusing to edit jujutsu/git metadata path {}",
+                "refusing to edit repository metadata path {}",
                 lex.display()
             ));
         }
@@ -233,7 +253,7 @@ fn validate_target(root: &Path, cwd: &Path, path: &Path) -> Result<PathBuf, Stri
 
     let rel = lex.strip_prefix(root).map_err(|_| {
         format!(
-            "path {} is outside the jujutsu workspace {}",
+            "path {} is outside the workspace {}",
             lex.display(),
             root.display()
         )
@@ -282,7 +302,7 @@ fn validate_target(root: &Path, cwd: &Path, path: &Path) -> Result<PathBuf, Stri
             .map_err(|e| format!("cannot canonicalize {}: {e}", anc.display()))?;
         if !canon.starts_with(root) {
             return Err(format!(
-                "path {} resolves outside the jujutsu workspace {}",
+                "path {} resolves outside the workspace {}",
                 lex.display(),
                 root.display()
             ));
@@ -319,15 +339,10 @@ pub(crate) struct MutationLock {
 }
 
 impl MutationLock {
+    /// Acquire the workspace mutation lock, creating `.juto-mutation.lock` in
+    /// `root` if needed. The lock file is excluded from every native snapshot.
     pub(crate) fn acquire(root: &Path) -> Result<Self, String> {
-        let dir = root.join(".jj");
-        if !dir.is_dir() {
-            return Err(format!(
-                "{} is not a jujutsu metadata directory",
-                dir.display()
-            ));
-        }
-        let path = dir.join(LOCK_FILE_NAME);
+        let path = root.join(LOCK_FILE_NAME);
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -421,118 +436,6 @@ fn atomic_write_preserving(target: &Path, contents: &[u8]) -> Result<(), String>
         let _ = dir.sync_all();
     }
     result
-}
-
-// ---------------------------------------------------------------------------
-// jj helpers
-// ---------------------------------------------------------------------------
-
-/// Working-copy identity captured from a snapshot.
-struct WorkingCopy {
-    commit_id: String,
-    change_id: String,
-}
-
-/// Run `jj` in `dir` without a shell.
-fn run_jj(dir: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("jj")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .map_err(|e| {
-            format!(
-                "failed to run `jj {}` in {}: {e}",
-                args.join(" "),
-                dir.display()
-            )
-        })
-}
-
-/// Format a jj command failure with its stderr.
-fn jj_err(command: &str, out: &std::process::Output) -> String {
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        format!("`{command}` failed with status {}", out.status)
-    } else {
-        format!("`{command}` failed: {stderr}")
-    }
-}
-
-/// Snapshot the working copy and read its commit id and change id.
-fn jj_working_copy(root: &Path) -> Result<WorkingCopy, String> {
-    const TEMPLATE: &str = "commit_id ++ \" \" ++ change_id";
-    let out = run_jj(root, &["log", "--no-graph", "-r", "@", "-T", TEMPLATE])?;
-    if !out.status.success() {
-        return Err(jj_err(
-            "jj log -r @ -T 'commit_id ++ \" \" ++ change_id'",
-            &out,
-        ));
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut parts = text.split_whitespace();
-    let commit_id = parts
-        .next()
-        .ok_or_else(|| "`jj log` returned no commit id".to_string())?
-        .to_string();
-    let change_id = parts
-        .next()
-        .ok_or_else(|| "`jj log` returned no change id".to_string())?
-        .to_string();
-    Ok(WorkingCopy {
-        commit_id,
-        change_id,
-    })
-}
-
-/// Build a literal workspace-relative fileset for `rel`.
-fn fileset_literal(rel: &str) -> String {
-    let mut escaped = String::with_capacity(rel.len() + 2);
-    for ch in rel.chars() {
-        match ch {
-            '"' => escaped.push_str("\\\""),
-            '\\' => escaped.push_str("\\\\"),
-            _ => escaped.push(ch),
-        }
-    }
-    format!("root-file:\"{escaped}\"")
-}
-
-/// Whether `fileset` has unresolved conflicts in the working copy.
-fn jj_path_conflicted(root: &Path, fileset: &str) -> Result<bool, String> {
-    let out = run_jj(root, &["resolve", "--list", "--", fileset])?;
-    if out.status.success() {
-        return Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty());
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if stderr.contains("No conflicts found") {
-        return Ok(false);
-    }
-    Err(jj_err(&format!("jj resolve --list -- {fileset}"), &out))
-}
-
-/// Whether `fileset` is tracked by jj in the working copy.
-fn jj_path_tracked(root: &Path, fileset: &str) -> Result<bool, String> {
-    let out = run_jj(root, &["file", "list", "--", fileset])?;
-    if !out.status.success() {
-        return Err(jj_err(&format!("jj file list -- {fileset}"), &out));
-    }
-    Ok(!String::from_utf8_lossy(&out.stdout).trim().is_empty())
-}
-
-/// Path-scoped git-format diff between two snapshots.
-fn jj_path_diff(root: &Path, from: &str, to: &str, fileset: &str) -> Result<String, String> {
-    let out = run_jj(
-        root,
-        &["diff", "--git", "--from", from, "--to", to, "--", fileset],
-    )?;
-    if !out.status.success() {
-        return Err(jj_err(
-            &format!("jj diff --git --from {from} --to {to} -- {fileset}"),
-            &out,
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Truncate `text` to `max` bytes at a char boundary, flagging truncation.

@@ -1,3 +1,5 @@
+mod changes;
+
 use std::{
     collections::BTreeSet,
     io::{self, BufRead, IsTerminal, Read, Write},
@@ -41,6 +43,11 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect live edits, mark exact snapshots, and transfer marked points to Git.
+    Changes {
+        #[command(subcommand)]
+        command: changes::ChangesCommand,
+    },
     /// Stream a turn, using a new or existing durable session. A prompt of '-' reads stdin.
     Run {
         prompt: String,
@@ -90,6 +97,9 @@ enum Command {
 async fn main() -> Result<()> {
     let arguments = Arguments::parse();
     let cwd = arguments.cwd.canonicalize().context("invalid --cwd")?;
+    if let Command::Changes { command } = &arguments.command {
+        return changes::run(&cwd, command);
+    }
     let data_dir = match arguments.data_dir {
         Some(path) => path,
         None => default_data_dir()?,
@@ -114,6 +124,7 @@ async fn main() -> Result<()> {
     }
     let runtime = Runtime::from_config(cwd, data_dir, config)?;
     match arguments.command {
+        Command::Changes { .. } => unreachable!("handled before runtime initialization"),
         Command::Run { prompt, session } => {
             let resumed = session.is_some();
             let prompt = if prompt == "-" {
