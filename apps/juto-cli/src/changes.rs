@@ -95,6 +95,8 @@ pub enum ChangesCommand {
         #[arg(long)]
         thread: String,
     },
+    /// Reclaim unreachable nodes, release their refs, and pack loose refs.
+    Gc,
 }
 
 pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
@@ -212,6 +214,7 @@ pub fn run(cwd: &Path, command: &ChangesCommand) -> Result<()> {
                 })
                 .collect(),
         ),
+        ChangesCommand::Gc => serde_json::to_value(graph.gc()?)?,
     };
     serde_json::to_writer_pretty(std::io::stdout().lock(), &value)?;
     println!();
