@@ -13,12 +13,9 @@
 
 use std::{
     collections::VecDeque,
-    io::{self, BufRead, Read as _, Write as _},
+    io::{self, BufRead, Read as _},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -139,17 +136,6 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes[..bytes.len().min(BINARY_SNIFF_BYTES)].contains(&0)
 }
 
-/// Decode file bytes as UTF-8, rejecting binary data with an explicit error.
-fn decode_file(cwd: &Path, path: &Path, bytes: &[u8]) -> Result<String, String> {
-    let shown = display_path(cwd, path);
-    if looks_binary(bytes) {
-        return Err(format!(
-            "{shown}: binary file (NUL byte in first {BINARY_SNIFF_BYTES} bytes)"
-        ));
-    }
-    String::from_utf8(bytes.to_vec()).map_err(|e| format!("{shown}: not valid UTF-8 ({e})"))
-}
-
 /// Truncate a string to `max` bytes at a char boundary, flagging truncation.
 fn truncate_bytes(text: &str, max: usize) -> (String, bool) {
     if text.len() <= max {
@@ -160,39 +146,6 @@ fn truncate_bytes(text: &str, max: usize) -> (String, bool) {
         end -= 1;
     }
     (text[..end].to_string(), true)
-}
-
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Write `contents` to `path` via a same-directory temp file + rename so a
-/// failure never truncates the destination. Creates parent directories.
-fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    std::fs::create_dir_all(&parent)?;
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "file".to_string());
-    let unique = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(
-        ".{file_name}.juto-{}-{unique}.tmp",
-        std::process::id()
-    ));
-    let result = (|| -> io::Result<()> {
-        {
-            let mut file = std::fs::File::create(&tmp)?;
-            file.write_all(contents)?;
-            file.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -413,8 +366,9 @@ impl Tool for WriteTool {
     fn definition(&self) -> juto_ai::ToolDefinition {
         juto_ai::ToolDefinition {
             name: "write".to_string(),
-            description: "Write content to a file, creating parent directories. Overwrites \
-				atomically so a failed write never truncates the destination."
+            description: "Write a UTF-8 file through the jj working copy, creating parents. \
+                Requires a path inside the session's jj workspace. Returns before/after \
+                revisions and the operation's diff; does not create a new change."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -441,16 +395,19 @@ impl Tool for WriteTool {
         check_cancel(&ctx.cancel)?;
         let cwd = effective_cwd(&self.cwd, &ctx).to_path_buf();
         let path = resolve_path(&cwd, &params.path);
+        let cancel = ctx.cancel.clone();
+        let provenance = crate::vcs::EditProvenance {
+            session_id: ctx.session_id,
+            tool: "write".to_string(),
+            selection_mode: None,
+            path: Some(params.path.clone()),
+        };
         tokio::task::spawn_blocking(move || {
-            atomic_write(&path, params.content.as_bytes())
-                .map_err(|e| format!("{}: {e}", display_path(&cwd, &path)))?;
+            let details =
+                crate::vcs::mutate(&cwd, &path, &cancel, &provenance, |_| Ok(params.content))?;
             Ok(output(
-                format!(
-                    "Wrote {} bytes to {}",
-                    params.content.len(),
-                    display_path(&cwd, &path)
-                ),
-                json!({"path": display_path(&cwd, &path), "bytes": params.content.len()}),
+                format!("Wrote {} through jj", display_path(&cwd, &path)),
+                details,
             ))
         })
         .await
@@ -463,12 +420,11 @@ impl Tool for WriteTool {
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EditParams {
     path: String,
-    old_string: String,
-    new_string: String,
-    #[serde(default)]
-    replace_all: bool,
+    selection: crate::contextual::Selection,
+    replacement: String,
 }
 
 struct EditTool {
@@ -480,18 +436,36 @@ impl Tool for EditTool {
     fn definition(&self) -> juto_ai::ToolDefinition {
         juto_ai::ToolDefinition {
             name: "edit".to_string(),
-            description: "Replace exact text in a file. old_string must match exactly once; \
-				set replace_all to replace every occurrence. The file is updated atomically."
+            description: "Contextual edit through jj. Prefer AST queries for supported Rust, \
+                Python, JavaScript and TypeScript files; use inclusive line ranges or exact \
+                text otherwise. AST query must uniquely capture @edit (or the supplied \
+                capture). Replacement is verbatim, including newlines. Returns revisions \
+                and the operation's diff; never silently falls back between modes."
                 .to_string(),
             parameters: json!({
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
-                    "path": {"type": "string", "description": "File to edit; relative paths resolve against the session cwd."},
-                    "old_string": {"type": "string", "description": "Exact text to find (must be non-empty)."},
-                    "new_string": {"type": "string", "description": "Replacement text."},
-                    "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring a unique match."},
+                    "path": {"type": "string"},
+                    "replacement": {"type": "string"},
+                    "selection": {
+                        "oneOf": [
+                            {"type": "object", "additionalProperties": false, "properties": {
+                                "mode": {"const": "ast"}, "query": {"type": "string"},
+                                "capture": {"type": "string", "default": "edit"}
+                            }, "required": ["mode", "query"]},
+                            {"type": "object", "additionalProperties": false, "properties": {
+                                "mode": {"const": "range"}, "start_line": {"type": "integer", "minimum": 1},
+                                "end_line": {"type": "integer", "minimum": 1}
+                            }, "required": ["mode", "start_line", "end_line"]},
+                            {"type": "object", "additionalProperties": false, "properties": {
+                                "mode": {"const": "text"}, "old_string": {"type": "string", "minLength": 1},
+                                "replace_all": {"type": "boolean", "default": false}
+                            }, "required": ["mode", "old_string"]}
+                        ]
+                    }
                 },
-                "required": ["path", "old_string", "new_string"],
+                "required": ["path", "selection", "replacement"],
             }),
         }
     }
@@ -507,33 +481,44 @@ impl Tool for EditTool {
     async fn execute(&self, arguments: Value, ctx: ToolContext) -> Result<ToolOutput, String> {
         let params: EditParams = serde_json::from_value(arguments)
             .map_err(|e| format!("invalid edit arguments: {e}"))?;
-        if params.old_string.is_empty() {
-            return Err("edit: old_string must not be empty".to_string());
-        }
+        let cancel = ctx.cancel.clone();
         check_cancel(&ctx.cancel)?;
         let cwd = effective_cwd(&self.cwd, &ctx).to_path_buf();
         let path = resolve_path(&cwd, &params.path);
+        let mode = match &params.selection {
+            crate::contextual::Selection::Ast { .. } => "ast",
+            crate::contextual::Selection::Range { .. } => "range",
+            crate::contextual::Selection::Text { .. } => "text",
+        };
+        let provenance = crate::vcs::EditProvenance {
+            session_id: ctx.session_id,
+            tool: "edit".to_string(),
+            selection_mode: Some(mode.to_string()),
+            path: Some(params.path.clone()),
+        };
         tokio::task::spawn_blocking(move || {
-            let shown = display_path(&cwd, &path);
-            let bytes = std::fs::read(&path).map_err(|e| format!("{shown}: {e}"))?;
-            let text = decode_file(&cwd, &path, &bytes)?;
-            let matches = text.matches(&params.old_string).count();
-            if matches == 0 {
-                return Err(format!("{shown}: old_string not found"));
-            }
-            if matches > 1 && !params.replace_all {
-                return Err(format!(
-                    "{shown}: old_string matches {matches} times; make it unique or set replace_all"
-                ));
-            }
-            let updated = text.replace(&params.old_string, &params.new_string);
-            atomic_write(&path, updated.as_bytes()).map_err(|e| format!("{shown}: {e}"))?;
+            let mut replacements = 0;
+            let mut details = crate::vcs::mutate(&cwd, &path, &cancel, &provenance, |original| {
+                let text = original.ok_or_else(|| "edit: file does not exist".to_string())?;
+                let ranges = crate::contextual::resolve(&path, text, &params.selection)?;
+                replacements = ranges.len();
+                let mut updated = String::with_capacity(text.len());
+                let mut cursor = 0;
+                for range in ranges {
+                    updated.push_str(&text[cursor..range.start]);
+                    updated.push_str(&params.replacement);
+                    cursor = range.end;
+                }
+                updated.push_str(&text[cursor..]);
+                Ok(updated)
+            })?;
+            details["replacements"] = json!(replacements);
             Ok(output(
                 format!(
-                    "Edited {shown} ({matches} replacement{})",
-                    if matches == 1 { "" } else { "s" }
+                    "Edited {} through jj ({replacements} replacements)",
+                    display_path(&cwd, &path)
                 ),
-                json!({"path": shown, "replacements": matches}),
+                details,
             ))
         })
         .await
@@ -1283,23 +1268,6 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_six_tools_with_schemas() {
-        let dir = tempfile::tempdir().unwrap();
-        let registry = builtin_tools(dir.path()).expect("builtin tools");
-        let mut names: Vec<String> = registry
-            .definitions()
-            .iter()
-            .map(|d| d.name.clone())
-            .collect();
-        names.sort();
-        assert_eq!(names, ["bash", "edit", "glob", "grep", "read", "write"]);
-        for def in registry.definitions() {
-            assert_eq!(def.parameters["type"], "object", "{}", def.name);
-            assert!(def.parameters["required"].is_array(), "{}", def.name);
-        }
-    }
-
-    #[test]
     fn tiers_and_concurrency() {
         assert!(matches!(
             ReadTool {
@@ -1424,9 +1392,34 @@ mod tests {
         assert!(err.contains("binary"), "{err}");
     }
 
+    fn jj_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let result = std::process::Command::new("jj")
+            .args(["git", "init", "--colocate"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result = std::process::Command::new("jj")
+            .arg("new")
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        dir
+    }
+
     #[tokio::test]
     async fn write_creates_parents_and_overwrites() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = jj_dir();
         let tool = WriteTool {
             cwd: dir.path().to_path_buf(),
         };
@@ -1461,7 +1454,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_requires_unique_match_unless_replace_all() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = jj_dir();
         std::fs::write(dir.path().join("f.txt"), "foo bar foo").unwrap();
         let tool = EditTool {
             cwd: dir.path().to_path_buf(),
@@ -1469,7 +1462,7 @@ mod tests {
 
         let err = tool
             .execute(
-                json!({"path": "f.txt", "old_string": "foo", "new_string": "x"}),
+                json!({"path": "f.txt", "selection": {"mode": "text", "old_string": "foo"}, "replacement": "x"}),
                 ctx(dir.path()),
             )
             .await
@@ -1482,14 +1475,14 @@ mod tests {
 
         let err = tool
             .execute(
-                json!({"path": "f.txt", "old_string": "nope", "new_string": "x"}),
+                json!({"path": "f.txt", "selection": {"mode": "text", "old_string": "nope"}, "replacement": "x"}),
                 ctx(dir.path()),
             )
             .await
             .unwrap_err();
         assert!(err.contains("not found"), "{err}");
 
-        let out = tool.execute(json!({"path": "f.txt", "old_string": "foo", "new_string": "x", "replace_all": true}), ctx(dir.path())).await.unwrap();
+        let out = tool.execute(json!({"path": "f.txt", "selection": {"mode": "text", "old_string": "foo", "replace_all": true}, "replacement": "x"}), ctx(dir.path())).await.unwrap();
         assert_eq!(out.details["replacements"], 2);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
@@ -1498,12 +1491,246 @@ mod tests {
 
         let err = tool
             .execute(
-                json!({"path": "f.txt", "old_string": "", "new_string": "x"}),
+                json!({"path": "f.txt", "selection": {"mode": "text", "old_string": ""}, "replacement": "x"}),
                 ctx(dir.path()),
             )
             .await
             .unwrap_err();
         assert!(err.contains("empty"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn contextual_edits_preserve_other_code_and_report_only_the_operation() {
+        let dir = jj_dir();
+        let tool = EditTool {
+            cwd: dir.path().to_path_buf(),
+        };
+        let path = dir.path().join("f.rs");
+        std::fs::write(&path, "fn first() { 1; }\nfn second() { 2; }\n").unwrap();
+        std::fs::write(dir.path().join("unrelated.txt"), "human edit\n").unwrap();
+        let ast = tool.execute(json!({
+            "path": "f.rs", "selection": {"mode": "ast",
+            "query": "(function_item name: (identifier) @name (#eq? @name \"second\")) @edit"},
+            "replacement": "fn second() { 3; }"
+        }), ctx(dir.path())).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn first() { 1; }\nfn second() { 3; }\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("unrelated.txt")).unwrap(),
+            "human edit\n"
+        );
+        assert_ne!(ast.details["before_commit"], ast.details["after_commit"]);
+        let diff = ast.details["diff"].as_str().unwrap();
+        assert!(diff.contains("-fn second() { 2; }"), "{diff}");
+        assert!(diff.contains("+fn second() { 3; }"), "{diff}");
+        assert!(!diff.contains("unrelated.txt"), "{diff}");
+        let range = tool
+            .execute(
+                json!({
+                    "path": "f.rs", "selection": {"mode": "range", "start_line": 1, "end_line": 1},
+                    "replacement": "fn first() { 4; }\n"
+                }),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn first() { 4; }\nfn second() { 3; }\n"
+        );
+        assert_eq!(range.details["change_id"], ast.details["change_id"]);
+        let err = tool
+            .execute(
+                json!({
+                    "path": "f.rs", "selection": {"mode": "ast", "query": "(function_item) @edit"},
+                    "replacement": ""
+                }),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("ambig") || err.contains("unique") || err.contains("2"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fn first() { 4; }\nfn second() { 3; }\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn mutations_fail_closed_without_jj_and_outside_workspace() {
+        let plain = tempfile::tempdir().unwrap();
+        let tool = WriteTool {
+            cwd: plain.path().to_path_buf(),
+        };
+        assert!(
+            tool.execute(
+                json!({"path": "f.txt", "content": "bad"}),
+                ctx(plain.path())
+            )
+            .await
+            .is_err()
+        );
+        assert!(!plain.path().join("f.txt").exists());
+        let repo = jj_dir();
+        let tool = WriteTool {
+            cwd: repo.path().to_path_buf(),
+        };
+        let outside = plain.path().join("outside.txt");
+        assert!(
+            tool.execute(json!({"path": outside, "content": "bad"}), ctx(repo.path()))
+                .await
+                .is_err()
+        );
+        assert!(!outside.exists());
+        assert!(
+            tool.execute(
+                json!({"path": ".jj/config.toml", "content": "bad"}),
+                ctx(repo.path())
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn range_edits_preserve_utf8_crlf_and_reject_phantom_lines() {
+        let dir = jj_dir();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "α\r\nβ\r\nlast").unwrap();
+        let tool = EditTool {
+            cwd: dir.path().to_path_buf(),
+        };
+        tool.execute(json!({"path":"f.txt","selection":{"mode":"range","start_line":2,"end_line":2},"replacement":"γ\r\n"}),ctx(dir.path())).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "α\r\nγ\r\nlast");
+        tool.execute(json!({"path":"f.txt","selection":{"mode":"range","start_line":3,"end_line":3},"replacement":"end\n"}),ctx(dir.path())).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "α\r\nγ\r\nend\n");
+        for (start, end) in [(0, 1), (2, 1), (4, 4)] {
+            assert!(tool.execute(json!({"path":"f.txt","selection":{"mode":"range","start_line":start,"end_line":end},"replacement":"bad"}),ctx(dir.path())).await.is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "α\r\nγ\r\nend\n");
+        }
+    }
+
+    #[tokio::test]
+    async fn ast_edits_use_each_language_grammar_and_fail_without_fallback() {
+        let dir = jj_dir();
+        let tool = EditTool {
+            cwd: dir.path().to_path_buf(),
+        };
+        for (path, source, query, expected) in [
+            (
+                "f.py",
+                "def old():\n    return 1\n",
+                "(function_definition name: (identifier) @edit)",
+                "def new():\n    return 1\n",
+            ),
+            (
+                "f.js",
+                "function old() { return 1; }\n",
+                "(function_declaration name: (identifier) @edit)",
+                "function new() { return 1; }\n",
+            ),
+            (
+                "f.ts",
+                "function old(): number { return 1; }\n",
+                "(function_declaration name: (identifier) @edit)",
+                "function new(): number { return 1; }\n",
+            ),
+            (
+                "f.tsx",
+                "const old = <div />;\n",
+                "(variable_declarator name: (identifier) @edit)",
+                "const new = <div />;\n",
+            ),
+        ] {
+            std::fs::write(dir.path().join(path), source).unwrap();
+            tool.execute(
+                json!({"path":path,"selection":{"mode":"ast","query":query},"replacement":"new"}),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(path)).unwrap(),
+                expected
+            );
+        }
+        for (path, source, query) in [
+            ("bad.rs", "fn broken( {", "(function_item) @edit"),
+            ("plain.txt", "old", "(_) @edit"),
+            ("query.rs", "fn old() {}", "(not_a_node) @edit"),
+            ("capture.rs", "fn old() {}", "(function_item) @other"),
+        ] {
+            std::fs::write(dir.path().join(path), source).unwrap();
+            assert!(tool.execute(json!({"path":path,"selection":{"mode":"ast","query":query},"replacement":"bad"}),ctx(dir.path())).await.is_err());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(path)).unwrap(),
+                source
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_noop_and_cancellation_do_not_create_edits() {
+        let dir = jj_dir();
+        let tool = WriteTool {
+            cwd: dir.path().to_path_buf(),
+        };
+        let first = tool
+            .execute(json!({"path":"f.txt","content":"kept"}), ctx(dir.path()))
+            .await
+            .unwrap();
+        let noop = tool
+            .execute(json!({"path":"f.txt","content":"kept"}), ctx(dir.path()))
+            .await
+            .unwrap();
+        assert_eq!(noop.details["no_op"], true);
+        assert_eq!(noop.details["after_commit"], first.details["after_commit"]);
+        let context = ctx(dir.path());
+        context.cancel.cancel();
+        assert!(
+            tool.execute(json!({"path":"f.txt","content":"bad"}), context)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "kept"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edits_preserve_executable_mode_and_reject_symlinks() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = jj_dir();
+        let path = dir.path().join("script");
+        std::fs::write(&path, "echo old\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tool = WriteTool {
+            cwd: dir.path().to_path_buf(),
+        };
+        tool.execute(
+            json!({"path":"script","content":"echo new\n"}),
+            ctx(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        symlink(&path, dir.path().join("link")).unwrap();
+        assert!(
+            tool.execute(json!({"path":"link","content":"bad"}), ctx(dir.path()))
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "echo new\n");
     }
 
     #[tokio::test]

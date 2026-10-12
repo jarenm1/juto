@@ -30,6 +30,50 @@ routing (`builder`, `reviewer`, `scout`, `sonic`), sequential verification quali
 (`format`, `build`, `test`, `smoke`), adversarial peer review handoff, bounded remediation
 retry loops, cooperative cancellation safety, and real-time lifecycle event broadcasting.
 
+**Contextual agent edits through jj.** The `edit` tool selects a unique tree-sitter
+AST capture, an inclusive line range/chunk, or exact text. Agents should prefer
+AST selection for Rust, Python, JavaScript, TypeScript, and TSX; unsupported
+languages, invalid queries, parse errors, and ambiguous captures fail explicitly
+rather than silently switching modes. The default capture is `@edit`.
+
+```json
+{"path":"src/lib.rs","selection":{"mode":"ast","query":"(function_item name: (identifier) @name (#eq? @name \"run\")) @edit"},"replacement":"fn run() { work(); }"}
+{"path":"notes.txt","selection":{"mode":"range","start_line":2,"end_line":4},"replacement":"replacement chunk\n"}
+{"path":"config.toml","selection":{"mode":"text","old_string":"enabled = false"},"replacement":"enabled = true"}
+```
+
+Ranges are 1-based and inclusive, replacing whole lines **including their
+terminators**. Replacement text is verbatim; include a newline when needed.
+Exact-text selection requires a unique match unless `replace_all: true` is set
+inside `selection`. This replaces the previous top-level
+`old_string` / `new_string` edit contract; there is no legacy alias.
+
+Both `edit` and whole-file `write` now require a path inside the session's jj
+workspace. A shared per-workspace advisory lock covers before/after snapshots
+and atomic writes, preserving existing file permissions. Receipts contain
+immutable `before_commit` / `after_commit`, stable `change_id`, an operation-only
+Git-format diff (capped at 64 KiB with `diff_truncated`), no-op/application status,
+and session/tool/selection provenance. Edits retain the jj change ID without
+calling `jj new` or `jj commit`; snapshots produce immutable commit identities.
+Existing unrelated working edits are snapshotted before the operation,
+not included in its diff.
+
+Workspace escapes, metadata paths, symlinks, unresolved conflicts, and existing
+ignored/untracked files are rejected. A newly created ignored file can be applied
+before jj reports it untracked; this returns an explicit applied-but-untracked
+error, not success. Post-write bookkeeping errors report that the file was
+applied; no rollback is claimed. Cancellation before writing leaves the file
+unchanged; once applied, snapshot/diff bookkeeping finishes. The lock coordinates
+Juto callers, not arbitrary external writers; `bash` is not intercepted.
+Live-change DAG recording, marking, and Git export belong to the separately
+stacked DAG/export change, not this edit-tool PR.
+
+Observed verification: runtime tests and a real Agent command/event smoke using
+a deterministic local model driver, actual file tools, and an actual scratch jj
+repository. The smoke exercised write, AST/range/text edits, ambiguous AST
+rejection, paired tool results, revision/provenance receipts, and no-op reporting.
+No live-provider, native-window, or DAG/export behavior was exercised by this PR.
+
 **Repository setup skill.** The runtime installs the bundled `juto-repo-setup`
 skill in its data directory on first startup. It guides agents through identifying
 a target repository's supported development workflow and documenting Juto-specific
