@@ -675,7 +675,7 @@ fn fork_workspace_materializes_tree_and_links_workspace() {
 }
 
 #[test]
-fn fork_workspace_refuses_gitlink() {
+fn fork_workspace_skips_gitlink_and_capture_preserves_it() {
     let temp = tempfile::tempdir().unwrap();
     let dir = repo(&temp, "repo");
     write_file(&dir.join("a.txt"), b"a\n");
@@ -683,18 +683,43 @@ fn fork_workspace_refuses_gitlink() {
 
     let repository = GitRepository::open(&dir).unwrap();
     let git_dir = repository.git_dir().to_path_buf();
+    let blob = run(
+        "git",
+        &[
+            "--git-dir",
+            git_dir.to_str().unwrap(),
+            "rev-parse",
+            &format!("{head}:a.txt"),
+        ],
+        &dir,
+    );
+    // A tree with a regular file and a gitlink (submodule) entry.
     let gitlink = run_stdin(
         "git",
         &["--git-dir", git_dir.to_str().unwrap(), "mktree"],
         &dir,
-        format!("160000 commit {head}\tsub\n").as_bytes(),
+        format!("100644 blob {blob}\ta.txt\n160000 commit {head}\tsub\n").as_bytes(),
     );
 
     let destination = temp.path().join("fork");
-    let error = repository
+    repository
         .fork_workspace(&gitlink, &destination, "thread-1")
-        .unwrap_err();
-    assert!(error.to_string().contains("submodule"), "{error}");
+        .unwrap();
+    // The regular file is materialized; the gitlink is deliberately skipped.
+    assert_eq!(fs::read(destination.join("a.txt")).unwrap(), b"a\n");
+    assert!(
+        !destination.join("sub").exists(),
+        "a gitlink must not be materialized"
+    );
+
+    // Capturing the fork preserves the baseline gitlink, so the tree is
+    // unchanged and the fork does not read as a submodule deletion.
+    let fork = GitRepository::open(&destination).unwrap();
+    assert_eq!(
+        fork.capture_tree(&gitlink).unwrap(),
+        gitlink,
+        "capture must preserve a baseline gitlink"
+    );
 }
 
 #[test]
