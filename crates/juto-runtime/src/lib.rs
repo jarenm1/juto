@@ -54,7 +54,7 @@ pub use subagents::{
     SubagentStatus, SubagentSummary, TaskSpec,
 };
 pub use tools::{DESKTOP_SESSION_ARTIFACT_VERSION, DesktopArtifactTool, DesktopSessionArtifact};
-pub use workspace::{GpuLockGuard, ResourceLimits, SubagentWorkspace, WorkspaceError};
+pub use workspace::{GpuLockGuard, ResourceLimits, ScopedStdio, SubagentWorkspace, WorkspaceError};
 
 use crate::change_graph::{ChangeGraph, EditProvenance};
 
@@ -582,13 +582,15 @@ struct ChildFactory {
 
 impl ChildFactory {
     /// Build a child runtime rooted at a fresh native fork of the parent's
-    /// current live point.
+    /// current live point, together with the workspace handle that owns the
+    /// fork directory.
     ///
     /// The parent's live source is captured on the parent's assigned native
     /// thread (or `main`), then materialized into an independent directory that
     /// shares only the Git object store. All blocking Git/file work runs on a
-    /// blocking thread.
-    async fn isolated_runtime(&self, id: &str) -> Result<Runtime> {
+    /// blocking thread. The caller owns the returned handle and must
+    /// [`SubagentWorkspace::cleanup`] it once the child run finishes.
+    async fn isolated_runtime(&self, id: &str) -> Result<(Runtime, SubagentWorkspace)> {
         let parent_cwd = self.runtime.inner.cwd.clone();
         let data_dir = self.runtime.inner.data_dir.clone();
         let child_path = data_dir.join("workspaces").join(id);
@@ -615,11 +617,43 @@ impl ChildFactory {
         let credentials = self.runtime.inner.credentials.clone();
         let provider = self.runtime.inner.provider.clone();
         let approval = self.runtime.inner.approval.clone();
-        tokio::task::spawn_blocking(move || {
+        let runtime = tokio::task::spawn_blocking(move || {
             Runtime::with_provider(cwd, data_dir, config, credentials, provider, approval)
         })
         .await
-        .context("child runtime construction task failed")?
+        .context("child runtime construction task failed")??;
+        Ok((runtime, workspace))
+    }
+}
+
+/// Remove an isolated child's workspace after its run finishes.
+///
+/// Cleanup is best-effort and never masks the run's own outcome: a failed run
+/// keeps its error (with the cleanup failure appended), and a successful run
+/// keeps its result (with the cleanup failure reported on stderr).
+async fn finish_isolated_run(
+    result: Result<SubagentResult>,
+    workspace: Option<SubagentWorkspace>,
+) -> Result<SubagentResult> {
+    let Some(workspace) = workspace else {
+        return result;
+    };
+    let path = workspace.path.clone();
+    match workspace.cleanup().await {
+        Ok(()) => result,
+        Err(cleanup_error) => match result {
+            Ok(value) => {
+                eprintln!(
+                    "juto: failed to clean up isolated workspace {}: {cleanup_error}",
+                    path.display()
+                );
+                Ok(value)
+            }
+            Err(run_error) => Err(anyhow::anyhow!(
+                "{run_error:#}; isolated workspace cleanup also failed for {}: {cleanup_error}",
+                path.display()
+            )),
+        },
     }
 }
 
@@ -632,12 +666,14 @@ impl subagents::SubagentFactory for ChildFactory {
         control: RunControl,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<SubagentResult, String> {
+        let (runtime, workspace) = if spec.isolated_workspace {
+            let (runtime, workspace) =
+                self.isolated_runtime(id).await.map_err(|e| e.to_string())?;
+            (runtime, Some(workspace))
+        } else {
+            (self.runtime.clone(), None)
+        };
         let result: Result<SubagentResult> = async {
-            let runtime = if spec.isolated_workspace {
-                self.isolated_runtime(id).await?
-            } else {
-                self.runtime.clone()
-            };
             let mut session = Session::create(&runtime.inner.data_dir.join("sessions/subagents"), &runtime.inner.cwd)?;
             let settings = runtime.config();
             let selector = spec
@@ -658,7 +694,12 @@ impl subagents::SubagentFactory for ChildFactory {
             let data = subagents::extract_json(&output);
             Ok(SubagentResult {id: id.to_owned(), output, data, usage: outcome.usage, stop_reason: outcome.stop_reason, session_path: session.path().to_path_buf()})
         }.await;
-        result.map_err(|error| error.to_string())
+        // The child runtime and session are dropped with the block above; only
+        // then is the fork directory removed.
+        drop(runtime);
+        finish_isolated_run(result, workspace)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -838,5 +879,238 @@ impl Tool for CancelTool {
             .cancel(arguments["id"].as_str().ok_or("id required")?)
             .map_err(|error| error.to_string())?;
         Ok(ToolOutput::text("Cancellation requested."))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::change_graph::{ChangeGraph, EditProvenance};
+    use juto_ai::{AssistantMessage, ProviderError, ProviderStream, StreamOptions, timestamp_ms};
+    use juto_catalog::ModelCost;
+    use tempfile::tempdir;
+    use tokio_util::sync::CancellationToken;
+
+    /// Streams one text response and stops, so an isolated child run completes
+    /// without touching a real provider.
+    struct MockProvider;
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        async fn stream(
+            &self,
+            _model: &Model,
+            _context: &Context,
+            _options: &StreamOptions,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let events: Vec<Result<ProviderEvent, ProviderError>> = vec![
+                Ok(ProviderEvent::Start),
+                Ok(ProviderEvent::TextDelta {
+                    index: 0,
+                    delta: "child output".to_string(),
+                }),
+                Ok(ProviderEvent::BlockEnd { index: 0 }),
+                Ok(ProviderEvent::Done {
+                    message: AssistantMessage {
+                        content: vec![ContentBlock::Text {
+                            text: "child output".to_string(),
+                        }],
+                        api: "mock".to_string(),
+                        provider: "mock".to_string(),
+                        model: "mock/test".to_string(),
+                        usage: Usage {
+                            input: 1,
+                            output: 1,
+                            cache_read: 0,
+                            cache_write: 0,
+                            total_tokens: 2,
+                            cost: 0.0,
+                        },
+                        stop_reason: StopReason::Stop,
+                        timestamp: timestamp_ms(),
+                        response_id: None,
+                        error: None,
+                    },
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn native_repo(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("create repo dir");
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.name", "Runtime Test"]);
+        git(dir, &["config", "user.email", "runtime@example.test"]);
+        std::fs::write(dir.join("README.md"), "# Initial\n").expect("write base file");
+        git(dir, &["add", "-A"]);
+        git(dir, &["commit", "-q", "-m", "initial"]);
+    }
+
+    fn mock_config() -> RuntimeConfig {
+        RuntimeConfig {
+            model: "mock/test".to_string(),
+            custom_models: vec![Model {
+                id: "test".to_string(),
+                name: "Mock Model".to_string(),
+                api: "openai-completions".to_string(),
+                provider: "mock".to_string(),
+                base_url: "http://localhost".to_string(),
+                reasoning: false,
+                input: vec!["text".to_string()],
+                cost: ModelCost::default(),
+                context_window: Some(8192),
+                max_tokens: Some(1024),
+                kind: "chat".to_string(),
+                supports_tools: true,
+                compat: Value::Null,
+            }],
+            ..RuntimeConfig::default()
+        }
+    }
+
+    fn mock_runtime(repo: &Path, data_dir: &Path) -> Runtime {
+        let credentials = Arc::new(
+            CredentialStore::open(data_dir.join("credentials.json")).expect("credentials"),
+        );
+        Runtime::with_provider(
+            repo,
+            data_dir,
+            mock_config(),
+            credentials,
+            Arc::new(MockProvider),
+            None,
+        )
+        .expect("runtime")
+    }
+
+    /// Provision a real fork workspace for `id` under `data_dir`.
+    async fn provision_workspace(repo: &Path, data_dir: &Path, id: &str) -> SubagentWorkspace {
+        let graph = ChangeGraph::open(repo).expect("open graph");
+        let source = graph
+            .capture(
+                "main",
+                EditProvenance {
+                    session_id: "runtime-test".to_string(),
+                    tool: "fork".to_string(),
+                    selection_mode: None,
+                    path: None,
+                },
+                None,
+            )
+            .expect("capture source point");
+        SubagentWorkspace::provision_in(repo, &data_dir.join("workspaces").join(id), &source.id, id)
+            .await
+            .expect("provision workspace")
+    }
+
+    #[tokio::test]
+    async fn isolated_subagent_run_removes_its_workspace() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+
+        let runtime = mock_runtime(&repo, &data_dir);
+        let control = RunControl::new();
+        let manager = runtime.subagent_manager(&control);
+
+        let mut spec = TaskSpec::new("say hello");
+        spec.isolated_workspace = true;
+        let id = manager.spawn(spec).expect("spawn child");
+        let result = manager.wait(&id).await.expect("child run");
+        assert_eq!(result.output, "child output");
+
+        let workspace_dir = data_dir.join("workspaces").join(&id);
+        assert!(
+            !workspace_dir.exists(),
+            "isolated child workspace must be removed after the run: {}",
+            workspace_dir.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_workspace_is_removed_when_the_run_fails() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+
+        let workspace = provision_workspace(&repo, &data_dir, "failing-child").await;
+        let workspace_dir = workspace.path.clone();
+        assert!(workspace_dir.exists());
+
+        let error =
+            finish_isolated_run(Err(anyhow::anyhow!("child run exploded")), Some(workspace))
+                .await
+                .expect_err("the run error must survive cleanup");
+
+        assert!(
+            !workspace_dir.exists(),
+            "workspace must be removed on failure"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("child run exploded"),
+            "the run's own error must not be masked: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_run_keeps_its_result_when_cleanup_fails() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+
+        // A workspace whose marker names a different thread: cleanup refuses it.
+        let workspace_dir = data_dir.join("workspaces").join("foreign");
+        std::fs::create_dir_all(&workspace_dir).expect("create dir");
+        std::fs::write(
+            workspace_dir.join(".juto-workspace.json"),
+            r#"{"git_dir":"/nonexistent","thread":"other"}"#,
+        )
+        .expect("write marker");
+        let workspace = SubagentWorkspace {
+            path: workspace_dir.clone(),
+            node_id: "none".to_string(),
+            thread: "expected".to_string(),
+            repo_root: repo.clone(),
+            subagent_id: "expected".to_string(),
+        };
+
+        let result = finish_isolated_run(
+            Ok(SubagentResult {
+                id: "child".to_string(),
+                output: "kept".to_string(),
+                data: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                session_path: PathBuf::from("/tmp/session"),
+            }),
+            Some(workspace),
+        )
+        .await
+        .expect("a cleanup failure must not discard a successful run");
+
+        assert_eq!(result.output, "kept");
+        assert!(
+            workspace_dir.exists(),
+            "refused cleanup leaves the directory"
+        );
     }
 }
