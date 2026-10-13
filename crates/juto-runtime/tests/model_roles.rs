@@ -85,3 +85,44 @@ fn invalid_selector_is_rejected_without_touching_config() {
     );
     assert!(!runtime.config().model_roles.contains_key("smol"));
 }
+
+#[test]
+fn judge_role_accepts_typesafe_judge_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, data_dir) = runtime_in(&dir);
+
+    runtime
+        .set_model_role("judge", "typesafe/jev-preview")
+        .expect("assign @judge to a TypeSafe judge model");
+
+    let text = std::fs::read_to_string(data_dir.join("config.yml")).unwrap();
+    assert!(
+        text.contains("judge: typesafe/jev-preview"),
+        "config.yml must record modelRoles.judge, got:\n{text}"
+    );
+    assert_eq!(
+        runtime.config().resolve_selector("@judge").unwrap().0,
+        "typesafe/jev-preview"
+    );
+}
+
+#[test]
+fn judge_and_chat_roles_reject_each_others_models() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, _data_dir) = runtime_in(&dir);
+
+    assert!(
+        runtime
+            .set_model_role("default", "typesafe/jev-preview")
+            .is_err(),
+        "a judge-only model must not bind the chat default"
+    );
+    assert!(
+        runtime.set_model_role("judge", "openai/gpt-4o").is_err(),
+        "a chat model must not bind the judge role"
+    );
+
+    let config = runtime.config();
+    assert_eq!(config.model, "anthropic/claude-sonnet-4-5");
+    assert!(!config.model_roles.contains_key("judge"));
+}

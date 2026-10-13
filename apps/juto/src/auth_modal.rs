@@ -295,6 +295,19 @@ pub const PROVIDERS: &[ProviderDefinition] = &[
             },
         ],
     },
+    ProviderDefinition {
+        id: "typesafe",
+        name: "TypeSafe",
+        tagline: "jev judge models for discrete decisions",
+        methods: &[AuthMethod {
+            id: "typesafe-api-key",
+            name: "TypeSafe API Key",
+            description: "API key from the TypeSafe console (used by the judge role)",
+            backend_id: "typesafe",
+            kind: AuthMethodKind::ApiKey,
+            env_var: Some("TYPESAFE_API_KEY"),
+        }],
+    },
 ];
 
 pub struct AuthModal {
