@@ -11,8 +11,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -253,6 +253,22 @@ pub trait SubagentFactory: Send + Sync {
     fn workspace_path(&self, _id: &str, _spec: &TaskSpec) -> Option<PathBuf> {
         None
     }
+
+    /// Run one more turn on a completed child: the same session journal at
+    /// `session_path` continues, so the child keeps its transcript, model, and
+    /// workspace. The default rejects every call; factories that keep no
+    /// resumable child state leave it as-is.
+    async fn follow_up(
+        &self,
+        _id: &str,
+        _spec: &TaskSpec,
+        _session_path: &Path,
+        _prompt: String,
+        _control: RunControl,
+        _events: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<SubagentResult, String> {
+        Err("follow-up not supported by this factory".into())
+    }
 }
 
 /// Snapshot a child exposes to waiters; the watch channel guarantees every
@@ -268,7 +284,10 @@ struct Child {
     spec: TaskSpec,
     focus: bool,
     workspace: Option<PathBuf>,
-    control: RunControl,
+    /// Replaced per turn: a fresh turn gets a fresh control so a cancelled or
+    /// paused first turn cannot poison a follow-up. Always lock it before
+    /// touching it so a turn boundary cannot swap mid-call.
+    control: Mutex<RunControl>,
     state: watch::Sender<ChildState>,
     status_tx: watch::Sender<SubagentStatus>,
     resolution_tx: Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
@@ -340,7 +359,7 @@ impl SubagentManager {
             spec,
             focus,
             workspace,
-            control: control.clone(),
+            control: Mutex::new(control.clone()),
             state,
             status_tx,
             resolution_tx: Mutex::new(None),
@@ -397,7 +416,7 @@ impl SubagentManager {
 
     /// Cancel a queued or running child. Idempotent for terminal children.
     pub fn cancel(&self, id: &str) -> Result<(), SubagentError> {
-        self.child(id)?.control.cancel();
+        self.child(id)?.control.lock().expect("mutex poisoned").cancel();
         Ok(())
     }
 
@@ -410,7 +429,64 @@ impl SubagentManager {
         if status.is_terminal() {
             return Err(SubagentError::Terminal(status));
         }
-        child.control.steer(Message::user(message));
+        child.control.lock().expect("mutex poisoned").steer(Message::user(message));
+        Ok(())
+    }
+
+    /// Start a follow-up turn on a completed child. The child moves back to
+    /// [`SubagentStatus::Running`], runs exactly one more turn in its original
+    /// session and workspace under a fresh [`RunControl`], then publishes its
+    /// own terminal state; `wait`/`output` then observe the new turn's result.
+    ///
+    /// Only `Completed` children accept a follow-up: `Failed` and `Cancelled`
+    /// children never ran to a usable result, so they stay rejected with
+    /// [`SubagentError::Terminal`], and any non-terminal state rejects with
+    /// [`SubagentError::InvalidTransition`]. Calling again while a follow-up
+    /// turn is in flight also rejects with `InvalidTransition`.
+    pub fn follow_up(&self, id: &str, prompt: String) -> Result<(), SubagentError> {
+        let child = self.child(id)?;
+        // Read the session path before the transition clears the outcome.
+        let session_path = child
+            .state
+            .borrow()
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.as_ref().ok())
+            .map(|result| result.session_path.clone());
+
+        // The gate and the Running transition share the control mutex so a
+        // racing second call can never install its own control for the turn.
+        let mut control_guard = child.control.lock().expect("mutex poisoned");
+        let current = child.state.borrow().status.clone();
+        if current.is_terminal() && current != SubagentStatus::Completed {
+            return Err(SubagentError::Terminal(current));
+        }
+        let transitioned = child.state.send_if_modified(|state| {
+            if state.status == SubagentStatus::Completed {
+                state.status = SubagentStatus::Running;
+                state.outcome = None;
+                true
+            } else {
+                false
+            }
+        });
+        if !transitioned {
+            return Err(SubagentError::InvalidTransition {
+                from: current,
+                to: SubagentStatus::Running,
+            });
+        }
+        *control_guard = RunControl::new();
+        let control = control_guard.clone();
+        drop(control_guard);
+
+        child.status_tx.send_modify(|status| {
+            *status = SubagentStatus::Running;
+        });
+
+        let inner = Arc::clone(&self.inner);
+        let task_id = id.to_string();
+        tokio::spawn(run_follow_up(inner, child, task_id, session_path, prompt, control));
         Ok(())
     }
 
@@ -473,7 +549,7 @@ impl SubagentManager {
             .values()
         {
             if !child.state.borrow().status.is_terminal() {
-                child.control.cancel();
+                child.control.lock().expect("mutex poisoned").cancel();
             }
         }
     }
@@ -491,7 +567,7 @@ impl SubagentManager {
         if current.is_terminal() {
             return Err(SubagentError::Terminal(current));
         }
-        child.control.pause();
+        child.control.lock().expect("mutex poisoned").pause();
         Ok(())
     }
 
@@ -502,7 +578,7 @@ impl SubagentManager {
         if current.is_terminal() {
             return Err(SubagentError::Terminal(current));
         }
-        child.control.resume();
+        child.control.lock().expect("mutex poisoned").resume();
         Ok(())
     }
 
@@ -536,7 +612,7 @@ impl SubagentManager {
         *child.resolution_tx.lock().expect("mutex poisoned") = Some(tx);
         *child.resolution_rx.lock().expect("mutex poisoned") = Some(rx);
 
-        child.control.pause();
+        child.control.lock().expect("mutex poisoned").pause();
         let new_status = SubagentStatus::Blocked { reason, prompt };
         child.state.send_modify(|state| {
             state.status = new_status.clone();
@@ -558,7 +634,7 @@ impl SubagentManager {
             .expect("mutex poisoned")
             .take()
             .ok_or_else(|| SubagentError::NotBlocked(id.to_string()))?;
-        let token = child.control.token();
+        let token = child.control.lock().expect("mutex poisoned").token();
         let parent_token = self.inner.parent_cancel.clone();
 
         tokio::select! {
@@ -648,9 +724,10 @@ impl SubagentManager {
             *s = SubagentStatus::Running;
         });
 
-        child.control.resume();
+        let control = child.control.lock().expect("mutex poisoned");
+        control.resume();
         if !is_credential {
-            child.control.steer(Message::user(resolution.clone()));
+            control.steer(Message::user(resolution.clone()));
         }
 
         let _ = tx.send(resolution);
@@ -737,8 +814,37 @@ impl SubagentManager {
     }
 }
 
-/// Lifecycle for one spawned child: permit wait (cancellation-safe), parent
-/// cancellation propagation, factory run, terminal publication.
+/// Cancellation-safe permit acquisition shared by first turns and follow-up
+/// turns; publishes the terminal state itself on the failure paths.
+async fn acquire_permit(
+    inner: &Inner,
+    child: &Child,
+    control: &RunControl,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let cancel = control.token();
+    let permit = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            finish(child, SubagentStatus::Cancelled, Err("cancelled while queued".into()));
+            return None;
+        }
+        _ = inner.parent_cancel.cancelled() => {
+            finish(child, SubagentStatus::Cancelled, Err("cancelled with parent while queued".into()));
+            return None;
+        }
+        permit = inner.semaphore.clone().acquire_owned() => match permit {
+            Ok(permit) => permit,
+            Err(_) => {
+                finish(child, SubagentStatus::Failed, Err("subagent semaphore closed".into()));
+                return None;
+            }
+        },
+    };
+    Some(permit)
+}
+
+/// Lifecycle for one spawned child: cancellation-safe permit wait, then one
+/// turn through the shared settle logic.
 async fn run_child(
     inner: Arc<Inner>,
     child: Arc<Child>,
@@ -746,28 +852,9 @@ async fn run_child(
     control: RunControl,
     validator: Option<jsonschema::Validator>,
 ) {
-    // Permit acquisition is cancellation-safe: a cancelled queued child
-    // neither steals a permit nor blocks waiting for one.
-    let cancel = control.token();
-    let permit = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => {
-            finish(&child, SubagentStatus::Cancelled, Err("cancelled while queued".into()));
-            return;
-        }
-        _ = inner.parent_cancel.cancelled() => {
-            finish(&child, SubagentStatus::Cancelled, Err("cancelled with parent while queued".into()));
-            return;
-        }
-        permit = inner.semaphore.clone().acquire_owned() => match permit {
-            Ok(permit) => permit,
-            Err(_) => {
-                finish(&child, SubagentStatus::Failed, Err("subagent semaphore closed".into()));
-                return;
-            }
-        },
+    let Some(_permit) = acquire_permit(&inner, &child, &control).await else {
+        return;
     };
-    let _permit = permit; // held for the duration of the run
 
     child.state.send_modify(|state| {
         state.status = SubagentStatus::Running;
@@ -775,8 +862,69 @@ async fn run_child(
     child.status_tx.send_modify(|status| {
         *status = SubagentStatus::Running;
     });
+
+    let factory = inner.factory.clone();
+    let spec = child.spec.clone();
+    let task_id = id.clone();
+    let task_control = control.clone();
+    run_turn(&inner, &child, &control, validator, move |events| async move {
+        factory.run(&task_id, spec, task_control, events).await
+    })
+    .await;
+}
+
+/// One additional turn on a completed child: same session journal, same
+/// workspace, fresh [`RunControl`]. Like the first turn it waits on the
+/// shared semaphore and publishes exactly one terminal state; `follow_up`
+/// already moved the child back to `Running`.
+async fn run_follow_up(
+    inner: Arc<Inner>,
+    child: Arc<Child>,
+    id: String,
+    session_path: Option<PathBuf>,
+    prompt: String,
+    control: RunControl,
+) {
+    let Some(_permit) = acquire_permit(&inner, &child, &control).await else {
+        return;
+    };
+
+    let validator = child
+        .spec
+        .output_schema
+        .as_ref()
+        .and_then(|schema| jsonschema::validator_for(schema).ok());
+    let factory = inner.factory.clone();
+    let spec = child.spec.clone();
+    let task_control = control.clone();
+    run_turn(&inner, &child, &control, validator, move |events| async move {
+        match session_path {
+            Some(path) => {
+                factory
+                    .follow_up(&id, &spec, &path, prompt, task_control, events)
+                    .await
+            }
+            None => Err("completed child has no recorded session path".into()),
+        }
+    })
+    .await;
+}
+
+/// Run one factory turn and publish exactly one terminal state: parent
+/// cancellation propagation, the awaited turn (panic-safe), output-schema
+/// enforcement, and the cancelled/failed/completed mapping.
+async fn run_turn<F, Fut>(
+    inner: &Inner,
+    child: &Child,
+    control: &RunControl,
+    validator: Option<jsonschema::Validator>,
+    turn: F,
+) where
+    F: FnOnce(mpsc::UnboundedSender<AgentEvent>) -> Fut,
+    Fut: Future<Output = Result<SubagentResult, String>>,
+{
     // Propagate parent cancellation into the child's RunControl for the whole
-    // run, then release the propagation task when the child finishes.
+    // turn, then release the propagation task when the turn finishes.
     let propagation_done = CancellationToken::new();
     tokio::spawn({
         let parent = inner.parent_cancel.clone();
@@ -795,9 +943,7 @@ async fn run_child(
     // so `UnboundedSender::send` does not fail during the run.
     let _events_rx = events_rx;
 
-    let run = inner
-        .factory
-        .run(&id, child.spec.clone(), control.clone(), events_tx);
+    let run = turn(events_tx);
     // A panicking factory must still publish a terminal state or every waiter
     // would hang.
     let outcome = AssertUnwindSafe(run).catch_unwind().await;
@@ -841,10 +987,10 @@ async fn run_child(
         Err(_) if cancelled => SubagentStatus::Cancelled,
         Err(_) => SubagentStatus::Failed,
     };
-    finish(&child, status, outcome);
+    finish(child, status, outcome);
 }
 
-/// Publish the terminal state exactly once.
+/// Publish the terminal state for a turn — exactly once per turn.
 fn finish(child: &Child, status: SubagentStatus, outcome: Result<SubagentResult, String>) {
     debug_assert!(status.is_terminal());
     child.state.send_modify(|state| {
@@ -2016,7 +2162,7 @@ mod tests {
         async fn run(
             &self,
             id: &str,
-            spec: TaskSpec,
+            _spec: TaskSpec,
             _control: RunControl,
             _events: mpsc::UnboundedSender<AgentEvent>,
         ) -> Result<SubagentResult, String> {
@@ -2098,6 +2244,336 @@ mod tests {
         assert!(!summary.focus);
         assert_eq!(summary.workspace, None);
         manager.wait(&id).await.unwrap();
+    }
+
+    /// Factory that also answers follow-up turns: `run` blocks on
+    /// `first_gate`, `follow_up` on `second_gate`. Call counts make session
+    /// and workspace reuse observable.
+    struct FollowUpFactory {
+        first_gate: watch::Receiver<bool>,
+        second_gate: watch::Receiver<bool>,
+        workspace_calls: Arc<AtomicUsize>,
+        workspace: PathBuf,
+    }
+
+    fn turn_result(id: &str, output: String) -> SubagentResult {
+        SubagentResult {
+            id: id.to_string(),
+            output,
+            data: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            session_path: PathBuf::from("/tmp/child.jsonl"),
+        }
+    }
+
+    #[async_trait]
+    impl SubagentFactory for FollowUpFactory {
+        async fn run(
+            &self,
+            id: &str,
+            spec: TaskSpec,
+            control: RunControl,
+            _events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<SubagentResult, String> {
+            let mut gate = self.first_gate.clone();
+            let cancel = control.token();
+            tokio::select! {
+                _ = cancel.cancelled() => Err("cancelled".to_string()),
+                opened = gate.wait_for(|open| *open) => match opened {
+                    Ok(_) => Ok(turn_result(id, format!("done:{}", spec.task))),
+                    Err(_) => Err("gate closed".to_string()),
+                },
+            }
+        }
+
+        async fn follow_up(
+            &self,
+            id: &str,
+            _spec: &TaskSpec,
+            session_path: &Path,
+            prompt: String,
+            control: RunControl,
+            _events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<SubagentResult, String> {
+            let mut gate = self.second_gate.clone();
+            let cancel = control.token();
+            tokio::select! {
+                _ = cancel.cancelled() => Err("cancelled".to_string()),
+                opened = gate.wait_for(|open| *open) => match opened {
+                    Ok(_) => {
+                        assert_eq!(session_path, Path::new("/tmp/child.jsonl"));
+                        Ok(turn_result(id, format!("again:{prompt}")))
+                    }
+                    Err(_) => Err("gate closed".to_string()),
+                },
+            }
+        }
+
+        fn workspace_path(&self, id: &str, spec: &TaskSpec) -> Option<PathBuf> {
+            self.workspace_calls.fetch_add(1, Ordering::SeqCst);
+            spec.isolated_workspace.then(|| self.workspace.join(id))
+        }
+    }
+
+    fn follow_up_factory(
+        first_gate: watch::Receiver<bool>,
+        second_gate: watch::Receiver<bool>,
+        workspace_calls: Arc<AtomicUsize>,
+    ) -> Arc<FollowUpFactory> {
+        Arc::new(FollowUpFactory {
+            first_gate,
+            second_gate,
+            workspace_calls,
+            workspace: PathBuf::from("/data"),
+        })
+    }
+
+    #[tokio::test]
+    async fn follow_up_completed_child_runs_a_new_turn() {
+        let (first, first_rx) = gate();
+        let (second, second_rx) = gate();
+        let workspace_calls = Arc::new(AtomicUsize::new(0));
+        let manager = manager(
+            follow_up_factory(first_rx, second_rx, workspace_calls.clone()),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("thread")).unwrap();
+        first.send(true).unwrap();
+        let result = manager.wait(&id).await.expect("first turn");
+        assert_eq!(result.output, "done:thread");
+
+        manager.follow_up(&id, "more".to_string()).expect("accepted");
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Running));
+        // While the new turn runs, completed-only readers see nothing new.
+        assert!(manager.output(&id).unwrap().is_none());
+        // A second follow-up cannot start while one is in flight.
+        assert!(matches!(
+            manager.follow_up(&id, "again".into()),
+            Err(SubagentError::InvalidTransition { .. })
+        ));
+
+        second.send(true).unwrap();
+        let result = manager.wait(&id).await.expect("follow-up turn");
+        assert_eq!(result.output, "again:more");
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Completed));
+        assert_eq!(manager.output(&id).unwrap().unwrap().output, "again:more");
+        // The workspace lookup ran once at spawn and never again.
+        assert_eq!(workspace_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn follow_up_rejects_non_completed_states() {
+        let (first, first_rx) = gate();
+        let (second, second_rx) = gate();
+        let make_manager = manager;
+        let manager = manager(
+            follow_up_factory(first_rx, second_rx, Arc::new(AtomicUsize::new(0))),
+            1,
+            CancellationToken::new(),
+        );
+
+        let queued_a = manager.spawn(spec("a")).unwrap();
+        let queued_b = manager.spawn(spec("b")).unwrap();
+        // A queued child cannot take a follow-up.
+        assert!(matches!(
+            manager.follow_up(&queued_b, "x".into()),
+            Err(SubagentError::InvalidTransition { .. })
+        ));
+
+        // Cancel while still queued so it never takes the only slot.
+        manager.cancel(&queued_b).unwrap();
+        first.send(true).unwrap();
+        manager.wait(&queued_a).await.expect("first turn");
+
+        // A failed child reports its terminal state explicitly.
+        let (fail_gate, fail_rx) = gate();
+        let failing = make_manager(
+            gate_factory(fail_rx, Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), true, None),
+            1,
+            CancellationToken::new(),
+        );
+        let failed_id = failing.spawn(spec("doomed")).unwrap();
+        fail_gate.send(true).unwrap();
+        assert!(matches!(
+            failing.wait(&failed_id).await,
+            Err(SubagentError::Failed(_))
+        ));
+        assert!(matches!(
+            failing.follow_up(&failed_id, "x".into()),
+            Err(SubagentError::Terminal(SubagentStatus::Failed))
+        ));
+
+        // A cancelled queued child reports its terminal state explicitly.
+        assert!(matches!(
+            manager.wait(&queued_b).await,
+            Err(SubagentError::Cancelled)
+        ));
+        assert!(matches!(
+            manager.follow_up(&queued_b, "x".into()),
+            Err(SubagentError::Terminal(SubagentStatus::Cancelled))
+        ));
+
+        // Unknown ids keep the existing not-found error.
+        assert!(matches!(
+            manager.follow_up("nope", "x".into()),
+            Err(SubagentError::Unknown(_))
+        ));
+        second.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn follow_up_rejected_while_child_is_running() {
+        let (_first, first_rx) = gate();
+        let (_second, second_rx) = gate();
+        let manager = manager(
+            follow_up_factory(first_rx, second_rx, Arc::new(AtomicUsize::new(0))),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("busy")).unwrap();
+        let mut status_rx = manager.subscribe_status(&id).unwrap();
+        status_rx
+            .wait_for(|status| *status == SubagentStatus::Running)
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.follow_up(&id, "too early".into()),
+            Err(SubagentError::InvalidTransition { .. })
+        ));
+        manager.cancel(&id).unwrap();
+        let _ = manager.wait(&id).await;
+    }
+
+    #[tokio::test]
+    async fn follow_up_runs_again_on_a_focus_child() {
+        let (first, first_rx) = gate();
+        let (second, second_rx) = gate();
+        let workspace_calls = Arc::new(AtomicUsize::new(0));
+        let factory = follow_up_factory(first_rx, second_rx, workspace_calls.clone());
+        let manager = manager(factory, 1, CancellationToken::new());
+
+        let mut focus = spec("focus task");
+        focus.focus = true;
+        let id = manager.spawn(focus).unwrap();
+        first.send(true).unwrap();
+        manager.wait(&id).await.expect("first turn");
+
+        manager.follow_up(&id, "next".to_string()).expect("accepted");
+        second.send(true).unwrap();
+        let result = manager.wait(&id).await.expect("follow-up turn");
+        assert_eq!(result.output, "again:next");
+
+        let summary = manager
+            .list()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .expect("spawned child listed");
+        assert!(summary.focus);
+        assert_eq!(summary.workspace, Some(PathBuf::from("/data").join(&id)));
+        assert_eq!(workspace_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn follow_up_failure_marks_the_turn_failed() {
+        struct FailFollowUp {
+            first_gate: watch::Receiver<bool>,
+        }
+
+        #[async_trait]
+        impl SubagentFactory for FailFollowUp {
+            async fn run(
+                &self,
+                id: &str,
+                spec: TaskSpec,
+                _control: RunControl,
+                _events: mpsc::UnboundedSender<AgentEvent>,
+            ) -> Result<SubagentResult, String> {
+                let mut gate = self.first_gate.clone();
+                let _ = gate.wait_for(|open| *open).await;
+                Ok(turn_result(id, format!("done:{}", spec.task)))
+            }
+
+            async fn follow_up(
+                &self,
+                _id: &str,
+                _spec: &TaskSpec,
+                _session_path: &Path,
+                _prompt: String,
+                _control: RunControl,
+                _events: mpsc::UnboundedSender<AgentEvent>,
+            ) -> Result<SubagentResult, String> {
+                Err("follow-up exploded".into())
+            }
+        }
+
+        let (first, first_rx) = gate();
+        let manager = manager(
+            Arc::new(FailFollowUp { first_gate: first_rx }),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("thread")).unwrap();
+        first.send(true).unwrap();
+        manager.wait(&id).await.expect("first turn");
+
+        manager.follow_up(&id, "go".to_string()).expect("accepted");
+        match manager.wait(&id).await {
+            Err(SubagentError::Failed(err)) => assert!(err.contains("follow-up exploded")),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Failed));
+        // The failed turn is terminal again: no further follow-up.
+        assert!(matches!(
+            manager.follow_up(&id, "again".into()),
+            Err(SubagentError::Terminal(SubagentStatus::Failed))
+        ));
+    }
+
+    #[tokio::test]
+    async fn follow_up_uses_a_fresh_run_control() {
+        let (first, first_rx) = gate();
+        let (second, second_rx) = gate();
+        let manager = manager(
+            follow_up_factory(first_rx, second_rx, Arc::new(AtomicUsize::new(0))),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("thread")).unwrap();
+        first.send(true).unwrap();
+        manager.wait(&id).await.expect("first turn");
+
+        // Cancelling after completion cancels the old control; the next turn
+        // must still run under a fresh one.
+        manager.cancel(&id).unwrap();
+        manager.follow_up(&id, "more".to_string()).expect("accepted");
+        second.send(true).unwrap();
+        let result = manager.wait(&id).await.expect("follow-up turn");
+        assert_eq!(result.output, "again:more");
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn follow_up_cancellation_marks_turn_cancelled() {
+        let (first, first_rx) = gate();
+        let (_second, second_rx) = gate();
+        let manager = manager(
+            follow_up_factory(first_rx, second_rx, Arc::new(AtomicUsize::new(0))),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("thread")).unwrap();
+        first.send(true).unwrap();
+        manager.wait(&id).await.expect("first turn");
+
+        manager.follow_up(&id, "more".to_string()).expect("accepted");
+        manager.cancel(&id).unwrap();
+        assert!(matches!(
+            manager.wait(&id).await,
+            Err(SubagentError::Cancelled)
+        ));
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Cancelled));
     }
 
     #[test]

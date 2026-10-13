@@ -335,6 +335,13 @@ only be spawned by the main thread". Spawning a focus spec forces
 `SubagentManager::list` reports `focus` plus the child's `workspace` path so the
 UI can surface the thread's working directory.
 
+Follow-up turns: `SubagentManager::follow_up(id, prompt)` resumes a `Completed`
+child by reopening its recorded session and reusing its isolated workspace without
+re-provisioning. Queued, running, blocked, failed, and cancelled children reject
+follow-ups. A successful turn keeps its workspace so later turns share one fork; a
+failed turn is terminal and its fork is removed. Retained workspaces stay on disk
+until a release tool reclaims them, which is not yet implemented.
+
 ---
 
 ## 6. Future Extensibility: Headless Daemon, Mobile & Automations

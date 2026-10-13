@@ -776,6 +776,21 @@ fn workspace_path_for(data_dir: &Path, id: &str) -> PathBuf {
 }
 
 impl ChildFactory {
+    /// Build a child runtime rooted at an existing directory, sharing the
+    /// parent's config, credentials, provider, and approval policy.
+    async fn runtime_at(&self, cwd: PathBuf) -> Result<Runtime> {
+        let data_dir = self.runtime.inner.data_dir.clone();
+        let config = self.runtime.config();
+        let credentials = self.runtime.inner.credentials.clone();
+        let provider = self.runtime.inner.provider.clone();
+        let approval = self.runtime.inner.approval.clone();
+        tokio::task::spawn_blocking(move || {
+            Runtime::with_provider(cwd, data_dir, config, credentials, provider, approval)
+        })
+        .await
+        .context("child runtime construction task failed")?
+    }
+
     /// Build a child runtime rooted at a fresh native fork of the parent's
     /// current live point, together with the workspace handle that owns the
     /// fork directory.
@@ -783,8 +798,8 @@ impl ChildFactory {
     /// The parent's live source is captured on the parent's assigned native
     /// thread (or `main`), then materialized into an independent directory that
     /// shares only the Git object store. All blocking Git/file work runs on a
-    /// blocking thread. The caller owns the returned handle and must
-    /// [`SubagentWorkspace::cleanup`] it once the child run finishes.
+    /// blocking thread. The workspace survives the run so follow-up turns can
+    /// keep working in it; reclamation is the lifecycle owner's job.
     async fn isolated_runtime(&self, id: &str) -> Result<(Runtime, SubagentWorkspace)> {
         let parent_cwd = self.runtime.inner.cwd.clone();
         let data_dir = self.runtime.inner.data_dir.clone();
@@ -807,16 +822,7 @@ impl ChildFactory {
         };
         let workspace =
             SubagentWorkspace::provision_in(&parent_cwd, &child_path, &source, id).await?;
-        let cwd = workspace.path.clone();
-        let config = self.runtime.config();
-        let credentials = self.runtime.inner.credentials.clone();
-        let provider = self.runtime.inner.provider.clone();
-        let approval = self.runtime.inner.approval.clone();
-        let runtime = tokio::task::spawn_blocking(move || {
-            Runtime::with_provider(cwd, data_dir, config, credentials, provider, approval)
-        })
-        .await
-        .context("child runtime construction task failed")??;
+        let runtime = self.runtime_at(workspace.path.clone()).await?;
         Ok((runtime, workspace))
     }
 }
@@ -917,24 +923,97 @@ impl subagents::SubagentFactory for ChildFactory {
                     },
                 )
                 .await?;
-            if outcome.stop_reason == StopReason::Aborted { bail!("subagent cancelled"); }
-            if outcome.stop_reason != StopReason::Stop { bail!("subagent did not complete: {:?}", outcome.stop_reason); }
-            let output = session.messages()?.iter().rev().find_map(|message| match message {Message::Assistant(message) if message.stop_reason == StopReason::Stop => Some(message.text()), _ => None}).context("subagent completed without an assistant message")?;
-            let data = subagents::extract_json(&output);
-            Ok(SubagentResult {id: id.to_owned(), output, data, usage: outcome.usage, stop_reason: outcome.stop_reason, session_path: session.path().to_path_buf()})
+            turn_result(id, &session, outcome)
         }.await;
         // The child runtime and session are dropped with the block above; only
-        // then is the fork directory removed.
+        // then may the fork be reclaimed. A completed turn keeps its workspace
+        // for follow-up turns; a failed turn is terminal, so its fork is
+        // removed like before.
         drop(runtime);
-        finish_isolated_run(result, workspace)
-            .await
-            .map_err(|error| error.to_string())
+        if result.is_ok() {
+            result.map_err(|error| error.to_string())
+        } else {
+            finish_isolated_run(result, workspace)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    async fn follow_up(
+        &self,
+        id: &str,
+        spec: &TaskSpec,
+        session_path: &Path,
+        prompt: String,
+        control: RunControl,
+        events: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<SubagentResult, String> {
+        let runtime = if spec.isolated_workspace {
+            // The first turn provisioned this directory; attach to it without
+            // provisioning again so the whole thread shares one fork.
+            self.runtime_at(workspace_path_for(&self.runtime.inner.data_dir, id))
+                .await
+                .map_err(|e| e.to_string())?
+        } else {
+            self.runtime.clone()
+        };
+        let result: Result<SubagentResult> = async {
+            let mut session = Session::open(session_path)?;
+            // The journal already records the model chosen at spawn and the
+            // schema instruction stays in history, so neither is re-applied;
+            // run_depth resolves the model from the session's `current_model`.
+            let role = spec.agent.as_deref().unwrap_or(roles::DEFAULT_ROLE);
+            let outcome = runtime
+                .run_depth(
+                    &mut session,
+                    prompt,
+                    events,
+                    control,
+                    RunPlacement {
+                        depth: self.depth,
+                        role,
+                        read_only: spec.read_only,
+                    },
+                )
+                .await?;
+            turn_result(id, &session, outcome)
+        }.await;
+        drop(runtime);
+        if result.is_ok() {
+            result.map_err(|error| error.to_string())
+        } else {
+            // A failed follow-up is terminal like a failed first turn, so its
+            // fork is reclaimed too. Only path/repo_root/thread are read by
+            // cleanup (and verified against the marker), so a synthesized
+            // handle is sufficient.
+            let workspace = spec.isolated_workspace.then(|| SubagentWorkspace {
+                path: workspace_path_for(&self.runtime.inner.data_dir, id),
+                node_id: String::new(),
+                thread: id.to_owned(),
+                repo_root: self.runtime.inner.cwd.clone(),
+                subagent_id: id.to_owned(),
+            });
+            finish_isolated_run(result, workspace)
+                .await
+                .map_err(|error| error.to_string())
+        }
     }
 
     fn workspace_path(&self, id: &str, spec: &TaskSpec) -> Option<PathBuf> {
         spec.isolated_workspace
             .then(|| workspace_path_for(&self.runtime.inner.data_dir, id))
     }
+}
+
+/// Build the turn's [`SubagentResult`] from a finished `run_depth` outcome and
+/// the session it wrote. Both the first turn and follow-up turns share this
+/// so the stop-reason contract and output extraction stay identical.
+fn turn_result(id: &str, session: &Session, outcome: RunOutcome) -> Result<SubagentResult> {
+    if outcome.stop_reason == StopReason::Aborted { bail!("subagent cancelled"); }
+    if outcome.stop_reason != StopReason::Stop { bail!("subagent did not complete: {:?}", outcome.stop_reason); }
+    let output = session.messages()?.iter().rev().find_map(|message| match message {Message::Assistant(message) if message.stop_reason == StopReason::Stop => Some(message.text()), _ => None}).context("subagent completed without an assistant message")?;
+    let data = subagents::extract_json(&output);
+    Ok(SubagentResult {id: id.to_owned(), output, data, usage: outcome.usage, stop_reason: outcome.stop_reason, session_path: session.path().to_path_buf()})
 }
 
 fn register_agent_tools(
@@ -1309,7 +1388,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn isolated_subagent_run_removes_its_workspace() {
+    async fn isolated_subagent_run_keeps_its_workspace_for_follow_up() {
         let root = tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         native_repo(&repo);
@@ -1325,10 +1404,12 @@ mod tests {
         let result = manager.wait(&id).await.expect("child run");
         assert_eq!(result.output, "child output");
 
+        // A completed child's fork is retained so a follow-up turn resumes in
+        // the same directory; reclamation is a separate lifecycle step.
         let workspace_dir = data_dir.join("workspaces").join(&id);
         assert!(
-            !workspace_dir.exists(),
-            "isolated child workspace must be removed after the run: {}",
+            workspace_dir.exists(),
+            "isolated child workspace must survive a completed run: {}",
             workspace_dir.display()
         );
     }
@@ -1454,6 +1535,96 @@ mod tests {
                 .contains_key(&key),
             "a finished run must reclaim the stale workspace head"
         );
+    }
+
+    /// Streams a distinct text reply per call and records every user prompt it
+    /// sees, so a follow-up turn is observable in the request history.
+    struct TurnProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        prompts: parking_lot::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for TurnProvider {
+        async fn stream(
+            &self,
+            _model: &Model,
+            context: &Context,
+            _options: &StreamOptions,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let call = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            for message in &context.messages {
+                if let Message::User { content, .. } = message {
+                    for block in content {
+                        if let ContentBlock::Text { text } = block {
+                            self.prompts.lock().push(text.clone());
+                        }
+                    }
+                }
+            }
+            let message = assistant_turn(
+                vec![ContentBlock::Text {
+                    text: format!("reply-{call}"),
+                }],
+                StopReason::Stop,
+            );
+            let events: Vec<Result<ProviderEvent, ProviderError>> = vec![
+                Ok(ProviderEvent::Start),
+                Ok(ProviderEvent::Done { message }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn follow_up_turn_reuses_the_same_session_and_workspace() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(TurnProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: parking_lot::Mutex::new(Vec::new()),
+        });
+        let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
+
+        let control = RunControl::new();
+        let manager = runtime.subagent_manager(&control);
+        let mut spec = TaskSpec::new("begin the thread");
+        spec.focus = true;
+        let id = manager.spawn(spec).expect("spawn focus child");
+        let first = manager.wait(&id).await.expect("first turn");
+        assert_eq!(first.output, "reply-0");
+
+        manager
+            .follow_up(&id, "continue the thread".to_string())
+            .expect("follow-up accepted");
+        let second = manager.wait(&id).await.expect("second turn");
+        assert_eq!(second.output, "reply-1");
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Completed));
+
+        // Same journal: the follow-up appends to the original session file
+        // instead of creating a new one.
+        assert_eq!(second.session_path, first.session_path);
+        let session = Session::open(&second.session_path).expect("reopen journal");
+        let user_messages = session
+            .messages()
+            .expect("messages")
+            .iter()
+            .filter(|message| matches!(message, Message::User { .. }))
+            .count();
+        assert_eq!(user_messages, 2, "both turns live in one journal");
+
+        // Same fork: the follow-up ran in the recorded workspace instead of
+        // provisioning a new one.
+        let workspace_dir = data_dir.join("workspaces").join(&id);
+        assert!(workspace_dir.exists(), "the focus fork must still exist");
+        let prompts = provider.prompts.lock();
+        assert_eq!(prompts.len(), 3, "task plus both committed prompts");
+        assert_eq!(prompts[2], "continue the thread");
     }
 
     /// Records the tool names advertised on each request, then streams the same
@@ -1690,9 +1861,10 @@ mod tests {
             !repo.join("built.txt").exists(),
             "the parent working tree must not receive the builder's write"
         );
-        assert!(
-            provider.fork_file().is_none(),
-            "the fork must be removed after the run"
+        assert_eq!(
+            provider.fork_file().as_deref(),
+            Some("from builder"),
+            "the completed child's fork keeps its edits for follow-up turns"
         );
     }
 
