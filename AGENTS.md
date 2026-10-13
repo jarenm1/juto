@@ -7,7 +7,8 @@ implementation. Read `README.md` for the current build and launch commands.
 ## Non-negotiables
 
 1. **Use jj.** Inspect the working-copy changes before editing; preserve the
-   human's work. Use jj for commits and workspaces, not git staging or checkout.
+   human's work. Use jj for commits and workspaces, not git staging or checkout;
+   `gh` is the one exception, run from the default checkout (see Handoff).
 2. **Wrap heavy commands in `scripts/agent-scope.sh`.** Builds, tests, clippy,
    and application runs need resource governance, including commands launched
    through Nix or direnv. No automatic enforcement hook is installed here.
@@ -35,7 +36,9 @@ export JUTO_FLAKE="git+file://$(dirname "$(jj git root)")?rev=$(jj log -r main@o
 ```
 
 Pin the full id: short hashes fail with "wrong length", and the bare checkout
-path failed in agent runs with a missing `glib-2.0`.
+path failed in agent runs with a missing `glib-2.0`. If the command errors or
+prints more than one id, `main@origin` is divergent: report it and stop; do not
+guess a commit id.
 
 Use Git-aware references to that checkout, not `path:` references. If a task
 changes the flake itself, evaluate a filtered source snapshot instead; the
@@ -144,10 +147,10 @@ a non-colocated workspace with a populated target directory. Keep the scope
 outermost for heavy commands. The flake's compiler is authoritative; a second
 rustup toolchain can change artifacts and undo reproducibility.
 
-Known build gap: `flake.nix`'s `nativeLibraries` omits glib, gstreamer, and
-pixman. A clean `cargo build -p juto` can fail with glib-sys,
-gstreamer-webrtc-sys, or pixman link errors. Report the failure and its first
-error line; do not patch `flake.nix` inside an unrelated task.
+Known build gap: `flake.nix`'s `nativeLibraries` is incomplete for the desktop
+crates, so a clean `cargo build -p juto` can fail at link time. Report the
+failure and its first error line; do not patch `flake.nix` inside an unrelated
+task.
 
 Optimize for build iteration: preserve unoptimized incremental dev/test
 profiles, reduced debug info, and Clang + mold linking. Do not copy jtech's
@@ -175,16 +178,18 @@ recordings, and smoke scripts outside tracked source (for example `/tmp`);
 keep them available for review. Do not claim Wayland, hardware acceleration,
 provider access, or OAuth was verified from a CLI-only or Xvfb smoke.
 
-Every task ends with a pull request; a task without one is not done. When the
-work is complete and verified:
+Every task that changes tracked files ends with a pull request; a task without
+one is not done. Read-only investigations end with a written report in the
+handoff instead; do not open an empty PR. When the work is complete and verified:
 
 1. Fetch and rebase onto the base: `jj git fetch && jj rebase -d main@origin`.
 2. Name the finished change's bookmark and push it:
    `jj bookmark set <type>/<slug> -r <change-id>`, then
    `jj git push --bookmark <type>/<slug>`.
 3. Open the PR from the default checkout, since `gh` needs git and secondary
-   workspaces lack it: `gh pr create --repo jarenm1/juto --base main --head <type>/<slug>`. Use
-   `.github/pull_request_template.md` if it exists; none exists today. The body
+   workspaces lack it:
+   `gh pr create --repo jarenm1/juto --base main --head <type>/<slug>`.
+   Use `.github/pull_request_template.md` if it exists. The body
    MUST list the change ids, the verification commands and their results, the
    observed behavior for runtime or UI changes (screenshot paths outside the
    repo), and any manual steps still required.
