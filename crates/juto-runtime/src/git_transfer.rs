@@ -798,6 +798,8 @@ impl GitRepository {
     /// gitlink is refused). Deleted paths are removed and their now-empty parent
     /// directories are pruned up to `destination`. Paths outside the delta are
     /// never touched.
+    /// Existing parent components that are symlinks or non-directories are
+    /// rejected before the operation writes, deletes, or prunes beneath them.
     pub fn restore_tree(&self, current: &str, target: &str, destination: &Path) -> Result<()> {
         let current = self.resolve_tree(current)?;
         let target = self.resolve_tree(target)?;
@@ -836,6 +838,7 @@ impl GitRepository {
                 b'A' | b'M' | b'T' => {
                     let relative = validate_tree_path(path)?;
                     let existing = destination.join(&relative);
+                    ensure_real_parents(destination, &relative)?;
                     if let Ok(metadata) = fs::symlink_metadata(&existing) {
                         if metadata.is_dir() {
                             bail!(
@@ -1301,6 +1304,10 @@ impl GitRepository {
 
         let relative = validate_tree_path(path)?;
         let target = destination.join(&relative);
+        ensure_real_parents(destination, &relative)?;
+        if fs::symlink_metadata(&target).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            bail!("refusing to write through symlink {}", target.display());
+        }
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -2114,6 +2121,8 @@ fn raw_entry(change: &RawChange, path: &[u8]) -> Vec<u8> {
 /// Remove `relative` under `destination` and prune now-empty parent
 /// directories, stopping at `destination`.
 fn remove_path(destination: &Path, relative: &Path) -> Result<()> {
+    // Never delete or prune through a symlinked or non-directory parent.
+    ensure_real_parents(destination, relative)?;
     let target = destination.join(relative);
     match fs::symlink_metadata(&target) {
         Ok(metadata) if metadata.is_dir() => {
@@ -2145,6 +2154,36 @@ fn remove_path(destination: &Path, relative: &Path) -> Result<()> {
             break;
         }
         parent = directory.parent();
+    }
+    Ok(())
+}
+
+/// Verify every existing parent beneath `destination` is a real directory.
+///
+/// `symlink_metadata` avoids following a symlink while checking each component.
+/// Stop at the first missing component; the caller may create the remaining
+/// directories afterward.
+fn ensure_real_parents(destination: &Path, relative: &Path) -> Result<()> {
+    let mut current = destination.to_path_buf();
+    let mut components = relative.components().peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("refusing to follow symlink {}", current.display());
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                bail!("{} is not a directory", current.display());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot stat {}", current.display()));
+            }
+        }
     }
     Ok(())
 }
