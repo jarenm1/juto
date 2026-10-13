@@ -415,13 +415,16 @@ impl Runtime {
         if let Some(mgr) = &*guard {
             return mgr.clone();
         }
+        let inbox = subagents::MainInbox::default();
         let mgr = Arc::new(SubagentManager::new(
             Arc::new(ChildFactory {
                 runtime: self.clone(),
                 depth: 1,
+                inbox: inbox.clone(),
             }),
             self.config().max_concurrency,
             control.token(),
+            inbox,
         ));
         *guard = Some(mgr.clone());
         mgr
@@ -438,8 +441,10 @@ impl Runtime {
             depth: 0,
             role: roles::MAIN_ROLE,
             read_only: false,
+            sender: None,
         };
-        self.run_depth(session, prompt.into(), events, control, placement)
+        let manager = self.subagent_manager(&control);
+        self.run_depth(session, prompt.into(), events, control, placement, manager)
             .await
     }
 
@@ -450,11 +455,13 @@ impl Runtime {
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
         placement: RunPlacement<'_>,
+        manager: Arc<SubagentManager>,
     ) -> Result<RunOutcome> {
         let RunPlacement {
             depth,
             role: role_name,
             read_only,
+            sender,
         } = placement;
         if session.header().cwd != self.inner.cwd {
             bail!("session belongs to a different working directory");
@@ -486,18 +493,6 @@ impl Runtime {
                 compaction_usage = self.compact(session, &control).await?;
             }
         }
-        let manager = if depth == 0 {
-            self.subagent_manager(&control)
-        } else {
-            Arc::new(SubagentManager::new(
-                Arc::new(ChildFactory {
-                    runtime: self.clone(),
-                    depth: depth + 1,
-                }),
-                settings.max_concurrency,
-                control.token(),
-            ))
-        };
         let _children = ChildCancellation(manager.clone());
         // Governance is opt-in and degrades to a bare spawn when `systemd-run`
         // is unavailable, so enabling it can never fail the tool outright.
@@ -509,7 +504,11 @@ impl Runtime {
             .then(|| ResourceLimits::default().with_enforce_scope(false));
         let mut registry = tools::builtin_tools_with_limits(&self.inner.cwd, limits)?;
         if can_delegate {
-            register_agent_tools(&mut registry, manager, catalog.clone(), depth == 0)?;
+            let peers = match sender {
+                Some(id) => PeerBus::for_child(manager.clone(), id),
+                None => PeerBus::new(manager.clone()),
+            };
+            register_agent_tools(&mut registry, manager, peers, catalog.clone(), depth == 0)?;
         }
         if scope.allows("desktop") {
             tools::register_desktop_tools(
@@ -761,11 +760,15 @@ struct RunPlacement<'a> {
     depth: usize,
     role: &'a str,
     read_only: bool,
+    /// Id of the child running here, if any. Its messages to `agent://main`
+    /// carry this id as `from`; `None` for the main thread.
+    sender: Option<&'a str>,
 }
 
 struct ChildFactory {
     runtime: Runtime,
     depth: usize,
+    inbox: subagents::MainInbox,
 }
 
 /// Where an isolated child's workspace is provisioned. Shared by
@@ -776,6 +779,21 @@ fn workspace_path_for(data_dir: &Path, id: &str) -> PathBuf {
 }
 
 impl ChildFactory {
+    /// Manager for the children a run at this factory's depth spawns. Every
+    /// nested manager shares the run tree's main inbox, so child messages and
+    /// completion notices all land in one depth-0 queue.
+    fn nested_manager(&self, runtime: &Runtime, control: &RunControl) -> Arc<SubagentManager> {
+        Arc::new(SubagentManager::new(
+            Arc::new(ChildFactory {
+                runtime: runtime.clone(),
+                depth: self.depth + 1,
+                inbox: self.inbox.clone(),
+            }),
+            runtime.config().max_concurrency,
+            control.token(),
+            self.inbox.clone(),
+        ))
+    }
     /// Build a child runtime rooted at an existing directory, sharing the
     /// parent's config, credentials, provider, and approval policy.
     async fn runtime_at(&self, cwd: PathBuf) -> Result<Runtime> {
@@ -910,6 +928,7 @@ impl subagents::SubagentFactory for ChildFactory {
                 prompt.push_str(&serde_json::to_string(&schema)?);
             }
             let role = spec.agent.as_deref().unwrap_or(roles::DEFAULT_ROLE);
+            let manager = self.nested_manager(&runtime, &control);
             let outcome = runtime
                 .run_depth(
                     &mut session,
@@ -920,7 +939,9 @@ impl subagents::SubagentFactory for ChildFactory {
                         depth: self.depth,
                         role,
                         read_only: spec.read_only,
+                        sender: Some(id),
                     },
+                    manager,
                 )
                 .await?;
             turn_result(id, &session, outcome)
@@ -963,6 +984,7 @@ impl subagents::SubagentFactory for ChildFactory {
             // schema instruction stays in history, so neither is re-applied;
             // run_depth resolves the model from the session's `current_model`.
             let role = spec.agent.as_deref().unwrap_or(roles::DEFAULT_ROLE);
+            let manager = self.nested_manager(&runtime, &control);
             let outcome = runtime
                 .run_depth(
                     &mut session,
@@ -973,11 +995,14 @@ impl subagents::SubagentFactory for ChildFactory {
                         depth: self.depth,
                         role,
                         read_only: spec.read_only,
+                        sender: Some(id),
                     },
+                    manager,
                 )
                 .await?;
             turn_result(id, &session, outcome)
-        }.await;
+        }
+        .await;
         drop(runtime);
         if result.is_ok() {
             result.map_err(|error| error.to_string())
@@ -1009,30 +1034,58 @@ impl subagents::SubagentFactory for ChildFactory {
 /// the session it wrote. Both the first turn and follow-up turns share this
 /// so the stop-reason contract and output extraction stay identical.
 fn turn_result(id: &str, session: &Session, outcome: RunOutcome) -> Result<SubagentResult> {
-    if outcome.stop_reason == StopReason::Aborted { bail!("subagent cancelled"); }
-    if outcome.stop_reason != StopReason::Stop { bail!("subagent did not complete: {:?}", outcome.stop_reason); }
-    let output = session.messages()?.iter().rev().find_map(|message| match message {Message::Assistant(message) if message.stop_reason == StopReason::Stop => Some(message.text()), _ => None}).context("subagent completed without an assistant message")?;
+    if outcome.stop_reason == StopReason::Aborted {
+        bail!("subagent cancelled");
+    }
+    if outcome.stop_reason != StopReason::Stop {
+        bail!("subagent did not complete: {:?}", outcome.stop_reason);
+    }
+    let output = session
+        .messages()?
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::Assistant(message) if message.stop_reason == StopReason::Stop => {
+                Some(message.text())
+            }
+            _ => None,
+        })
+        .context("subagent completed without an assistant message")?;
     let data = subagents::extract_json(&output);
-    Ok(SubagentResult {id: id.to_owned(), output, data, usage: outcome.usage, stop_reason: outcome.stop_reason, session_path: session.path().to_path_buf()})
+    Ok(SubagentResult {
+        id: id.to_owned(),
+        output,
+        data,
+        usage: outcome.usage,
+        stop_reason: outcome.stop_reason,
+        session_path: session.path().to_path_buf(),
+    })
 }
 
 fn register_agent_tools(
     registry: &mut ToolRegistry,
     manager: Arc<SubagentManager>,
+    peers: PeerBus,
     catalog: Arc<BTreeMap<String, AgentRole>>,
-    allow_focus: bool,
+    main: bool,
 ) -> Result<()> {
     registry.register(Arc::new(TaskTool {
         manager: manager.clone(),
         catalog,
-        allow_focus,
+        allow_focus: main,
     }))?;
     registry.register(Arc::new(WaitTool {
         manager: manager.clone(),
     }))?;
     registry.register(Arc::new(SendTool {
         manager: manager.clone(),
+        peers,
     }))?;
+    if main {
+        registry.register(Arc::new(InboxTool {
+            inbox: manager.main_inbox(),
+        }))?;
+    }
     registry.register(Arc::new(CancelTool { manager }))?;
     Ok(())
 }
@@ -1199,13 +1252,14 @@ async fn collect_agents(manager: &SubagentManager, ids: Vec<String>) -> Result<T
 }
 struct SendTool {
     manager: Arc<SubagentManager>,
+    peers: PeerBus,
 }
 #[async_trait]
 impl Tool for SendTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "agent_send".into(),
-            description: "Steer a queued or running child agent.".into(),
+            description: "Steer a queued or running child agent by id. Use id `agent://main` to send a message to the main agent's inbox.".into(),
             parameters: json!({"type":"object","properties":{"id":{"type":"string"},"message":{"type":"string"}},"required":["id","message"],"additionalProperties":false}),
         }
     }
@@ -1213,16 +1267,42 @@ impl Tool for SendTool {
         ToolTier::Write
     }
     async fn execute(&self, arguments: Value, _ctx: ToolContext) -> Result<ToolOutput, String> {
+        let id = arguments["id"].as_str().ok_or("id required")?;
+        let message = arguments["message"]
+            .as_str()
+            .ok_or("message required")?
+            .to_owned();
+        if id == crate::peers::MAIN_URI {
+            self.peers
+                .send(id, message)
+                .map_err(|error| error.to_string())?;
+            return Ok(ToolOutput::text("Message queued for the main agent."));
+        }
         self.manager
-            .send(
-                arguments["id"].as_str().ok_or("id required")?,
-                arguments["message"]
-                    .as_str()
-                    .ok_or("message required")?
-                    .to_owned(),
-            )
+            .send(id, message)
             .map_err(|error| error.to_string())?;
         Ok(ToolOutput::text("Steering message queued."))
+    }
+}
+struct InboxTool {
+    inbox: subagents::MainInbox,
+}
+#[async_trait]
+impl Tool for InboxTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "agent_inbox".into(),
+            description: "Drain messages and completion notices that child agents sent to the main agent. Each entry has from, kind, and body; the inbox is cleared once returned.".into(),
+            parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+        }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Write
+    }
+    async fn execute(&self, _arguments: Value, _ctx: ToolContext) -> Result<ToolOutput, String> {
+        let messages = self.inbox.drain();
+        let json = serde_json::to_string_pretty(&messages).map_err(|error| error.to_string())?;
+        Ok(ToolOutput::text(json))
     }
 }
 struct CancelTool {
@@ -1553,9 +1633,7 @@ mod tests {
             _options: &StreamOptions,
             _cancel: CancellationToken,
         ) -> Result<ProviderStream, ProviderError> {
-            let call = self
-                .calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             for message in &context.messages {
                 if let Message::User { content, .. } = message {
                     for block in content {
@@ -1697,6 +1775,7 @@ mod tests {
                 "wait",
                 "agent_send",
                 "agent_cancel",
+                "agent_inbox",
             ])]
         );
     }
@@ -1913,7 +1992,9 @@ mod tests {
                     depth: 2,
                     role: "builder",
                     read_only: false,
+                    sender: None,
                 },
+                runtime.subagent_manager(&RunControl::new()),
             )
             .await
             .expect("depth-2 run");
@@ -2019,6 +2100,7 @@ mod tests {
             Arc::new(InstantFactory),
             1,
             CancellationToken::new(),
+            subagents::MainInbox::default(),
         ));
         let tool = TaskTool {
             manager: manager.clone(),
@@ -2047,5 +2129,42 @@ mod tests {
         let summaries = tool.manager.list();
         assert_eq!(summaries.len(), 1);
         assert!(summaries[0].focus);
+    }
+
+    #[tokio::test]
+    async fn agent_inbox_drains_pending_messages_once() {
+        let inbox = subagents::MainInbox::default();
+        inbox.push(subagents::MainMessage {
+            from: "child-1".into(),
+            kind: subagents::MainMessageKind::Message,
+            body: "need input".into(),
+        });
+        let context = ToolContext {
+            cwd: PathBuf::from("/repo"),
+            session_id: "test".to_string(),
+            cancel: CancellationToken::new(),
+        };
+        let tool = InboxTool { inbox };
+
+        let first = tool
+            .execute(json!({}), context.clone())
+            .await
+            .expect("first drain");
+        let ContentBlock::Text { text } = &first.content[0] else {
+            panic!("inbox drain returns text");
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(text).expect("json entries"),
+            json!([{"from": "child-1", "kind": "message", "body": "need input"}])
+        );
+
+        let second = tool
+            .execute(json!({}), context)
+            .await
+            .expect("second drain");
+        let ContentBlock::Text { text } = &second.content[0] else {
+            panic!("inbox drain returns text");
+        };
+        assert_eq!(text.as_str(), "[]");
     }
 }

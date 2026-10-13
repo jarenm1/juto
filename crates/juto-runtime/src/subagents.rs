@@ -11,8 +11,8 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
 use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -280,7 +280,64 @@ pub struct ChildState {
     pub outcome: Option<Result<SubagentResult, String>>,
 }
 
+/// Kind of message delivered to the main agent's inbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MainMessageKind {
+    /// A child sent a message to `agent://main`.
+    Message,
+    /// A child reached the `Completed` terminal state.
+    Completed,
+    /// A child reached the `Failed` terminal state.
+    Failed,
+    /// A child reached the `Cancelled` terminal state.
+    Cancelled,
+}
+
+impl MainMessageKind {
+    fn from_terminal(status: &SubagentStatus) -> Option<Self> {
+        match status {
+            SubagentStatus::Completed => Some(Self::Completed),
+            SubagentStatus::Failed => Some(Self::Failed),
+            SubagentStatus::Cancelled => Some(Self::Cancelled),
+            _ => None,
+        }
+    }
+}
+
+/// One entry in the main agent's inbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MainMessage {
+    /// Child id, or the sender placeholder used when a peer has no sender id.
+    pub from: String,
+    pub kind: MainMessageKind,
+    pub body: String,
+}
+
+/// In-memory mailbox the main agent drains with `agent_inbox`. One inbox is
+/// shared by every manager in a run tree, so nested children write into the
+/// same main thread. Not persisted: messages are lost when the process exits.
+#[derive(Clone, Default)]
+pub struct MainInbox {
+    messages: Arc<Mutex<Vec<MainMessage>>>,
+}
+
+impl MainInbox {
+    pub fn push(&self, message: MainMessage) {
+        self.messages
+            .lock()
+            .expect("main inbox poisoned")
+            .push(message);
+    }
+
+    /// Remove and return every pending message in arrival order.
+    pub fn drain(&self) -> Vec<MainMessage> {
+        std::mem::take(&mut *self.messages.lock().expect("main inbox poisoned"))
+    }
+}
+
 struct Child {
+    id: String,
     spec: TaskSpec,
     focus: bool,
     workspace: Option<PathBuf>,
@@ -298,6 +355,7 @@ struct Inner {
     factory: Arc<dyn SubagentFactory>,
     semaphore: Arc<Semaphore>,
     parent_cancel: CancellationToken,
+    main_inbox: MainInbox,
     children: Mutex<HashMap<String, Arc<Child>>>,
 }
 
@@ -314,15 +372,23 @@ impl SubagentManager {
         factory: Arc<dyn SubagentFactory>,
         max_concurrency: usize,
         parent_cancel: CancellationToken,
+        main_inbox: MainInbox,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 factory,
                 semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
                 parent_cancel,
+                main_inbox,
                 children: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// The inbox every child of this manager pushes into. Shared with nested
+    /// managers so the whole run tree reports to one main thread.
+    pub fn main_inbox(&self) -> MainInbox {
+        self.inner.main_inbox.clone()
     }
 
     /// Queue a child run. Returns the generated child id immediately; the
@@ -356,6 +422,7 @@ impl SubagentManager {
         let focus = spec.focus;
         let workspace = self.inner.factory.workspace_path(&id, &spec);
         let child = Arc::new(Child {
+            id: id.clone(),
             spec,
             focus,
             workspace,
@@ -416,7 +483,11 @@ impl SubagentManager {
 
     /// Cancel a queued or running child. Idempotent for terminal children.
     pub fn cancel(&self, id: &str) -> Result<(), SubagentError> {
-        self.child(id)?.control.lock().expect("mutex poisoned").cancel();
+        self.child(id)?
+            .control
+            .lock()
+            .expect("mutex poisoned")
+            .cancel();
         Ok(())
     }
 
@@ -429,7 +500,11 @@ impl SubagentManager {
         if status.is_terminal() {
             return Err(SubagentError::Terminal(status));
         }
-        child.control.lock().expect("mutex poisoned").steer(Message::user(message));
+        child
+            .control
+            .lock()
+            .expect("mutex poisoned")
+            .steer(Message::user(message));
         Ok(())
     }
 
@@ -486,7 +561,14 @@ impl SubagentManager {
 
         let inner = Arc::clone(&self.inner);
         let task_id = id.to_string();
-        tokio::spawn(run_follow_up(inner, child, task_id, session_path, prompt, control));
+        tokio::spawn(run_follow_up(
+            inner,
+            child,
+            task_id,
+            session_path,
+            prompt,
+            control,
+        ));
         Ok(())
     }
 
@@ -825,17 +907,17 @@ async fn acquire_permit(
     let permit = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            finish(child, SubagentStatus::Cancelled, Err("cancelled while queued".into()));
+            finish(inner, child, SubagentStatus::Cancelled, Err("cancelled while queued".into()));
             return None;
         }
         _ = inner.parent_cancel.cancelled() => {
-            finish(child, SubagentStatus::Cancelled, Err("cancelled with parent while queued".into()));
+            finish(inner, child, SubagentStatus::Cancelled, Err("cancelled with parent while queued".into()));
             return None;
         }
         permit = inner.semaphore.clone().acquire_owned() => match permit {
             Ok(permit) => permit,
             Err(_) => {
-                finish(child, SubagentStatus::Failed, Err("subagent semaphore closed".into()));
+                finish(inner, child, SubagentStatus::Failed, Err("subagent semaphore closed".into()));
                 return None;
             }
         },
@@ -867,9 +949,13 @@ async fn run_child(
     let spec = child.spec.clone();
     let task_id = id.clone();
     let task_control = control.clone();
-    run_turn(&inner, &child, &control, validator, move |events| async move {
-        factory.run(&task_id, spec, task_control, events).await
-    })
+    run_turn(
+        &inner,
+        &child,
+        &control,
+        validator,
+        move |events| async move { factory.run(&task_id, spec, task_control, events).await },
+    )
     .await;
 }
 
@@ -897,16 +983,22 @@ async fn run_follow_up(
     let factory = inner.factory.clone();
     let spec = child.spec.clone();
     let task_control = control.clone();
-    run_turn(&inner, &child, &control, validator, move |events| async move {
-        match session_path {
-            Some(path) => {
-                factory
-                    .follow_up(&id, &spec, &path, prompt, task_control, events)
-                    .await
+    run_turn(
+        &inner,
+        &child,
+        &control,
+        validator,
+        move |events| async move {
+            match session_path {
+                Some(path) => {
+                    factory
+                        .follow_up(&id, &spec, &path, prompt, task_control, events)
+                        .await
+                }
+                None => Err("completed child has no recorded session path".into()),
             }
-            None => Err("completed child has no recorded session path".into()),
-        }
-    })
+        },
+    )
     .await;
 }
 
@@ -987,12 +1079,30 @@ async fn run_turn<F, Fut>(
         Err(_) if cancelled => SubagentStatus::Cancelled,
         Err(_) => SubagentStatus::Failed,
     };
-    finish(child, status, outcome);
+    finish(inner, child, status, outcome);
 }
 
-/// Publish the terminal state for a turn — exactly once per turn.
-fn finish(child: &Child, status: SubagentStatus, outcome: Result<SubagentResult, String>) {
+/// Publish the terminal state for a turn — exactly once per turn. The main
+/// inbox notice is pushed before the state is published, so a waiter woken by
+/// the state already observes the notice.
+fn finish(
+    inner: &Inner,
+    child: &Child,
+    status: SubagentStatus,
+    outcome: Result<SubagentResult, String>,
+) {
     debug_assert!(status.is_terminal());
+    if let Some(kind) = MainMessageKind::from_terminal(&status) {
+        let body = match &outcome {
+            Ok(result) => result.output.clone(),
+            Err(err) => err.clone(),
+        };
+        inner.main_inbox.push(MainMessage {
+            from: child.id.clone(),
+            kind,
+            body,
+        });
+    }
     child.state.send_modify(|state| {
         state.status = status.clone();
         state.outcome = Some(outcome);
@@ -1148,7 +1258,7 @@ mod tests {
         max_concurrency: usize,
         parent: CancellationToken,
     ) -> SubagentManager {
-        SubagentManager::new(factory, max_concurrency, parent)
+        SubagentManager::new(factory, max_concurrency, parent, MainInbox::default())
     }
 
     /// Poll until `running` reaches `n`.
@@ -2344,7 +2454,9 @@ mod tests {
         let result = manager.wait(&id).await.expect("first turn");
         assert_eq!(result.output, "done:thread");
 
-        manager.follow_up(&id, "more".to_string()).expect("accepted");
+        manager
+            .follow_up(&id, "more".to_string())
+            .expect("accepted");
         assert_eq!(manager.status(&id), Some(SubagentStatus::Running));
         // While the new turn runs, completed-only readers see nothing new.
         assert!(manager.output(&id).unwrap().is_none());
@@ -2390,7 +2502,13 @@ mod tests {
         // A failed child reports its terminal state explicitly.
         let (fail_gate, fail_rx) = gate();
         let failing = make_manager(
-            gate_factory(fail_rx, Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)), true, None),
+            gate_factory(
+                fail_rx,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                true,
+                None,
+            ),
             1,
             CancellationToken::new(),
         );
@@ -2460,7 +2578,9 @@ mod tests {
         first.send(true).unwrap();
         manager.wait(&id).await.expect("first turn");
 
-        manager.follow_up(&id, "next".to_string()).expect("accepted");
+        manager
+            .follow_up(&id, "next".to_string())
+            .expect("accepted");
         second.send(true).unwrap();
         let result = manager.wait(&id).await.expect("follow-up turn");
         assert_eq!(result.output, "again:next");
@@ -2510,7 +2630,9 @@ mod tests {
 
         let (first, first_rx) = gate();
         let manager = manager(
-            Arc::new(FailFollowUp { first_gate: first_rx }),
+            Arc::new(FailFollowUp {
+                first_gate: first_rx,
+            }),
             1,
             CancellationToken::new(),
         );
@@ -2547,7 +2669,9 @@ mod tests {
         // Cancelling after completion cancels the old control; the next turn
         // must still run under a fresh one.
         manager.cancel(&id).unwrap();
-        manager.follow_up(&id, "more".to_string()).expect("accepted");
+        manager
+            .follow_up(&id, "more".to_string())
+            .expect("accepted");
         second.send(true).unwrap();
         let result = manager.wait(&id).await.expect("follow-up turn");
         assert_eq!(result.output, "again:more");
@@ -2567,7 +2691,9 @@ mod tests {
         first.send(true).unwrap();
         manager.wait(&id).await.expect("first turn");
 
-        manager.follow_up(&id, "more".to_string()).expect("accepted");
+        manager
+            .follow_up(&id, "more".to_string())
+            .expect("accepted");
         manager.cancel(&id).unwrap();
         assert!(matches!(
             manager.wait(&id).await,
@@ -2592,5 +2718,143 @@ mod tests {
         );
         assert!(extract_json("no json here").is_none());
         assert!(extract_json("").is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_child_pushes_one_completion_notice() {
+        let (gate, gate_rx) = gate();
+        let manager = manager(
+            gate_factory(
+                gate_rx,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("alpha")).unwrap();
+        gate.send(true).unwrap();
+        manager.wait(&id).await.expect("wait failed");
+        assert_eq!(
+            manager.main_inbox().drain(),
+            vec![MainMessage {
+                from: id,
+                kind: MainMessageKind::Completed,
+                body: "done:alpha".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_child_pushes_one_failure_notice() {
+        let (gate, gate_rx) = gate();
+        let manager = manager(
+            gate_factory(
+                gate_rx,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                true,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("alpha")).unwrap();
+        gate.send(true).unwrap();
+        assert!(manager.wait(&id).await.is_err());
+        assert_eq!(
+            manager.main_inbox().drain(),
+            vec![MainMessage {
+                from: id,
+                kind: MainMessageKind::Failed,
+                body: "boom".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_child_pushes_one_cancellation_notice() {
+        let (_gate, gate_rx) = gate();
+        let running = Arc::new(AtomicUsize::new(0));
+        let manager = manager(
+            gate_factory(
+                gate_rx,
+                running.clone(),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("alpha")).unwrap();
+        until_running(&running, 1).await;
+        manager.cancel(&id).unwrap();
+        assert!(matches!(
+            manager.wait(&id).await,
+            Err(SubagentError::Cancelled)
+        ));
+        assert_eq!(
+            manager.main_inbox().drain(),
+            vec![MainMessage {
+                from: id,
+                kind: MainMessageKind::Cancelled,
+                body: "cancelled".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn running_child_pushes_no_notice_until_terminal() {
+        let (gate, gate_rx) = gate();
+        let running = Arc::new(AtomicUsize::new(0));
+        let manager = manager(
+            gate_factory(
+                gate_rx,
+                running.clone(),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("alpha")).unwrap();
+        until_running(&running, 1).await;
+        assert!(manager.main_inbox().drain().is_empty());
+        gate.send(true).unwrap();
+        manager.wait(&id).await.expect("wait failed");
+        assert_eq!(manager.main_inbox().drain().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn nested_manager_notices_reach_shared_inbox() {
+        let inbox = MainInbox::default();
+        let (gate, gate_rx) = gate();
+        let nested = SubagentManager::new(
+            gate_factory(
+                gate_rx,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+            inbox.clone(),
+        );
+        let id = nested.spawn(spec("alpha")).unwrap();
+        gate.send(true).unwrap();
+        nested.wait(&id).await.expect("wait failed");
+        assert_eq!(
+            inbox.drain(),
+            vec![MainMessage {
+                from: id,
+                kind: MainMessageKind::Completed,
+                body: "done:alpha".into(),
+            }]
+        );
     }
 }
