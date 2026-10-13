@@ -811,7 +811,7 @@ impl AuthModal {
 
     // --- RENDER HELPERS ---
 
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn header(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .items_center()
@@ -833,12 +833,14 @@ impl AuthModal {
                             .text_color(rgb(0xffffff))
                             .child("Providers"),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(0x888888))
-                            .child("Connect an account or API key"),
-                    ),
+                    .when(!narrow, |group| {
+                        group.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(0x888888))
+                                .child("Connect an account or API key"),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -857,15 +859,15 @@ impl AuthModal {
             )
     }
 
-    fn sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn sidebar(&self, narrow: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let filtered = self.filtered_providers(cx);
         let selected_id = self.selected_provider_id.clone();
         let total_count = self.providers.len();
 
         div()
-            .w(px(200.))
+            .when(narrow, |side| side.w_full().h(px(220.)).border_b_1())
+            .when(!narrow, |side| side.w(px(200.)).border_r_1())
             .flex_none()
-            .border_r_1()
             .border_color(rgb(0x2d2d2d))
             .bg(rgb(0x181818))
             .flex()
@@ -1561,6 +1563,9 @@ impl Focusable for AuthModal {
 
 impl Render for AuthModal {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Below 640px the provider list stacks above the detail pane instead of
+        // splitting the panel, so neither column is squeezed.
+        let narrow = (window.viewport_size().width - px(48.)).min(px(860.)) < px(640.);
         div()
             .key_context("AuthModal")
             .track_focus(&self.focus_handle)
@@ -1579,13 +1584,14 @@ impl Render for AuthModal {
             .bg(rgb(0x141414))
             .shadow_xl()
             .text_color(rgb(0xe4e4e7))
-            .child(self.header(cx))
+            .child(self.header(narrow, cx))
             .child(
                 div()
                     .flex()
+                    .when(narrow, |body| body.flex_col())
                     .flex_1()
                     .min_h_0()
-                    .child(self.sidebar(cx))
+                    .child(self.sidebar(narrow, cx))
                     .child(self.detail_pane(cx)),
             )
     }

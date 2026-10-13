@@ -398,8 +398,7 @@ impl ModelPicker {
         &self,
         row: usize,
         index: usize,
-        compact: bool,
-        name_width: gpui::Pixels,
+        narrow: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let model = &self.data.models[index];
@@ -471,14 +470,11 @@ impl ModelPicker {
                             .flex()
                             .gap_2()
                             .min_w_0()
-                            .when(compact, |name| {
-                                name.w(name_width).flex_none().flex_col().gap_1()
-                            })
-                            .when(!compact, |name| name.w(px(270.)).flex_none().items_center())
+                            .when(narrow, |name| name.flex_1().flex_col().gap_1())
+                            .when(!narrow, |name| name.w(px(270.)).flex_none().items_center())
                             .child(
                                 div()
                                     .min_w_0()
-                                    .when(compact, |name| name.w(name_width))
                                     .text_sm()
                                     .text_color(rgb(0xffffff))
                                     .truncate()
@@ -499,7 +495,7 @@ impl ModelPicker {
                                 )))
                             }),
                     )
-                    .when(!compact, |row| {
+                    .when(!narrow, |row| {
                         row.child(
                             div()
                                 .flex_1()
@@ -509,39 +505,39 @@ impl ModelPicker {
                                 .truncate()
                                 .child(model.selector.clone()),
                         )
-                    })
-                    .child(
-                        div()
-                            .w(px(90.))
-                            .flex_none()
-                            .text_right()
-                            .text_xs()
-                            .text_color(rgb(0xd4d4d8))
-                            .child(model.context.clone()),
-                    )
-                    .child(
-                        div()
-                            .w(px(60.))
-                            .flex_none()
-                            .text_right()
-                            .text_xs()
-                            .text_color(rgb(0xd4d4d8))
-                            .child("n/a"),
-                    )
-                    .child(
-                        div()
-                            .w(px(64.))
-                            .flex_none()
-                            .text_right()
-                            .text_xs()
-                            .text_color(rgb(0xaaaaaa))
-                            .child("n/a"),
-                    ),
+                        .child(
+                            div()
+                                .w(px(90.))
+                                .flex_none()
+                                .text_right()
+                                .text_xs()
+                                .text_color(rgb(0xd4d4d8))
+                                .child(model.context.clone()),
+                        )
+                        .child(
+                            div()
+                                .w(px(60.))
+                                .flex_none()
+                                .text_right()
+                                .text_xs()
+                                .text_color(rgb(0xd4d4d8))
+                                .child("n/a"),
+                        )
+                        .child(
+                            div()
+                                .w(px(64.))
+                                .flex_none()
+                                .text_right()
+                                .text_xs()
+                                .text_color(rgb(0xaaaaaa))
+                                .child("n/a"),
+                        )
+                    }),
             )
     }
 
-    fn columns_header(&self, compact: bool, name_width: gpui::Pixels) -> impl IntoElement {
-        div()
+    fn columns_header(&self, narrow: bool) -> impl IntoElement {
+        let header = div()
             .flex_none()
             .flex()
             .items_center()
@@ -550,11 +546,22 @@ impl ModelPicker {
             .py_1()
             .text_xs()
             .text_color(rgb(0xaaaaaa))
-            .child(div().min_w_0().w(name_width).flex_none().child("Model"))
-            .when(!compact, |row| row.child(div().flex_1()))
-            .child(div().w(px(90.)).flex_none().text_right().child("Context"))
-            .child(div().w(px(60.)).flex_none().text_right().child("tok/s"))
-            .child(div().w(px(64.)).flex_none().text_right().child("DeepSWE"))
+            .child(
+                div()
+                    .min_w_0()
+                    .when(narrow, |model| model.flex_1())
+                    .when(!narrow, |model| model.w(px(270.)).flex_none())
+                    .child("Model"),
+            );
+        if narrow {
+            header
+        } else {
+            header
+                .child(div().flex_1())
+                .child(div().w(px(90.)).flex_none().text_right().child("Context"))
+                .child(div().w(px(60.)).flex_none().text_right().child("tok/s"))
+                .child(div().w(px(64.)).flex_none().text_right().child("DeepSWE"))
+        }
     }
 
     fn assignments(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -704,15 +711,10 @@ impl Focusable for ModelPicker {
 
 impl Render for ModelPicker {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let compact = window.viewport_size().width < px(800.);
-        // Compact names share the remaining width with the header. Reserve the
-        // dialog padding (24), border (2), row padding (24), gaps (36), and
-        // metric columns (90 + 60 + 64) before measuring truncated text.
-        let name_width = if compact {
-            (window.viewport_size().width - px(300.)).max(px(0.))
-        } else {
-            px(270.)
-        };
+        let panel_width = (window.viewport_size().width - px(48.)).min(px(900.));
+        // Below 640px the selector and metric columns are hidden so the model
+        // name fills the row instead of pushing content past the dialog edge.
+        let narrow = panel_width < px(640.);
         let message = if self.loading {
             Some("Loading connected providers…".to_string())
         } else if let Some(error) = &self.error {
@@ -777,7 +779,7 @@ impl Render for ModelPicker {
                     ),
             )
             .child(div().flex_none().p_3().child(self.search_input.clone()))
-            .child(self.columns_header(compact, name_width))
+            .child(self.columns_header(narrow))
             .child(
                 div()
                     .pb_2()
@@ -786,13 +788,20 @@ impl Render for ModelPicker {
                     .when(message.is_some(), |list| {
                         list.child(
                             div()
+                                .w_full()
+                                .h_full()
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .h_full()
-                                .text_sm()
-                                .text_color(rgb(0xaaaaaa))
-                                .child(message.clone().unwrap_or_default()),
+                                .px_4()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .text_sm()
+                                        .text_center()
+                                        .text_color(rgb(0xaaaaaa))
+                                        .child(message.clone().unwrap_or_default()),
+                                ),
                         )
                     })
                     .when(!self.data.filtered.is_empty(), |list| {
@@ -803,13 +812,7 @@ impl Render for ModelPicker {
                                 cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                                     range
                                         .map(|row| {
-                                            this.model_row(
-                                                row,
-                                                this.data.filtered[row],
-                                                compact,
-                                                name_width,
-                                                cx,
-                                            )
+                                            this.model_row(row, this.data.filtered[row], narrow, cx)
                                         })
                                         .collect()
                                 }),
@@ -831,6 +834,8 @@ impl Render for ModelPicker {
                     .flex()
                     .items_center()
                     .justify_between()
+                    .flex_wrap()
+                    .gap_2()
                     .child(div().text_xs().text_color(rgb(0x888888)).child(format!(
                         "↑ ↓ Navigate · Enter assigns to @{}",
                         self.assign_role
