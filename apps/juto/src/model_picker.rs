@@ -8,7 +8,7 @@ use gpui::{
     SharedString, Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*,
     px, rgb, uniform_list,
 };
-use juto_ai::{HttpProvider, supports_judge_model};
+use juto_ai::judge_role_accepts;
 use juto_catalog::{Model, Registry};
 use juto_runtime::{Runtime, RuntimeConfig};
 
@@ -149,11 +149,9 @@ impl PickerData {
         let mut models = registry
             .iter()
             .filter(|model| {
-                // Chat and tiny models are pickable for chat roles; TypeSafe judge
-                // models only for the judge role (see `set_judge_role`).
-                supports_judge_model(model)
-                    || (matches!(model.kind.as_str(), "chat" | "tiny")
-                        && HttpProvider::supports_model(model))
+                // Judge-kind rows served by the TypeSafe transport, plus chat and tiny
+                // models. Judge-kind rows are offered only in the judge scope.
+                judge_role_accepts(model)
             })
             .map(ModelEntry::from_catalog)
             .collect::<Vec<_>>();
@@ -221,7 +219,7 @@ impl PickerData {
             .iter()
             .enumerate()
             .filter(|(_, model)| {
-                model.judge == self.judge_role
+                (self.judge_role || !model.judge)
                     && self.connected.contains(&model.provider)
                     && model.search.contains(&query)
             })
@@ -969,5 +967,24 @@ mod tests {
             data.models[data.filtered[0]].selector,
             "typesafe/jev-preview"
         );
+    }
+
+    #[test]
+    fn judge_scope_offers_chat_models_and_chat_scope_hides_judge_models() {
+        let bundled = Registry::bundled().unwrap();
+        let mut registry = Registry::empty();
+        registry.upsert(bundled.get("typesafe", "jev-preview").unwrap().clone());
+        registry.upsert(bundled.get("openai", "gpt-4o").unwrap().clone());
+        let mut data = PickerData::new(&RuntimeConfig::default(), &registry);
+        data.connect(BTreeSet::from(["typesafe".into(), "openai".into()]), "");
+        let selectors = |data: &PickerData| -> Vec<String> {
+            data.filtered
+                .iter()
+                .map(|&index| data.models[index].selector.clone())
+                .collect()
+        };
+        assert_eq!(selectors(&data), ["openai/gpt-4o"]);
+        data.set_judge_role(true, "");
+        assert_eq!(selectors(&data), ["openai/gpt-4o", "typesafe/jev-preview"]);
     }
 }

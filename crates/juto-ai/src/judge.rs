@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Choice, Context, CredentialStore, Decision, Judge, JudgeError, Message, Provider,
+    Choice, Context, CredentialStore, Decision, HttpProvider, Judge, JudgeError, Message, Provider,
     ProviderError, ProviderEvent, StreamOptions, Usage,
 };
 
@@ -361,6 +361,13 @@ const TYPESAFE_PROVIDER: &str = "typesafe";
 /// Other judge-kind rows (e.g. `opencode-zen` `jev-1.13`) are catalog metadata only.
 pub fn supports_judge_model(model: &Model) -> bool {
     model.kind == "judge" && model.api == "typesafe" && model.provider == TYPESAFE_PROVIDER
+}
+
+/// Whether `model` may bind the `judge` role: a TypeSafe judge-kind row, or a chat or
+/// tiny model that the HTTP provider can stream (judged through [`TextJudge`]).
+pub fn judge_role_accepts(model: &Model) -> bool {
+    supports_judge_model(model)
+        || (matches!(model.kind.as_str(), "chat" | "tiny") && HttpProvider::supports_model(model))
 }
 
 /// Build the [`Judge`] for a model accepted by [`supports_judge_model`]. The catalog
