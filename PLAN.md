@@ -36,16 +36,16 @@ Full detailed specification: [`docs/orchestration-plan.md`](docs/orchestration-p
   - *Scope*: `Judge` trait, `TypeSafeJudge` (`/v1/systemone` / OpenRouter decisions), `Choice`/`Decision` types, mock tests.
 - [x] **Slice B: Workspace Isolation & Resource Scopes (`jj` + systemd)**
   - *Files*: `crates/juto-runtime/src/workspace.rs`
-  - *Scope*: `SubagentWorkspace` (`jj workspace add/forget`), `systemd-run` user scope wrapper (`agents.slice`), flock GPU lock.
+  - *Scope*: `SubagentWorkspace` (native change-graph fork), `systemd-run` user scope wrapper (`agents.slice`), flock GPU lock.
 - [x] **Slice C: Subagent State Machine & Blocker Protocol**
   - *Files*: `crates/juto-runtime/src/subagents.rs`
   - *Scope*: Add `Blocked`, `Verifying`, `Reviewing` to `SubagentStatus`, pause/resume escalation channel, `TaskSpec` extensions including strict/permissive structured-output schema validation.
 - [x] **Slice D: GPUI Sidebar Mission Control & Diff Cards**
   - *Files*: `apps/juto/src/sidebar.rs`, `apps/juto/src/task_card.rs`
   - *Scope*: Sidebar view, task status badges, expandable duration/token cards, live diff viewer, steering buttons.
-- [x] **Slice E: End-to-End Orchestrator & Peer Review DAG**
-  - *Files*: `crates/juto-runtime/src/orchestrator.rs`
-  - *Scope*: Manager DAG pipeline, Jev routing hook, Builder $\to$ Reviewer handoff, verification quality gates.
+- [x] **Slice E: Role-Based Delegation (replaces the Orchestrator)**
+  - *Files*: `crates/juto-runtime/src/roles.rs`, `crates/juto-runtime/src/roles/*.md`
+  - *Scope*: `main` delegates through `task` and cannot edit; built-in `builder`/`scout`/`reviewer`/`task` roles from markdown with `tools` frontmatter; `.juto/agents` and data-dir overrides; `max_recursion_depth` defaults to 2.
 - [x] **Slice F: Peer Messaging & Session History URIs**
   - *Files*: `crates/juto-runtime/src/peers.rs`
   - *Scope*: `agent://<id>` status/output reads and steering, `agent://all` live-child broadcast, and read-only `history://<id>` session journals.

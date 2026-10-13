@@ -101,9 +101,9 @@ designed specifically for picking from discrete candidate sets in under 50ms.
    When the user submits a message in the main chat, Jev evaluates whether it is:
    * `DIRECT_REPLY`: Clarification or conversational answer (no subagent needed).
    * `EXPLORE_SCOUT`: Read-only question needing fast code search (`scout`).
-   * `MECHANICAL_EDIT`: Small, localized, deterministic refactor (`sonic`).
-   * `END_TO_END_TASK`: Multi-step implementation requiring isolated workspace and manager
-     orchestration (`task` + `reviewer`).
+   * `MECHANICAL_EDIT`: Small, localized, deterministic refactor (`builder`).
+   * `END_TO_END_TASK`: Multi-step implementation needing an isolated workspace and manager
+     orchestration (`builder`, then `reviewer`, delegated through the `task` tool).
 2. **Agent Persona & Model Tier Routing**:
    Selecting the best worker profile for a delegated task based on complexity, context
    depth, and tool capability.
@@ -135,8 +135,8 @@ pub struct TaskSpec {
     pub name: Option<String>,
     /// High-level goal and contract
     pub task: String,
-    /// Agent persona: "scout" | "builder" | "reviewer" | "sonic"
-    pub agent: String,
+    /// Role name: "builder" | "scout" | "reviewer" | "task" (default)
+    pub agent: Option<String>,
     /// Model selector override (e.g., "anthropic/claude-sonnet-4-5")
     pub model: Option<String>,
     /// Strict JSON schema the subagent must conform to upon completion
@@ -145,7 +145,7 @@ pub struct TaskSpec {
     pub schema_mode: SchemaMode,
     /// Read-only sandbox (denies write/exec tools)
     pub read_only: bool,
-    /// Dedicated Jujutsu workspace requested
+    /// Dedicated native change-graph fork requested
     pub isolated_workspace: bool,
 }
 
@@ -205,12 +205,12 @@ Juto establishes strict workspace isolation:
    depend on `jj` being installed.
 2. **Execution**: The subagent executes all filesystem mutations, formatting, builds,
    and tests strictly inside that directory.
-3. **Integration**: Once verification and review pass, the builder's thread head is frozen
-   as a verified checkpoint and folded back into the parent thread with `join`, which merges
-   trees into a two-parent node rather than rebasing. The parent's own uncaptured edits are
-   captured first, so the merge cannot overwrite them, and a conflicting merge is reported
-   rather than forced. On failure or abandonment, `SubagentWorkspace::cleanup` removes the
-   fork directory and `gc` reclaims the nodes only that workspace kept alive.
+3. **Integration**: Not wired into the subagent path. `finish_isolated_run` deletes the fork
+   directory and runs `ChangeGraph::gc` after every isolated run, success or failure, so an
+   isolated child's file edits do not reach the parent. Folding a verified builder checkpoint into
+   the parent with `ChangeGraph::join` (which merges trees into a two-parent node rather than
+   rebasing) is planned but not implemented; `join` runs only from the explicit `vcs` tool and
+   `juto-cli changes`.
 
 ### 4.2 Resource Governance (`agent-scope.sh` Model)
 To prevent parallel agents from exhausting host memory, CPU, or lock contention:
@@ -445,26 +445,24 @@ implemented by a dedicated subagent concurrently, and validates against its own 
 * **Acceptance**: Visual smoke test under Xvfb/Mesa displaying updating task cards
   and responsive state transitions without panics.
 
-### Slice E: End-to-End Orchestrator & Peer Review DAG
-* **File Ownership**: `crates/juto-runtime/src/orchestrator.rs`
-* **Interface Contract**:
-  ```rust
-  pub struct Orchestrator {
-      judge: Arc<dyn Judge>,
-      subagents: Arc<SubagentManager>,
-  }
-  impl Orchestrator {
-      pub async fn execute_task(&self, intent: &str) -> Result<TaskOutcome, OrchestratorError>;
-  }
-  ```
+### Slice E: Role-Based Delegation (replaces the Orchestrator)
+* **File Ownership**: `crates/juto-runtime/src/roles.rs`, `crates/juto-runtime/src/roles/*.md`,
+  and the `run_depth` and `TaskTool` code in `crates/juto-runtime/src/lib.rs`
 * **Implementation Details**:
-  - Directs the builder agent $\to$ reviewer agent handoff.
-  - Uses `Judge` (Slice A) to triage intent and select agent persona.
-  - Automates post-implementation verification: runs formatting, builds, tests, and
-    observable smoke commands.
-  - Enforces the quality gate before signaling `Completed`.
-* **Acceptance**: End-to-end unit test with mock subagent factories verifying the DAG
-  orchestration from initial prompt through peer review to final completion.
+  - `main` is top-level only. It has `read`, `glob`, `grep`, `task`, `wait`, `agent_send`, and
+    `agent_cancel`. `parse_task` rejects `main` as a child agent.
+  - Built-in roles: `builder` (all tools), `scout` and `reviewer` (read-only), and `task` (all
+    tools, the default). Frontmatter `tools` takes `all`, `read-only`, or a list; missing means
+    read-only.
+  - Overrides: `.juto/agents/<role>.md` in the working directory or an ancestor, then
+    `<data_dir>/agents/<role>.md`. The nearest file wins.
+  - Delegation tools are offered only below `max_recursion_depth` (default 2).
+  - No intent triage, quality-gate pipeline, or remediation loop. Verification is left to the
+    caller; `reviewer` is read-only and cannot run tests.
+* **Acceptance**: `roles.rs` tests cover built-in grants, nearest-file override, and read-only
+  default. `lib.rs` tests observe the advertised tool set for the main thread, read-only
+  approval, a scout child, and the recursion limit, and check that `task` rejects unknown and
+  `main` roles before spawning anything.
 
 ### Slice F: Peer Messaging & Session History URIs
 * **File Ownership**: `crates/juto-runtime/src/peers.rs`, `crates/juto-runtime/src/lib.rs`
