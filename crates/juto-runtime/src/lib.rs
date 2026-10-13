@@ -1493,6 +1493,146 @@ mod tests {
         );
     }
 
+    /// Plays a builder. The first turn calls `write` for `built.txt`; the turn
+    /// after records whether that call succeeded and what the child fork holds.
+    struct WritingBuilder {
+        data_dir: PathBuf,
+        turns: std::sync::atomic::AtomicUsize,
+        observed: std::sync::Mutex<Option<(bool, Option<String>)>>,
+    }
+
+    impl WritingBuilder {
+        fn new(data_dir: PathBuf) -> Self {
+            Self {
+                data_dir,
+                turns: std::sync::atomic::AtomicUsize::new(0),
+                observed: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn observed(&self) -> Option<(bool, Option<String>)> {
+            self.observed.lock().unwrap().clone()
+        }
+
+        /// Contents of `built.txt` in whichever child fork currently holds it.
+        fn fork_file(&self) -> Option<String> {
+            let forks = std::fs::read_dir(self.data_dir.join("workspaces")).ok()?;
+            forks
+                .filter_map(Result::ok)
+                .find_map(|entry| std::fs::read_to_string(entry.path().join("built.txt")).ok())
+        }
+    }
+
+    fn assistant_turn(content: Vec<ContentBlock>, stop_reason: StopReason) -> AssistantMessage {
+        AssistantMessage {
+            content,
+            api: "mock".to_string(),
+            provider: "mock".to_string(),
+            model: "mock/test".to_string(),
+            usage: Usage {
+                input: 1,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0,
+                total_tokens: 2,
+                cost: 0.0,
+            },
+            stop_reason,
+            timestamp: timestamp_ms(),
+            response_id: None,
+            error: None,
+        }
+    }
+
+    #[async_trait]
+    impl Provider for WritingBuilder {
+        async fn stream(
+            &self,
+            _model: &Model,
+            context: &Context,
+            _options: &StreamOptions,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let turn = self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let message = if turn == 0 {
+                assistant_turn(
+                    vec![ContentBlock::ToolCall(juto_ai::ToolCall {
+                        id: "write-1".to_string(),
+                        name: "write".to_string(),
+                        arguments: serde_json::json!({
+                            "path": "built.txt",
+                            "content": "from builder",
+                        }),
+                        thought_signature: None,
+                    })],
+                    StopReason::ToolUse,
+                )
+            } else {
+                let write_succeeded = context.messages.iter().any(|message| {
+                    matches!(
+                        message,
+                        Message::ToolResult { tool_name, is_error: false, .. } if tool_name == "write"
+                    )
+                });
+                *self.observed.lock().unwrap() = Some((write_succeeded, self.fork_file()));
+                assistant_turn(
+                    vec![ContentBlock::Text {
+                        text: "builder finished".to_string(),
+                    }],
+                    StopReason::Stop,
+                )
+            };
+            let events: Vec<Result<ProviderEvent, ProviderError>> = vec![
+                Ok(ProviderEvent::Start),
+                Ok(ProviderEvent::Done { message }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn builder_write_lands_in_its_fork_and_not_the_parent_tree() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(WritingBuilder::new(data_dir.clone()));
+        let config = RuntimeConfig {
+            approval_mode: ApprovalMode::Allow,
+            ..mock_config()
+        };
+        let runtime = runtime_with(&repo, &data_dir, config, provider.clone());
+
+        let control = RunControl::new();
+        let manager = runtime.subagent_manager(&control);
+        let mut spec = TaskSpec::new("write built.txt");
+        spec.agent = Some("builder".to_string());
+        spec.isolated_workspace = true;
+        let id = manager.spawn(spec).expect("spawn builder");
+        manager.wait(&id).await.expect("builder run");
+
+        let (write_succeeded, fork_contents) = provider
+            .observed()
+            .expect("builder reached its second turn");
+        assert!(
+            write_succeeded,
+            "the builder's write must succeed inside its fork"
+        );
+        assert_eq!(
+            fork_contents.as_deref(),
+            Some("from builder"),
+            "the file must exist in the child fork during the run"
+        );
+        assert!(
+            !repo.join("built.txt").exists(),
+            "the parent working tree must not receive the builder's write"
+        );
+        assert!(
+            provider.fork_file().is_none(),
+            "the fork must be removed after the run"
+        );
+    }
+
     #[tokio::test]
     async fn scout_child_advertises_read_tools_without_delegation() {
         let root = tempdir().expect("tempdir");
