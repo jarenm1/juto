@@ -784,6 +784,7 @@ mod tests {
             error: None,
             focus: true,
             workspace: None,
+            released: false,
         };
         sidebar.apply_summaries(&[summary1]);
         assert_eq!(sidebar.tasks().len(), 1);
@@ -800,6 +801,7 @@ mod tests {
             error: None,
             focus: true,
             workspace: None,
+            released: false,
         };
         sidebar.apply_summaries(&[summary2]);
         assert_eq!(sidebar.filter_counts(), (1, 1, 0, 0));
@@ -818,6 +820,7 @@ mod tests {
             error: None,
             focus: true,
             workspace: None,
+            released: false,
         };
         sidebar.apply_summaries(&[summary3]);
         assert_eq!(sidebar.filter_counts(), (1, 0, 1, 0));
@@ -834,6 +837,7 @@ mod tests {
             error: None,
             focus: true,
             workspace: None,
+            released: false,
         };
         sidebar.apply_summaries(&[summary4]);
         assert_eq!(sidebar.filter_counts(), (1, 1, 0, 0));
@@ -849,6 +853,7 @@ mod tests {
             error: None,
             focus: true,
             workspace: None,
+            released: false,
         };
         sidebar.apply_summaries(&[summary5]);
         assert_eq!(sidebar.filter_counts(), (1, 1, 0, 0));
@@ -864,6 +869,7 @@ mod tests {
             error: None,
             focus: true,
             workspace: None,
+            released: false,
         };
         sidebar.apply_summaries(&[summary6]);
         assert_eq!(sidebar.filter_counts(), (1, 0, 0, 1));
@@ -914,6 +920,7 @@ mod tests {
             error: None,
             focus,
             workspace: None,
+            released: false,
         };
 
         sidebar.apply_summaries(&[summary("worker-1", false), summary("focus-1", true)]);
@@ -945,6 +952,7 @@ mod tests {
             error: None,
             focus: true,
             workspace: Some(PathBuf::from("/tmp/juto-focus-1")),
+            released: false,
         };
 
         sidebar.apply_summaries(&[summary]);

@@ -40,6 +40,8 @@ pub struct FocusState<V> {
     thread_id: String,
     status: SubagentStatus,
     vcs: Option<V>,
+    /// The main agent released this thread's workspace, so its fork is gone.
+    released: bool,
     transcript: Result<Vec<Message>, String>,
     transcript_fresh: bool,
     pending_load: Option<u64>,
@@ -47,11 +49,17 @@ pub struct FocusState<V> {
 }
 
 impl<V> FocusState<V> {
-    pub fn enter(thread_id: String, status: SubagentStatus, vcs: Option<V>) -> Self {
+    pub fn enter(
+        thread_id: String,
+        status: SubagentStatus,
+        vcs: Option<V>,
+        released: bool,
+    ) -> Self {
         Self {
             thread_id,
             status,
             vcs,
+            released,
             transcript: Ok(Vec::new()),
             transcript_fresh: false,
             pending_load: None,
@@ -75,8 +83,17 @@ impl<V> FocusState<V> {
         &self.transcript
     }
 
+    /// Why the composer is disabled, or `None` when a follow-up can be sent.
+    /// A released thread's fork is gone, so it cannot take follow-ups.
+    pub fn follow_up_unavailable(&self) -> Option<&'static str> {
+        follow_up_unavailable_reason(&self.status).or_else(|| {
+            self.released
+                .then_some("The workspace was released, so follow-ups are disabled.")
+        })
+    }
+
     pub fn can_follow_up(&self) -> bool {
-        follow_up_unavailable_reason(&self.status).is_none()
+        self.follow_up_unavailable().is_none()
     }
 
     /// Drops the VCS panel handle. The thread itself keeps running.
@@ -173,7 +190,7 @@ impl FocusView {
             }
         });
         Self {
-            state: FocusState::enter(summary.id, status, vcs),
+            state: FocusState::enter(summary.id, status, vcs, summary.released),
             title: summary.name.unwrap_or(summary.task).into(),
             subagents,
             input,
@@ -302,7 +319,7 @@ impl FocusView {
     }
 
     fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let footer = match follow_up_unavailable_reason(self.state.status()) {
+        let footer = match self.state.follow_up_unavailable() {
             Some(reason) => div()
                 .text_sm()
                 .text_color(rgb(0x9ca3af))
@@ -452,7 +469,7 @@ mod tests {
     fn follow_up_is_enabled_only_when_completed() {
         for status in all_statuses() {
             let expected = status == SubagentStatus::Completed;
-            let state: FocusState<()> = FocusState::enter("t".into(), status.clone(), None);
+            let state: FocusState<()> = FocusState::enter("t".into(), status.clone(), None, false);
             assert_eq!(state.can_follow_up(), expected, "status {status:?}");
             assert_eq!(
                 follow_up_unavailable_reason(&status).is_none(),
@@ -463,10 +480,30 @@ mod tests {
     }
 
     #[test]
+    fn released_thread_refuses_follow_up_with_reason() {
+        let state: FocusState<()> =
+            FocusState::enter("t".into(), SubagentStatus::Completed, None, true);
+        assert!(!state.can_follow_up());
+        assert_eq!(
+            state.follow_up_unavailable(),
+            Some("The workspace was released, so follow-ups are disabled.")
+        );
+    }
+
+    #[test]
+    fn thread_without_workspace_keeps_follow_up() {
+        let state: FocusState<()> =
+            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
+        assert!(state.can_follow_up());
+        assert_eq!(state.follow_up_unavailable(), None);
+    }
+
+    #[test]
     fn exit_releases_the_vcs_handle() {
         let handle = Rc::new(());
         let weak = Rc::downgrade(&handle);
-        let mut state = FocusState::enter("t".into(), SubagentStatus::Completed, Some(handle));
+        let mut state =
+            FocusState::enter("t".into(), SubagentStatus::Completed, Some(handle), false);
         assert!(state.vcs().is_some());
         state.exit();
         assert!(state.vcs().is_none());
@@ -476,7 +513,7 @@ mod tests {
     #[test]
     fn transcript_loads_once_per_terminal_state() {
         let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None);
+            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
         let token = state
             .begin_transcript_load()
             .expect("terminal thread loads");
@@ -494,14 +531,14 @@ mod tests {
     #[test]
     fn running_thread_has_no_transcript_load() {
         let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Running, None);
+            FocusState::enter("t".into(), SubagentStatus::Running, None, false);
         assert!(state.begin_transcript_load().is_none());
     }
 
     #[test]
     fn next_terminal_state_reloads_transcript() {
         let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None);
+            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
         let first = state.begin_transcript_load().expect("first load");
         assert!(state.apply_transcript(first, Ok(Vec::new())));
         state.set_status(SubagentStatus::Running);
@@ -519,7 +556,7 @@ mod tests {
     #[test]
     fn stale_transcript_read_is_ignored() {
         let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None);
+            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
         let stale = state.begin_transcript_load().expect("first load");
         state.set_status(SubagentStatus::Running);
         state.set_status(SubagentStatus::Completed);

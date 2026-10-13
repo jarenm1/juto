@@ -858,27 +858,7 @@ async fn finish_isolated_run(
         return result;
     };
     let path = workspace.path.clone();
-    let repo_root = workspace.repo_root.clone();
-    let cleanup = workspace.cleanup().await;
-    if cleanup.is_ok() {
-        // The workspace head is now stale — its directory is gone — so reclaim
-        // the graph: gc drops the stale head and releases any node only it kept
-        // alive, and packs the refs. Best-effort, like the cleanup itself, and
-        // off the async runtime because it shells out to git.
-        match tokio::task::spawn_blocking(move || -> Result<()> {
-            ChangeGraph::open(&repo_root)?.gc().map(|_| ())
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                eprintln!("juto: failed to reclaim the change graph: {error:#}");
-            }
-            Err(join) => {
-                eprintln!("juto: change graph reclaim task failed: {join}");
-            }
-        }
-    }
+    let cleanup = remove_isolated_workspace(workspace).await;
     match cleanup {
         Ok(()) => result,
         Err(cleanup_error) => match result {
@@ -895,6 +875,32 @@ async fn finish_isolated_run(
             )),
         },
     }
+}
+
+/// Remove an isolated workspace directory, then reclaim the change graph. The
+/// graph is reclaimed only after the directory is gone: the workspace head is
+/// stale by then, so gc drops it and any node only it kept alive.
+async fn remove_isolated_workspace(workspace: SubagentWorkspace) -> Result<(), WorkspaceError> {
+    let repo_root = workspace.repo_root.clone();
+    let cleanup = workspace.cleanup().await;
+    if cleanup.is_ok() {
+        // gc shells out to git, so it runs off the async runtime. Best-effort,
+        // like the cleanup itself.
+        match tokio::task::spawn_blocking(move || -> Result<()> {
+            ChangeGraph::open(&repo_root)?.gc().map(|_| ())
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("juto: failed to reclaim the change graph: {error:#}");
+            }
+            Err(join) => {
+                eprintln!("juto: change graph reclaim task failed: {join}");
+            }
+        }
+    }
+    cleanup
 }
 
 #[async_trait]
@@ -1028,6 +1034,28 @@ impl subagents::SubagentFactory for ChildFactory {
         spec.isolated_workspace
             .then(|| workspace_path_for(&self.runtime.inner.data_dir, id))
     }
+
+    async fn release_workspace(&self, id: &str, path: &Path) -> Result<(), String> {
+        // A failed run already removed its fork, so a missing directory is a
+        // workspace that is already gone. The check is async so the tokio
+        // worker never blocks on the filesystem.
+        if !tokio::fs::try_exists(path)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(());
+        }
+        let workspace = SubagentWorkspace {
+            path: path.to_owned(),
+            node_id: String::new(),
+            thread: id.to_owned(),
+            repo_root: self.runtime.inner.cwd.clone(),
+            subagent_id: id.to_owned(),
+        };
+        remove_isolated_workspace(workspace)
+            .await
+            .map_err(|error| error.to_string())
+    }
 }
 
 /// Build the turn's [`SubagentResult`] from a finished `run_depth` outcome and
@@ -1084,6 +1112,9 @@ fn register_agent_tools(
     if main {
         registry.register(Arc::new(InboxTool {
             inbox: manager.main_inbox(),
+        }))?;
+        registry.register(Arc::new(SubagentReleaseTool {
+            manager: manager.clone(),
         }))?;
     }
     registry.register(Arc::new(CancelTool { manager }))?;
@@ -1325,6 +1356,30 @@ impl Tool for CancelTool {
             .cancel(arguments["id"].as_str().ok_or("id required")?)
             .map_err(|error| error.to_string())?;
         Ok(ToolOutput::text("Cancellation requested."))
+    }
+}
+
+struct SubagentReleaseTool {
+    manager: Arc<SubagentManager>,
+}
+#[async_trait]
+impl Tool for SubagentReleaseTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "subagent_release".into(),
+            description: "Release a finished focus thread's isolated workspace. Afterwards its follow-up and transcript are refused. A running or queued thread cannot be released.".into(),
+            parameters: json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}),
+        }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Write
+    }
+    async fn execute(&self, arguments: Value, _ctx: ToolContext) -> Result<ToolOutput, String> {
+        self.manager
+            .release(arguments["id"].as_str().ok_or("id required")?)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(ToolOutput::text("Workspace released."))
     }
 }
 
@@ -1705,6 +1760,89 @@ mod tests {
         assert_eq!(prompts[2], "continue the thread");
     }
 
+    #[tokio::test]
+    async fn main_releases_focus_workspace_and_refuses_later_use() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(TurnProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            prompts: parking_lot::Mutex::new(Vec::new()),
+        });
+        let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
+
+        let control = RunControl::new();
+        let manager = runtime.subagent_manager(&control);
+        let mut spec = TaskSpec::new("begin the thread");
+        spec.focus = true;
+        let id = manager.spawn(spec).expect("spawn focus child");
+        manager.wait(&id).await.expect("first turn");
+
+        let workspace_dir = data_dir.join("workspaces").join(&id);
+        assert!(
+            workspace_dir.exists(),
+            "the focus fork exists before release"
+        );
+
+        manager
+            .release(&id)
+            .await
+            .expect("release a completed focus child");
+        assert!(!workspace_dir.exists(), "release removes the focus fork");
+        let summary = manager
+            .list()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .expect("released child stays listed");
+        assert!(summary.workspace.is_none());
+        assert!(summary.released);
+
+        manager
+            .release(&id)
+            .await
+            .expect("second release is idempotent");
+
+        assert!(matches!(
+            manager.follow_up(&id, "too late".to_string()),
+            Err(SubagentError::WorkspaceReleased(_))
+        ));
+        assert!(matches!(
+            manager.transcript(&id),
+            Err(SubagentError::WorkspaceReleased(_))
+        ));
+        assert!(matches!(
+            manager.release("missing").await,
+            Err(SubagentError::Unknown(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn focus_children_never_advertise_subagent_release() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(AdvertisedTools::default());
+        let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
+
+        let control = RunControl::new();
+        let manager = runtime.subagent_manager(&control);
+        let mut spec = TaskSpec::new("work");
+        spec.focus = true;
+        let id = manager.spawn(spec).expect("spawn focus child");
+        manager.wait(&id).await.expect("child run");
+
+        let requests = provider.requests();
+        assert!(!requests.is_empty(), "the child made a model request");
+        for names in requests {
+            assert!(
+                !names.contains("subagent_release"),
+                "children must not receive subagent_release"
+            );
+        }
+    }
+
     /// Records the tool names advertised on each request, then streams the same
     /// single-text response as `MockProvider`.
     #[derive(Default)]
@@ -1776,6 +1914,7 @@ mod tests {
                 "agent_send",
                 "agent_cancel",
                 "agent_inbox",
+                "subagent_release",
             ])]
         );
     }

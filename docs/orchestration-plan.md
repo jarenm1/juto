@@ -340,7 +340,7 @@ child by reopening its recorded session and reusing its isolated workspace witho
 re-provisioning. Queued, running, blocked, failed, and cancelled children reject
 follow-ups. A successful turn keeps its workspace so later turns share one fork; a
 failed turn is terminal and its fork is removed. Retained workspaces stay on disk
-until a release tool reclaims them, which is not yet implemented.
+until the main agent releases them with `subagent_release` (PR6, below).
 
 PR3 adds a main mailbox. Children send messages to the main agent with
 `agent://main`, which lands in one in-memory inbox shared by the whole run tree.
@@ -369,6 +369,24 @@ state, and no transcript is available while a follow-up turn is in progress. A
 The composer is enabled only for `Completed` threads, and rejected follow-ups
 show an error and keep the draft. The main sidebar no longer has a Changes tab;
 VCS is visible only in focus mode.
+
+PR6 adds workspace release, which belongs to the main thread. `subagent_release` takes
+`{ "id" }` and is registered only for the main thread, so children never receive it.
+It calls `SubagentManager::release(id)`, which accepts only a terminal child: a running
+child is rejected with `NotTerminal` and its workspace is left alone. The fork is removed
+through `SubagentWorkspace::cleanup`, which deletes only a directory carrying the
+`.juto-workspace.json` ownership marker. The removal runs on the blocking pool, so the
+async runtime and the GPUI foreground do not wait on disk I/O. On success the summary
+reports `workspace: None` and `released: true`, and a second release is a no-op. A failed
+cleanup keeps the workspace recorded and returns `WorkspaceRelease`, so the release can
+be retried. After release, `follow_up` and `transcript` both return `WorkspaceReleased`.
+The focus view treats a missing workspace as no VCS panel and a released thread as
+follow-up disabled. A focus view already open at release time is not updated; its next
+send is refused and shows the error. Completion notices are still not rendered in the UI:
+the main agent reads them through `agent_inbox` and decides what reaches the user.
+
+Limitation: a failed cleanup restores the recorded workspace, so follow-ups are accepted
+again until a release succeeds, even if the directory was partly removed.
 
 ---
 
@@ -495,7 +513,7 @@ implemented by a dedicated subagent concurrently, and validates against its own 
   and the `run_depth` and `TaskTool` code in `crates/juto-runtime/src/lib.rs`
 * **Implementation Details**:
   - `main` is top-level only. It has `read`, `glob`, `grep`, `task`, `wait`, `agent_send`,
-    `agent_cancel`, and `agent_inbox`. `parse_task` rejects `main` as a child agent.
+    `agent_cancel`, `agent_inbox`, and `subagent_release`. `parse_task` rejects `main` as a child agent.
   - Built-in roles: `builder` (all tools), `scout` and `reviewer` (read-only), and `task` (all
     tools, the default). Frontmatter `tools` takes `all`, `read-only`, or a list; missing means
     read-only.
