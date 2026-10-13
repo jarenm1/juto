@@ -219,12 +219,21 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// Mirrors focus threads only: worker summaries (`focus == false`) are not
+    /// Mission Control cards.
     pub fn apply_summaries(&mut self, summaries: &[SubagentSummary]) {
-        for summary in summaries {
+        for summary in summaries.iter().filter(|summary| summary.focus) {
+            let workspace = summary
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.display().to_string());
             if let Some(existing) = self.tasks.iter_mut().find(|t| t.id == summary.id) {
                 existing.status = summary.status.clone();
                 if let Some(name) = &summary.name {
                     existing.name = Some(name.clone());
+                }
+                if let Some(workspace) = workspace {
+                    existing.workspace = Some(workspace);
                 }
                 if let Some(usage) = &summary.usage {
                     existing.usage = TokenUsageModel {
@@ -242,6 +251,9 @@ impl Sidebar {
 
                 if let Some(name) = &summary.name {
                     card.name = Some(name.clone());
+                }
+                if let Some(workspace) = workspace {
+                    card = card.with_workspace(workspace);
                 }
                 if let Some(usage) = &summary.usage {
                     card.usage = TokenUsageModel {
@@ -770,7 +782,7 @@ mod tests {
             stop_reason: None,
             usage: None,
             error: None,
-            focus: false,
+            focus: true,
             workspace: None,
         };
         sidebar.apply_summaries(&[summary1]);
@@ -786,7 +798,7 @@ mod tests {
             stop_reason: None,
             usage: None,
             error: None,
-            focus: false,
+            focus: true,
             workspace: None,
         };
         sidebar.apply_summaries(&[summary2]);
@@ -804,7 +816,7 @@ mod tests {
             stop_reason: None,
             usage: None,
             error: None,
-            focus: false,
+            focus: true,
             workspace: None,
         };
         sidebar.apply_summaries(&[summary3]);
@@ -820,7 +832,7 @@ mod tests {
             stop_reason: None,
             usage: None,
             error: None,
-            focus: false,
+            focus: true,
             workspace: None,
         };
         sidebar.apply_summaries(&[summary4]);
@@ -835,7 +847,7 @@ mod tests {
             stop_reason: None,
             usage: None,
             error: None,
-            focus: false,
+            focus: true,
             workspace: None,
         };
         sidebar.apply_summaries(&[summary5]);
@@ -850,7 +862,7 @@ mod tests {
             stop_reason: None,
             usage: None,
             error: None,
-            focus: false,
+            focus: true,
             workspace: None,
         };
         sidebar.apply_summaries(&[summary6]);
@@ -879,5 +891,67 @@ mod tests {
 
         sidebar.set_error_message(None);
         assert!(sidebar.error_message.is_none());
+    }
+
+    #[test]
+    fn only_focus_summaries_become_cards() {
+        let mut sidebar = Sidebar {
+            focus_handle: None,
+            scroll_handle: ScrollHandle::new(),
+            tasks: Vec::new(),
+            selected_task: None,
+            filter: TaskFilter::All,
+            search_query: String::new(),
+            error_message: None,
+        };
+        let summary = |id: &str, focus: bool| SubagentSummary {
+            id: id.into(),
+            name: None,
+            task: "task".into(),
+            status: SubagentStatus::Running,
+            stop_reason: None,
+            usage: None,
+            error: None,
+            focus,
+            workspace: None,
+        };
+
+        sidebar.apply_summaries(&[summary("worker-1", false), summary("focus-1", true)]);
+
+        let ids: Vec<&str> = sidebar.tasks().iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["focus-1"]);
+    }
+
+    #[test]
+    fn focus_summary_workspace_is_carried_into_card() {
+        use std::path::PathBuf;
+
+        let mut sidebar = Sidebar {
+            focus_handle: None,
+            scroll_handle: ScrollHandle::new(),
+            tasks: Vec::new(),
+            selected_task: None,
+            filter: TaskFilter::All,
+            search_query: String::new(),
+            error_message: None,
+        };
+        let summary = SubagentSummary {
+            id: "focus-1".into(),
+            name: None,
+            task: "task".into(),
+            status: SubagentStatus::Running,
+            stop_reason: None,
+            usage: None,
+            error: None,
+            focus: true,
+            workspace: Some(PathBuf::from("/tmp/juto-focus-1")),
+        };
+
+        sidebar.apply_summaries(&[summary]);
+
+        assert_eq!(
+            sidebar.tasks()[0].workspace.as_deref(),
+            Some("/tmp/juto-focus-1")
+        );
     }
 }

@@ -248,7 +248,7 @@ pub struct ChatView {
     model_picker: Entity<ModelPicker>,
     auth_modal: Entity<AuthModal>,
     sidebar: Entity<Sidebar>,
-    vcs_sidebar: Entity<VcsSidebar>,
+    vcs_sidebar: Option<Entity<VcsSidebar>>,
     sidebar_tab: SidebarTab,
     subagents: Arc<juto_runtime::subagents::SubagentManager>,
     show_sidebar: bool,
@@ -308,8 +308,6 @@ impl ChatView {
         let subagent_control = RunControl::new();
         let subagents = runtime.subagent_manager(&subagent_control);
         let sidebar = cx.new(Sidebar::new);
-        let workspace_cwd = session.header().cwd.clone();
-        let vcs_sidebar = cx.new(|cx| VcsSidebar::new(workspace_cwd, tokio_handle.clone(), cx));
         let initial_summaries = subagents.list();
         sidebar.update(cx, |s, cx| {
             s.sync_from_summaries(&initial_summaries, cx);
@@ -361,7 +359,15 @@ impl ChatView {
                 cx.notify();
             }
             SidebarEvent::SelectTask(id) => {
-                this.sidebar.update(cx, |s, cx| s.select_task(id, cx));
+                let workspace = this
+                    .sidebar
+                    .read(cx)
+                    .tasks()
+                    .iter()
+                    .find(|task| &task.id == id)
+                    .and_then(|task| task.workspace.as_deref())
+                    .map(PathBuf::from);
+                this.set_focus_vcs(workspace, cx);
             }
             SidebarEvent::PauseTask(id) => {
                 if let Err(err) = this.subagents.pause(id) {
@@ -407,8 +413,8 @@ impl ChatView {
             model_picker,
             auth_modal,
             sidebar,
-            vcs_sidebar,
-            sidebar_tab: SidebarTab::Vcs,
+            vcs_sidebar: None,
+            sidebar_tab: SidebarTab::Agents,
             subagents,
             show_sidebar: true,
             active_modal: ActiveModal::None,
@@ -628,6 +634,20 @@ impl ChatView {
 
     pub fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.show_sidebar = !self.show_sidebar;
+        cx.notify();
+    }
+
+    /// Scopes the Changes tab to a selected focus thread's workspace. Without a
+    /// workspace the VCS view is dropped and the Agents tab is shown.
+    fn set_focus_vcs(&mut self, workspace: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.vcs_sidebar = workspace.map(|workspace| {
+            cx.new(|cx| VcsSidebar::new(workspace, self.tokio_handle.clone(), cx))
+        });
+        self.sidebar_tab = if self.vcs_sidebar.is_some() {
+            SidebarTab::Vcs
+        } else {
+            SidebarTab::Agents
+        };
         cx.notify();
     }
 
@@ -1800,38 +1820,40 @@ impl Render for ChatView {
                                         .border_b_1()
                                         .border_color(rgb(0x27272a))
                                         .bg(rgb(0x18181b))
-                                        .child(
-                                            div()
-                                                .id("sidebar-tab-vcs")
-                                                .flex_1()
-                                                .py_2()
-                                                .text_center()
-                                                .text_xs()
-                                                .cursor_pointer()
-                                                .border_b_2()
-                                                .border_color(
-                                                    if self.sidebar_tab == SidebarTab::Vcs {
-                                                        rgb(0x60a5fa)
-                                                    } else {
-                                                        rgb(0x00000000)
-                                                    },
-                                                )
-                                                .text_color(
-                                                    if self.sidebar_tab == SidebarTab::Vcs {
-                                                        rgb(0xffffff)
-                                                    } else {
-                                                        rgb(0x9ca3af)
-                                                    },
-                                                )
-                                                .hover(|s| s.bg(rgb(0x27272a)))
-                                                .on_click(cx.listener(
-                                                    |this, _: &ClickEvent, _, cx| {
-                                                        this.sidebar_tab = SidebarTab::Vcs;
-                                                        cx.notify();
-                                                    },
-                                                ))
-                                                .child("Changes"),
-                                        )
+                                        .when(self.vcs_sidebar.is_some(), |row| {
+                                            row.child(
+                                                div()
+                                                    .id("sidebar-tab-vcs")
+                                                    .flex_1()
+                                                    .py_2()
+                                                    .text_center()
+                                                    .text_xs()
+                                                    .cursor_pointer()
+                                                    .border_b_2()
+                                                    .border_color(
+                                                        if self.sidebar_tab == SidebarTab::Vcs {
+                                                            rgb(0x60a5fa)
+                                                        } else {
+                                                            rgb(0x00000000)
+                                                        },
+                                                    )
+                                                    .text_color(
+                                                        if self.sidebar_tab == SidebarTab::Vcs {
+                                                            rgb(0xffffff)
+                                                        } else {
+                                                            rgb(0x9ca3af)
+                                                        },
+                                                    )
+                                                    .hover(|s| s.bg(rgb(0x27272a)))
+                                                    .on_click(cx.listener(
+                                                        |this, _: &ClickEvent, _, cx| {
+                                                            this.sidebar_tab = SidebarTab::Vcs;
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                    .child("Changes"),
+                                            )
+                                        })
                                         .child(
                                             div()
                                                 .id("sidebar-tab-agents")
@@ -1872,7 +1894,9 @@ impl Render for ChatView {
                                         .flex_1()
                                         .min_h_0()
                                         .when(self.sidebar_tab == SidebarTab::Vcs, |view| {
-                                            view.child(self.vcs_sidebar.clone())
+                                            view.when_some(self.vcs_sidebar.clone(), |view, vcs| {
+                                                view.child(vcs)
+                                            })
                                         })
                                         .when(self.sidebar_tab == SidebarTab::Agents, |view| {
                                             view.child(self.sidebar.clone())
