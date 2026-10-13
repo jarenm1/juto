@@ -509,7 +509,7 @@ impl Runtime {
             .then(|| ResourceLimits::default().with_enforce_scope(false));
         let mut registry = tools::builtin_tools_with_limits(&self.inner.cwd, limits)?;
         if can_delegate {
-            register_agent_tools(&mut registry, manager, catalog.clone())?;
+            register_agent_tools(&mut registry, manager, catalog.clone(), depth == 0)?;
         }
         if scope.allows("desktop") {
             tools::register_desktop_tools(
@@ -768,6 +768,13 @@ struct ChildFactory {
     depth: usize,
 }
 
+/// Where an isolated child's workspace is provisioned. Shared by
+/// [`ChildFactory::workspace_path`] and [`ChildFactory::isolated_runtime`] so
+/// the advertised path can never drift from the real one.
+fn workspace_path_for(data_dir: &Path, id: &str) -> PathBuf {
+    data_dir.join("workspaces").join(id)
+}
+
 impl ChildFactory {
     /// Build a child runtime rooted at a fresh native fork of the parent's
     /// current live point, together with the workspace handle that owns the
@@ -781,7 +788,7 @@ impl ChildFactory {
     async fn isolated_runtime(&self, id: &str) -> Result<(Runtime, SubagentWorkspace)> {
         let parent_cwd = self.runtime.inner.cwd.clone();
         let data_dir = self.runtime.inner.data_dir.clone();
-        let child_path = data_dir.join("workspaces").join(id);
+        let child_path = workspace_path_for(&data_dir, id);
         let source = {
             let parent_cwd = parent_cwd.clone();
             tokio::task::spawn_blocking(move || -> Result<String> {
@@ -923,16 +930,23 @@ impl subagents::SubagentFactory for ChildFactory {
             .await
             .map_err(|error| error.to_string())
     }
+
+    fn workspace_path(&self, id: &str, spec: &TaskSpec) -> Option<PathBuf> {
+        spec.isolated_workspace
+            .then(|| workspace_path_for(&self.runtime.inner.data_dir, id))
+    }
 }
 
 fn register_agent_tools(
     registry: &mut ToolRegistry,
     manager: Arc<SubagentManager>,
     catalog: Arc<BTreeMap<String, AgentRole>>,
+    allow_focus: bool,
 ) -> Result<()> {
     registry.register(Arc::new(TaskTool {
         manager: manager.clone(),
         catalog,
+        allow_focus,
     }))?;
     registry.register(Arc::new(WaitTool {
         manager: manager.clone(),
@@ -948,6 +962,8 @@ struct TaskTool {
     manager: Arc<SubagentManager>,
     /// Roles a `task` entry may name, keyed by role name.
     catalog: Arc<BTreeMap<String, AgentRole>>,
+    /// `task` entries may request `focus` only on the main thread.
+    allow_focus: bool,
 }
 #[async_trait]
 impl Tool for TaskTool {
@@ -955,7 +971,7 @@ impl Tool for TaskTool {
         ToolDefinition {
             name: "task".into(),
             description: "Run child agents concurrently. Each child gets an independent durable transcript; optional output_schema validates its JSON result. Set schema_mode to strict (default) to fail on missing or invalid data, or permissive to preserve the result. This call waits for all children. Set agent to a role from the available agents list; omit it for the default task role. A role's tools bound what its child may use, and read_only further restricts a child to read, glob, and grep.".into(),
-            parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"agent":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"schema_mode":{"type":"string","enum":["strict","permissive"]},"read_only":{"type":"boolean"},"isolated_workspace":{"type":"boolean"},"solution_space":{"type":"string"}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false}),
+            parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"agent":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"schema_mode":{"type":"string","enum":["strict","permissive"]},"read_only":{"type":"boolean"},"isolated_workspace":{"type":"boolean"},"focus":{"type":"boolean"},"solution_space":{"type":"string"}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false}),
         }
     }
     fn tier(&self) -> ToolTier {
@@ -1019,6 +1035,10 @@ impl TaskTool {
             }
             Some(_) => return Err("agent must be a string".into()),
         };
+        let focus = value.get("focus").and_then(Value::as_bool).unwrap_or(false);
+        if focus && !self.allow_focus {
+            return Err("focus threads may only be spawned by the main thread".into());
+        }
         Ok(TaskSpec {
             name: value.get("name").and_then(Value::as_str).map(str::to_owned),
             agent,
@@ -1051,6 +1071,7 @@ impl TaskTool {
                 .get("solution_space")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            focus,
         })
     }
 }
@@ -1751,6 +1772,7 @@ mod tests {
         let tool = TaskTool {
             manager: manager.clone(),
             catalog: Arc::new(roles::load(&repo, &data_dir).expect("roles")),
+            allow_focus: false,
         };
         let context = ToolContext {
             cwd: repo.clone(),
@@ -1787,5 +1809,71 @@ mod tests {
             0,
             "rejected batches must start no child"
         );
+    }
+
+    #[tokio::test]
+    async fn task_focus_is_main_thread_only() {
+        struct InstantFactory;
+
+        #[async_trait]
+        impl subagents::SubagentFactory for InstantFactory {
+            async fn run(
+                &self,
+                id: &str,
+                _spec: TaskSpec,
+                _control: RunControl,
+                _events: mpsc::UnboundedSender<AgentEvent>,
+            ) -> Result<SubagentResult, String> {
+                Ok(SubagentResult {
+                    id: id.to_string(),
+                    output: "done".to_string(),
+                    data: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    session_path: PathBuf::from("/tmp/child.jsonl"),
+                })
+            }
+        }
+
+        let context = ToolContext {
+            cwd: PathBuf::from("/repo"),
+            session_id: "test".to_string(),
+            cancel: CancellationToken::new(),
+        };
+        let arguments = json!({"tasks": [{"task": "work", "focus": true}]});
+
+        // Below the main thread, focus tasks are rejected before spawning.
+        let manager = Arc::new(SubagentManager::new(
+            Arc::new(InstantFactory),
+            1,
+            CancellationToken::new(),
+        ));
+        let tool = TaskTool {
+            manager: manager.clone(),
+            catalog: Arc::new(BTreeMap::new()),
+            allow_focus: false,
+        };
+        let error = tool
+            .execute(arguments.clone(), context.clone())
+            .await
+            .expect_err("child threads cannot spawn focus tasks");
+        assert_eq!(
+            error,
+            "focus threads may only be spawned by the main thread"
+        );
+        assert!(manager.list().is_empty(), "rejected batch starts no child");
+
+        // The main thread may spawn them.
+        let tool = TaskTool {
+            manager,
+            catalog: Arc::new(BTreeMap::new()),
+            allow_focus: true,
+        };
+        tool.execute(arguments, context)
+            .await
+            .expect("main thread spawns focus tasks");
+        let summaries = tool.manager.list();
+        assert_eq!(summaries.len(), 1);
+        assert!(summaries[0].focus);
     }
 }

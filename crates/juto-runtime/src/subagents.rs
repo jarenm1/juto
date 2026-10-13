@@ -55,6 +55,14 @@ pub struct TaskSpec {
     /// Open-endedness / problem-solving guidance for the child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub solution_space: Option<String>,
+    /// A focus thread owns one orchestration-started task. It is always
+    /// isolated and may only be spawned by the main thread.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub focus: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Policy for enforcing a task's declared structured-output schema.
@@ -80,6 +88,7 @@ impl TaskSpec {
             read_only: false,
             isolated_workspace: false,
             solution_space: None,
+            focus: false,
         }
     }
 }
@@ -169,6 +178,11 @@ pub struct SubagentSummary {
     pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// `true` for a focus thread that owns one orchestration-started task.
+    pub focus: bool,
+    /// The child's dedicated workspace path, when it runs isolated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<PathBuf>,
 }
 
 /// Errors surfaced by [`SubagentManager`]. Distinct variants preserve the
@@ -233,6 +247,12 @@ pub trait SubagentFactory: Send + Sync {
         control: RunControl,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<SubagentResult, String>;
+
+    /// The child's dedicated workspace path, when it runs isolated. Default
+    /// for factories that never provision workspaces.
+    fn workspace_path(&self, _id: &str, _spec: &TaskSpec) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// Snapshot a child exposes to waiters; the watch channel guarantees every
@@ -246,6 +266,8 @@ pub struct ChildState {
 
 struct Child {
     spec: TaskSpec,
+    focus: bool,
+    workspace: Option<PathBuf>,
     control: RunControl,
     state: watch::Sender<ChildState>,
     status_tx: watch::Sender<SubagentStatus>,
@@ -286,7 +308,13 @@ impl SubagentManager {
 
     /// Queue a child run. Returns the generated child id immediately; the
     /// permit wait, run, and terminal-state publication are asynchronous.
-    pub fn spawn(&self, spec: TaskSpec) -> Result<String, SubagentError> {
+    pub fn spawn(&self, mut spec: TaskSpec) -> Result<String, SubagentError> {
+        if spec.focus {
+            // A focus thread tracks one task through its own VCS view, so it
+            // always needs a dedicated workspace regardless of what the
+            // caller requested.
+            spec.isolated_workspace = true;
+        }
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(SubagentError::NoRuntime);
         }
@@ -306,8 +334,12 @@ impl SubagentManager {
             outcome: None,
         });
         let (status_tx, _) = watch::channel(SubagentStatus::Queued);
+        let focus = spec.focus;
+        let workspace = self.inner.factory.workspace_path(&id, &spec);
         let child = Arc::new(Child {
             spec,
+            focus,
+            workspace,
             control: control.clone(),
             state,
             status_tx,
@@ -406,6 +438,8 @@ impl SubagentManager {
                     status: state.status.clone(),
                     stop_reason,
                     usage,
+                    focus: child.focus,
+                    workspace: child.workspace.clone(),
                     error,
                 }
             })
@@ -895,6 +929,7 @@ mod tests {
             read_only: false,
             isolated_workspace: false,
             solution_space: None,
+            focus: false,
         }
     }
 
@@ -1967,6 +2002,102 @@ mod tests {
         manager.unblock(&id, "sk-secret-token-12345").unwrap();
         let res = manager.wait(&id).await.unwrap();
         assert_eq!(res.output, "authed-with-len:21");
+    }
+
+    /// Factory that records whether the spawned spec requested isolation and
+    /// reports a per-child workspace path, like the runtime's ChildFactory.
+    struct WorkspaceFactory {
+        base: PathBuf,
+        isolated: Arc<parking_lot::Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait]
+    impl SubagentFactory for WorkspaceFactory {
+        async fn run(
+            &self,
+            id: &str,
+            spec: TaskSpec,
+            _control: RunControl,
+            _events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<SubagentResult, String> {
+            Ok(SubagentResult {
+                id: id.to_string(),
+                output: "done".to_string(),
+                data: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                session_path: PathBuf::from("/tmp/child.jsonl"),
+            })
+        }
+
+        fn workspace_path(&self, id: &str, spec: &TaskSpec) -> Option<PathBuf> {
+            self.isolated.lock().push(spec.isolated_workspace);
+            spec.isolated_workspace.then(|| self.base.join(id))
+        }
+    }
+
+    #[tokio::test]
+    async fn focus_spawn_forces_isolation_and_reports_workspace() {
+        let base = PathBuf::from("/data");
+        let isolated = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let factory = Arc::new(WorkspaceFactory {
+            base: base.clone(),
+            isolated: Arc::clone(&isolated),
+        });
+        let manager = manager(factory, 1, CancellationToken::new());
+
+        let mut focus = spec("focus task");
+        focus.focus = true;
+        let id = manager.spawn(focus).unwrap();
+        let summary = manager
+            .list()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .expect("spawned child listed");
+        assert!(summary.focus);
+        assert_eq!(summary.workspace, Some(base.join(&id)));
+
+        // The factory must observe the forced isolation.
+        manager.wait(&id).await.unwrap();
+        assert_eq!(*isolated.lock(), vec![true]);
+
+        // A non-focus spec keeps its declared flags and reports no workspace.
+        let id = manager.spawn(spec("plain task")).unwrap();
+        let summary = manager
+            .list()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .expect("spawned child listed");
+        assert!(!summary.focus);
+        assert_eq!(summary.workspace, None);
+        manager.wait(&id).await.unwrap();
+        assert_eq!(*isolated.lock(), vec![true, false]);
+    }
+
+    #[tokio::test]
+    async fn non_focus_spawn_uses_default_workspace_path() {
+        // A factory that leaves `workspace_path` at its default yields no
+        // workspace in the summary even for isolated specs.
+        let (gate, gate_rx) = gate();
+        let _ = gate.send(true);
+        let running = Arc::new(AtomicUsize::new(0));
+        let manager = manager(
+            gate_factory(gate_rx, running, Arc::new(AtomicUsize::new(0)), false, None),
+            1,
+            CancellationToken::new(),
+        );
+
+        let mut isolated_spec = spec("isolated task");
+        isolated_spec.isolated_workspace = true;
+        let id = manager.spawn(isolated_spec).unwrap();
+        let summary = manager
+            .list()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .expect("spawned child listed");
+        assert!(!summary.focus);
+        assert_eq!(summary.workspace, None);
+        manager.wait(&id).await.unwrap();
     }
 
     #[test]

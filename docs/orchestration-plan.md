@@ -325,6 +325,16 @@ rejected push therefore means a real conflict, never a lost update.
 `workspace_heads` is keyed by absolute workspace path and is machine-local: it is
 never replicated.
 
+### 5.4 Focus Threads *(shipped)*
+
+A focus thread is a subagent that owns exactly one orchestration-started task.
+`TaskSpec.focus` marks it; only the main thread (`depth == 0`) may request it —
+the `task` tool rejects `focus: true` from child threads with "focus threads may
+only be spawned by the main thread". Spawning a focus spec forces
+`isolated_workspace`, since a per-thread VCS view needs its own workspace, and
+`SubagentManager::list` reports `focus` plus the child's `workspace` path so the
+UI can surface the thread's working directory.
+
 ---
 
 ## 6. Future Extensibility: Headless Daemon, Mobile & Automations

@@ -770,6 +770,8 @@ mod tests {
             stop_reason: None,
             usage: None,
             error: None,
+            focus: false,
+            workspace: None,
         };
         sidebar.apply_summaries(&[summary1]);
         assert_eq!(sidebar.tasks().len(), 1);
@@ -784,6 +786,8 @@ mod tests {
             stop_reason: None,
             usage: None,
             error: None,
+            focus: false,
+            workspace: None,
         };
         sidebar.apply_summaries(&[summary2]);
         assert_eq!(sidebar.filter_counts(), (1, 1, 0, 0));
@@ -800,6 +804,8 @@ mod tests {
             stop_reason: None,
             usage: None,
             error: None,
+            focus: false,
+            workspace: None,
         };
         sidebar.apply_summaries(&[summary3]);
         assert_eq!(sidebar.filter_counts(), (1, 0, 1, 0));
@@ -814,6 +820,8 @@ mod tests {
             stop_reason: None,
             usage: None,
             error: None,
+            focus: false,
+            workspace: None,
         };
         sidebar.apply_summaries(&[summary4]);
         assert_eq!(sidebar.filter_counts(), (1, 1, 0, 0));
@@ -827,6 +835,8 @@ mod tests {
             stop_reason: None,
             usage: None,
             error: None,
+            focus: false,
+            workspace: None,
         };
         sidebar.apply_summaries(&[summary5]);
         assert_eq!(sidebar.filter_counts(), (1, 1, 0, 0));
@@ -840,6 +850,8 @@ mod tests {
             stop_reason: None,
             usage: None,
             error: None,
+            focus: false,
+            workspace: None,
         };
         sidebar.apply_summaries(&[summary6]);
         assert_eq!(sidebar.filter_counts(), (1, 0, 0, 1));
