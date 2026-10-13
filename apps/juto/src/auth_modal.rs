@@ -357,12 +357,13 @@ impl AuthModal {
         });
 
         let obs_search = cx.observe(&search_input, |_, _, cx| cx.notify());
-        // Providers surface when the catalog carries chat models for them, so
-        // login can be configured for every transport juto ships.
+        // Providers surface when the catalog carries rows they can serve, so
+        // login can be configured for every transport juto ships. TypeSafe
+        // ships only judge-kind rows, so judge rows count too.
         let supported: BTreeSet<&str> = runtime
             .catalog()
             .iter()
-            .filter(|model| matches!(model.kind.as_str(), "chat" | "tiny"))
+            .filter(|model| matches!(model.kind.as_str(), "chat" | "tiny" | "judge"))
             .map(|model| model.provider.as_str())
             .collect();
         let providers = PROVIDERS
