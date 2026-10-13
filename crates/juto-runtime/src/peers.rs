@@ -1,6 +1,6 @@
 //! In-process peer messaging and transcript lookup for subagent URIs.
 //!
-//! `agent://<id>` addresses one child, `agent://all` broadcasts to all live
+//! `agent://<id>` addresses one child, `agent://{a, b, c}` addresses a list of
 //! children, and `history://<id>` reads a completed child's active session
 //! journal. User-supplied URIs never become filesystem paths; history resolves
 //! the journal path from the manager's completed result.
@@ -48,12 +48,12 @@ pub struct PeerAgentSnapshot {
     pub result: Option<SubagentResult>,
 }
 
-/// Outcome of a message sent through `agent://<id>` or `agent://all`.
+/// Outcome of a message sent through `agent://<id>`, `agent://{...}`, or `agent://main`.
 #[derive(Debug, Clone, Default)]
 pub struct PeerSendReport {
     /// Recipients that accepted the message: child IDs, or `main` for the main inbox.
     pub sent: Vec<String>,
-    /// Per-child failures. A broadcast continues when one child is terminal.
+    /// Per-child failures. A list send continues when one child is rejected.
     pub failed: Vec<PeerSendFailure>,
 }
 
@@ -107,9 +107,10 @@ impl PeerBus {
         }
     }
 
-    /// Send a steering message to one child, every currently live child, or
-    /// the main inbox. Broadcast failures are returned per recipient, so a
-    /// terminal child does not prevent delivery to other children.
+    /// Send a message to one child, a list of children, or the main inbox. A
+    /// queued or running child receives a steer, a completed child starts a new
+    /// turn, and a failed or cancelled child is reported as failed. A list send
+    /// continues past each failure.
     pub fn send(&self, uri: &str, message: impl Into<String>) -> Result<PeerSendReport, PeerError> {
         let target = parse_uri(uri)?;
         let message = message.into();
@@ -129,13 +130,7 @@ impl PeerBus {
                 });
             }
             PeerTarget::Agent(id) => vec![id],
-            PeerTarget::All => self
-                .subagents
-                .list()
-                .into_iter()
-                .filter(|child| !child.status.is_terminal())
-                .map(|child| child.id)
-                .collect(),
+            PeerTarget::Children(ids) => ids,
             PeerTarget::History(_) => return Err(PeerError::ReadOnly(uri.to_string())),
         };
         let mut report = PeerSendReport::default();
@@ -148,19 +143,17 @@ impl PeerBus {
         Ok(report)
     }
 
-    /// Read a child's current status/output, all child snapshots, or the active
-    /// journal entries of a successfully completed child.
+    /// Read a child's current status/output, a list of child snapshots, or the
+    /// active journal entries of a successfully completed child.
     pub fn read(&self, uri: &str) -> Result<PeerResource, PeerError> {
         match parse_uri(uri)? {
             PeerTarget::Agent(agent_id) => {
                 Ok(PeerResource::Agent(Box::new(self.snapshot(&agent_id)?)))
             }
-            PeerTarget::All => {
-                let snapshots = self
-                    .subagents
-                    .list()
-                    .into_iter()
-                    .map(|summary| self.snapshot_from_summary(summary))
+            PeerTarget::Children(ids) => {
+                let snapshots = ids
+                    .iter()
+                    .map(|id| self.snapshot(id))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(PeerResource::Agents(snapshots))
             }
@@ -210,28 +203,50 @@ impl PeerBus {
 enum PeerTarget {
     Main,
     Agent(String),
-    All,
+    Children(Vec<String>),
     History(String),
 }
 
 fn parse_uri(uri: &str) -> Result<PeerTarget, PeerError> {
     let invalid = || PeerError::InvalidUri(uri.to_string());
-    let (scheme, agent_id) = uri.split_once("://").ok_or_else(invalid)?;
-    if agent_id.is_empty()
-        || agent_id.trim() != agent_id
-        || agent_id
-            .chars()
-            .any(|character| matches!(character, '/' | '?' | '#'))
-    {
-        return Err(invalid());
-    }
+    let (scheme, target) = uri.split_once("://").ok_or_else(invalid)?;
     match scheme {
-        "agent" if agent_id == "main" => Ok(PeerTarget::Main),
-        "agent" if agent_id == "all" => Ok(PeerTarget::All),
-        "agent" => Ok(PeerTarget::Agent(agent_id.to_string())),
-        "history" => Ok(PeerTarget::History(agent_id.to_string())),
+        "agent" if target == MAIN_RECIPIENT => Ok(PeerTarget::Main),
+        "agent" if target.starts_with('{') => parse_child_list(target)
+            .map(PeerTarget::Children)
+            .ok_or_else(invalid),
+        "agent" => parse_id(target).map(PeerTarget::Agent).ok_or_else(invalid),
+        "history" => parse_id(target)
+            .map(PeerTarget::History)
+            .ok_or_else(invalid),
         _ => Err(invalid()),
     }
+}
+
+/// Parses `{a, b, c}` into distinct child ids in first-seen order. Main is not
+/// a child, so `{main}` is rejected; address the inbox as `agent://main`.
+fn parse_child_list(target: &str) -> Option<Vec<String>> {
+    let inner = target.strip_prefix('{')?.strip_suffix('}')?;
+    let mut ids: Vec<String> = Vec::new();
+    for part in inner.split(',') {
+        let id = parse_id(part.trim())?;
+        if id == MAIN_RECIPIENT {
+            return None;
+        }
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    (!ids.is_empty()).then_some(ids)
+}
+
+fn parse_id(id: &str) -> Option<String> {
+    let valid = !id.is_empty()
+        && id.trim() == id
+        && !id
+            .chars()
+            .any(|c| matches!(c, '/' | '?' | '#' | '{' | '}' | ','));
+    valid.then(|| id.to_string())
 }
 
 #[cfg(test)]
@@ -331,7 +346,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_all_sends_only_to_live_agents() {
+    async fn agent_list_sends_to_each_named_child_and_reports_failures() {
         let temp = tempfile::tempdir().unwrap();
         let manager = manager(temp.path());
         let finished = manager
@@ -347,9 +362,15 @@ mod tests {
         }
         let bus = PeerBus::new(Arc::clone(&manager));
 
-        let report = bus.send("agent://all", "review this edge case").unwrap();
-        assert_eq!(report.sent, [active]);
-        assert!(report.failed.is_empty());
+        let uri = format!("agent://{{{active}, {finished}, missing, {active}}}");
+        let report = bus.send(&uri, "review this edge case").unwrap();
+        assert_eq!(report.sent, [active, finished]);
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.failed[0].agent_id, "missing");
+        assert_eq!(
+            report.failed[0].error,
+            SubagentError::Unknown("missing".into())
+        );
         manager.cancel_all();
     }
     #[tokio::test]
@@ -444,7 +465,19 @@ mod tests {
             Err(PeerError::InvalidUri(_))
         ));
         assert!(matches!(
-            bus.read("agent://all/extra"),
+            bus.read("agent://{a, b}/extra"),
+            Err(PeerError::InvalidUri(_))
+        ));
+        assert!(matches!(
+            bus.read("agent://{}"),
+            Err(PeerError::InvalidUri(_))
+        ));
+        assert!(matches!(
+            bus.send("agent://{a,,b}", "hi"),
+            Err(PeerError::InvalidUri(_))
+        ));
+        assert!(matches!(
+            bus.send("agent://{main}", "hi"),
             Err(PeerError::InvalidUri(_))
         ));
         assert!(matches!(
@@ -506,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn broadcast_does_not_reach_main_inbox() {
+    async fn list_send_does_not_reach_main_inbox() {
         let temp = tempfile::tempdir().unwrap();
         let manager = manager(temp.path());
         let id = manager
@@ -514,7 +547,7 @@ mod tests {
             .unwrap();
         let bus = PeerBus::new(manager.clone());
 
-        let report = bus.send("agent://all", "status?").unwrap();
+        let report = bus.send(&format!("agent://{{{id}}}"), "status?").unwrap();
         assert_eq!(report.sent, vec![id.clone()]);
         assert!(manager.main_inbox().drain().is_empty());
 

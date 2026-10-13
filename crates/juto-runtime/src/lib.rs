@@ -1105,10 +1105,7 @@ fn register_agent_tools(
     registry.register(Arc::new(WaitTool {
         manager: manager.clone(),
     }))?;
-    registry.register(Arc::new(SendTool {
-        manager: manager.clone(),
-        peers,
-    }))?;
+    registry.register(Arc::new(SendTool { peers }))?;
     if main {
         registry.register(Arc::new(InboxTool {
             inbox: manager.main_inbox(),
@@ -1282,7 +1279,6 @@ async fn collect_agents(manager: &SubagentManager, ids: Vec<String>) -> Result<T
     })
 }
 struct SendTool {
-    manager: Arc<SubagentManager>,
     peers: PeerBus,
 }
 #[async_trait]
@@ -1290,29 +1286,40 @@ impl Tool for SendTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "agent_send".into(),
-            description: "Message a child agent by id. A queued or running child receives it as a steer. A completed child starts a new turn with it as the prompt. Failed or cancelled children reject it. Use id `agent://main` to send a message to the main agent's inbox.".into(),
-            parameters: json!({"type":"object","properties":{"id":{"type":"string"},"message":{"type":"string"}},"required":["id","message"],"additionalProperties":false}),
+            description: "Message child agents. `to` is one child id, a list such as `{id1, id2}`, or `agent://main` for the main agent's inbox. A queued or running child receives the message as a steer. A completed child starts a new turn with it as the prompt. Failed or cancelled children are reported as failed, and a list send still delivers to the rest.".into(),
+            parameters: json!({"type":"object","properties":{"to":{"type":"string"},"message":{"type":"string"}},"required":["to","message"],"additionalProperties":false}),
         }
     }
     fn tier(&self) -> ToolTier {
         ToolTier::Write
     }
     async fn execute(&self, arguments: Value, _ctx: ToolContext) -> Result<ToolOutput, String> {
-        let id = arguments["id"].as_str().ok_or("id required")?;
+        let to = arguments["to"].as_str().ok_or("to required")?;
         let message = arguments["message"]
             .as_str()
             .ok_or("message required")?
             .to_owned();
-        if id == crate::peers::MAIN_URI {
-            self.peers
-                .send(id, message)
-                .map_err(|error| error.to_string())?;
-            return Ok(ToolOutput::text("Message queued for the main agent."));
-        }
-        self.manager
-            .send(id, message)
+        let uri = if to.contains("://") {
+            to.to_owned()
+        } else {
+            format!("agent://{to}")
+        };
+        let report = self
+            .peers
+            .send(&uri, message)
             .map_err(|error| error.to_string())?;
-        Ok(ToolOutput::text("Steering message queued."))
+        let failed: Vec<Value> = report
+            .failed
+            .iter()
+            .map(|failure| json!({"id": failure.agent_id, "error": failure.error.to_string()}))
+            .collect();
+        let value = json!({"sent": report.sent, "failed": failed});
+        let text = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text { text }],
+            details: value,
+            is_error: !report.failed.is_empty(),
+        })
     }
 }
 struct InboxTool {

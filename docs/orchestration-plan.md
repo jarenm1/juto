@@ -180,8 +180,8 @@ Subagents coordinate as specialized coworkers rather than an uncontrolled group 
   * Peer communication uses an internal URI/bus pattern (`agent://<id>`, `history://<id>`).
     A reviewer can directly inspect `history://<builder-id>` to see why a decision was
     made without re-running the builder's analysis.
-  * `agent://<id>` reads status/output and sends steering messages; `agent://all` broadcasts
-    to live children and reports per-child failures.
+  * `agent://<id>` reads status/output and sends steering messages; `agent://{a, b, c}`
+    addresses an explicit child list and reports per-child failures.
   * `history://<id>` reads the active journal entries for a successfully completed child.
     The URI resolves through the subagent result; it is never treated as a filesystem path.
 
@@ -540,11 +540,10 @@ implemented by a dedicated subagent concurrently, and validates against its own 
   ```
 * **Implementation Details**:
   - `agent://<id>` exposes a child status/result snapshot and accepts steering messages.
-  - `agent://all` broadcasts to live children; individual failures do not stop delivery.
+  - `agent://{a, b, c}` sends to each listed child, including completed ones (which start a new turn). Duplicates collapse, `main` is rejected, and a per-child failure does not stop delivery to the rest. `agent_send` takes the same forms in its `to` field.
   - `agent://main` is write-only: child messages land in the main inbox with the
     child id as `from` (`unknown` when sent from the main thread). Reads fail with
-    `PeerError::WriteOnly`. `agent://all` never reaches main.
+    `PeerError::WriteOnly`. A child list never reaches main.
   - `history://<id>` reads a completed child's active session journal via the manager's
     result path; unsupported, malformed, unknown, and unavailable resources fail explicitly.
-* **Acceptance**: Tests cover completed output and transcript reads, active-child broadcast
-  selection, malformed/read-only URIs, and history availability before completion.
+* **Acceptance**: Tests cover completed output and transcript reads, child-list sends with per-child failures, malformed and read-only URIs (including `{}`, `{main}`, and a list with a suffix), and history availability before completion.
