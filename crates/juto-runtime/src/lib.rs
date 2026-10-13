@@ -34,8 +34,8 @@ use juto_agent::{
 };
 use juto_ai::{
     ContentBlock, Context, CredentialStore, HttpProvider, Judge, Message, Provider, ProviderEvent,
-    StopReason, StreamOptions, ToolCall, ToolDefinition, Usage, create_judge, judge_for_model,
-    supports_judge_model,
+    StopReason, StreamOptions, TextJudge, ToolCall, ToolDefinition, Usage, create_judge,
+    judge_for_model, judge_role_accepts, supports_judge_model,
 };
 use juto_catalog::{Model, Registry};
 pub use juto_desktop::protocol;
@@ -287,8 +287,12 @@ impl Runtime {
         let (resolved, _) = updated.resolve_selector(selector)?;
         let model = self.inner.registry.resolve(&resolved)?.clone();
         if role == "judge" {
-            if !supports_judge_model(&model) {
-                bail!("{} is not a TypeSafe judge model", model.id);
+            if !judge_role_accepts(&model) {
+                bail!(
+                    "{} is a {} model, not a judge or chat model",
+                    model.id,
+                    model.kind
+                );
             }
         } else if model.kind != "chat" && model.kind != "tiny" {
             bail!("{} is a {} model, not a chat model", model.id, model.kind);
@@ -299,8 +303,9 @@ impl Runtime {
     }
 
     /// Judge for the `judge` role. Without a `judge` binding, falls back to
-    /// credential-based selection ([`create_judge`]); a bound model builds its
-    /// judge through [`judge_for_model`].
+    /// credential-based selection ([`create_judge`]). A TypeSafe judge-kind model
+    /// builds its judge through [`judge_for_model`]; a chat or tiny model judges
+    /// through the runtime's HTTP provider via [`TextJudge`].
     pub async fn judge(&self) -> Result<Arc<dyn Judge>> {
         let config = self.config();
         if !config.model_roles.contains_key("judge") {
@@ -308,7 +313,13 @@ impl Runtime {
         }
         let (selector, _) = config.resolve_selector("@judge")?;
         let model = self.inner.registry.resolve(&selector)?.clone();
-        Ok(judge_for_model(&self.inner.credentials, &model).await?)
+        if supports_judge_model(&model) {
+            return Ok(judge_for_model(&self.inner.credentials, &model).await?);
+        }
+        if !judge_role_accepts(&model) {
+            bail!("{} cannot serve the judge role", model.id);
+        }
+        Ok(Arc::new(TextJudge::new(self.inner.provider.clone(), model)))
     }
 
     /// Merge one role binding into `data_dir/config.yml` without disturbing

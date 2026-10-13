@@ -107,9 +107,9 @@ fn judge_role_accepts_typesafe_judge_models() {
 }
 
 #[test]
-fn judge_and_chat_roles_reject_each_others_models() {
+fn default_role_rejects_judge_only_models_and_judge_role_accepts_chat_models() {
     let dir = tempfile::tempdir().unwrap();
-    let (runtime, _data_dir) = runtime_in(&dir);
+    let (runtime, data_dir) = runtime_in(&dir);
 
     assert!(
         runtime
@@ -117,12 +117,48 @@ fn judge_and_chat_roles_reject_each_others_models() {
             .is_err(),
         "a judge-only model must not bind the chat default"
     );
-    assert!(
-        runtime.set_model_role("judge", "openai/gpt-4o").is_err(),
-        "a chat model must not bind the judge role"
-    );
+    runtime
+        .set_model_role("judge", "openai/gpt-4o")
+        .expect("a chat model may serve the judge role");
 
+    let text = std::fs::read_to_string(data_dir.join("config.yml")).unwrap();
+    assert!(
+        text.contains("judge: openai/gpt-4o"),
+        "config.yml must record modelRoles.judge, got:\n{text}"
+    );
     let config = runtime.config();
     assert_eq!(config.model, "anthropic/claude-sonnet-4-5");
-    assert!(!config.model_roles.contains_key("judge"));
+    assert_eq!(config.model_roles["judge"], "openai/gpt-4o");
+}
+
+#[tokio::test]
+async fn judge_bound_to_chat_model_builds_a_text_judge() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, _data_dir) = runtime_in(&dir);
+
+    runtime
+        .set_model_role("judge", "openai/gpt-4o")
+        .expect("assign @judge to a chat model");
+    assert!(
+        runtime.judge().await.is_ok(),
+        "a chat model bound to the judge role must build a judge"
+    );
+}
+
+#[tokio::test]
+async fn judge_bound_to_typesafe_model_without_credentials_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, _data_dir) = runtime_in(&dir);
+
+    runtime
+        .set_model_role("judge", "typesafe/jev-preview")
+        .expect("assign @judge to a TypeSafe judge model");
+    let message = match runtime.judge().await {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a TypeSafe judge without credentials must not build"),
+    };
+    assert!(
+        message.contains("no TypeSafe credentials for judge model"),
+        "unexpected error: {message}"
+    );
 }
