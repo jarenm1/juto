@@ -17,7 +17,7 @@ use gpui::{
     App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
     prelude::*, px, size,
 };
-use juto_runtime::{Runtime, RuntimeConfig, Session, default_data_dir};
+use juto_runtime::{ChannelApprovalHandler, Runtime, RuntimeConfig, Session, default_data_dir};
 
 actions!(juto, [Quit]);
 
@@ -123,13 +123,15 @@ fn run() -> ExitCode {
     if config.model.trim().is_empty() {
         config.model = "anthropic/claude-sonnet-4-5".into();
     }
-    let runtime = match Runtime::from_config(&cwd, &data_dir, config) {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            eprintln!("error: failed to initialize agent runtime: {err}");
-            return ExitCode::from(1);
-        }
-    };
+    let (approval_handler, approval_requests) = ChannelApprovalHandler::channel();
+    let runtime =
+        match Runtime::from_config_with_approval(&cwd, &data_dir, config, Some(approval_handler)) {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                eprintln!("error: failed to initialize agent runtime: {err}");
+                return ExitCode::from(1);
+            }
+        };
     let session = match session_path {
         Some(path) => match Session::open(&path) {
             Ok(session) => session,
@@ -181,8 +183,16 @@ fn run() -> ExitCode {
                 ..Default::default()
             },
             |window, cx| {
-                let chat =
-                    cx.new(|cx| chat::ChatView::new(runtime, session, tokio_handle, window, cx));
+                let chat = cx.new(|cx| {
+                    chat::ChatView::new(
+                        runtime,
+                        session,
+                        tokio_handle,
+                        approval_requests,
+                        window,
+                        cx,
+                    )
+                });
                 if let Some(argv) = desktop_argv.clone() {
                     chat.update(cx, |chat, cx| {
                         chat.open_desktop_command(argv, window, cx);

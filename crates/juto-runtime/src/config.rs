@@ -54,9 +54,9 @@ pub enum ApprovalMode {
     /// Write and Exec tier tools are denied outright.
     ReadOnly,
     /// Ask the host before Write/Exec.
-    #[default]
     Ask,
-    /// Explicit user opt-in: run everything without prompting.
+    /// Run everything without prompting. Default: full permission.
+    #[default]
     Allow,
 }
 
@@ -136,7 +136,7 @@ impl Default for RuntimeConfig {
             thinking: None,
             temperature: None,
             max_tokens: None,
-            approval_mode: ApprovalMode::Ask,
+            approval_mode: ApprovalMode::Allow,
             max_concurrency: default_max_concurrency(),
             max_recursion_depth: default_recursion_depth(),
             max_turns: None,
@@ -379,7 +379,7 @@ mod tests {
     #[test]
     fn defaults_are_source_shaped() {
         let cfg = RuntimeConfig::default();
-        assert_eq!(cfg.approval_mode, ApprovalMode::Ask);
+        assert_eq!(cfg.approval_mode, ApprovalMode::Allow);
         assert!(cfg.max_concurrency > 0);
         assert!((0.0..=1.0).contains(&cfg.compaction_threshold));
         assert!(cfg.approval_mode.permits(juto_agent::ToolTier::Read));

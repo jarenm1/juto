@@ -1,6 +1,7 @@
 //! Headless session orchestration. The agent loop and provider layer have no UI dependency.
 //! Behavioral reference: oh-my-pi 579da1d6; upstream attribution is in licenses/OMP-MIT.txt.
 
+pub mod approval;
 pub mod change_graph;
 pub mod config;
 pub mod context;
@@ -75,6 +76,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+pub use approval::{ApprovalRequest, ChannelApprovalHandler};
 pub use config::{ApprovalMode, RuntimeConfig};
 pub use desktop_artifact::{DesktopArtifactResolver, ResolveError, ViewerRoute};
 pub use peers::{
@@ -149,11 +151,22 @@ impl Runtime {
         data_dir: impl AsRef<Path>,
         config: RuntimeConfig,
     ) -> Result<Self> {
+        Self::from_config_with_approval(cwd, data_dir, config, None)
+    }
+
+    /// Like [`Runtime::from_config`], with the host's answer channel for
+    /// Write/Exec tool approvals. `None` makes `ApprovalMode::Ask` fail closed.
+    pub fn from_config_with_approval(
+        cwd: impl AsRef<Path>,
+        data_dir: impl AsRef<Path>,
+        config: RuntimeConfig,
+        approval: Option<Arc<dyn ApprovalHandler>>,
+    ) -> Result<Self> {
         let data_dir = data_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&data_dir)?;
         let credentials = Arc::new(CredentialStore::open(data_dir.join("credentials.json"))?);
         let provider = Arc::new(HttpProvider::new(credentials.clone())?);
-        Self::with_provider(cwd, data_dir, config, credentials, provider, None)
+        Self::with_provider(cwd, data_dir, config, credentials, provider, approval)
     }
 
     pub fn with_provider(
