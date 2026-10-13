@@ -377,9 +377,17 @@ flow and clears the key input. Removing a stored credential does not unset an
 environment variable, so an environment credential can keep a provider connected.
 The provider list and login details scroll independently in compact windows.
 
-The model picker (Ctrl-M) and `juto-cli models` show only chat models with an
-implemented transport and a stored or nonempty environment credential for
-their provider.
+TypeSafe (`TYPESAFE_API_KEY`) is a judge-only provider. `typesafe/jev-latest` and
+`typesafe/jev-preview` (wire ids `jev-latest` and `jev-preview`) call
+`POST /v1/systemone`, a classifier that picks one of the caller's discrete options.
+They bind only to `@judge`: `set_model_role` rejects them for chat roles and rejects
+chat models for `judge`. Verified by the wire contract in TypeSafe's OpenAPI example,
+runtime role tests, and a picker unit test. Not verified: a live TypeSafe call (no key
+was available), and the picker's native-window rendering.
+
+The model picker (Ctrl-M) shows chat models for chat roles and TypeSafe judge models
+only for the `judge` role, each limited to providers with a stored or nonempty
+environment credential. `juto-cli models` was not changed by this work.
 local models are not included in this connected-only view; explicit CLI/session
 model selectors remain available. With no connections, the picker offers
 **Manage providers…** rather than fabricated fallback models.

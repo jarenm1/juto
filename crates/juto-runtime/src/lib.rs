@@ -33,8 +33,9 @@ use juto_agent::{
     ToolOutput, ToolRegistry, ToolTier,
 };
 use juto_ai::{
-    ContentBlock, Context, CredentialStore, HttpProvider, Message, Provider, ProviderEvent,
-    StopReason, StreamOptions, ToolCall, ToolDefinition, Usage,
+    ContentBlock, Context, CredentialStore, HttpProvider, Judge, Message, Provider, ProviderEvent,
+    StopReason, StreamOptions, ToolCall, ToolDefinition, Usage, create_judge, judge_for_model,
+    supports_judge_model,
 };
 use juto_catalog::{Model, Registry};
 pub use juto_desktop::protocol;
@@ -285,12 +286,29 @@ impl Runtime {
         // under the would-be config so a bad binding never hits disk.
         let (resolved, _) = updated.resolve_selector(selector)?;
         let model = self.inner.registry.resolve(&resolved)?.clone();
-        if model.kind != "chat" && model.kind != "tiny" {
+        if role == "judge" {
+            if !supports_judge_model(&model) {
+                bail!("{} is not a TypeSafe judge model", model.id);
+            }
+        } else if model.kind != "chat" && model.kind != "tiny" {
             bail!("{} is a {} model, not a chat model", model.id, model.kind);
         }
         self.persist_model_role(role, selector)?;
         *self.inner.config.write() = updated;
         Ok(())
+    }
+
+    /// Judge for the `judge` role. Without a `judge` binding, falls back to
+    /// credential-based selection ([`create_judge`]); a bound model builds its
+    /// judge through [`judge_for_model`].
+    pub async fn judge(&self) -> Result<Arc<dyn Judge>> {
+        let config = self.config();
+        if !config.model_roles.contains_key("judge") {
+            return Ok(create_judge(&self.inner.credentials, None).await?);
+        }
+        let (selector, _) = config.resolve_selector("@judge")?;
+        let model = self.inner.registry.resolve(&selector)?.clone();
+        Ok(judge_for_model(&self.inner.credentials, &model).await?)
     }
 
     /// Merge one role binding into `data_dir/config.yml` without disturbing

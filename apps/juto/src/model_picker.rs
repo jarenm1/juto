@@ -8,7 +8,7 @@ use gpui::{
     SharedString, Subscription, Task, UniformListScrollHandle, Window, actions, div, prelude::*,
     px, rgb, uniform_list,
 };
-use juto_ai::HttpProvider;
+use juto_ai::{HttpProvider, supports_judge_model};
 use juto_catalog::{Model, Registry};
 use juto_runtime::{Runtime, RuntimeConfig};
 
@@ -40,6 +40,7 @@ struct ModelEntry {
     context: SharedString,
     roles: Vec<String>,
     search: String,
+    judge: bool,
 }
 
 impl ModelEntry {
@@ -61,6 +62,7 @@ impl ModelEntry {
             name: name.into(),
             context: context.into(),
             roles: Vec::new(),
+            judge: model.kind == "judge",
             search,
         }
     }
@@ -105,6 +107,7 @@ struct PickerData {
     available: BTreeSet<String>,
     filtered: Vec<usize>,
     query: Option<String>,
+    judge_role: bool,
 }
 
 impl PickerData {
@@ -146,10 +149,11 @@ impl PickerData {
         let mut models = registry
             .iter()
             .filter(|model| {
-                // Every catalog model whose wire transport juto implements is
-                // pickable once its provider is connected.
-                matches!(model.kind.as_str(), "chat" | "tiny")
-                    && HttpProvider::supports_model(model)
+                // Chat and tiny models are pickable for chat roles; TypeSafe judge
+                // models only for the judge role (see `set_judge_role`).
+                supports_judge_model(model)
+                    || (matches!(model.kind.as_str(), "chat" | "tiny")
+                        && HttpProvider::supports_model(model))
             })
             .map(ModelEntry::from_catalog)
             .collect::<Vec<_>>();
@@ -172,6 +176,7 @@ impl PickerData {
             available: BTreeSet::new(),
             filtered: Vec::new(),
             query: None,
+            judge_role: false,
         }
     }
 
@@ -216,12 +221,21 @@ impl PickerData {
             .iter()
             .enumerate()
             .filter(|(_, model)| {
-                self.connected.contains(&model.provider) && model.search.contains(&query)
+                model.judge == self.judge_role
+                    && self.connected.contains(&model.provider)
+                    && model.search.contains(&query)
             })
             .map(|(index, _)| index)
             .collect();
         self.query = Some(query);
         true
+    }
+
+    /// Switch between chat and judge scopes and re-filter with the current query.
+    fn set_judge_role(&mut self, judge_role: bool, query: &str) {
+        self.judge_role = judge_role;
+        self.query = None;
+        self.filter(query);
     }
 }
 
@@ -596,6 +610,11 @@ impl ModelPicker {
                         .hover(|style| style.bg(rgb(0x232c44)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.assign_role = role_name.clone();
+                            let judge = this.assign_role == "judge";
+                            this.data
+                                .set_judge_role(judge, this.search_input.read(cx).text());
+                            this.selected = 0;
+                            this.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
                             this.error = None;
                             cx.notify();
                         }))
@@ -930,5 +949,25 @@ mod tests {
         assert!(data.available.is_empty());
         data.connect(BTreeSet::from(["devin".into()]), "");
         assert_eq!(data.available, BTreeSet::from(["devin/swe-1-6".into()]));
+    }
+
+    #[test]
+    fn typesafe_judge_models_are_offered_only_for_the_judge_role() {
+        let mut registry = Registry::empty();
+        let judge = Registry::bundled()
+            .unwrap()
+            .get("typesafe", "jev-preview")
+            .unwrap()
+            .clone();
+        registry.upsert(judge);
+        let mut data = PickerData::new(&RuntimeConfig::default(), &registry);
+        data.connect(BTreeSet::from(["typesafe".into()]), "");
+        assert!(data.filtered.is_empty());
+        data.set_judge_role(true, "");
+        assert_eq!(data.filtered.len(), 1);
+        assert_eq!(
+            data.models[data.filtered[0]].selector,
+            "typesafe/jev-preview"
+        );
     }
 }

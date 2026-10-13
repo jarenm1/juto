@@ -134,6 +134,21 @@ impl Registry {
                     .push(model);
             }
         }
+        // TypeSafe System One preview alias. The bundled snapshot predates it;
+        // metadata from jev-api.com/models/jev-preview.
+        let preview = serde_json::json!({
+            "id": "jev-preview",
+            "name": "TypeSafe jev preview",
+            "api": "typesafe",
+            "provider": "typesafe",
+            "baseUrl": "https://api.typesafe.ai",
+            "kind": "judge",
+            "input": ["text"],
+            "cost": {"input": 0.084, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+            "contextWindow": 64000,
+            "supportsTools": false
+        });
+        registry.upsert(serde_json::from_value(preview).expect("static jev-preview row"));
         Ok(registry)
     }
 

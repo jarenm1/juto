@@ -22,7 +22,7 @@ use crate::{
 
 pub const DEFAULT_TYPESAFE_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 pub const DEFAULT_OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/decisions";
-pub const DEFAULT_TYPESAFE_MODEL: &str = "typesafe/jev-latest";
+pub const DEFAULT_TYPESAFE_MODEL: &str = "jev-latest";
 pub const DEFAULT_OPENROUTER_MODEL: &str = "openrouter/~typesafe/jev-latest";
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -352,6 +352,49 @@ pub async fn create_judge(
         "no TypeSafe or OpenRouter credentials found and no fallback completion model provided"
             .to_string(),
     ))
+}
+
+/// Catalog provider whose judge-kind rows [`judge_for_model`] serves.
+const TYPESAFE_PROVIDER: &str = "typesafe";
+
+/// Whether `model` is a judge-kind row served by the TypeSafe System One transport.
+/// Other judge-kind rows (e.g. `opencode-zen` `jev-1.13`) are catalog metadata only.
+pub fn supports_judge_model(model: &Model) -> bool {
+    model.kind == "judge" && model.api == "typesafe" && model.provider == TYPESAFE_PROVIDER
+}
+
+/// Build the [`Judge`] for a model accepted by [`supports_judge_model`]. The catalog
+/// model id is sent as the wire `model` selector.
+pub async fn judge_for_model(
+    credentials: &CredentialStore,
+    model: &Model,
+) -> Result<Arc<dyn Judge>, JudgeError> {
+    if !supports_judge_model(model) {
+        return Err(JudgeError::Protocol(format!(
+            "{}/{} is not a supported judge model",
+            model.provider, model.id
+        )));
+    }
+    match credentials.resolve_provider(TYPESAFE_PROVIDER).await {
+        Ok(Some(cred)) => {
+            let secret = cred.expose_secret();
+            if !secret.trim().is_empty() {
+                return Ok(Arc::new(
+                    TypeSafeJudge::new(secret).with_model(model.id.clone()),
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            return Err(JudgeError::Authentication(format!(
+                "failed to resolve TypeSafe credentials: {err}"
+            )));
+        }
+    }
+    Err(JudgeError::Authentication(format!(
+        "no TypeSafe credentials for judge model {}",
+        model.id
+    )))
 }
 
 fn validate_options(options: &[Choice]) -> Result<(), JudgeError> {
@@ -755,7 +798,7 @@ mod tests {
         let req_text = &recorded[0];
         assert!(req_text.contains("authorization: Bearer sk-typesafe-test-123"));
         assert!(req_text.contains("content-type: application/json"));
-        assert!(req_text.contains("typesafe/jev-latest"));
+        assert!(req_text.contains("\"model\":\"jev-latest\""));
     }
 
     #[tokio::test]
