@@ -446,8 +446,8 @@ The composer features a modern card with an input field and bottom toolbar row:
 a circular **+** button opens a menu to attach **Files…** through the native file
 dialog. Selected attachments appear as removable chips (`×`). Messages can be sent
 with text, attachments, or attachments alone. The composer supports cursor movement,
-selection, Backspace/Delete, clipboard copy/cut/paste, and horizontal scrolling for
-long drafts. Sent messages wrap naturally.
+selection, Backspace/Delete, clipboard copy/cut/paste. Long drafts wrap onto new rows; the
+composer grows to eight rows, then scrolls vertically. Sent messages wrap naturally.
 
 The UI is styled with neutral grays throughout—including backgrounds, borders,
 hover states, focus borders, caret, selection, and active/disabled button states.
@@ -632,7 +632,7 @@ Observed for the agent-wired chat view: locked application build; 15 unit tests
 passing in `juto` (116 across workspace); Clippy with warnings denied; native typing,
 Enter and Send submission, empty/whitespace rejection, attachment dropdown (+),
 attached file chips, message with attachment submission, attachment-only submission,
-chip removal (×), copy/cut/paste, long-input scrolling, wrapped messages, history
+chip removal (×), copy/cut/paste, multi-line draft wrapping with vertical scrolling past eight rows, wrapped messages, history
 scrolling, streaming assistant responses, durable append-only JSONL session creation
 and persistence, existing session loading via `--session`, model selection via `--model`,
 mounting and rendering of `DesktopSessionArtifact` remote-sharing cards, explicit
