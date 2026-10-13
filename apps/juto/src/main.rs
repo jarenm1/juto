@@ -4,6 +4,7 @@ mod auth_modal;
 mod chat;
 mod chat_input;
 mod desktop_viewer;
+mod focus_view;
 mod model_picker;
 mod sidebar;
 mod task_card;

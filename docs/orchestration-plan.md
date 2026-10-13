@@ -356,6 +356,20 @@ an `agent_send` to a completed child) push a notice on every terminal publicatio
 turn the user types in a focus thread pushes none; its result reaches the user through
 the focus view.
 
+PR5 adds focus chat mode. Clicking a focus card opens the thread's view: its
+transcript, a follow-up composer, the VCS panel rooted at its workspace, and a
+`← Main` button that returns to the main transcript and sidebar. The transcript
+is read from the child's session file through `SubagentManager::transcript(id)`,
+which accepts only focus threads. The read runs on the background executor, and
+the view reloads it each time the thread reaches a terminal state. Limitations:
+live streaming is not implemented, so a running thread shows only its status
+(a blocked thread shows its prompt); the transcript refreshes only on terminal
+state, and no transcript is available while a follow-up turn is in progress. A
+`Failed` or `Cancelled` focus child has no transcript and shows the read error.
+The composer is enabled only for `Completed` threads, and rejected follow-ups
+show an error and keep the draft. The main sidebar no longer has a Changes tab;
+VCS is visible only in focus mode.
+
 ---
 
 ## 6. Future Extensibility: Headless Daemon, Mobile & Automations

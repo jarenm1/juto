@@ -15,6 +15,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::session::Session;
 use async_trait::async_trait;
 use futures::FutureExt;
 use juto_agent::{AgentEvent, RunControl};
@@ -212,6 +213,12 @@ pub enum SubagentError {
     },
     /// Operation timed out.
     Timeout(String),
+    /// The child is not a focus thread, so it has no transcript view.
+    NotFocus(String),
+    /// The child has no persisted transcript: it has not completed a turn, or it ended as failed/cancelled.
+    NoTranscript(String),
+    /// Reading the child's session file failed.
+    Transcript(String),
 }
 
 impl fmt::Display for SubagentError {
@@ -229,6 +236,9 @@ impl fmt::Display for SubagentError {
                 write!(f, "invalid transition from {from:?} to {to:?}")
             }
             Self::Timeout(msg) => write!(f, "subagent operation timed out: {msg}"),
+            Self::NotFocus(id) => write!(f, "subagent {id} is not a focus thread"),
+            Self::NoTranscript(id) => write!(f, "subagent {id} has no completed transcript"),
+            Self::Transcript(err) => write!(f, "failed to read subagent transcript: {err}"),
         }
     }
 }
@@ -643,6 +653,27 @@ impl SubagentManager {
                     .cloned()
             })
             .flatten())
+    }
+
+    /// Persisted transcript of a completed focus child, read from its session file.
+    /// Pending, failed, and cancelled children have no transcript.
+    pub fn transcript(&self, id: &str) -> Result<Vec<Message>, SubagentError> {
+        let child = self.child(id)?;
+        if !child.focus {
+            return Err(SubagentError::NotFocus(id.to_string()));
+        }
+        let path = {
+            let state = child.state.borrow();
+            match (&state.status, &state.outcome) {
+                (SubagentStatus::Completed, Some(Ok(result))) => result.session_path.clone(),
+                _ => return Err(SubagentError::NoTranscript(id.to_string())),
+            }
+        };
+        let session =
+            Session::open(&path).map_err(|err| SubagentError::Transcript(err.to_string()))?;
+        session
+            .messages()
+            .map_err(|err| SubagentError::Transcript(err.to_string()))
     }
 
     /// Cancel every child that has not reached a terminal state.
@@ -2962,5 +2993,79 @@ mod tests {
                 body: "done:alpha".into(),
             }]
         );
+    }
+
+    /// Factory whose completed turns persist a real session journal, so the
+    /// transcript accessor has persisted messages to read back.
+    struct TranscriptFactory {
+        dir: PathBuf,
+    }
+
+    #[async_trait]
+    impl SubagentFactory for TranscriptFactory {
+        async fn run(
+            &self,
+            id: &str,
+            spec: TaskSpec,
+            _control: RunControl,
+            _events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<SubagentResult, String> {
+            let mut session =
+                Session::create(&self.dir, &self.dir).map_err(|err| err.to_string())?;
+            session
+                .append(crate::session::EntryKind::Message {
+                    message: Message::user(spec.task.clone()),
+                })
+                .map_err(|err| err.to_string())?;
+            session
+                .append(crate::session::EntryKind::Message {
+                    message: Message::user(format!("reply:{}", spec.task)),
+                })
+                .map_err(|err| err.to_string())?;
+            Ok(SubagentResult {
+                id: id.to_string(),
+                output: spec.task,
+                data: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                session_path: session.path().to_path_buf(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_focus_child_returns_persisted_transcript() {
+        let dir = std::env::temp_dir().join(format!("juto-transcript-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = manager(
+            Arc::new(TranscriptFactory { dir: dir.clone() }),
+            1,
+            CancellationToken::new(),
+        );
+
+        let mut focus = spec("focus task");
+        focus.focus = true;
+        let focus_id = manager.spawn(focus).unwrap();
+        manager.wait(&focus_id).await.unwrap();
+        let texts: Vec<String> = manager
+            .transcript(&focus_id)
+            .unwrap()
+            .iter()
+            .map(Message::text)
+            .collect();
+        assert_eq!(texts, vec!["focus task", "reply:focus task"]);
+
+        let plain_id = manager.spawn(spec("plain task")).unwrap();
+        manager.wait(&plain_id).await.unwrap();
+        assert_eq!(
+            manager.transcript(&plain_id).unwrap_err(),
+            SubagentError::NotFocus(plain_id.clone())
+        );
+        assert_eq!(
+            manager.transcript("missing").unwrap_err(),
+            SubagentError::Unknown("missing".into())
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
