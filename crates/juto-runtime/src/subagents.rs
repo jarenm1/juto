@@ -491,12 +491,16 @@ impl SubagentManager {
         Ok(())
     }
 
-    /// Steer a queued or running child with a user message. The child's
-    /// [`RunControl`] exists from spawn, so steering a queued child takes
-    /// effect on its first turn boundary.
+    /// Message a child by id. A queued or running child takes the message as a
+    /// steer at its next turn boundary. A completed child starts a new turn with
+    /// the message as its prompt, as [`SubagentManager::follow_up`] does. Failed
+    /// and cancelled children reject it with [`SubagentError::Terminal`].
     pub fn send(&self, id: &str, message: String) -> Result<(), SubagentError> {
         let child = self.child(id)?;
         let status = child.state.borrow().status.clone();
+        if status == SubagentStatus::Completed {
+            return self.follow_up(id, message);
+        }
         if status.is_terminal() {
             return Err(SubagentError::Terminal(status));
         }
@@ -508,8 +512,9 @@ impl SubagentManager {
         Ok(())
     }
 
-    /// Start a follow-up turn that main requested. Its terminal state also
-    /// pushes a completion notice to the main inbox.
+    /// Start a follow-up turn on a completed child, as main requested through
+    /// `agent_send`. Its terminal state also pushes a completion notice to the
+    /// main inbox.
     pub fn follow_up(&self, id: &str, prompt: String) -> Result<(), SubagentError> {
         self.start_follow_up(id, prompt, TurnOrigin::Main)
     }
@@ -1495,10 +1500,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_steers_queued_and_rejects_terminal() {
-        // RunControl queues are internal to juto-agent; the observable
-        // contract is that send() succeeds for queued/running children and is
-        // a typed error once the child is terminal.
+    async fn send_steers_live_children_and_rejects_cancelled() {
+        // The observable contract: send() succeeds for queued and running
+        // children and is a typed error once the child is cancelled.
         let (gate, gate_rx) = gate();
         let running = Arc::new(AtomicUsize::new(0));
         let manager = manager(
@@ -1533,10 +1537,28 @@ mod tests {
         ));
         gate.send(true).unwrap();
         assert!(manager.wait(&held).await.is_ok());
-        assert!(matches!(
-            manager.send(&held, "done".into()),
-            Err(SubagentError::Terminal(SubagentStatus::Completed))
-        ));
+    }
+
+    #[tokio::test]
+    async fn send_to_completed_child_starts_a_turn() {
+        let (first, first_rx) = gate();
+        let (second, second_rx) = gate();
+        let manager = manager(
+            follow_up_factory(first_rx, second_rx, Arc::new(AtomicUsize::new(0))),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("thread")).unwrap();
+        first.send(true).unwrap();
+        manager.wait(&id).await.expect("first turn");
+
+        manager
+            .send(&id, "more".to_string())
+            .expect("completed child accepts a message as a new turn");
+        assert_eq!(manager.status(&id), Some(SubagentStatus::Running));
+        second.send(true).unwrap();
+        let result = manager.wait(&id).await.expect("follow-up turn");
+        assert_eq!(result.output, "again:more");
     }
 
     #[tokio::test]

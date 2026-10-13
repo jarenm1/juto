@@ -49,7 +49,7 @@ are handled explicitly above. The mechanism is tested against a real `cargo chec
 sandbox.
 
 **Delegating role model.** The top-level `main` role has `read`, `glob`, `grep`, `task`, `wait`,
-`agent_send`, and `agent_cancel`; it cannot edit files. Work runs in child agents defined as
+`agent_send`, `agent_cancel`, and `agent_inbox`; it cannot edit files. Work runs in child agents defined as
 markdown roles in `crates/juto-runtime/src/roles/`: `builder` (all tools), `scout` and `reviewer`
 (read-only), and `task` (all tools, the default). A role's `tools` frontmatter takes `all`,
 `read-only`, or a list of tool names; a missing field means read-only. A `<role>.md` file in
