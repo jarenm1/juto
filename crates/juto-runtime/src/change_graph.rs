@@ -914,7 +914,7 @@ impl ChangeGraph {
     /// cannot silently revert files that existed only in the remote workspace.
     ///
     /// Public so a caller that knows a thread's work belongs on another thread
-    /// — the orchestrator folding a builder's approved thread back — can adopt
+    /// — as when a builder's approved thread is folded back — can adopt
     /// it when the target has no history yet.
     pub fn adopt_head(&self, thread: &str, remote: &str) -> Result<()> {
         let tree = {

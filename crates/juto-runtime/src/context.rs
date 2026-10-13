@@ -27,7 +27,7 @@ pub enum ContextError {
         #[source]
         source: io::Error,
     },
-    #[error("malformed SKILL.md frontmatter in {path}: {reason}")]
+    #[error("malformed frontmatter in {path}: {reason}")]
     Frontmatter { path: PathBuf, reason: String },
 }
 
@@ -106,6 +106,23 @@ pub fn load_instructions(cwd: &Path, global_dir: &Path) -> Result<Vec<String>> {
 
 /// Parse a SKILL.md body: `---` frontmatter block then free text.
 fn parse_skill(path: &Path, text: &str) -> Result<Option<(Option<String>, Option<String>)>> {
+    let Some((yaml, _body)) = split_frontmatter(path, text)? else {
+        return Ok(None);
+    };
+    let fm: SkillFrontmatter =
+        serde_yaml::from_str(yaml).map_err(|e| ContextError::Frontmatter {
+            path: path.to_path_buf(),
+            reason: e.to_string(),
+        })?;
+    Ok(Some((fm.name, fm.description)))
+}
+
+/// Split a markdown file into its `---` frontmatter YAML and its body. Returns
+/// `None` when the file has no frontmatter block.
+pub(crate) fn split_frontmatter<'a>(
+    path: &Path,
+    text: &'a str,
+) -> Result<Option<(&'a str, &'a str)>> {
     let trimmed = text.trim_start_matches('\u{feff}');
     if !trimmed.starts_with("---") {
         return Ok(None);
@@ -122,13 +139,10 @@ fn parse_skill(path: &Path, text: &str) -> Result<Option<(Option<String>, Option
             path: path.to_path_buf(),
             reason: "opening '---' has no closing delimiter".into(),
         })?;
-    let yaml = &rest[..end];
-    let fm: SkillFrontmatter =
-        serde_yaml::from_str(yaml).map_err(|e| ContextError::Frontmatter {
-            path: path.to_path_buf(),
-            reason: e.to_string(),
-        })?;
-    Ok(Some((fm.name, fm.description)))
+    // The body starts on the line after the closing delimiter.
+    let after = &rest[end + "\n---".len()..];
+    let body = after.split_once('\n').map_or("", |(_, body)| body);
+    Ok(Some((&rest[..end], body)))
 }
 
 fn scan_skills_root(root: &Path, out: &mut BTreeMap<String, Skill>) -> Result<()> {

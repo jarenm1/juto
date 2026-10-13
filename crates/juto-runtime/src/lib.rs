@@ -7,9 +7,9 @@ pub mod context;
 mod contextual;
 pub mod desktop_artifact;
 pub mod git_transfer;
-pub mod orchestrator;
 pub mod peers;
 pub mod replication;
+mod roles;
 pub mod session;
 pub mod subagents;
 pub mod tools;
@@ -17,6 +17,7 @@ mod vcs;
 pub mod workspace;
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -75,12 +76,6 @@ use tokio_util::sync::CancellationToken;
 
 pub use config::{ApprovalMode, RuntimeConfig};
 pub use desktop_artifact::{DesktopArtifactResolver, ResolveError, ViewerRoute};
-pub use orchestrator::{
-    CommandGateRunner, GateResult, IntentRoute, MockGateRunner, Orchestrator, OrchestratorBuilder,
-    OrchestratorConfig, OrchestratorError, OrchestratorEvent, PipelinePhase, QualityGateKind,
-    QualityGateRunner, QualityGateSpec, ReviewVerdict, RuleBasedJudge, ScriptedJudge, TaskOutcome,
-    VerificationReport,
-};
 pub use peers::{
     PeerAgentSnapshot, PeerBus, PeerError, PeerResource, PeerSendFailure, PeerSendReport,
 };
@@ -96,6 +91,7 @@ pub use tools::{
 pub use workspace::{GpuLockGuard, ResourceLimits, ScopedStdio, SubagentWorkspace, WorkspaceError};
 
 use crate::change_graph::{ChangeGraph, EditProvenance};
+use crate::roles::{AgentRole, ToolScope};
 
 #[async_trait]
 pub trait ApprovalHandler: Send + Sync {
@@ -396,7 +392,12 @@ impl Runtime {
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
     ) -> Result<RunOutcome> {
-        self.run_depth(session, prompt.into(), events, control, 0, false)
+        let placement = RunPlacement {
+            depth: 0,
+            role: roles::MAIN_ROLE,
+            read_only: false,
+        };
+        self.run_depth(session, prompt.into(), events, control, placement)
             .await
     }
 
@@ -406,14 +407,29 @@ impl Runtime {
         prompt: String,
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
-        depth: usize,
-        read_only: bool,
+        placement: RunPlacement<'_>,
     ) -> Result<RunOutcome> {
+        let RunPlacement {
+            depth,
+            role: role_name,
+            read_only,
+        } = placement;
         if session.header().cwd != self.inner.cwd {
             bail!("session belongs to a different working directory");
         }
         let settings = self.config();
         let read_only = read_only || matches!(settings.approval_mode, ApprovalMode::ReadOnly);
+        let catalog = Arc::new(roles::load(&self.inner.cwd, &self.inner.data_dir)?);
+        let role = catalog
+            .get(role_name)
+            .with_context(|| format!("unknown agent role `{role_name}`"))?
+            .clone();
+        let scope = if read_only {
+            role.tools.intersect(&ToolScope::read_only())
+        } else {
+            role.tools.clone()
+        };
+        let can_delegate = depth < settings.max_recursion_depth && scope.allows("task");
         let selector = session
             .current_model()
             .unwrap_or_else(|| settings.model.clone());
@@ -450,10 +466,10 @@ impl Runtime {
             .bash_scoped
             .then(|| ResourceLimits::default().with_enforce_scope(false));
         let mut registry = tools::builtin_tools_with_limits(&self.inner.cwd, limits)?;
-        if !read_only && depth < settings.max_recursion_depth {
-            register_agent_tools(&mut registry, manager)?;
+        if can_delegate {
+            register_agent_tools(&mut registry, manager, catalog.clone())?;
         }
-        if !read_only {
+        if scope.allows("desktop") {
             tools::register_desktop_tools(
                 &mut registry,
                 self.desktop_supervisor(),
@@ -461,12 +477,36 @@ impl Runtime {
                 self.inner.data_dir.clone(),
             )?;
         }
+        scope.apply(&mut registry);
         if !settings.tools.is_empty() {
             registry.retain_names(&settings.tools);
         }
         let mut system_prompt = context::load_instructions(&self.inner.cwd, &self.inner.data_dir)?;
         if !settings.system_prompt.is_empty() {
             system_prompt.push(settings.system_prompt.clone());
+        }
+        if !role.instructions.is_empty() {
+            system_prompt.push(role.instructions.clone());
+        }
+        if can_delegate {
+            let delegates: Vec<&AgentRole> = catalog
+                .values()
+                .filter(|candidate| {
+                    candidate.name != role.name && candidate.name != roles::MAIN_ROLE
+                })
+                .collect();
+            if !delegates.is_empty() {
+                let mut descriptions = String::from(
+                    "Available agents for the task tool's `agent` field; omit it for the default `task` agent:\n",
+                );
+                for candidate in delegates {
+                    descriptions.push_str(&format!(
+                        "- {}: {}\n",
+                        candidate.name, candidate.description
+                    ));
+                }
+                system_prompt.push(descriptions);
+            }
         }
         let skills = context::discover_skills(&self.inner.cwd, &self.inner.data_dir)?;
         if !skills.is_empty() {
@@ -672,6 +712,15 @@ impl Drop for ChildCancellation {
     }
 }
 
+/// Where a run sits in the delegation tree: its depth, the role it runs as,
+/// and whether it is confined to read-only tools.
+#[derive(Clone, Copy)]
+struct RunPlacement<'a> {
+    depth: usize,
+    role: &'a str,
+    read_only: bool,
+}
+
 struct ChildFactory {
     runtime: Runtime,
     depth: usize,
@@ -805,7 +854,20 @@ impl subagents::SubagentFactory for ChildFactory {
                 prompt.push_str("\n\nReturn a single JSON value validating against this JSON Schema, without surrounding prose:\n");
                 prompt.push_str(&serde_json::to_string(&schema)?);
             }
-            let outcome = runtime.run_depth(&mut session, prompt, events, control, self.depth, spec.read_only).await?;
+            let role = spec.agent.as_deref().unwrap_or(roles::DEFAULT_ROLE);
+            let outcome = runtime
+                .run_depth(
+                    &mut session,
+                    prompt,
+                    events,
+                    control,
+                    RunPlacement {
+                        depth: self.depth,
+                        role,
+                        read_only: spec.read_only,
+                    },
+                )
+                .await?;
             if outcome.stop_reason == StopReason::Aborted { bail!("subagent cancelled"); }
             if outcome.stop_reason != StopReason::Stop { bail!("subagent did not complete: {:?}", outcome.stop_reason); }
             let output = session.messages()?.iter().rev().find_map(|message| match message {Message::Assistant(message) if message.stop_reason == StopReason::Stop => Some(message.text()), _ => None}).context("subagent completed without an assistant message")?;
@@ -821,9 +883,14 @@ impl subagents::SubagentFactory for ChildFactory {
     }
 }
 
-fn register_agent_tools(registry: &mut ToolRegistry, manager: Arc<SubagentManager>) -> Result<()> {
+fn register_agent_tools(
+    registry: &mut ToolRegistry,
+    manager: Arc<SubagentManager>,
+    catalog: Arc<BTreeMap<String, AgentRole>>,
+) -> Result<()> {
     registry.register(Arc::new(TaskTool {
         manager: manager.clone(),
+        catalog,
     }))?;
     registry.register(Arc::new(WaitTool {
         manager: manager.clone(),
@@ -837,11 +904,17 @@ fn register_agent_tools(registry: &mut ToolRegistry, manager: Arc<SubagentManage
 
 struct TaskTool {
     manager: Arc<SubagentManager>,
+    /// Roles a `task` entry may name, keyed by role name.
+    catalog: Arc<BTreeMap<String, AgentRole>>,
 }
 #[async_trait]
 impl Tool for TaskTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {name: "task".into(), description: "Run child agents concurrently. Each child gets an independent durable transcript; optional output_schema validates its JSON result. Set schema_mode to strict (default) to fail on missing or invalid data, or permissive to preserve the result. This call waits for all children. Use read_only for research-only children.".into(), parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"schema_mode":{"type":"string","enum":["strict","permissive"]},"read_only":{"type":"boolean"},"isolated_workspace":{"type":"boolean"},"solution_space":{"type":"string"}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false})}
+        ToolDefinition {
+            name: "task".into(),
+            description: "Run child agents concurrently. Each child gets an independent durable transcript; optional output_schema validates its JSON result. Set schema_mode to strict (default) to fail on missing or invalid data, or permissive to preserve the result. This call waits for all children. Set agent to a role from the available agents list; omit it for the default task role. A role's tools bound what its child may use, and read_only further restricts a child to read, glob, and grep.".into(),
+            parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"agent":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"schema_mode":{"type":"string","enum":["strict","permissive"]},"read_only":{"type":"boolean"},"isolated_workspace":{"type":"boolean"},"solution_space":{"type":"string"}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false}),
+        }
     }
     fn tier(&self) -> ToolTier {
         ToolTier::Exec
@@ -855,44 +928,13 @@ impl Tool for TaskTool {
             .get("context")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let mut ids = Vec::with_capacity(tasks.len());
-        for value in tasks {
-            let task = value
-                .get("task")
-                .and_then(Value::as_str)
-                .ok_or("task text is required")?;
-            let spec = TaskSpec {
-                name: value.get("name").and_then(Value::as_str).map(str::to_owned),
-                task: if context.is_empty() {
-                    task.to_owned()
-                } else {
-                    format!("{context}\n\n{task}")
-                },
-                model: value
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                output_schema: value.get("output_schema").cloned(),
-                schema_mode: value
-                    .get("schema_mode")
-                    .cloned()
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(|error| format!("invalid schema_mode: {error}"))?
-                    .unwrap_or_default(),
-                read_only: value
-                    .get("read_only")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                isolated_workspace: value
-                    .get("isolated_workspace")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                solution_space: value
-                    .get("solution_space")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-            };
+        // Parse every entry before spawning any child, so one bad entry starts nothing.
+        let specs = tasks
+            .iter()
+            .map(|value| self.parse_task(value, context))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut ids = Vec::with_capacity(specs.len());
+        for spec in specs {
             match self.manager.spawn(spec) {
                 Ok(id) => ids.push(id),
                 Err(error) => {
@@ -904,6 +946,70 @@ impl Tool for TaskTool {
             }
         }
         collect_agents(&self.manager, ids).await
+    }
+}
+
+impl TaskTool {
+    fn parse_task(&self, value: &Value, context: &str) -> Result<TaskSpec, String> {
+        let task = value
+            .get("task")
+            .and_then(Value::as_str)
+            .ok_or("task text is required")?;
+        let agent = match value.get("agent") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(name)) => {
+                if name == roles::MAIN_ROLE {
+                    return Err("`main` is the top-level role and cannot run as a child".into());
+                }
+                if !self.catalog.contains_key(name) {
+                    let available = self
+                        .catalog
+                        .keys()
+                        .filter(|key| key.as_str() != roles::MAIN_ROLE)
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!(
+                        "unknown agent `{name}`; available agents: {available}"
+                    ));
+                }
+                Some(name.clone())
+            }
+            Some(_) => return Err("agent must be a string".into()),
+        };
+        Ok(TaskSpec {
+            name: value.get("name").and_then(Value::as_str).map(str::to_owned),
+            agent,
+            task: if context.is_empty() {
+                task.to_owned()
+            } else {
+                format!("{context}\n\n{task}")
+            },
+            model: value
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            output_schema: value.get("output_schema").cloned(),
+            schema_mode: value
+                .get("schema_mode")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| format!("invalid schema_mode: {error}"))?
+                .unwrap_or_default(),
+            read_only: value
+                .get("read_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            isolated_workspace: value
+                .get("isolated_workspace")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            solution_space: value
+                .get("solution_space")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
     }
 }
 struct WaitTool {
@@ -1006,6 +1112,7 @@ mod tests {
     use crate::change_graph::{ChangeGraph, EditProvenance};
     use juto_ai::{AssistantMessage, ProviderError, ProviderStream, StreamOptions, timestamp_ms};
     use juto_catalog::ModelCost;
+    use std::collections::BTreeSet;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
 
@@ -1102,18 +1209,20 @@ mod tests {
     }
 
     fn mock_runtime(repo: &Path, data_dir: &Path) -> Runtime {
+        runtime_with(repo, data_dir, mock_config(), Arc::new(MockProvider))
+    }
+
+    fn runtime_with(
+        repo: &Path,
+        data_dir: &Path,
+        config: RuntimeConfig,
+        provider: Arc<dyn Provider>,
+    ) -> Runtime {
         let credentials = Arc::new(
             CredentialStore::open(data_dir.join("credentials.json")).expect("credentials"),
         );
-        Runtime::with_provider(
-            repo,
-            data_dir,
-            mock_config(),
-            credentials,
-            Arc::new(MockProvider),
-            None,
-        )
-        .expect("runtime")
+        Runtime::with_provider(repo, data_dir, config, credentials, provider, None)
+            .expect("runtime")
     }
 
     /// Provision a real fork workspace for `id` under `data_dir`.
@@ -1281,6 +1390,220 @@ mod tests {
                 .workspace_heads
                 .contains_key(&key),
             "a finished run must reclaim the stale workspace head"
+        );
+    }
+
+    /// Records the tool names advertised on each request, then streams the same
+    /// single-text response as `MockProvider`.
+    #[derive(Default)]
+    struct AdvertisedTools {
+        requests: std::sync::Mutex<Vec<BTreeSet<String>>>,
+    }
+
+    impl AdvertisedTools {
+        fn requests(&self) -> Vec<BTreeSet<String>> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for AdvertisedTools {
+        async fn stream(
+            &self,
+            model: &Model,
+            context: &Context,
+            options: &StreamOptions,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let names: BTreeSet<String> =
+                context.tools.iter().map(|tool| tool.name.clone()).collect();
+            self.requests.lock().unwrap().push(names);
+            MockProvider.stream(model, context, options, cancel).await
+        }
+    }
+
+    fn tool_set(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// Runs one child through the manager a `task` call uses, so its role is
+    /// resolved exactly as delegated work is.
+    async fn run_child(runtime: &Runtime, role: &str, task: &str) {
+        let control = RunControl::new();
+        let manager = runtime.subagent_manager(&control);
+        let mut spec = TaskSpec::new(task);
+        spec.agent = Some(role.to_string());
+        let id = manager.spawn(spec).expect("spawn child");
+        manager.wait(&id).await.expect("child run");
+    }
+
+    #[tokio::test]
+    async fn main_thread_advertises_read_and_delegation_tools_only() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(AdvertisedTools::default());
+        let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
+
+        let mut session = runtime.new_session().expect("session");
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime
+            .run(&mut session, "hello", events, RunControl::new())
+            .await
+            .expect("main run");
+
+        assert_eq!(
+            provider.requests(),
+            vec![tool_set(&[
+                "read",
+                "glob",
+                "grep",
+                "task",
+                "wait",
+                "agent_send",
+                "agent_cancel",
+            ])]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_approval_advertises_only_read_tools() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(AdvertisedTools::default());
+        let config = RuntimeConfig {
+            approval_mode: ApprovalMode::ReadOnly,
+            ..mock_config()
+        };
+        let runtime = runtime_with(&repo, &data_dir, config, provider.clone());
+
+        let mut session = runtime.new_session().expect("session");
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime
+            .run(&mut session, "hello", events, RunControl::new())
+            .await
+            .expect("main run");
+
+        assert_eq!(
+            provider.requests(),
+            vec![tool_set(&["read", "glob", "grep"])]
+        );
+    }
+
+    #[tokio::test]
+    async fn scout_child_advertises_read_tools_without_delegation() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(AdvertisedTools::default());
+        let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
+
+        run_child(&runtime, "scout", "look around").await;
+
+        assert_eq!(
+            provider.requests(),
+            vec![tool_set(&["read", "glob", "grep"])]
+        );
+    }
+
+    #[tokio::test]
+    async fn delegation_stops_at_the_recursion_limit() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(AdvertisedTools::default());
+        let config = RuntimeConfig {
+            max_recursion_depth: 2,
+            ..mock_config()
+        };
+        let runtime = runtime_with(&repo, &data_dir, config, provider.clone());
+
+        // Depth 1: a builder spawned by `task` may still delegate.
+        run_child(&runtime, "builder", "make the change").await;
+        // Depth 2 is the limit: the same builder role loses its delegation tools.
+        let mut session = runtime.new_session().expect("session");
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime
+            .run_depth(
+                &mut session,
+                "make the change".to_string(),
+                events,
+                RunControl::new(),
+                RunPlacement {
+                    depth: 2,
+                    role: "builder",
+                    read_only: false,
+                },
+            )
+            .await
+            .expect("depth-2 run");
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "one request per run: {requests:?}");
+        assert!(
+            requests[0].contains("task") && requests[0].contains("wait"),
+            "depth 1 must delegate: {:?}",
+            requests[0]
+        );
+        assert!(
+            !requests[1].contains("task") && !requests[1].contains("wait"),
+            "depth 2 must not delegate: {:?}",
+            requests[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn task_rejects_unknown_and_top_level_agents_before_spawning() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let runtime = runtime_with(&repo, &data_dir, mock_config(), Arc::new(MockProvider));
+        let control = RunControl::new();
+        let manager = runtime.subagent_manager(&control);
+        let tool = TaskTool {
+            manager: manager.clone(),
+            catalog: Arc::new(roles::load(&repo, &data_dir).expect("roles")),
+        };
+        let context = ToolContext {
+            cwd: repo.clone(),
+            session_id: "test".to_string(),
+            cancel: CancellationToken::new(),
+        };
+
+        // The valid first entry must not start when a later entry is invalid.
+        let unknown = tool
+            .execute(
+                json!({"tasks": [{"task": "ok"}, {"task": "bad", "agent": "nope"}]}),
+                context.clone(),
+            )
+            .await
+            .expect_err("unknown agent must be rejected");
+        assert!(unknown.contains("unknown agent `nope`"), "{unknown}");
+        assert!(unknown.contains("builder"), "{unknown}");
+        assert!(
+            !unknown.contains("main"),
+            "top-level role is not listed: {unknown}"
+        );
+
+        let top = tool
+            .execute(
+                json!({"tasks": [{"task": "bad", "agent": "main"}]}),
+                context,
+            )
+            .await
+            .expect_err("top-level role must not run as a child");
+        assert!(top.contains("top-level"), "{top}");
+
+        assert_eq!(
+            manager.list().len(),
+            0,
+            "rejected batches must start no child"
         );
     }
 }
