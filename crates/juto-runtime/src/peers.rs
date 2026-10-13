@@ -4,6 +4,9 @@
 //! children, and `history://<id>` reads a completed child's active session
 //! journal. User-supplied URIs never become filesystem paths; history resolves
 //! the journal path from the manager's completed result.
+//!
+//! `agent://main` is write-only: children send messages to the main agent's
+//! inbox, and reading it is rejected so only the main agent drains it.
 
 use std::sync::Arc;
 
@@ -11,7 +14,10 @@ use thiserror::Error;
 
 use crate::{
     session::{Session, SessionEntry, SessionError},
-    subagents::{SubagentError, SubagentManager, SubagentResult, SubagentStatus, SubagentSummary},
+    subagents::{
+        MainMessage, MainMessageKind, SubagentError, SubagentManager, SubagentResult,
+        SubagentStatus, SubagentSummary,
+    },
 };
 
 /// Errors returned while resolving a peer URI or reading a transcript.
@@ -21,6 +27,8 @@ pub enum PeerError {
     InvalidUri(String),
     #[error("cannot send a message to read-only peer URI `{0}`")]
     ReadOnly(String),
+    #[error("peer URI `{0}` accepts messages only and cannot be read")]
+    WriteOnly(String),
     #[error("subagent `{agent_id}` has no completed transcript (status: {status:?})")]
     HistoryUnavailable {
         agent_id: String,
@@ -43,7 +51,7 @@ pub struct PeerAgentSnapshot {
 /// Outcome of a message sent through `agent://<id>` or `agent://all`.
 #[derive(Debug, Clone, Default)]
 pub struct PeerSendReport {
-    /// Child IDs whose steering queue accepted the message.
+    /// Recipients that accepted the message: child IDs, or `main` for the main inbox.
     pub sent: Vec<String>,
     /// Per-child failures. A broadcast continues when one child is terminal.
     pub failed: Vec<PeerSendFailure>,
@@ -67,23 +75,59 @@ pub enum PeerResource {
     },
 }
 
+/// Peer URI for the main agent's inbox. Write-only: children send to it and
+/// the main agent drains it through `agent_inbox`.
+pub const MAIN_URI: &str = "agent://main";
+/// Sender recorded for a message to the main inbox that has no sender id.
+pub const UNKNOWN_SENDER: &str = "unknown";
+const MAIN_RECIPIENT: &str = "main";
+
 /// Peer URI adapter over the runtime's subagent manager and durable sessions.
 #[derive(Clone)]
 pub struct PeerBus {
     subagents: Arc<SubagentManager>,
+    /// Sender recorded for messages to `agent://main`; `None` for the main thread.
+    sender: Option<String>,
 }
 
 impl PeerBus {
     pub fn new(subagents: Arc<SubagentManager>) -> Self {
-        Self { subagents }
+        Self {
+            subagents,
+            sender: None,
+        }
     }
 
-    /// Send a steering message to one child or every currently live child.
-    /// Broadcast failures are returned per recipient, so a terminal child does
-    /// not prevent delivery to other children.
+    /// A bus for a child's own tools: messages to `agent://main` are recorded
+    /// with `sender` as their `from`.
+    pub fn for_child(subagents: Arc<SubagentManager>, sender: impl Into<String>) -> Self {
+        Self {
+            subagents,
+            sender: Some(sender.into()),
+        }
+    }
+
+    /// Send a steering message to one child, every currently live child, or
+    /// the main inbox. Broadcast failures are returned per recipient, so a
+    /// terminal child does not prevent delivery to other children.
     pub fn send(&self, uri: &str, message: impl Into<String>) -> Result<PeerSendReport, PeerError> {
         let target = parse_uri(uri)?;
+        let message = message.into();
         let ids = match target {
+            PeerTarget::Main => {
+                self.subagents.main_inbox().push(MainMessage {
+                    from: self
+                        .sender
+                        .clone()
+                        .unwrap_or_else(|| UNKNOWN_SENDER.to_string()),
+                    kind: MainMessageKind::Message,
+                    body: message,
+                });
+                return Ok(PeerSendReport {
+                    sent: vec![MAIN_RECIPIENT.to_string()],
+                    failed: Vec::new(),
+                });
+            }
             PeerTarget::Agent(id) => vec![id],
             PeerTarget::All => self
                 .subagents
@@ -94,7 +138,6 @@ impl PeerBus {
                 .collect(),
             PeerTarget::History(_) => return Err(PeerError::ReadOnly(uri.to_string())),
         };
-        let message = message.into();
         let mut report = PeerSendReport::default();
         for agent_id in ids {
             match self.subagents.send(&agent_id, message.clone()) {
@@ -121,6 +164,7 @@ impl PeerBus {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(PeerResource::Agents(snapshots))
             }
+            PeerTarget::Main => Err(PeerError::WriteOnly(uri.to_string())),
             PeerTarget::History(agent_id) => {
                 let snapshot = self.snapshot(&agent_id)?;
                 let Some(result) = snapshot.result else {
@@ -164,6 +208,7 @@ impl PeerBus {
 }
 
 enum PeerTarget {
+    Main,
     Agent(String),
     All,
     History(String),
@@ -181,6 +226,7 @@ fn parse_uri(uri: &str) -> Result<PeerTarget, PeerError> {
         return Err(invalid());
     }
     match scheme {
+        "agent" if agent_id == "main" => Ok(PeerTarget::Main),
         "agent" if agent_id == "all" => Ok(PeerTarget::All),
         "agent" => Ok(PeerTarget::Agent(agent_id.to_string())),
         "history" => Ok(PeerTarget::History(agent_id.to_string())),
@@ -249,6 +295,7 @@ mod tests {
             }),
             4,
             CancellationToken::new(),
+            crate::subagents::MainInbox::default(),
         ))
     }
 
@@ -410,5 +457,68 @@ mod tests {
             report.failed[0].error,
             SubagentError::Unknown("unknown".into())
         );
+    }
+
+    #[tokio::test]
+    async fn child_message_to_main_lands_in_main_inbox_with_child_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(temp.path());
+        let id = manager
+            .spawn(crate::subagents::TaskSpec::new("wait"))
+            .unwrap();
+        let bus = PeerBus::for_child(manager.clone(), id.clone());
+
+        let report = bus.send(MAIN_URI, "need a decision").unwrap();
+        assert_eq!(report.sent, vec![MAIN_RECIPIENT.to_string()]);
+        assert!(report.failed.is_empty());
+        assert_eq!(
+            manager.main_inbox().drain(),
+            vec![MainMessage {
+                from: id.clone(),
+                kind: MainMessageKind::Message,
+                body: "need a decision".into(),
+            }]
+        );
+
+        manager.cancel(&id).unwrap();
+        let _ = manager.wait(&id).await;
+    }
+
+    #[tokio::test]
+    async fn reading_main_is_rejected_and_keeps_pending_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(temp.path());
+        let bus = PeerBus::new(manager.clone());
+        bus.send(MAIN_URI, "queued").unwrap();
+
+        assert!(matches!(
+            bus.read(MAIN_URI),
+            Err(PeerError::WriteOnly(uri)) if uri == MAIN_URI
+        ));
+        assert_eq!(
+            manager.main_inbox().drain(),
+            vec![MainMessage {
+                from: UNKNOWN_SENDER.into(),
+                kind: MainMessageKind::Message,
+                body: "queued".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_does_not_reach_main_inbox() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager(temp.path());
+        let id = manager
+            .spawn(crate::subagents::TaskSpec::new("wait"))
+            .unwrap();
+        let bus = PeerBus::new(manager.clone());
+
+        let report = bus.send("agent://all", "status?").unwrap();
+        assert_eq!(report.sent, vec![id.clone()]);
+        assert!(manager.main_inbox().drain().is_empty());
+
+        manager.cancel(&id).unwrap();
+        let _ = manager.wait(&id).await;
     }
 }

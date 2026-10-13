@@ -342,6 +342,18 @@ follow-ups. A successful turn keeps its workspace so later turns share one fork;
 failed turn is terminal and its fork is removed. Retained workspaces stay on disk
 until a release tool reclaims them, which is not yet implemented.
 
+PR3 adds a main mailbox. Children send messages to the main agent with
+`agent://main`, which lands in one in-memory inbox shared by the whole run tree.
+When a child reaches a terminal state (`Completed`, `Failed`, or `Cancelled`), a
+completion notice is pushed to the same inbox; the notice is pushed before the
+terminal state is published, so a waiter sees it. The main thread drains the
+inbox with the `agent_inbox` tool, which returns each entry's `from`, `kind`, and
+`body` and clears the inbox. Reading `agent://main` fails with
+`PeerError::WriteOnly`, so draining happens only through `agent_inbox`. Children
+never write to the user UI; the main agent decides what reaches the user. The
+inbox is not persisted across process restart. Notices fire on every terminal
+publication, so a follow-up turn that ends terminal pushes another notice.
+
 ---
 
 ## 6. Future Extensibility: Headless Daemon, Mobile & Automations
@@ -495,6 +507,9 @@ implemented by a dedicated subagent concurrently, and validates against its own 
 * **Implementation Details**:
   - `agent://<id>` exposes a child status/result snapshot and accepts steering messages.
   - `agent://all` broadcasts to live children; individual failures do not stop delivery.
+  - `agent://main` is write-only: child messages land in the main inbox with the
+    child id as `from` (`unknown` when sent from the main thread). Reads fail with
+    `PeerError::WriteOnly`. `agent://all` never reaches main.
   - `history://<id>` reads a completed child's active session journal via the manager's
     result path; unsupported, malformed, unknown, and unavailable resources fail explicitly.
 * **Acceptance**: Tests cover completed output and transcript reads, active-child broadcast
