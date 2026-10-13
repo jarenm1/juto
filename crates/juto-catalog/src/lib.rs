@@ -144,7 +144,7 @@ impl Registry {
             "baseUrl": "https://api.typesafe.ai",
             "kind": "judge",
             "input": ["text"],
-            "cost": {"input": 0.084, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+            "cost": {"input": 0.042, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
             "contextWindow": 64000,
             "supportsTools": false
         });
