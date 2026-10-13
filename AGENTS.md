@@ -24,17 +24,22 @@ application runs belong in a dedicated jj workspace under `~/workspaces/`,
 not in default. `origin` is configured; use `main@origin` as the base for new
 independent tasks after fetching. Do not assume branch-protection policy.
 
-Use the clean default checkout as the development-flake source. Secondary jj
-workspaces are not Git-colocated; evaluating their `.` flake can copy ignored
-build outputs into the Nix store. Keep Cargo's cwd and target cache in the task
-workspace while reading the default flake:
+Use the committed flake at `main@origin` as the development-flake source,
+pinned to its full 40-character commit id. Secondary jj workspaces are not
+Git-colocated; evaluating their `.` flake can copy ignored build outputs into
+the Nix store. Keep Cargo's cwd and target cache in the task workspace while
+reading the pinned flake:
 
 ```sh
-export JUTO_FLAKE="$(dirname "$(jj git root)")"
+export JUTO_FLAKE="git+file://$(dirname "$(jj git root)")?rev=$(jj log -r main@origin --no-graph -T commit_id)"
 ```
 
+Pin the full id: short hashes fail with "wrong length", and the bare checkout
+path failed in agent runs with a missing `glib-2.0`.
+
 Use Git-aware references to that checkout, not `path:` references. If a task
-changes the flake itself, evaluate a filtered source snapshot instead.
+changes the flake itself, evaluate a filtered source snapshot instead; the
+pinned rev does not include uncommitted `flake.nix` edits.
 
 Before starting a task, inspect `jj root` and create a dedicated workspace from
 the published base:
@@ -45,6 +50,17 @@ jj workspace add ~/workspaces/juto-<slug> -r main@origin
 
 When explicitly moving an existing unfinished change, preserve that change id
 and edit it in the new workspace; leave default on a clean published base.
+
+Re-check the base before starting and again before opening the PR:
+`main@origin` moves while other agents push. Run `jj git fetch`; if it moved,
+rebase with `jj rebase -d main@origin` and rerun verification on the rebased
+change.
+
+The default checkout may hold divergent or conflicted bookmarks (`main` and
+many `vcs-*` and `pr-*` bookmarks have been seen in that state). Do not resolve,
+delete, or move them during a task. Refer to a divergent change by commit id,
+since its change id is ambiguous, and report the hygiene problem to the human
+rather than cleaning it up.
 
 Use one integration owner. Delegated slices may edit the integration workspace
 only with explicit, nonoverlapping file ownership; the owner alone mutates jj
@@ -128,6 +144,11 @@ a non-colocated workspace with a populated target directory. Keep the scope
 outermost for heavy commands. The flake's compiler is authoritative; a second
 rustup toolchain can change artifacts and undo reproducibility.
 
+Known build gap: `flake.nix`'s `nativeLibraries` omits glib, gstreamer, and
+pixman. A clean `cargo build -p juto` can fail with glib-sys,
+gstreamer-webrtc-sys, or pixman link errors. Report the failure and its first
+error line; do not patch `flake.nix` inside an unrelated task.
+
 Optimize for build iteration: preserve unoptimized incremental dev/test
 profiles, reduced debug info, and Clang + mold linking. Do not copy jtech's
 optimized dependency profiles, CUDA toolchain, or release LTO into dev builds
@@ -161,7 +182,8 @@ work is complete and verified:
 2. Name the finished change's bookmark and push it:
    `jj bookmark set <type>/<slug> -r <change-id>`, then
    `jj git push --bookmark <type>/<slug>`.
-3. Open the PR: `gh pr create --base main --head <type>/<slug>`. Use
+3. Open the PR from the default checkout, since `gh` needs git and secondary
+   workspaces lack it: `gh pr create --repo jarenm1/juto --base main --head <type>/<slug>`. Use
    `.github/pull_request_template.md` if it exists; none exists today. The body
    MUST list the change ids, the verification commands and their results, the
    observed behavior for runtime or UI changes (screenshot paths outside the
