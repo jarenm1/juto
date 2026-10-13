@@ -508,6 +508,19 @@ impl SubagentManager {
         Ok(())
     }
 
+    /// Start a follow-up turn that main requested. Its terminal state also
+    /// pushes a completion notice to the main inbox.
+    pub fn follow_up(&self, id: &str, prompt: String) -> Result<(), SubagentError> {
+        self.start_follow_up(id, prompt, TurnOrigin::Main)
+    }
+
+    /// Start a follow-up turn the user typed into a focus thread. The turn gets
+    /// `USER_TURN_PREFACE` first and reports only to the focus view.
+    pub fn follow_up_from_user(&self, id: &str, prompt: String) -> Result<(), SubagentError> {
+        let prompt = format!("{USER_TURN_PREFACE}\n\n{prompt}");
+        self.start_follow_up(id, prompt, TurnOrigin::User)
+    }
+
     /// Start a follow-up turn on a completed child. The child moves back to
     /// [`SubagentStatus::Running`], runs exactly one more turn in its original
     /// session and workspace under a fresh [`RunControl`], then publishes its
@@ -518,7 +531,12 @@ impl SubagentManager {
     /// [`SubagentError::Terminal`], and any non-terminal state rejects with
     /// [`SubagentError::InvalidTransition`]. Calling again while a follow-up
     /// turn is in flight also rejects with `InvalidTransition`.
-    pub fn follow_up(&self, id: &str, prompt: String) -> Result<(), SubagentError> {
+    fn start_follow_up(
+        &self,
+        id: &str,
+        prompt: String,
+        origin: TurnOrigin,
+    ) -> Result<(), SubagentError> {
         let child = self.child(id)?;
         // Read the session path before the transition clears the outcome.
         let session_path = child
@@ -568,6 +586,7 @@ impl SubagentManager {
             session_path,
             prompt,
             control,
+            origin,
         ));
         Ok(())
     }
@@ -902,22 +921,23 @@ async fn acquire_permit(
     inner: &Inner,
     child: &Child,
     control: &RunControl,
+    origin: TurnOrigin,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
     let cancel = control.token();
     let permit = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            finish(inner, child, SubagentStatus::Cancelled, Err("cancelled while queued".into()));
+            finish(inner, child, SubagentStatus::Cancelled, Err("cancelled while queued".into()), origin);
             return None;
         }
         _ = inner.parent_cancel.cancelled() => {
-            finish(inner, child, SubagentStatus::Cancelled, Err("cancelled with parent while queued".into()));
+            finish(inner, child, SubagentStatus::Cancelled, Err("cancelled with parent while queued".into()), origin);
             return None;
         }
         permit = inner.semaphore.clone().acquire_owned() => match permit {
             Ok(permit) => permit,
             Err(_) => {
-                finish(inner, child, SubagentStatus::Failed, Err("subagent semaphore closed".into()));
+                finish(inner, child, SubagentStatus::Failed, Err("subagent semaphore closed".into()), origin);
                 return None;
             }
         },
@@ -934,7 +954,7 @@ async fn run_child(
     control: RunControl,
     validator: Option<jsonschema::Validator>,
 ) {
-    let Some(_permit) = acquire_permit(&inner, &child, &control).await else {
+    let Some(_permit) = acquire_permit(&inner, &child, &control, TurnOrigin::Main).await else {
         return;
     };
 
@@ -954,6 +974,7 @@ async fn run_child(
         &child,
         &control,
         validator,
+        TurnOrigin::Main,
         move |events| async move { factory.run(&task_id, spec, task_control, events).await },
     )
     .await;
@@ -970,8 +991,9 @@ async fn run_follow_up(
     session_path: Option<PathBuf>,
     prompt: String,
     control: RunControl,
+    origin: TurnOrigin,
 ) {
-    let Some(_permit) = acquire_permit(&inner, &child, &control).await else {
+    let Some(_permit) = acquire_permit(&inner, &child, &control, origin).await else {
         return;
     };
 
@@ -988,6 +1010,7 @@ async fn run_follow_up(
         &child,
         &control,
         validator,
+        origin,
         move |events| async move {
             match session_path {
                 Some(path) => {
@@ -1010,6 +1033,7 @@ async fn run_turn<F, Fut>(
     child: &Child,
     control: &RunControl,
     validator: Option<jsonschema::Validator>,
+    origin: TurnOrigin,
     turn: F,
 ) where
     F: FnOnce(mpsc::UnboundedSender<AgentEvent>) -> Fut,
@@ -1079,7 +1103,20 @@ async fn run_turn<F, Fut>(
         Err(_) if cancelled => SubagentStatus::Cancelled,
         Err(_) => SubagentStatus::Failed,
     };
-    finish(inner, child, status, outcome);
+    finish(inner, child, status, outcome, origin);
+}
+
+/// Prepended to follow-ups the user types in a focus thread. The contract main
+/// gave at spawn stays in the session history, so the thread keeps it.
+const USER_TURN_PREFACE: &str = "The user is chatting with you directly in your focus thread. Answer them. Your contract from main still applies, including what to report to main and when.";
+
+/// Who started a turn. Main-started turns (the first run and main's follow-ups)
+/// push a completion notice to the main inbox. User-started focus turns do not:
+/// the user reads their result in the focus view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnOrigin {
+    Main,
+    User,
 }
 
 /// Publish the terminal state for a turn — exactly once per turn. The main
@@ -1090,9 +1127,11 @@ fn finish(
     child: &Child,
     status: SubagentStatus,
     outcome: Result<SubagentResult, String>,
+    origin: TurnOrigin,
 ) {
     debug_assert!(status.is_terminal());
-    if let Some(kind) = MainMessageKind::from_terminal(&status) {
+    let kind = MainMessageKind::from_terminal(&status).filter(|_| origin == TurnOrigin::Main);
+    if let Some(kind) = kind {
         let body = match &outcome {
             Ok(result) => result.output.clone(),
             Err(err) => err.clone(),
@@ -2473,6 +2512,51 @@ mod tests {
         assert_eq!(manager.output(&id).unwrap().unwrap().output, "again:more");
         // The workspace lookup ran once at spawn and never again.
         assert_eq!(workspace_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn user_follow_up_skips_main_notice_and_main_follow_up_pushes_one() {
+        let (first, first_rx) = gate();
+        let (second, second_rx) = gate();
+        let manager = manager(
+            follow_up_factory(first_rx, second_rx, Arc::new(AtomicUsize::new(0))),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("thread")).unwrap();
+        first.send(true).unwrap();
+        manager.wait(&id).await.expect("first turn");
+        assert_eq!(
+            manager.main_inbox().drain(),
+            vec![MainMessage {
+                from: id.clone(),
+                kind: MainMessageKind::Completed,
+                body: "done:thread".into(),
+            }]
+        );
+
+        // The user's follow-up runs the turn but leaves main's inbox empty.
+        manager
+            .follow_up_from_user(&id, "more".to_string())
+            .expect("accepted");
+        second.send(true).unwrap();
+        let result = manager.wait(&id).await.expect("user turn");
+        assert!(result.output.ends_with("\n\nmore"));
+        assert!(manager.main_inbox().drain().is_empty());
+
+        // Main's own follow-up reports to main again.
+        manager
+            .follow_up(&id, "report".to_string())
+            .expect("accepted");
+        manager.wait(&id).await.expect("main turn");
+        assert_eq!(
+            manager.main_inbox().drain(),
+            vec![MainMessage {
+                from: id,
+                kind: MainMessageKind::Completed,
+                body: "again:report".into(),
+            }]
+        );
     }
 
     #[tokio::test]
