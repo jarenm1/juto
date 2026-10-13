@@ -368,6 +368,10 @@ impl GitRepository {
         let forks = self.forks_directory();
         fs::create_dir_all(&forks)
             .with_context(|| format!("failed to create {}", forks.display()))?;
+        // Serialize record creation with cleanup's scan-and-unlink. Otherwise
+        // cleanup can unlink the record after it is opened but before this
+        // call acquires its per-record lock.
+        let registry = lock_fork_registry(&forks)?;
         let pending_path = forks.join(pending_fork_name(destination));
         // Whether a crashed creator already registered this destination. Only a
         // pre-existing record may be reclaimed; an unregistered directory is
@@ -396,6 +400,7 @@ impl GitRepository {
                 thread: thread.to_string(),
             },
         )?;
+        drop(registry);
 
         // Atomic: fails with `AlreadyExists` instead of racing an `exists` check.
         match fs::create_dir(destination) {
@@ -557,18 +562,23 @@ impl GitRepository {
     /// destination paths. A missing registry directory is not an error.
     pub fn cleanup_orphaned_forks(&self) -> Result<Vec<PathBuf>> {
         let forks = self.forks_directory();
-        let entries = match fs::read_dir(&forks) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed to read {}", forks.display()));
-            }
-        };
+        fs::create_dir_all(&forks)
+            .with_context(|| format!("failed to create {}", forks.display()))?;
+        // Hold the registry lock across the directory scan and every unlink.
+        let _registry = lock_fork_registry(&forks)?;
+        let entries =
+            fs::read_dir(&forks).with_context(|| format!("failed to read {}", forks.display()))?;
         let mut reclaimed = Vec::new();
         for entry in entries {
             let path = entry
                 .with_context(|| format!("failed to read {}", forks.display()))?
                 .path();
+            if !path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("fork-"))
+            {
+                continue;
+            }
             if !path.is_file() {
                 continue;
             }
@@ -1524,6 +1534,25 @@ fn write_pending(file: &fs::File, record: &PendingFork) -> Result<()> {
         .flush()
         .context("failed to flush the pending fork record")?;
     Ok(())
+}
+
+/// Registry-wide lock name; unlike pending records, this never starts with
+/// `fork-` and is excluded from cleanup scans.
+const FORK_REGISTRY_LOCK: &str = ".fork-registry.lock";
+
+/// Lock the registry while pending entries are created or swept.
+fn lock_fork_registry(forks: &Path) -> Result<fs::File> {
+    let path = forks.join(FORK_REGISTRY_LOCK);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("failed to lock {}", path.display()))?;
+    Ok(file)
 }
 
 /// Discover an ordinary Git worktree with `git rev-parse`.

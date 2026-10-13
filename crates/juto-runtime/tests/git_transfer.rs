@@ -1367,3 +1367,60 @@ fn cleanup_orphaned_forks_skips_live_fork() {
     assert!(!destination.exists());
     assert!(!pending.exists());
 }
+
+#[test]
+fn interleaved_forks_and_cleanup_keep_every_registration() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("a.txt"), b"a\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let tree = git_at(repository.git_dir(), &["rev-parse", "HEAD^{tree}"]);
+    let forks_dir = repository.git_dir().join("juto/forks");
+
+    let mut handles = Vec::new();
+    for index in 0..4 {
+        let repository = repository.clone();
+        let tree = tree.clone();
+        let destination = temp.path().join(format!("fork-{index}"));
+        handles.push(std::thread::spawn(move || {
+            for attempt in 0..5 {
+                repository
+                    .fork_workspace(&tree, &destination, &format!("thread-{index}-{attempt}"))
+                    .unwrap();
+                fs::remove_dir_all(&destination).unwrap();
+            }
+        }));
+    }
+    let cleanup_repository = repository.clone();
+    let cleanup = std::thread::spawn(move || {
+        for _ in 0..20 {
+            let _ = cleanup_repository.cleanup_orphaned_forks();
+        }
+    });
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    cleanup.join().unwrap();
+
+    for _ in 0..100 {
+        if repository.cleanup_orphaned_forks().unwrap().is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let leftover: Vec<_> = fs::read_dir(&forks_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("fork-"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leftover.is_empty(),
+        "no pending record may survive: {leftover:?}"
+    );
+}
