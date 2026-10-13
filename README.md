@@ -606,8 +606,10 @@ ImageMagick, Python, a DejaVu font configuration, and a pinned Mesa software
 Vulkan driver. It does not require the hardware GPU lock:
 
 ```sh
-scripts/agent-scope.sh -- nix develop .#smoke -c xvfb-run -a -s "-screen 0 1280x1024x24" cargo run -p juto --locked
+scripts/agent-scope.sh -- nix develop .#smoke -c env -u WAYLAND_DISPLAY xvfb-run -a -s "-screen 0 1280x1024x24" cargo run -p juto --locked
 ```
+
+`WAYLAND_DISPLAY` must be unset for this command. GPUI picks Wayland whenever it is set, and the window then appears on the host session instead of Xvfb.
 
 This opens a real window on the virtual display and remains running until
 closed or sent Ctrl-Q. The explicit display resolution keeps the 960×720
