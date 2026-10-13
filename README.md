@@ -386,7 +386,7 @@ flow and clears the key input. Removing a stored credential does not unset an
 environment variable, so an environment credential can keep a provider connected.
 The provider list and login details scroll independently in compact windows.
 
-TypeSafe (`TYPESAFE_API_KEY`) is a judge provider. `typesafe/jev-latest` and
+TypeSafe (`TYPESAFE_API_KEY`) is a judge provider and appears in the Providers login list as an API-key method. `typesafe/jev-latest` and
 `typesafe/jev-preview` (wire ids `jev-latest` and `jev-preview`) call
 `POST /v1/systemone`, a classifier that picks one of the caller's discrete options.
 They are judge-only: `set_model_role` rejects them for chat roles. The `judge` role
