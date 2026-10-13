@@ -351,8 +351,10 @@ inbox with the `agent_inbox` tool, which returns each entry's `from`, `kind`, an
 `body` and clears the inbox. Reading `agent://main` fails with
 `PeerError::WriteOnly`, so draining happens only through `agent_inbox`. Children
 never write to the user UI; the main agent decides what reaches the user. The
-inbox is not persisted across process restart. Notices fire on every terminal
-publication, so a follow-up turn that ends terminal pushes another notice.
+inbox is not persisted across process restart. Main-started turns (the first run and
+an `agent_send` to a completed child) push a notice on every terminal publication. A
+turn the user types in a focus thread pushes none; its result reaches the user through
+the focus view.
 
 ---
 
@@ -478,8 +480,8 @@ implemented by a dedicated subagent concurrently, and validates against its own 
 * **File Ownership**: `crates/juto-runtime/src/roles.rs`, `crates/juto-runtime/src/roles/*.md`,
   and the `run_depth` and `TaskTool` code in `crates/juto-runtime/src/lib.rs`
 * **Implementation Details**:
-  - `main` is top-level only. It has `read`, `glob`, `grep`, `task`, `wait`, `agent_send`, and
-    `agent_cancel`. `parse_task` rejects `main` as a child agent.
+  - `main` is top-level only. It has `read`, `glob`, `grep`, `task`, `wait`, `agent_send`,
+    `agent_cancel`, and `agent_inbox`. `parse_task` rejects `main` as a child agent.
   - Built-in roles: `builder` (all tools), `scout` and `reviewer` (read-only), and `task` (all
     tools, the default). Frontmatter `tools` takes `all`, `read-only`, or a list; missing means
     read-only.

@@ -1259,7 +1259,7 @@ impl Tool for SendTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "agent_send".into(),
-            description: "Steer a queued or running child agent by id. Use id `agent://main` to send a message to the main agent's inbox.".into(),
+            description: "Message a child agent by id. A queued or running child receives it as a steer. A completed child starts a new turn with it as the prompt. Failed or cancelled children reject it. Use id `agent://main` to send a message to the main agent's inbox.".into(),
             parameters: json!({"type":"object","properties":{"id":{"type":"string"},"message":{"type":"string"}},"required":["id","message"],"additionalProperties":false}),
         }
     }
