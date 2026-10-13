@@ -1619,3 +1619,65 @@ fn supports_tree_merge_reports_a_bool() {
     // The probe must not panic; this crate requires Git >= 2.45.
     assert!(repository.supports_tree_merge().unwrap());
 }
+
+#[test]
+fn restore_tree_does_not_replace_through_a_symlinked_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("nested/inner.txt"), b"base\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let base = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+    write_file(&dir.join("nested/inner.txt"), b"target\n");
+    commit(&dir, "target");
+    let target = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    let work = temp.path().join("work");
+    repository.fork_workspace(&base, &work, "thread-1").unwrap();
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    write_file(&outside.join("inner.txt"), b"outside\n");
+    fs::remove_dir_all(work.join("nested")).unwrap();
+    symlink(&outside, work.join("nested")).unwrap();
+
+    let error = repository.restore_tree(&base, &target, &work).unwrap_err();
+    assert!(error.to_string().contains("symlink"), "{error}");
+    assert_eq!(
+        fs::read(outside.join("inner.txt")).unwrap(),
+        b"outside\n",
+        "restore must not remove or replace a file through a symlinked parent"
+    );
+}
+
+#[test]
+fn restore_tree_does_not_delete_through_a_symlinked_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = repo(&temp, "repo");
+    write_file(&dir.join("nested/gone.txt"), b"base\n");
+    commit(&dir, "base");
+
+    let repository = GitRepository::open(&dir).unwrap();
+    let git_dir = repository.git_dir().to_path_buf();
+    let base = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+    fs::remove_file(dir.join("nested/gone.txt")).unwrap();
+    commit(&dir, "target");
+    let target = git_at(&git_dir, &["rev-parse", "HEAD^{tree}"]);
+
+    let work = temp.path().join("work");
+    repository.fork_workspace(&base, &work, "thread-1").unwrap();
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    write_file(&outside.join("gone.txt"), b"outside\n");
+    fs::remove_dir_all(work.join("nested")).unwrap();
+    symlink(&outside, work.join("nested")).unwrap();
+
+    let error = repository.restore_tree(&base, &target, &work).unwrap_err();
+    assert!(error.to_string().contains("symlink"), "{error}");
+    assert_eq!(
+        fs::read(outside.join("gone.txt")).unwrap(),
+        b"outside\n",
+        "restore must not delete through a symlinked parent"
+    );
+}
