@@ -185,10 +185,33 @@ fn image_data(data: &str, mime_type: &str) -> ProtoWriter {
     writer
 }
 
+/// Tool-call ids are replayed to routed backends that accept only
+/// `[a-zA-Z0-9_-]` up to 40 chars (upstream `transformMessages`). Calls and
+/// results both pass through here so pairs stay matched. Overlong ids keep a
+/// hash suffix so distinct ids sharing a long prefix do not collide.
+fn wire_tool_call_id(id: &str) -> String {
+    const MAX_LEN: usize = 40;
+    let clean: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.len() <= MAX_LEN {
+        return clean;
+    }
+    let hex = format!("{:x}", sha2::Sha256::digest(id.as_bytes()));
+    format!("{}_{}", &clean[..MAX_LEN - 9], &hex[..8])
+}
+
 /// Map one tool call to `ChatToolCall` (id, name, arguments_json).
 fn chat_tool_call(call: &ToolCall) -> ProtoWriter {
     let mut writer = ProtoWriter::new();
-    writer.string(1, &call.id);
+    writer.string(1, &wire_tool_call_id(&call.id));
     writer.string(2, &call.name);
     let arguments = serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into());
     writer.string(3, &arguments);
@@ -301,7 +324,7 @@ fn build_chat_message_prompts(
                 writer.string(1, &deterministic_uuid(&seed));
                 writer.varint_field(2, CHAT_SOURCE_TOOL);
                 writer.string(3, &result_text);
-                writer.string(7, tool_call_id);
+                writer.string(7, &wire_tool_call_id(tool_call_id));
                 writer.bool(9, *is_error);
                 writer.repeated_message(10, &images);
                 prompts.push(writer);
@@ -445,10 +468,19 @@ fn build_assign_request(
     writer
 }
 
-fn build_auth_request(api_key: &str) -> ProtoWriter {
+fn build_auth_request(metadata: &ProtoWriter) -> ProtoWriter {
     let mut writer = ProtoWriter::new();
-    writer.message(1, Some(&cli_metadata(api_key)));
+    writer.message(1, Some(metadata));
     writer
+}
+
+/// Strip credential material from server-echoed text before it reaches a
+/// transcript. Empty secrets are skipped: `replace("")` would insert everywhere.
+fn redact_secrets(text: String, secrets: &[&str]) -> String {
+    secrets
+        .iter()
+        .filter(|secret| !secret.is_empty())
+        .fold(text, |text, secret| text.replace(secret, "<redacted>"))
 }
 
 /// Decode a unary Connect response: edges variously return bare protobuf or a
@@ -523,15 +555,20 @@ async fn devin_http_error_async(
         .get("content-type")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let mut body = response.bytes_stream();
     let mut bytes = Vec::new();
-    while let Some(Ok(chunk)) = body.next().await {
-        let retain = chunk.len().min(32_768 - usize::min(bytes.len(), 32_768));
-        bytes.extend_from_slice(&chunk[..retain]);
-        if bytes.len() == 32_768 {
-            break;
+    // Bounded: a stalled error body must not hang the failure path; partial bytes suffice.
+    const ERROR_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let _ = tokio::time::timeout(ERROR_BODY_TIMEOUT, async {
+        let mut body = response.bytes_stream();
+        while let Some(Ok(chunk)) = body.next().await {
+            let retain = chunk.len().min(32_768 - usize::min(bytes.len(), 32_768));
+            bytes.extend_from_slice(&chunk[..retain]);
+            if bytes.len() == 32_768 {
+                break;
+            }
         }
-    }
+    })
+    .await;
     let mut message = match devin_error_detail(content_type.as_deref(), &bytes) {
         Some(detail) => format!("Devin {operation} error {status}: {detail}"),
         None => format!("Devin {operation} error {status}"),
@@ -548,14 +585,15 @@ async fn devin_http_error_async(
     }
 }
 
-/// One `GetUserJwt` attempt: raw protobuf body, `application/proto`.
+/// One `GetUserJwt` attempt: raw protobuf body, `application/proto`. `metadata`
+/// carries the key: session token (`cli_metadata`) or raw key (`wire_metadata`).
 async fn request_auth(
     client: &reqwest::Client,
-    api_key: &str,
+    metadata: &ProtoWriter,
     base_url: &str,
     timeout: std::time::Duration,
 ) -> Result<(reqwest::StatusCode, Vec<u8>), ProviderError> {
-    let request = build_auth_request(api_key);
+    let request = build_auth_request(metadata);
     let response = tokio::time::timeout(
         timeout,
         client
@@ -569,7 +607,11 @@ async fn request_auth(
     .map_err(|_| ProviderError::Transport("auth request timeout".into()))?
     .map_err(transport_error)?;
     let status = response.status();
-    let payload = response.bytes().await.map_err(transport_error)?.to_vec();
+    let payload = tokio::time::timeout(timeout, response.bytes())
+        .await
+        .map_err(|_| ProviderError::Transport("auth response timeout".into()))?
+        .map_err(transport_error)?
+        .to_vec();
     Ok((status, payload))
 }
 
@@ -683,26 +725,31 @@ pub(super) async fn stream_devin(
 
     // --- GetUserJwt: session-token metadata first, raw-key retry on 401. ---
     let session_key = normalize_session_token(&api_key);
+    let session_metadata = cli_metadata(&session_key);
     let (status, payload) = tokio::select! {
         _ = cancel.cancelled() => return Err(ProviderError::Aborted),
-        result = request_auth(client, &session_key, &base_url, options.timeout) => result?,
+        result = request_auth(client, &session_metadata, &base_url, options.timeout) => result?,
     };
     let mut auth_status = status;
     let mut auth_payload = payload;
     let mut wire_api_key = session_key.clone();
     if auth_status.as_u16() == 401 && api_key != session_key {
+        let raw_metadata = wire_metadata(&api_key, "");
         let retry = tokio::select! {
             _ = cancel.cancelled() => return Err(ProviderError::Aborted),
-            result = request_auth(client, &api_key, &base_url, options.timeout) => result?,
+            result = request_auth(client, &raw_metadata, &base_url, options.timeout) => result?,
         };
         auth_status = retry.0;
         auth_payload = retry.1;
         wire_api_key = api_key.clone();
     }
     if !auth_status.is_success() {
+        // Redact the session token first: the raw key is a substring of it.
+        let detail = devin_error_detail(None, &auth_payload)
+            .map(|detail| redact_secrets(detail, &[&session_key, &api_key]));
         return Err(ProviderError::Http {
             status: auth_status.as_u16(),
-            message: devin_error_detail(None, &auth_payload)
+            message: detail
                 .map(|detail| format!("Devin auth error {auth_status}: {detail}"))
                 .unwrap_or_else(|| format!("Devin auth error {auth_status}")),
             retry_after: None,
@@ -753,7 +800,10 @@ pub(super) async fn stream_devin(
         if !response.status().is_success() {
             return Err(devin_http_error_async("AssignModel", response, credential).await);
         }
-        let payload = response.bytes().await.map_err(transport_error)?;
+        let payload = tokio::time::timeout(options.timeout, response.bytes())
+            .await
+            .map_err(|_| ProviderError::Transport("AssignModel response timeout".into()))?
+            .map_err(transport_error)?;
         let parsed = decode_unary(&payload)
             .and_then(|message| message.message(1))
             .ok_or_else(|| {
@@ -1080,10 +1130,21 @@ mod tests {
         assign_response: Vec<u8>,
         chat_frames: Vec<Vec<u8>>,
     ) -> (String, CapturedRequests) {
+        spawn_stub_with_first_auth(200, auth_response, assign_response, chat_frames).await
+    }
+
+    /// Like `spawn_stub`, but the first `GetUserJwt` answers `first_auth_status`.
+    async fn spawn_stub_with_first_auth(
+        first_auth_status: u16,
+        auth_response: Vec<u8>,
+        assign_response: Vec<u8>,
+        chat_frames: Vec<Vec<u8>>,
+    ) -> (String, CapturedRequests) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests: CapturedRequests = Arc::new(Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let mut auth_calls = 0usize;
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let mut reader = BufReader::new(stream);
@@ -1106,7 +1167,12 @@ mod tests {
                 let mut body = vec![0u8; content_length];
                 let _ = reader.read_exact(&mut body).await;
                 seen.lock().push((head.clone(), body));
+                let mut status = 200u16;
                 let (content_type, payload): (&str, Vec<u8>) = if head.contains(AUTH_PATH) {
+                    auth_calls += 1;
+                    if auth_calls == 1 {
+                        status = first_auth_status;
+                    }
                     ("application/proto", auth_response.clone())
                 } else if head.contains(ASSIGN_MODEL_PATH) {
                     ("application/proto", assign_response.clone())
@@ -1114,7 +1180,7 @@ mod tests {
                     ("application/connect+proto", chat_frames.concat())
                 };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    "HTTP/1.1 {status} stub\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     payload.len()
                 );
                 let stream = reader.get_mut();
@@ -1288,6 +1354,52 @@ mod tests {
         assert_eq!(prompts.len(), 1);
         assert_eq!(prompts[0].string(3), "hi");
         assert_eq!(prompts[0].varint(2), CHAT_SOURCE_USER);
+    }
+
+    /// A 401 on the session-token `GetUserJwt` retries with the raw key. The
+    /// retry must send that key unprefixed: the session prefix belongs only to
+    /// the first attempt (upstream `devinWireMetadata` vs `devinCliMetadata`).
+    #[tokio::test]
+    async fn auth_401_retries_with_unprefixed_raw_key() {
+        let frames = vec![
+            frame_connect_message(&chat_response("ok", 0), 0),
+            frame_connect_message(b"{}", CONNECT_END_STREAM_FLAG),
+        ];
+        let (base_url, requests) =
+            spawn_stub_with_first_auth(401, jwt_response("jwt-abc", ""), vec![], frames).await;
+        let model = devin_model(&base_url);
+        let context = Context {
+            system_prompt: vec![],
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+        };
+        let client = reqwest::Client::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::CredentialStore::open(dir.path().join("auth.json")).unwrap();
+        store.set_api_key("devin", "devin-key-1").unwrap();
+        let credential = store.resolve_provider("devin").await.unwrap();
+        let stream = stream_devin(
+            &client,
+            &model,
+            &context,
+            &StreamOptions::default(),
+            credential.as_ref(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let events: Vec<_> = stream.collect().await;
+        assert!(events.iter().all(|event| event.is_ok()), "stream errors");
+
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 3, "auth, auth retry, chat");
+        let (_, first_auth) = request_body(&requests[0]);
+        let (_, retry_auth) = request_body(&requests[1]);
+        assert_eq!(
+            request_metadata(&first_auth).string(3),
+            format!("{DEVIN_SESSION_TOKEN_PREFIX}devin-key-1")
+        );
+        assert_eq!(request_metadata(&retry_auth).string(3), "devin-key-1");
     }
 
     #[tokio::test]
