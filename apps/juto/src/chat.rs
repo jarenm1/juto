@@ -7,9 +7,9 @@ use std::sync::Arc;
 use crate::Quit;
 use crate::auth_modal::{AuthModal, AuthModalEvent};
 use crate::chat_input::{ChatInput, SubmitMessage};
+use crate::focus_view::{FocusEvent, FocusView};
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
-use crate::vcs_sidebar::VcsSidebar;
 use gpui::{
     App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding, MouseButton,
     MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Subscription, Task,
@@ -48,12 +48,6 @@ pub enum ActiveModal {
     ModelPicker,
     AuthModal,
     DesktopViewer,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SidebarTab {
-    Vcs,
-    Agents,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,54 +129,62 @@ pub fn extract_desktop_artifacts(message: &AiMessage) -> Vec<DesktopSessionArtif
 }
 
 pub fn load_messages(session: &Session) -> Vec<Message> {
+    let Ok(entries) = session.active_entries() else {
+        return Vec::new();
+    };
+    view_messages(entries.iter().filter_map(|entry| match &entry.kind {
+        EntryKind::Message { message } => Some(message),
+        _ => None,
+    }))
+}
+
+/// Converts agent messages into transcript rows. Shared by the main transcript
+/// and focus views.
+pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec<Message> {
     let mut messages = Vec::new();
-    if let Ok(entries) = session.active_entries() {
-        for entry in entries {
-            if let EntryKind::Message { message } = &entry.kind {
-                match message {
-                    AiMessage::User { .. } => {
+    for message in source {
+        match message {
+            AiMessage::User { .. } => {
+                messages.push(Message {
+                    role: MessageRole::User,
+                    text: message.text().into(),
+                    attachments: Vec::new(),
+                    desktop_artifacts: Vec::new(),
+                    approval: None,
+                });
+            }
+            AiMessage::Assistant(assistant) => {
+                let text = assistant.text();
+                let desktop_artifacts = extract_desktop_artifacts(message);
+                if !text.is_empty() || !desktop_artifacts.is_empty() {
+                    messages.push(Message {
+                        role: MessageRole::Assistant,
+                        text: text.into(),
+                        attachments: Vec::new(),
+                        desktop_artifacts,
+                        approval: None,
+                    });
+                }
+            }
+            AiMessage::ToolResult { .. } => {
+                let desktop_artifacts = extract_desktop_artifacts(message);
+                if !desktop_artifacts.is_empty() {
+                    if let Some(last) = messages.last_mut()
+                        && last.role == MessageRole::Assistant
+                    {
+                        last.desktop_artifacts.extend(desktop_artifacts);
+                    } else {
                         messages.push(Message {
-                            role: MessageRole::User,
-                            text: message.text().into(),
+                            role: MessageRole::Assistant,
+                            text: SharedString::default(),
                             attachments: Vec::new(),
-                            desktop_artifacts: Vec::new(),
+                            desktop_artifacts,
                             approval: None,
                         });
                     }
-                    AiMessage::Assistant(assistant) => {
-                        let text = assistant.text();
-                        let desktop_artifacts = extract_desktop_artifacts(message);
-                        if !text.is_empty() || !desktop_artifacts.is_empty() {
-                            messages.push(Message {
-                                role: MessageRole::Assistant,
-                                text: text.into(),
-                                attachments: Vec::new(),
-                                desktop_artifacts,
-                                approval: None,
-                            });
-                        }
-                    }
-                    AiMessage::ToolResult { .. } => {
-                        let desktop_artifacts = extract_desktop_artifacts(message);
-                        if !desktop_artifacts.is_empty() {
-                            if let Some(last) = messages.last_mut()
-                                && last.role == MessageRole::Assistant
-                            {
-                                last.desktop_artifacts.extend(desktop_artifacts);
-                            } else {
-                                messages.push(Message {
-                                    role: MessageRole::Assistant,
-                                    text: SharedString::default(),
-                                    attachments: Vec::new(),
-                                    desktop_artifacts,
-                                    approval: None,
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
                 }
             }
+            _ => {}
         }
     }
     messages
@@ -248,8 +250,8 @@ pub struct ChatView {
     model_picker: Entity<ModelPicker>,
     auth_modal: Entity<AuthModal>,
     sidebar: Entity<Sidebar>,
-    vcs_sidebar: Option<Entity<VcsSidebar>>,
-    sidebar_tab: SidebarTab,
+    focus: Option<Entity<FocusView>>,
+    _focus_subscription: Option<Subscription>,
     subagents: Arc<juto_runtime::subagents::SubagentManager>,
     show_sidebar: bool,
     active_modal: ActiveModal,
@@ -358,17 +360,7 @@ impl ChatView {
                 this.show_sidebar = false;
                 cx.notify();
             }
-            SidebarEvent::SelectTask(id) => {
-                let workspace = this
-                    .sidebar
-                    .read(cx)
-                    .tasks()
-                    .iter()
-                    .find(|task| &task.id == id)
-                    .and_then(|task| task.workspace.as_deref())
-                    .map(PathBuf::from);
-                this.set_focus_vcs(workspace, cx);
-            }
+            SidebarEvent::SelectTask(id) => this.enter_focus(id, cx),
             SidebarEvent::PauseTask(id) => {
                 if let Err(err) = this.subagents.pause(id) {
                     this.sidebar.update(cx, |s, cx| {
@@ -413,8 +405,8 @@ impl ChatView {
             model_picker,
             auth_modal,
             sidebar,
-            vcs_sidebar: None,
-            sidebar_tab: SidebarTab::Agents,
+            focus: None,
+            _focus_subscription: None,
             subagents,
             show_sidebar: true,
             active_modal: ActiveModal::None,
@@ -637,17 +629,40 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Scopes the Changes tab to a selected focus thread's workspace. Without a
-    /// workspace the VCS view is dropped and the Agents tab is shown.
-    fn set_focus_vcs(&mut self, workspace: Option<PathBuf>, cx: &mut Context<Self>) {
-        self.vcs_sidebar = workspace.map(|workspace| {
-            cx.new(|cx| VcsSidebar::new(workspace, self.tokio_handle.clone(), cx))
-        });
-        self.sidebar_tab = if self.vcs_sidebar.is_some() {
-            SidebarTab::Vcs
-        } else {
-            SidebarTab::Agents
+    /// Opens focus mode for the focus thread `id`. Ids that are not focus threads are ignored.
+    fn enter_focus(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(summary) = self
+            .subagents
+            .list()
+            .into_iter()
+            .find(|summary| summary.focus && summary.id == id)
+        else {
+            return;
         };
+        let updates = match self.subagents.subscribe(id) {
+            Ok(updates) => updates,
+            Err(err) => {
+                self.sidebar.update(cx, |s, cx| {
+                    s.set_error(Some(format!("Focus rejected: {err}").into()), cx);
+                });
+                return;
+            }
+        };
+        let subagents = Arc::clone(&self.subagents);
+        let tokio_handle = self.tokio_handle.clone();
+        let focus = cx.new(|cx| FocusView::new(summary, updates, subagents, tokio_handle, cx));
+        let subscription = cx.subscribe(&focus, |this, _, _: &FocusEvent, cx| {
+            this.exit_focus(cx);
+        });
+        self.focus = Some(focus);
+        self._focus_subscription = Some(subscription);
+        cx.notify();
+    }
+
+    /// Leaves focus mode and drops the focus view, including its VCS panel.
+    fn exit_focus(&mut self, cx: &mut Context<Self>) {
+        self.focus = None;
+        self._focus_subscription = None;
         cx.notify();
     }
 
@@ -1147,13 +1162,42 @@ impl ChatView {
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.toggle_sidebar(cx);
                             }))
-                            .child(if self.sidebar_tab == SidebarTab::Vcs {
-                                "⌥ VCS Graph"
-                            } else {
-                                "⚡ Mission Control"
-                            }),
+                            .child("⚡ Mission Control"),
                     ),
             )
+    }
+
+    /// The main transcript and composer, with the Mission Control sidebar when shown.
+    fn main_body(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(self.message_list(cx))
+                    .child(self.composer(window, cx)),
+            )
+            .when(self.show_sidebar, |row| {
+                row.child(
+                    div()
+                        .w(px(380.0))
+                        .flex_none()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .bg(rgb(0x18181b))
+                        .border_l_1()
+                        .border_color(rgb(0x27272a))
+                        .child(self.sidebar.clone()),
+                )
+            })
     }
 
     fn message_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1786,125 +1830,10 @@ impl Render for ChatView {
                 this.toggle_sidebar(cx);
             }))
             .child(self.header(cx))
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_h_0()
-                    .w_full()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .child(self.message_list(cx))
-                            .child(self.composer(window, cx)),
-                    )
-                    .when(self.show_sidebar, |row| {
-                        row.child(
-                            div()
-                                .w(px(380.0))
-                                .flex_none()
-                                .h_full()
-                                .flex()
-                                .flex_col()
-                                .bg(rgb(0x18181b))
-                                .border_l_1()
-                                .border_color(rgb(0x27272a))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_none()
-                                        .border_b_1()
-                                        .border_color(rgb(0x27272a))
-                                        .bg(rgb(0x18181b))
-                                        .when(self.vcs_sidebar.is_some(), |row| {
-                                            row.child(
-                                                div()
-                                                    .id("sidebar-tab-vcs")
-                                                    .flex_1()
-                                                    .py_2()
-                                                    .text_center()
-                                                    .text_xs()
-                                                    .cursor_pointer()
-                                                    .border_b_2()
-                                                    .border_color(
-                                                        if self.sidebar_tab == SidebarTab::Vcs {
-                                                            rgb(0x60a5fa)
-                                                        } else {
-                                                            rgb(0x00000000)
-                                                        },
-                                                    )
-                                                    .text_color(
-                                                        if self.sidebar_tab == SidebarTab::Vcs {
-                                                            rgb(0xffffff)
-                                                        } else {
-                                                            rgb(0x9ca3af)
-                                                        },
-                                                    )
-                                                    .hover(|s| s.bg(rgb(0x27272a)))
-                                                    .on_click(cx.listener(
-                                                        |this, _: &ClickEvent, _, cx| {
-                                                            this.sidebar_tab = SidebarTab::Vcs;
-                                                            cx.notify();
-                                                        },
-                                                    ))
-                                                    .child("Changes"),
-                                            )
-                                        })
-                                        .child(
-                                            div()
-                                                .id("sidebar-tab-agents")
-                                                .flex_1()
-                                                .py_2()
-                                                .text_center()
-                                                .text_xs()
-                                                .cursor_pointer()
-                                                .border_b_2()
-                                                .border_color(
-                                                    if self.sidebar_tab == SidebarTab::Agents {
-                                                        rgb(0x60a5fa)
-                                                    } else {
-                                                        rgb(0x00000000)
-                                                    },
-                                                )
-                                                .text_color(
-                                                    if self.sidebar_tab == SidebarTab::Agents {
-                                                        rgb(0xffffff)
-                                                    } else {
-                                                        rgb(0x9ca3af)
-                                                    },
-                                                )
-                                                .hover(|s| s.bg(rgb(0x27272a)))
-                                                .on_click(cx.listener(
-                                                    |this, _: &ClickEvent, _, cx| {
-                                                        this.sidebar_tab = SidebarTab::Agents;
-                                                        cx.notify();
-                                                    },
-                                                ))
-                                                .child("Agents"),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .flex_1()
-                                        .min_h_0()
-                                        .when(self.sidebar_tab == SidebarTab::Vcs, |view| {
-                                            view.when_some(self.vcs_sidebar.clone(), |view, vcs| {
-                                                view.child(vcs)
-                                            })
-                                        })
-                                        .when(self.sidebar_tab == SidebarTab::Agents, |view| {
-                                            view.child(self.sidebar.clone())
-                                        }),
-                                ),
-                        )
-                    }),
-            )
+            .child(match self.focus.clone() {
+                Some(focus) => focus.into_any_element(),
+                None => self.main_body(window, cx).into_any_element(),
+            })
             .when_some(self.modal_content(), |view, content| {
                 view.child(self.modal_overlay(content, cx))
             })
