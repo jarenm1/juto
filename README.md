@@ -23,8 +23,9 @@ Agent contributors should read [AGENTS.md](AGENTS.md).
 for provisioning a dedicated fork directory per subagent task: a native change-graph fork that
 shares the parent's Git object store, not a `jj` workspace and not a Git worktree. Commands run
 under systemd user scopes (`agents.slice`) with configurable CPU, memory, and swap ceilings, and
-GPU access is serialized with `flock`. Completed work is folded back with `join`/`reconcile`, which
-merge trees into a two-parent node rather than rebasing.
+GPU access is serialized with `flock`. `ChangeGraph::join` and `reconcile` merge trees into a
+two-parent node rather than rebasing. They are explicit operations (the `vcs` tool and
+`juto-cli changes`); subagent results are not folded back automatically.
 
 `jj` is the *human's* interface to this repository (see [AGENTS.md](AGENTS.md)); the runtime does
 not invoke it. The only place `jj` appears in the runtime is the `.jj` metadata-path exclusion, so
@@ -47,14 +48,21 @@ is supervised — a service rather than a scope, which is why the environment an
 are handled explicitly above. The mechanism is tested against a real `cargo check` inside the
 sandbox.
 
-**Multi-agent orchestrator and peer review DAG.** `juto-runtime` provides `Orchestrator`
-for end-to-end task execution: intent triage via discrete classification (`Judge`), persona
-routing (`builder`, `reviewer`, `scout`, `sonic`), sequential verification quality gates
-(`format`, `build`, `test`, `smoke`), adversarial peer review handoff, bounded remediation
-retry loops, cooperative cancellation safety, and real-time lifecycle event broadcasting.
-An approved task's isolated workspace is folded back into the parent thread — the builder's
-head is frozen as a verified checkpoint and joined into the parent, with the parent's own
-uncaptured edits captured first so the merge cannot overwrite them.
+**Delegating role model.** The top-level `main` role has `read`, `glob`, `grep`, `task`, `wait`,
+`agent_send`, and `agent_cancel`; it cannot edit files. Work runs in child agents defined as
+markdown roles in `crates/juto-runtime/src/roles/`: `builder` (all tools), `scout` and `reviewer`
+(read-only), and `task` (all tools, the default). A role's `tools` frontmatter takes `all`,
+`read-only`, or a list of tool names; a missing field means read-only. A `<role>.md` file in
+`.juto/agents/` in the working directory or an ancestor, or in the runtime data directory's
+`agents/`, replaces the built-in of the same name, and the nearest file wins. Children receive
+delegation tools only below `max_recursion_depth` (default 2).
+
+Delegation runs through the Exec-tier `task` tool, so it requires `juto-cli --yes`
+(`ApprovalMode::Allow`) or an installed `ApprovalHandler`; in Ask mode with neither, `task` fails.
+Builders write to the shared working tree unless a call sets `isolated_workspace: true`, and
+concurrent builders on one tree can conflict. An isolated child's fork is deleted when its run
+finishes and its file edits are not folded back, so they never reach the parent; its returned
+result and session transcript are kept. Nothing folds subagent work back automatically.
 
 **Native live-change DAG and Git transfer.** Juto tracks live agent edits in its own
 version control DAG rather than synthesizing premature Git commits or depending on
