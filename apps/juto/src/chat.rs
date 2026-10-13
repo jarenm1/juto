@@ -1,5 +1,6 @@
 //! Chat UI wired to the agent runtime and session persistence.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,9 +15,9 @@ use gpui::{
     MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Subscription, Task,
     Window, actions, deferred, div, prelude::*, px, rgb, rgba,
 };
-use juto_agent::{AgentEvent, RunControl, RunOutcome};
-use juto_ai::{Message as AiMessage, ProviderEvent, StopReason};
-use juto_runtime::{DesktopSessionArtifact, EntryKind, Runtime, Session};
+use juto_agent::{AgentEvent, RunControl, RunOutcome, ToolTier};
+use juto_ai::{Message as AiMessage, ProviderEvent, StopReason, ToolCall};
+use juto_runtime::{ApprovalRequest, DesktopSessionArtifact, EntryKind, Runtime, Session};
 use tokio::sync::Mutex;
 
 actions!(
@@ -145,6 +146,7 @@ pub fn load_messages(session: &Session) -> Vec<Message> {
                             text: message.text().into(),
                             attachments: Vec::new(),
                             desktop_artifacts: Vec::new(),
+                            approval: None,
                         });
                     }
                     AiMessage::Assistant(assistant) => {
@@ -156,6 +158,7 @@ pub fn load_messages(session: &Session) -> Vec<Message> {
                                 text: text.into(),
                                 attachments: Vec::new(),
                                 desktop_artifacts,
+                                approval: None,
                             });
                         }
                     }
@@ -172,6 +175,7 @@ pub fn load_messages(session: &Session) -> Vec<Message> {
                                     text: SharedString::default(),
                                     attachments: Vec::new(),
                                     desktop_artifacts,
+                                    approval: None,
                                 });
                             }
                         }
@@ -190,6 +194,53 @@ pub struct Message {
     pub text: SharedString,
     pub attachments: Vec<Attachment>,
     pub desktop_artifacts: Vec<DesktopSessionArtifact>,
+    pub approval: Option<ApprovalCard>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalState {
+    Pending,
+    Allowed,
+    Denied,
+    Cancelled,
+}
+
+/// Inline permission prompt for one tool call. The responder that answers it
+/// lives in `ChatView::pending_approvals`; this is only the rendered record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalCard {
+    pub id: u64,
+    pub tool: SharedString,
+    pub tier: ToolTier,
+    /// Exact bash command, or pretty-printed arguments for other tools.
+    pub detail: SharedString,
+    pub cwd: Option<SharedString>,
+    pub state: ApprovalState,
+}
+
+fn bash_command(call: &ToolCall) -> Option<&str> {
+    if call.name == "bash" {
+        call.arguments.get("command")?.as_str()
+    } else {
+        None
+    }
+}
+
+fn approval_cwd(call: &ToolCall) -> Option<&str> {
+    if call.name == "bash" {
+        call.arguments.get("cwd")?.as_str()
+    } else {
+        None
+    }
+}
+
+/// What the operator is approving: the exact bash command, or the tool's
+/// arguments verbatim as pretty-printed JSON.
+fn approval_detail(call: &ToolCall) -> String {
+    if let Some(command) = bash_command(call) {
+        return command.to_owned();
+    }
+    serde_json::to_string_pretty(&call.arguments).unwrap_or_else(|_| call.arguments.to_string())
 }
 
 pub struct ChatView {
@@ -218,6 +269,9 @@ pub struct ChatView {
     run_task: Option<Task<()>>,
     artifact_notice: Option<SharedString>,
     desktop_viewer: Option<Entity<crate::desktop_viewer::DesktopViewer>>,
+    approval_requests: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalRequest>>>,
+    pending_approvals: HashMap<u64, ApprovalRequest>,
+    next_approval_id: u64,
     _subscriptions: Vec<Subscription>,
 }
 impl Drop for ChatView {
@@ -233,6 +287,7 @@ impl ChatView {
         runtime: Runtime,
         session: Session,
         tokio_handle: tokio::runtime::Handle,
+        approval_requests: tokio::sync::mpsc::UnboundedReceiver<ApprovalRequest>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -373,6 +428,9 @@ impl ChatView {
             is_running: false,
             active_control: None,
             run_task: None,
+            approval_requests: Arc::new(Mutex::new(approval_requests)),
+            pending_approvals: HashMap::new(),
+            next_approval_id: 0,
             _subscriptions: vec![
                 submitted,
                 changed,
@@ -612,6 +670,7 @@ impl ChatView {
             },
             attachments,
             desktop_artifacts: Vec::new(),
+            approval: None,
         });
         self.attachment_error = None;
         self.artifact_notice = None;
@@ -633,15 +692,32 @@ impl ChatView {
                 .await
         });
 
+        let approval_requests = self.approval_requests.clone();
         self.run_task = Some(cx.spawn_in(window, async move |this, cx| {
-            while let Some(event) = events_rx.recv().await {
-                let updated = this.update_in(cx, |this, _window, cx| {
-                    this.handle_agent_event(event, cx);
-                });
-                if updated.is_err() {
-                    break;
+            let mut approvals = approval_requests.lock_owned().await;
+            loop {
+                tokio::select! {
+                    biased;
+                    event = events_rx.recv() => {
+                        let Some(event) = event else { break };
+                        let updated = this.update_in(cx, |this, _window, cx| {
+                            this.handle_agent_event(event, cx);
+                        });
+                        if updated.is_err() {
+                            break;
+                        }
+                    }
+                    Some(request) = approvals.recv() => {
+                        let updated = this.update_in(cx, |this, _window, cx| {
+                            this.handle_approval_request(request, cx);
+                        });
+                        if updated.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
+            drop(approvals);
 
             let outcome = run_future.await;
             this.update_in(cx, |this, window, cx| {
@@ -661,6 +737,7 @@ impl ChatView {
                     text: SharedString::default(),
                     attachments: Vec::new(),
                     desktop_artifacts: Vec::new(),
+                    approval: None,
                 });
                 self.scroll.scroll_to_bottom();
                 cx.notify();
@@ -703,6 +780,7 @@ impl ChatView {
                             text: error_text.into(),
                             attachments: Vec::new(),
                             desktop_artifacts: Vec::new(),
+                            approval: None,
                         });
                     }
                 } else {
@@ -711,6 +789,7 @@ impl ChatView {
                         text: error_text.into(),
                         attachments: Vec::new(),
                         desktop_artifacts: Vec::new(),
+                        approval: None,
                     });
                 }
                 self.scroll.scroll_to_bottom();
@@ -732,6 +811,7 @@ impl ChatView {
                             text: SharedString::default(),
                             attachments: Vec::new(),
                             desktop_artifacts: artifacts,
+                            approval: None,
                         });
                     }
                     self.scroll.scroll_to_bottom();
@@ -743,6 +823,74 @@ impl ChatView {
         }
     }
 
+    fn handle_approval_request(&mut self, request: ApprovalRequest, cx: &mut Context<Self>) {
+        if request.is_abandoned() {
+            return;
+        }
+        let id = self.next_approval_id;
+        self.next_approval_id += 1;
+        let call = request.call();
+        let card = ApprovalCard {
+            id,
+            tool: call.name.clone().into(),
+            tier: request.tier(),
+            detail: approval_detail(call).into(),
+            cwd: approval_cwd(call).map(|cwd| SharedString::from(cwd.to_owned())),
+            state: ApprovalState::Pending,
+        };
+        self.pending_approvals.insert(id, request);
+        self.messages.push(Message {
+            role: MessageRole::Assistant,
+            text: SharedString::default(),
+            attachments: Vec::new(),
+            desktop_artifacts: Vec::new(),
+            approval: Some(card),
+        });
+        self.scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    fn resolve_approval(&mut self, id: u64, allow: bool, cx: &mut Context<Self>) {
+        let Some(request) = self.pending_approvals.remove(&id) else {
+            return;
+        };
+        request.respond(allow);
+        let state = if allow {
+            ApprovalState::Allowed
+        } else {
+            ApprovalState::Denied
+        };
+        self.set_approval_state(id, state);
+        cx.notify();
+    }
+
+    fn set_approval_state(&mut self, id: u64, state: ApprovalState) {
+        for card in self
+            .messages
+            .iter_mut()
+            .filter_map(|message| message.approval.as_mut())
+        {
+            if card.id == id {
+                card.state = state;
+            }
+        }
+    }
+
+    /// Ends outstanding approvals when a run stops. Dropping the responders
+    /// fails any tool call still waiting on them instead of leaving it hung.
+    fn cancel_pending_approvals(&mut self) {
+        self.pending_approvals.clear();
+        for card in self
+            .messages
+            .iter_mut()
+            .filter_map(|message| message.approval.as_mut())
+        {
+            if card.state == ApprovalState::Pending {
+                card.state = ApprovalState::Cancelled;
+            }
+        }
+    }
+
     fn finish_run(
         &mut self,
         outcome: Result<Result<RunOutcome, anyhow::Error>, tokio::task::JoinError>,
@@ -750,6 +898,7 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         self.is_running = false;
+        self.cancel_pending_approvals();
         self.active_control = None;
         self.run_task = None;
         match outcome {
@@ -788,6 +937,7 @@ impl ChatView {
                             text: error_msg.into(),
                             attachments: Vec::new(),
                             desktop_artifacts: Vec::new(),
+                            approval: None,
                         });
                     }
                 } else {
@@ -796,6 +946,7 @@ impl ChatView {
                         text: error_msg.into(),
                         attachments: Vec::new(),
                         desktop_artifacts: Vec::new(),
+                        approval: None,
                     });
                 }
             }
@@ -806,6 +957,7 @@ impl ChatView {
                     text: error_msg.into(),
                     attachments: Vec::new(),
                     desktop_artifacts: Vec::new(),
+                    approval: None,
                 });
             }
         }
@@ -1051,6 +1203,9 @@ impl ChatView {
                                         .child(message.text.clone()),
                                 )
                             })
+                            .when_some(message.approval.clone(), |row, card| {
+                                row.child(self.approval_card(&card, cx))
+                            })
                             .when(!message.attachments.is_empty(), |row| {
                                 row.child(div().mt_2().flex().flex_wrap().gap_2().children(
                                     message.attachments.iter().map(|attachment| {
@@ -1097,6 +1252,104 @@ impl ChatView {
                             })
                     })),
             )
+    }
+
+    fn approval_card(&self, card: &ApprovalCard, cx: &Context<Self>) -> impl IntoElement {
+        let id = card.id;
+        let tier = match card.tier {
+            ToolTier::Read => "read",
+            ToolTier::Write => "write",
+            ToolTier::Exec => "exec",
+        };
+        let footer = match card.state {
+            ApprovalState::Pending => div()
+                .flex()
+                .gap_2()
+                .child(
+                    div()
+                        .id(("approval-allow", id as u32))
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0x16a34a))
+                        .hover(|s| s.bg(rgb(0x15803d)))
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(0xffffff))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.resolve_approval(id, true, cx);
+                        }))
+                        .child("Allow"),
+                )
+                .child(
+                    div()
+                        .id(("approval-deny", id as u32))
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(0xdc2626))
+                        .hover(|s| s.bg(rgb(0xb91c1c)))
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgb(0xffffff))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.resolve_approval(id, false, cx);
+                        }))
+                        .child("Deny"),
+                ),
+            ApprovalState::Allowed => div().text_xs().text_color(rgb(0x86efac)).child("Allowed"),
+            ApprovalState::Denied => div().text_xs().text_color(rgb(0xfca5a5)).child("Denied"),
+            ApprovalState::Cancelled => {
+                div().text_xs().text_color(rgb(0xa0a0a0)).child("Cancelled")
+            }
+        };
+        let detail_lines = card.detail.lines().map(|line| {
+            let text = if line.is_empty() { " " } else { line };
+            div().child(SharedString::from(text.to_owned()))
+        });
+        div()
+            .w_full()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(0xf59e0b))
+            .bg(rgb(0x1e293b))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(0xfcd34d))
+                    .child(SharedString::from(format!(
+                        "Permission requested: {} ({tier})",
+                        card.tool
+                    ))),
+            )
+            .when_some(card.cwd.clone(), |card_div, cwd| {
+                card_div.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(0xa0a0a0))
+                        .child(SharedString::from(format!("cwd: {cwd}"))),
+                )
+            })
+            .child(
+                div()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgb(0x0f172a))
+                    .font_family("monospace")
+                    .text_size(px(13.))
+                    .text_color(rgb(0xe2e8f0))
+                    .flex()
+                    .flex_col()
+                    .children(detail_lines),
+            )
+            .child(footer)
     }
 
     fn attachment_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1637,6 +1890,33 @@ impl Render for ChatView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bash_approval_shows_exact_command_and_cwd() {
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({
+                "command": "rm -rf build\n  echo done",
+                "cwd": "/tmp/work",
+            }),
+            thought_signature: None,
+        };
+        assert_eq!(approval_detail(&call), "rm -rf build\n  echo done");
+        assert_eq!(approval_cwd(&call), Some("/tmp/work"));
+    }
+
+    #[test]
+    fn non_bash_approval_shows_arguments_and_no_cwd() {
+        let call = ToolCall {
+            id: "call-2".into(),
+            name: "write".into(),
+            arguments: serde_json::json!({ "path": "a.txt", "cwd": "/tmp" }),
+            thought_signature: None,
+        };
+        assert!(approval_detail(&call).contains("\"path\": \"a.txt\""));
+        assert_eq!(approval_cwd(&call), None);
+    }
 
     fn labels(attachments: &[Attachment]) -> Vec<&str> {
         attachments
