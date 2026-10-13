@@ -32,6 +32,9 @@ pub struct TaskSpec {
     /// Optional human-facing label; the child id is always generated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Role that sets the child's tools and instructions; `None` runs `task`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     /// The task instructions given to the child agent.
     pub task: String,
     /// Registry selector (`provider/model`) overriding the factory's base model.
@@ -43,7 +46,7 @@ pub struct TaskSpec {
     /// Validation policy for `output_schema`; defaults to strict enforcement.
     #[serde(default)]
     pub schema_mode: SchemaMode,
-    /// Deny Write/Exec-tier tools to the child.
+    /// Restrict the child to read, glob, and grep.
     #[serde(default)]
     pub read_only: bool,
     /// Dedicated Jujutsu workspace requested.
@@ -69,6 +72,7 @@ impl TaskSpec {
     pub fn new(task: impl Into<String>) -> Self {
         Self {
             name: None,
+            agent: None,
             task: task.into(),
             model: None,
             output_schema: None,
@@ -883,6 +887,7 @@ mod tests {
     fn spec(task: &str) -> TaskSpec {
         TaskSpec {
             name: None,
+            agent: None,
             task: task.to_string(),
             model: None,
             output_schema: None,

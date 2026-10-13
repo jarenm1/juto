@@ -57,7 +57,7 @@ impl TaskFilter {
     }
 }
 
-/// Events emitted by the Sidebar component to the parent ChatView or Orchestrator.
+/// Events emitted by the Sidebar component to the parent ChatView.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SidebarEvent {
     SelectTask(String),

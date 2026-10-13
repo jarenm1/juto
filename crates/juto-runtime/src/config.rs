@@ -80,7 +80,7 @@ fn default_max_concurrency() -> usize {
     32
 }
 fn default_recursion_depth() -> usize {
-    1
+    2
 }
 fn default_auto_compact() -> bool {
     true
@@ -107,9 +107,9 @@ pub struct RuntimeConfig {
     pub max_tokens: Option<u64>,
     pub approval_mode: ApprovalMode,
     pub max_concurrency: usize,
-    /// Subagent nesting depth. Root agents run at depth 0; depth >= this value
-    /// gets no task tools. Source-compatible default 1 avoids nested
-    /// semaphore deadlock.
+    /// Subagent nesting depth. Root agents run at depth 0. A run at depth >= this
+    /// value gets no `task` tool. Each depth gets its own subagent manager and
+    /// concurrency limit, so a parent never waits on permits it holds.
     pub max_recursion_depth: usize,
     pub max_turns: Option<usize>,
     pub auto_compact: bool,
@@ -380,7 +380,6 @@ mod tests {
     fn defaults_are_source_shaped() {
         let cfg = RuntimeConfig::default();
         assert_eq!(cfg.approval_mode, ApprovalMode::Ask);
-        assert_eq!(cfg.max_recursion_depth, 1);
         assert!(cfg.max_concurrency > 0);
         assert!((0.0..=1.0).contains(&cfg.compaction_threshold));
         assert!(cfg.approval_mode.permits(juto_agent::ToolTier::Read));
