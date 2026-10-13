@@ -22,7 +22,7 @@ use juto_agent::{AgentEvent, RunControl};
 use juto_ai::{Message, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -184,6 +184,8 @@ pub struct SubagentSummary {
     /// The child's dedicated workspace path, when it runs isolated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<PathBuf>,
+    /// `true` once the main agent released this focus thread's workspace.
+    pub released: bool,
 }
 
 /// Errors surfaced by [`SubagentManager`]. Distinct variants preserve the
@@ -219,6 +221,12 @@ pub enum SubagentError {
     NoTranscript(String),
     /// Reading the child's session file failed.
     Transcript(String),
+    /// `release` targeted a child that has not reached a terminal state.
+    NotTerminal(String),
+    /// The child's workspace was released; follow-ups and transcripts are refused.
+    WorkspaceReleased(String),
+    /// Removing the child's workspace failed; the workspace stays recorded.
+    WorkspaceRelease(String),
 }
 
 impl fmt::Display for SubagentError {
@@ -239,6 +247,16 @@ impl fmt::Display for SubagentError {
             Self::NotFocus(id) => write!(f, "subagent {id} is not a focus thread"),
             Self::NoTranscript(id) => write!(f, "subagent {id} has no completed transcript"),
             Self::Transcript(err) => write!(f, "failed to read subagent transcript: {err}"),
+            Self::NotTerminal(id) => {
+                write!(
+                    f,
+                    "subagent {id} is not terminal; release it after it finishes"
+                )
+            }
+            Self::WorkspaceReleased(id) => write!(f, "subagent {id} workspace was released"),
+            Self::WorkspaceRelease(err) => {
+                write!(f, "failed to release subagent workspace: {err}")
+            }
         }
     }
 }
@@ -278,6 +296,13 @@ pub trait SubagentFactory: Send + Sync {
         _events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<SubagentResult, String> {
         Err("follow-up not supported by this factory".into())
+    }
+
+    /// Remove the child's isolated workspace directory. Called by
+    /// [`SubagentManager::release`] for a terminal child only. The default
+    /// refuses, since the factory did not provision the workspace.
+    async fn release_workspace(&self, _id: &str, _path: &Path) -> Result<(), String> {
+        Err("workspace release not supported by this factory".into())
     }
 }
 
@@ -346,11 +371,21 @@ impl MainInbox {
     }
 }
 
+/// Where a child's isolated workspace stands. `Releasing` covers the cleanup
+/// window so no follow-up or transcript read can race the directory removal.
+enum WorkspaceState {
+    /// The child never had an isolated workspace.
+    Unprovisioned,
+    Live(PathBuf),
+    Releasing,
+    Released,
+}
+
 struct Child {
     id: String,
     spec: TaskSpec,
     focus: bool,
-    workspace: Option<PathBuf>,
+    workspace: Mutex<WorkspaceState>,
     /// Replaced per turn: a fresh turn gets a fresh control so a cancelled or
     /// paused first turn cannot poison a follow-up. Always lock it before
     /// touching it so a turn boundary cannot swap mid-call.
@@ -359,6 +394,28 @@ struct Child {
     status_tx: watch::Sender<SubagentStatus>,
     resolution_tx: Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
     resolution_rx: Mutex<Option<tokio::sync::oneshot::Receiver<String>>>,
+    /// Serializes `release` calls so a retry waits for the attempt in flight.
+    release_gate: AsyncMutex<()>,
+}
+
+impl Child {
+    fn workspace_path(&self) -> Option<PathBuf> {
+        let guard = self.workspace.lock().expect("mutex poisoned");
+        match &*guard {
+            WorkspaceState::Live(path) => Some(path.clone()),
+            _ => None,
+        }
+    }
+
+    /// True once a release has started or finished. Such a child refuses
+    /// follow-ups and transcript reads.
+    fn workspace_released(&self) -> bool {
+        let guard = self.workspace.lock().expect("mutex poisoned");
+        matches!(
+            &*guard,
+            WorkspaceState::Releasing | WorkspaceState::Released
+        )
+    }
 }
 
 struct Inner {
@@ -435,7 +492,11 @@ impl SubagentManager {
             id: id.clone(),
             spec,
             focus,
-            workspace,
+            workspace: Mutex::new(match workspace {
+                Some(path) => WorkspaceState::Live(path),
+                None => WorkspaceState::Unprovisioned,
+            }),
+            release_gate: AsyncMutex::new(()),
             control: Mutex::new(control.clone()),
             state,
             status_tx,
@@ -565,6 +626,9 @@ impl SubagentManager {
         // The gate and the Running transition share the control mutex so a
         // racing second call can never install its own control for the turn.
         let mut control_guard = child.control.lock().expect("mutex poisoned");
+        if child.workspace_released() {
+            return Err(SubagentError::WorkspaceReleased(id.to_string()));
+        }
         let current = child.state.borrow().status.clone();
         if current.is_terminal() && current != SubagentStatus::Completed {
             return Err(SubagentError::Terminal(current));
@@ -631,7 +695,8 @@ impl SubagentManager {
                     stop_reason,
                     usage,
                     focus: child.focus,
-                    workspace: child.workspace.clone(),
+                    workspace: child.workspace_path(),
+                    released: child.workspace_released(),
                     error,
                 }
             })
@@ -662,6 +727,9 @@ impl SubagentManager {
         if !child.focus {
             return Err(SubagentError::NotFocus(id.to_string()));
         }
+        if child.workspace_released() {
+            return Err(SubagentError::WorkspaceReleased(id.to_string()));
+        }
         let path = {
             let state = child.state.borrow();
             match (&state.status, &state.outcome) {
@@ -674,6 +742,44 @@ impl SubagentManager {
         session
             .messages()
             .map_err(|err| SubagentError::Transcript(err.to_string()))
+    }
+
+    /// Remove a terminal child's isolated workspace. Main calls this once it no
+    /// longer needs the child's VCS state. Cleanup runs through the factory's
+    /// async path, so no blocking work lands on the tokio worker. A child refuses
+    /// follow-ups and transcript reads after a successful release. A failed
+    /// cleanup restores the recorded workspace, so a retry is possible.
+    pub async fn release(&self, id: &str) -> Result<(), SubagentError> {
+        let child = self.child(id)?;
+        // Serialize releases: a second caller waits for the first and then sees
+        // the settled state.
+        let _gate = child.release_gate.lock().await;
+        let path = {
+            // Lock order is control, then workspace, matching follow-up.
+            let _control = child.control.lock().expect("mutex poisoned");
+            let status = child.state.borrow().status.clone();
+            if !status.is_terminal() {
+                return Err(SubagentError::NotTerminal(id.to_string()));
+            }
+            let mut workspace = child.workspace.lock().expect("mutex poisoned");
+            match std::mem::replace(&mut *workspace, WorkspaceState::Releasing) {
+                WorkspaceState::Live(path) => path,
+                settled => {
+                    *workspace = settled;
+                    return Ok(());
+                }
+            }
+        };
+        match self.inner.factory.release_workspace(id, &path).await {
+            Ok(()) => {
+                *child.workspace.lock().expect("mutex poisoned") = WorkspaceState::Released;
+                Ok(())
+            }
+            Err(err) => {
+                *child.workspace.lock().expect("mutex poisoned") = WorkspaceState::Live(path);
+                Err(SubagentError::WorkspaceRelease(err))
+            }
+        }
     }
 
     /// Cancel every child that has not reached a terminal state.
@@ -1244,7 +1350,7 @@ pub fn extract_json(text: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::time::{Duration as TokioDuration, timeout};
 
     const WAIT_TIMEOUT: TokioDuration = TokioDuration::from_secs(5);
@@ -3067,5 +3173,228 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn summary_of(manager: &SubagentManager, id: &str) -> SubagentSummary {
+        manager
+            .list()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .expect("child is listed")
+    }
+
+    /// Focus children run in a real directory under `base` and their
+    /// `release_workspace` deletes it. Runs wait on `gate` when given, and
+    /// `started` counts runs that have begun.
+    struct ReleaseFactory {
+        base: PathBuf,
+        gate: Option<watch::Receiver<bool>>,
+        started: Arc<AtomicUsize>,
+        releases: AtomicUsize,
+        fail_release: AtomicBool,
+    }
+
+    fn release_factory(base: &Path, gate: Option<watch::Receiver<bool>>) -> Arc<ReleaseFactory> {
+        Arc::new(ReleaseFactory {
+            base: base.to_path_buf(),
+            gate,
+            started: Arc::new(AtomicUsize::new(0)),
+            releases: AtomicUsize::new(0),
+            fail_release: AtomicBool::new(false),
+        })
+    }
+
+    #[async_trait]
+    impl SubagentFactory for ReleaseFactory {
+        async fn run(
+            &self,
+            id: &str,
+            spec: TaskSpec,
+            control: RunControl,
+            _events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<SubagentResult, String> {
+            tokio::fs::create_dir_all(self.base.join(id))
+                .await
+                .map_err(|err| err.to_string())?;
+            self.started.fetch_add(1, Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                let mut gate = gate.clone();
+                let cancel = control.token();
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err("cancelled".to_string()),
+                    opened = gate.wait_for(|open| *open) => {
+                        if opened.is_err() {
+                            return Err("gate closed".to_string());
+                        }
+                    }
+                }
+            }
+            Ok(SubagentResult {
+                id: id.to_string(),
+                output: format!("done:{}", spec.task),
+                data: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                session_path: PathBuf::from("/tmp/child.jsonl"),
+            })
+        }
+
+        fn workspace_path(&self, id: &str, spec: &TaskSpec) -> Option<PathBuf> {
+            spec.isolated_workspace.then(|| self.base.join(id))
+        }
+
+        async fn release_workspace(&self, _id: &str, path: &Path) -> Result<(), String> {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+            if self.fail_release.load(Ordering::SeqCst) {
+                return Err("disk busy".to_string());
+            }
+            tokio::fs::remove_dir_all(path)
+                .await
+                .map_err(|err| err.to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn release_removes_focus_workspace_and_clears_summary() {
+        let root = tempfile::tempdir().unwrap();
+        let factory = release_factory(root.path(), None);
+        let manager = manager(factory.clone(), 1, CancellationToken::new());
+
+        let mut focus = spec("focus task");
+        focus.focus = true;
+        let id = manager.spawn(focus).unwrap();
+        manager.wait(&id).await.unwrap();
+        let dir = root.path().join(&id);
+        assert_eq!(summary_of(&manager, &id).workspace, Some(dir.clone()));
+
+        manager.release(&id).await.unwrap();
+        assert!(!dir.exists(), "release removes the focus workspace");
+        let summary = summary_of(&manager, &id);
+        assert_eq!(summary.workspace, None);
+        assert!(summary.released);
+        assert_eq!(factory.releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn release_rejects_running_child_and_keeps_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let (open, gate) = gate();
+        let factory = release_factory(root.path(), Some(gate));
+        let manager = manager(factory.clone(), 1, CancellationToken::new());
+
+        let mut focus = spec("focus task");
+        focus.focus = true;
+        let id = manager.spawn(focus).unwrap();
+        until_running(&factory.started, 1).await;
+        let dir = root.path().join(&id);
+
+        assert_eq!(
+            manager.release(&id).await.unwrap_err(),
+            SubagentError::NotTerminal(id.clone())
+        );
+        assert!(dir.exists(), "a running child keeps its workspace");
+        assert_eq!(factory.releases.load(Ordering::SeqCst), 0);
+        assert_eq!(summary_of(&manager, &id).workspace, Some(dir.clone()));
+
+        open.send(true).unwrap();
+        manager.wait(&id).await.unwrap();
+        manager.release(&id).await.unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[tokio::test]
+    async fn release_twice_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let factory = release_factory(root.path(), None);
+        let manager = manager(factory.clone(), 1, CancellationToken::new());
+
+        let mut focus = spec("focus task");
+        focus.focus = true;
+        let id = manager.spawn(focus).unwrap();
+        manager.wait(&id).await.unwrap();
+
+        manager.release(&id).await.unwrap();
+        manager.release(&id).await.unwrap();
+        assert_eq!(factory.releases.load(Ordering::SeqCst), 1);
+        assert!(summary_of(&manager, &id).released);
+    }
+
+    #[tokio::test]
+    async fn released_focus_refuses_follow_up_and_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let factory = release_factory(root.path(), None);
+        let manager = manager(factory.clone(), 1, CancellationToken::new());
+
+        let mut focus = spec("focus task");
+        focus.focus = true;
+        let id = manager.spawn(focus).unwrap();
+        manager.wait(&id).await.unwrap();
+        manager.release(&id).await.unwrap();
+
+        assert_eq!(
+            manager.follow_up(&id, "more".to_string()).unwrap_err(),
+            SubagentError::WorkspaceReleased(id.clone())
+        );
+        assert_eq!(
+            manager.transcript(&id).unwrap_err(),
+            SubagentError::WorkspaceReleased(id.clone())
+        );
+    }
+
+    #[tokio::test]
+    async fn release_unknown_id_is_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = manager(
+            release_factory(root.path(), None),
+            1,
+            CancellationToken::new(),
+        );
+        assert_eq!(
+            manager.release("missing").await.unwrap_err(),
+            SubagentError::Unknown("missing".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_release_keeps_workspace_live_and_can_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let factory = release_factory(root.path(), None);
+        factory.fail_release.store(true, Ordering::SeqCst);
+        let manager = manager(factory.clone(), 1, CancellationToken::new());
+
+        let mut focus = spec("focus task");
+        focus.focus = true;
+        let id = manager.spawn(focus).unwrap();
+        manager.wait(&id).await.unwrap();
+        let dir = root.path().join(&id);
+
+        assert!(matches!(
+            manager.release(&id).await.unwrap_err(),
+            SubagentError::WorkspaceRelease(_)
+        ));
+        let summary = summary_of(&manager, &id);
+        assert_eq!(summary.workspace, Some(dir.clone()));
+        assert!(!summary.released);
+
+        factory.fail_release.store(false, Ordering::SeqCst);
+        manager.release(&id).await.unwrap();
+        assert!(!dir.exists());
+        assert!(summary_of(&manager, &id).released);
+    }
+
+    #[tokio::test]
+    async fn release_without_isolated_workspace_is_a_no_op() {
+        let root = tempfile::tempdir().unwrap();
+        let factory = release_factory(root.path(), None);
+        let manager = manager(factory.clone(), 1, CancellationToken::new());
+
+        let id = manager.spawn(spec("plain task")).unwrap();
+        manager.wait(&id).await.unwrap();
+        manager.release(&id).await.unwrap();
+
+        assert_eq!(factory.releases.load(Ordering::SeqCst), 0);
+        let summary = summary_of(&manager, &id);
+        assert_eq!(summary.workspace, None);
+        assert!(!summary.released);
     }
 }
