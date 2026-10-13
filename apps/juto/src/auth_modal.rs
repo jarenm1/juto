@@ -273,19 +273,6 @@ pub const PROVIDERS: &[ProviderDefinition] = &[
         }],
     },
     ProviderDefinition {
-        id: "typesafe",
-        name: "TypeSafe",
-        tagline: "TypeSafe System One decision models and Jev",
-        methods: &[AuthMethod {
-            id: "typesafe-api-key",
-            name: "TypeSafe API Key",
-            description: "API key from TypeSafe (System One)",
-            backend_id: "typesafe",
-            kind: AuthMethodKind::ApiKey,
-            env_var: Some("TYPESAFE_API_KEY"),
-        }],
-    },
-    ProviderDefinition {
         id: "devin",
         name: "Devin",
         tagline: "SWE models via Devin account or API key",
