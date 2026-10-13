@@ -2,18 +2,24 @@
 // https://docs.rs/crate/gpui/0.2.2/source/examples/input.rs
 // Copyright 2022 - 2025 Zed Industries, Inc.
 // Licensed under Apache-2.0; see licenses/GPUI-APACHE-2.0.txt.
-// Changes: local submission, dark styling, horizontal scrolling, and IME range fixes.
+// Changes: local submission, dark styling, wrapped multi-line input with capped vertical scrolling, and IME range fixes.
 
 use std::ops::Range;
 
 use gpui::{
-    App, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId, ElementInputHandler,
-    Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, point, prelude::*, px, relative, rgb, rgba, size,
+    App, AvailableSpace, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    GlobalElementId, KeyBinding, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Style, TextAlign, TextRun,
+    UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, point, prelude::*, px,
+    relative, rgb, rgba, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
+
+/// Line height of every composer row, including wrapped rows.
+const LINE_HEIGHT_PX: f32 = 24.;
+/// Rows shown before the composer stops growing and scrolls instead.
+const MAX_VISIBLE_LINES: usize = 8;
 
 actions!(
     chat_input,
@@ -42,9 +48,9 @@ pub struct ChatInput {
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
-    last_layout: Option<ShapedLine>,
+    last_layout: Option<WrappedLine>,
     last_bounds: Option<Bounds<Pixels>>,
-    scroll_x: Pixels,
+    scroll_y: Pixels,
     is_selecting: bool,
 }
 
@@ -78,7 +84,7 @@ impl ChatInput {
             marked_range: None,
             last_layout: None,
             last_bounds: None,
-            scroll_x: px(0.),
+            scroll_y: px(0.),
             is_selecting: false,
         }
     }
@@ -96,7 +102,7 @@ impl ChatInput {
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.marked_range = None;
-        self.scroll_x = px(0.);
+        self.scroll_y = px(0.);
         self.is_selecting = false;
         cx.notify();
         text
@@ -204,11 +210,7 @@ impl ChatInput {
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            if text.contains(['\r', '\n']) {
-                self.replace_text_in_range(None, &text.replace(['\r', '\n'], " "), window, cx);
-            } else {
-                self.replace_text_in_range(None, &text, window, cx);
-            }
+            self.replace_text_in_range(None, &text, window, cx);
         }
     }
 
@@ -237,7 +239,13 @@ impl ChatInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x)
+        let local = point(
+            position.x - bounds.left(),
+            position.y - bounds.top() + self.scroll_y,
+        );
+        match line.closest_index_for_position(local, px(LINE_HEIGHT_PX)) {
+            Ok(index) | Err(index) => index,
+        }
     }
 
     fn on_mouse_down(
@@ -274,9 +282,12 @@ impl ChatInput {
     }
 
     fn replace_range(&mut self, range: Range<usize>, new_text: &str) {
+        // The composer is one paragraph, so line breaks become spaces. Each break maps to one
+        // space of equal byte and UTF-16 length, so the caller's offsets stay valid.
+        let new_text = new_text.replace(['\r', '\n'], " ");
         let mut content = String::with_capacity(self.content.len() - range.len() + new_text.len());
         content.push_str(&self.content[..range.start]);
-        content.push_str(new_text);
+        content.push_str(&new_text);
         content.push_str(&self.content[range.end..]);
         self.content = content.into();
         self.selection_reversed = false;
@@ -313,6 +324,115 @@ fn selection_after_replacement(
             start + offset_from_utf16(text, range.start)..start + offset_from_utf16(text, range.end)
         })
         .unwrap_or(start + text.len()..start + text.len())
+}
+
+/// Width available to wrapped text; the caret is drawn in the 2px to its right.
+fn text_wrap_width(width: Pixels) -> Pixels {
+    (width - px(2.)).max(px(0.))
+}
+
+/// Number of visual rows the wrapped composer text occupies.
+fn visual_row_count(line: &WrappedLine) -> usize {
+    line.wrap_boundaries().len() + 1
+}
+
+/// Composer height for `rows` visual rows, capped at `MAX_VISIBLE_LINES`.
+fn composer_height(rows: usize) -> Pixels {
+    px(LINE_HEIGHT_PX * rows.min(MAX_VISIBLE_LINES) as f32)
+}
+
+/// Shapes the composer text, or its placeholder, as one paragraph wrapped at `wrap_width`.
+fn shape_composer_text(input: &ChatInput, window: &mut Window, wrap_width: Pixels) -> WrappedLine {
+    let style = window.text_style();
+    let display_text: SharedString = if input.content.is_empty() {
+        "Message Juto…".into()
+    } else {
+        input.content.clone()
+    };
+    let base = TextRun {
+        len: display_text.len(),
+        font: style.font(),
+        color: if input.content.is_empty() {
+            rgb(0x909090).into()
+        } else {
+            style.color
+        },
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let runs = match &input.marked_range {
+        Some(marked) => vec![
+            TextRun {
+                len: marked.start,
+                ..base.clone()
+            },
+            TextRun {
+                len: marked.len(),
+                underline: Some(UnderlineStyle {
+                    color: Some(style.color),
+                    thickness: px(1.),
+                    wavy: false,
+                }),
+                ..base.clone()
+            },
+            TextRun {
+                len: display_text.len() - marked.end,
+                ..base
+            },
+        ],
+        None => vec![base],
+    };
+    let font_size = style.font_size.to_pixels(window.rem_size());
+    window
+        .text_system()
+        .shape_text(display_text, font_size, &runs, Some(wrap_width), None)
+        .expect("composer text shaping failed")
+        .into_iter()
+        .next()
+        .expect("single-paragraph composer text yields one wrapped line")
+}
+
+/// Scroll offset that keeps the caret row visible, clamped to the scrollable range.
+fn scroll_y_for_caret(
+    current: Pixels,
+    caret_top: Pixels,
+    caret_bottom: Pixels,
+    viewport: Pixels,
+    content: Pixels,
+) -> Pixels {
+    let max_scroll = (content - viewport).max(px(0.));
+    let mut scroll = current.min(max_scroll);
+    if caret_top < scroll {
+        scroll = caret_top;
+    }
+    if caret_bottom > scroll + viewport {
+        scroll = caret_bottom - viewport;
+    }
+    scroll.max(px(0.)).min(max_scroll)
+}
+
+/// One rectangle per visual row between `start` and `end`, both local to the wrapped text.
+fn selection_row_bounds(
+    origin: Point<Pixels>,
+    start: Point<Pixels>,
+    end: Point<Pixels>,
+    wrap_width: Pixels,
+    row_height: Pixels,
+) -> Vec<Bounds<Pixels>> {
+    let first_row = (start.y / row_height) as usize;
+    let last_row = (end.y / row_height) as usize;
+    (first_row..=last_row)
+        .map(|row| {
+            let left = if row == first_row { start.x } else { px(0.) };
+            let right = if row == last_row { end.x } else { wrap_width };
+            let y = origin.y + row_height * row as f32;
+            Bounds::from_corners(
+                point(origin.x + left, y),
+                point(origin.x + right, y + row_height),
+            )
+        })
+        .collect()
 }
 
 impl EntityInputHandler for ChatInput {
@@ -401,15 +521,15 @@ impl EntityInputHandler for ChatInput {
         let bounds = self.last_bounds?;
         let line = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
+        let row_height = px(LINE_HEIGHT_PX);
+        let start = line.position_for_index(range.start, row_height)?;
+        let end = line.position_for_index(range.end, row_height)?;
+        let top = bounds.top() + start.y - self.scroll_y;
+        // Anchor on the start row; extend to the end x only when the range stays on that row.
+        let right = if end.y == start.y { end.x } else { start.x };
         Some(Bounds::from_corners(
-            point(
-                bounds.left() + line.x_for_index(range.start) - self.scroll_x,
-                bounds.top(),
-            ),
-            point(
-                bounds.left() + line.x_for_index(range.end) - self.scroll_x,
-                bounds.bottom(),
-            ),
+            point(bounds.left() + start.x, top),
+            point(bounds.left() + right, top + row_height),
         ))
     }
 
@@ -431,10 +551,10 @@ struct TextElement {
     input: Entity<ChatInput>,
 }
 struct PrepaintState {
-    line: Option<ShapedLine>,
+    line: Option<WrappedLine>,
     cursor: Option<PaintQuad>,
-    selection: Option<PaintQuad>,
-    scroll_x: Pixels,
+    selections: Vec<PaintQuad>,
+    scroll_y: Pixels,
 }
 
 impl IntoElement for TextElement {
@@ -460,12 +580,30 @@ impl Element for TextElement {
         _: Option<&GlobalElementId>,
         _: Option<&gpui::InspectorElementId>,
         window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> (LayoutId, ()) {
         let mut style = Style::default();
         style.size.width = relative(1.).into();
-        style.size.height = window.line_height().into();
-        (window.request_layout(style, [], cx), ())
+        let input = self.input.clone();
+        let layout_id =
+            window.request_measured_layout(style, move |known, available, window, cx| {
+                let width = known.width.or(match available.width {
+                    AvailableSpace::Definite(width) => Some(width),
+                    _ => None,
+                });
+                let rows = match width {
+                    Some(width) => {
+                        let line =
+                            shape_composer_text(input.read(cx), window, text_wrap_width(width));
+                        visual_row_count(&line)
+                    }
+                    // Intrinsic-size queries have no definite width: report one row, and the
+                    // definite-width pass wraps the text.
+                    None => 1,
+                };
+                size(width.unwrap_or(px(0.)), composer_height(rows))
+            });
+        (layout_id, ())
     }
 
     fn prepaint(
@@ -478,88 +616,49 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> PrepaintState {
         let input = self.input.read(cx);
-        let style = window.text_style();
-        let display_text = if input.content.is_empty() {
-            "Message Juto…".into()
-        } else {
-            input.content.clone()
-        };
-        let run = TextRun {
-            len: display_text.len(),
-            font: style.font(),
-            color: if input.content.is_empty() {
-                rgb(0x909090).into()
-            } else {
-                style.color
-            },
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let mut runs = [run.clone(), run.clone(), run];
-        let run_count = if let Some(marked) = &input.marked_range {
-            runs[0].len = marked.start;
-            runs[1].len = marked.len();
-            runs[1].underline = Some(UnderlineStyle {
-                color: Some(style.color),
-                thickness: px(1.),
-                wavy: false,
-            });
-            runs[2].len = display_text.len() - marked.end;
-            3
-        } else {
-            1
-        };
-        let font_size = style.font_size.to_pixels(window.rem_size());
-        let line =
-            window
-                .text_system()
-                .shape_line(display_text, font_size, &runs[..run_count], None);
-        let cursor_x = line.x_for_index(input.cursor_offset());
-        let mut scroll_x = input.scroll_x;
-        let available = (bounds.size.width - px(2.)).max(px(0.));
-        if cursor_x < scroll_x {
-            scroll_x = cursor_x;
-        }
-        if cursor_x > scroll_x + available {
-            scroll_x = cursor_x - available;
-        }
-        scroll_x = scroll_x.min((line.width - available).max(px(0.)));
-        let origin_x = bounds.left() - scroll_x;
-        let (selection, cursor) = if input.selected_range.is_empty() {
-            (
-                None,
-                Some(fill(
+        let row_height = px(LINE_HEIGHT_PX);
+        let wrap_width = text_wrap_width(bounds.size.width);
+        let line = shape_composer_text(input, window, wrap_width);
+        let content_height = row_height * visual_row_count(&line) as f32;
+        let caret = line
+            .position_for_index(input.cursor_offset(), row_height)
+            .expect("caret offset lies within composer text");
+        let scroll_y = scroll_y_for_caret(
+            input.scroll_y,
+            caret.y,
+            caret.y + row_height,
+            bounds.size.height,
+            content_height,
+        );
+        let origin = point(bounds.left(), bounds.top() - scroll_y);
+        let (selections, cursor): (Vec<PaintQuad>, Option<PaintQuad>) =
+            if input.selected_range.is_empty() {
+                let cursor = fill(
                     Bounds::new(
-                        point(origin_x + cursor_x, bounds.top()),
-                        size(px(2.), bounds.size.height),
+                        point(origin.x + caret.x, origin.y + caret.y),
+                        size(px(2.), row_height),
                     ),
                     rgb(0xd4d4d4),
-                )),
-            )
-        } else {
-            (
-                Some(fill(
-                    Bounds::from_corners(
-                        point(
-                            origin_x + line.x_for_index(input.selected_range.start),
-                            bounds.top(),
-                        ),
-                        point(
-                            origin_x + line.x_for_index(input.selected_range.end),
-                            bounds.bottom(),
-                        ),
-                    ),
-                    rgba(0xffffff30),
-                )),
-                None,
-            )
-        };
+                );
+                (Vec::new(), Some(cursor))
+            } else {
+                let start = line
+                    .position_for_index(input.selected_range.start, row_height)
+                    .expect("selection start lies within composer text");
+                let end = line
+                    .position_for_index(input.selected_range.end, row_height)
+                    .expect("selection end lies within composer text");
+                let selections = selection_row_bounds(origin, start, end, wrap_width, row_height)
+                    .into_iter()
+                    .map(|rect| fill(rect, rgba(0xffffff30)))
+                    .collect();
+                (selections, None)
+            };
         PrepaintState {
             line: Some(line),
             cursor,
-            selection,
-            scroll_x,
+            selections,
+            scroll_y,
         }
     }
 
@@ -580,13 +679,16 @@ impl Element for TextElement {
             cx,
         );
         let line = prepaint.line.take().unwrap();
+        let origin = point(bounds.left(), bounds.top() - prepaint.scroll_y);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            if let Some(selection) = prepaint.selection.take() {
+            for selection in prepaint.selections.drain(..) {
                 window.paint_quad(selection);
             }
             line.paint(
-                point(bounds.left() - prepaint.scroll_x, bounds.top()),
-                window.line_height(),
+                origin,
+                px(LINE_HEIGHT_PX),
+                TextAlign::Left,
+                Some(bounds),
                 window,
                 cx,
             )
@@ -598,7 +700,7 @@ impl Element for TextElement {
             }
         });
         self.input.update(cx, |input, _| {
-            input.scroll_x = prepaint.scroll_x;
+            input.scroll_y = prepaint.scroll_y;
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
         });
@@ -617,7 +719,7 @@ impl Render for ChatInput {
             .cursor(CursorStyle::IBeam)
             .px_2()
             .py_1()
-            .line_height(px(24.))
+            .line_height(px(LINE_HEIGHT_PX))
             .text_size(px(15.))
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
@@ -663,5 +765,50 @@ mod tests {
     fn ime_selection_is_relative_to_inserted_text_not_existing_content() {
         assert_eq!(selection_after_replacement(7, "🙂界", Some(2..3)), 11..14);
         assert_eq!(selection_after_replacement(7, "界", None), 10..10);
+    }
+
+    #[test]
+    fn caret_scrolls_only_as_far_as_needed() {
+        let viewport = px(192.);
+        let content = px(240.);
+        // Caret on the last row (y 216..240) of 10 rows, in an 8-row viewport.
+        assert_eq!(
+            scroll_y_for_caret(px(0.), px(216.), px(240.), viewport, content),
+            px(48.)
+        );
+        // Caret moved above the viewport: scroll follows it up.
+        assert_eq!(
+            scroll_y_for_caret(px(48.), px(24.), px(48.), viewport, content),
+            px(24.)
+        );
+        // Caret already visible: no movement.
+        assert_eq!(
+            scroll_y_for_caret(px(48.), px(100.), px(124.), viewport, content),
+            px(48.)
+        );
+        // Content shrank below the old offset: clamp to the new maximum.
+        assert_eq!(
+            scroll_y_for_caret(px(48.), px(0.), px(24.), viewport, px(100.)),
+            px(0.)
+        );
+    }
+
+    #[test]
+    fn selection_spans_each_visual_row() {
+        let rects = selection_row_bounds(
+            point(px(10.), px(20.)),
+            point(px(30.), px(0.)),
+            point(px(15.), px(48.)),
+            px(100.),
+            px(24.),
+        );
+        assert_eq!(
+            rects,
+            vec![
+                Bounds::from_corners(point(px(40.), px(20.)), point(px(110.), px(44.))),
+                Bounds::from_corners(point(px(10.), px(44.)), point(px(110.), px(68.))),
+                Bounds::from_corners(point(px(10.), px(68.)), point(px(25.), px(92.))),
+            ]
+        );
     }
 }
