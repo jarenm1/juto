@@ -38,6 +38,9 @@ commands: `README.md`. Detailed workflow: `docs/agent-workflow.md`.
 
 - Before reporting complete: format changed files, compile touched crates, run
   relevant tests, and smoke the changed path.
+- Visual checks and smoke tests run offscreen only: the `smoke` shell under
+  Xvfb with software Vulkan. Never open windows on the user's display (host
+  `DISPLAY` or `WAYLAND_DISPLAY`).
 - Do not claim Wayland, hardware acceleration, provider access, or OAuth from a
   CLI or Xvfb smoke.
 - Tasks that change tracked files end with a PR. Read-only investigations end
