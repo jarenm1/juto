@@ -22,7 +22,7 @@ implementation. Read `README.md` for the current build and launch commands.
 The default workspace is the human's checkout. Agent edits, builds, tests, and
 application runs belong in a dedicated jj workspace under `~/workspaces/`,
 not in default. `origin` is configured; use `main@origin` as the base for new
-independent tasks after fetching. Do not assume PR or branch-protection policy.
+independent tasks after fetching. Do not assume branch-protection policy.
 
 Use the clean default checkout as the development-flake source. Secondary jj
 workspaces are not Git-colocated; evaluating their `.` flake can copy ignored
@@ -81,14 +81,18 @@ jj, source searches) need no scope.
 
 - Keep history linear on every branch: update changes with `jj rebase`, never
   merge commits. Integrate pull requests with **Rebase and merge** only.
-- Name each logical change with a conventional prefix (`chore:`, `feat:`,
-  `fix:`, `refactor:`, `docs:`).
+- Commit as you go, at each logical checkpoint, not once at the end. A smart
+  commit:
+  - is one logical change that compiles and passes its relevant tests on its own;
+  - keeps refactors, behavior changes, tests, and docs in separate commits;
+  - contains no unrelated edits, debug output, scratch files, or generated artifacts;
+  - has a conventional prefix (`chore:`, `feat:`, `fix:`, `refactor:`, `docs:`, `test:`) and a message stating what changed and why.
+- Before each commit, read `jj diff` for that change and confirm it matches the message.
 - `jj describe -m "<type>: <what>"` names the current change;
   `jj commit -m "<type>: <what>"` finalizes it and opens a new working copy.
   Snapshotting is automatic; no staging step is needed.
 - Amend only changes owned by this task. Preserve unrelated edits and leave
-  workspaces in place for review. Fetch, rebase, push, or create a PR only when
-  the task calls for it and the relevant remote/bookmarks actually exist.
+  workspaces in place for review.
 - Track `Cargo.lock` and `flake.lock`. Change dependencies only as the task
   requires; regenerate Cargo locks with Cargo rather than hand-editing them.
 
@@ -150,6 +154,17 @@ recordings, and smoke scripts outside tracked source (for example `/tmp`);
 keep them available for review. Do not claim Wayland, hardware acceleration,
 provider access, or OAuth was verified from a CLI-only or Xvfb smoke.
 
-The human owns publication and merging. When asked for a PR, follow the
-repository's template if one exists and include evidence for behavioral or UI
-changes; otherwise hand off the local jj change directly.
+Every task ends with a pull request; a task without one is not done. When the
+work is complete and verified:
+
+1. Fetch and rebase onto the base: `jj git fetch && jj rebase -d main@origin`.
+2. Name the finished change's bookmark and push it:
+   `jj bookmark set <type>/<slug> -r <change-id>`, then
+   `jj git push --bookmark <type>/<slug>`.
+3. Open the PR: `gh pr create --base main --head <type>/<slug>`. Use
+   `.github/pull_request_template.md` if it exists; none exists today. The body
+   MUST list the change ids, the verification commands and their results, the
+   observed behavior for runtime or UI changes (screenshot paths outside the
+   repo), and any manual steps still required.
+4. Report the PR URL in the final handoff. Do not merge; the human owns merging
+   and integrates with Rebase and merge.
