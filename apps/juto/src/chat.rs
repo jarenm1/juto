@@ -1206,6 +1206,8 @@ impl ChatView {
             .id("messages")
             .flex_1()
             .min_h_0()
+            .w_full()
+            .min_w_0()
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
             .px_6()
@@ -1216,6 +1218,7 @@ impl ChatView {
                     .flex_col()
                     .gap_4()
                     .w_full()
+                    .min_w_0()
                     .max_w(px(800.))
                     .mx_auto()
                     .when(messages.is_empty(), |view| {
