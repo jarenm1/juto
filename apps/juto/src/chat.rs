@@ -10,12 +10,13 @@ use crate::chat_input::{ChatInput, SubmitMessage};
 use crate::focus_view::{FocusEvent, FocusView};
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
+use crate::view_element::render_view;
 use gpui::{
     App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding, MouseButton,
     MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Subscription, Task,
     Window, actions, deferred, div, prelude::*, px, rgb, rgba,
 };
-use juto_agent::{AgentEvent, RunControl, RunOutcome, ToolTier};
+use juto_agent::{AgentEvent, RunControl, RunOutcome, ToolTier, ViewNode, view_from_details};
 use juto_ai::{Message as AiMessage, ProviderEvent, StopReason, ToolCall};
 use juto_runtime::{ApprovalRequest, DesktopSessionArtifact, EntryKind, Runtime, Session};
 use tokio::sync::Mutex;
@@ -151,6 +152,7 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
                     attachments: Vec::new(),
                     desktop_artifacts: Vec::new(),
                     approval: None,
+                    views: Vec::new(),
                 });
             }
             AiMessage::Assistant(assistant) => {
@@ -163,10 +165,11 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
                         attachments: Vec::new(),
                         desktop_artifacts,
                         approval: None,
+                        views: Vec::new(),
                     });
                 }
             }
-            AiMessage::ToolResult { .. } => {
+            AiMessage::ToolResult { details, .. } => {
                 let desktop_artifacts = extract_desktop_artifacts(message);
                 if !desktop_artifacts.is_empty() {
                     if let Some(last) = messages.last_mut()
@@ -180,14 +183,30 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
                             attachments: Vec::new(),
                             desktop_artifacts,
                             approval: None,
+                            views: Vec::new(),
                         });
                     }
+                }
+                if let Some(view) = view_from_details(details) {
+                    messages.push(view_row(view));
                 }
             }
             _ => {}
         }
     }
     messages
+}
+
+/// Transcript row that shows a tool's view tree in place of text output.
+pub fn view_row(view: ViewNode) -> Message {
+    Message {
+        role: MessageRole::Assistant,
+        text: SharedString::default(),
+        attachments: Vec::new(),
+        desktop_artifacts: Vec::new(),
+        approval: None,
+        views: vec![view],
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -197,6 +216,7 @@ pub struct Message {
     pub attachments: Vec<Attachment>,
     pub desktop_artifacts: Vec<DesktopSessionArtifact>,
     pub approval: Option<ApprovalCard>,
+    pub views: Vec<ViewNode>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -706,6 +726,7 @@ impl ChatView {
             attachments,
             desktop_artifacts: Vec::new(),
             approval: None,
+            views: Vec::new(),
         });
         self.attachment_error = None;
         self.artifact_notice = None;
@@ -773,6 +794,7 @@ impl ChatView {
                     attachments: Vec::new(),
                     desktop_artifacts: Vec::new(),
                     approval: None,
+                    views: Vec::new(),
                 });
                 self.scroll.scroll_to_bottom();
                 cx.notify();
@@ -794,6 +816,7 @@ impl ChatView {
                 let text = message.text();
                 if let Some(last) = self.messages.last_mut()
                     && last.role == MessageRole::Assistant
+                    && matches!(message, AiMessage::Assistant(_))
                 {
                     last.text = text.into();
                     self.scroll.scroll_to_bottom();
@@ -816,6 +839,7 @@ impl ChatView {
                             attachments: Vec::new(),
                             desktop_artifacts: Vec::new(),
                             approval: None,
+                            views: Vec::new(),
                         });
                     }
                 } else {
@@ -825,6 +849,7 @@ impl ChatView {
                         attachments: Vec::new(),
                         desktop_artifacts: Vec::new(),
                         approval: None,
+                        views: Vec::new(),
                     });
                 }
                 self.scroll.scroll_to_bottom();
@@ -847,8 +872,16 @@ impl ChatView {
                             attachments: Vec::new(),
                             desktop_artifacts: artifacts,
                             approval: None,
+                            views: Vec::new(),
                         });
                     }
+                    self.scroll.scroll_to_bottom();
+                    cx.notify();
+                }
+                if let AiMessage::ToolResult { details, .. } = &result
+                    && let Some(view) = view_from_details(details)
+                {
+                    self.messages.push(view_row(view));
                     self.scroll.scroll_to_bottom();
                     cx.notify();
                 }
@@ -880,6 +913,7 @@ impl ChatView {
             attachments: Vec::new(),
             desktop_artifacts: Vec::new(),
             approval: Some(card),
+            views: Vec::new(),
         });
         self.scroll.scroll_to_bottom();
         cx.notify();
@@ -973,6 +1007,7 @@ impl ChatView {
                             attachments: Vec::new(),
                             desktop_artifacts: Vec::new(),
                             approval: None,
+                            views: Vec::new(),
                         });
                     }
                 } else {
@@ -982,6 +1017,7 @@ impl ChatView {
                         attachments: Vec::new(),
                         desktop_artifacts: Vec::new(),
                         approval: None,
+                        views: Vec::new(),
                     });
                 }
             }
@@ -993,6 +1029,7 @@ impl ChatView {
                     attachments: Vec::new(),
                     desktop_artifacts: Vec::new(),
                     approval: None,
+                    views: Vec::new(),
                 });
             }
         }
@@ -1250,6 +1287,7 @@ impl ChatView {
                             MessageRole::Assistant => "Assistant",
                         };
                         let artifacts = message.desktop_artifacts.clone();
+                        let views = message.views.clone();
                         div()
                             .id(("message", index))
                             .flex_none()
@@ -1315,6 +1353,16 @@ impl ChatView {
                                             },
                                         ),
                                     ),
+                                )
+                            })
+                            .when(!views.is_empty(), |row| {
+                                row.child(
+                                    div()
+                                        .mt_2()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .children(views.iter().map(render_view)),
                                 )
                             })
                     })),
@@ -1997,5 +2045,60 @@ mod tests {
         assert_eq!(messages[0].role, MessageRole::Assistant);
         assert_eq!(messages[0].desktop_artifacts.len(), 1);
         assert_eq!(messages[0].desktop_artifacts[0], artifact);
+    }
+
+    #[test]
+    fn load_messages_places_view_result_in_its_own_row_after_text() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        let mut session = Session::create(temp_dir.path(), &cwd).unwrap();
+
+        let assistant = juto_ai::AssistantMessage {
+            content: vec![juto_ai::ContentBlock::Text {
+                text: "Spawned a worker".into(),
+            }],
+            api: "test".into(),
+            provider: "test".into(),
+            model: "test-model".into(),
+            usage: Default::default(),
+            stop_reason: StopReason::Stop,
+            timestamp: 0,
+            response_id: None,
+            error: None,
+        };
+        session
+            .append(EntryKind::Message {
+                message: AiMessage::Assistant(assistant),
+            })
+            .unwrap();
+
+        let view = juto_agent::ViewNode {
+            tag: "Badge".into(),
+            props: serde_json::json!({"label": "done"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            children: Vec::new(),
+        };
+        let tool_result = AiMessage::ToolResult {
+            tool_call_id: "call-2".into(),
+            tool_name: "view_test".into(),
+            content: vec![juto_ai::ContentBlock::Text { text: "ok".into() }],
+            is_error: false,
+            details: juto_agent::view_details(view.clone()),
+            timestamp: 0,
+        };
+        session
+            .append(EntryKind::Message {
+                message: tool_result,
+            })
+            .unwrap();
+
+        let messages = load_messages(&session);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].text.as_ref(), "Spawned a worker");
+        assert!(messages[0].views.is_empty());
+        assert!(messages[1].text.is_empty());
+        assert_eq!(messages[1].views, vec![view]);
     }
 }
