@@ -10,16 +10,19 @@ use crate::chat_input::{ChatInput, SubmitMessage};
 use crate::focus_view::{FocusEvent, FocusView};
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
+use crate::subagent_card;
 use crate::view_element::render_view;
 use gpui::{
-    App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding, MouseButton,
-    MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Subscription, Task,
-    Window, actions, deferred, div, prelude::*, px, rgb, rgba,
+    AnyElement, App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding,
+    MouseButton, MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString,
+    Subscription, Task, Window, actions, deferred, div, prelude::*, px, rgb, rgba,
 };
 use juto_agent::{AgentEvent, RunControl, RunOutcome, ToolTier, ViewNode, view_from_details};
 use juto_ai::{Message as AiMessage, ProviderEvent, StopReason, ToolCall};
+use juto_runtime::subagents::SubagentEvent;
 use juto_runtime::{ApprovalRequest, DesktopSessionArtifact, EntryKind, Runtime, Session};
 use tokio::sync::Mutex;
+use tokio::sync::broadcast::error::RecvError;
 
 actions!(
     chat,
@@ -209,6 +212,22 @@ pub fn view_row(view: ViewNode) -> Message {
     }
 }
 
+/// Renders a view. A subagent card is clickable and opens its focus thread.
+fn card_element(view: &ViewNode, cx: &Context<ChatView>) -> AnyElement {
+    let Some(id) = subagent_card::card_id(view) else {
+        return render_view(view);
+    };
+    let id = id.to_owned();
+    div()
+        .id(SharedString::from(format!("subagent-card-{id}")))
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.enter_focus(&id, cx);
+        }))
+        .child(render_view(view))
+        .into_any_element()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: MessageRole,
@@ -295,6 +314,7 @@ pub struct ChatView {
     pending_approvals: HashMap<u64, ApprovalRequest>,
     next_approval_id: u64,
     _subscriptions: Vec<Subscription>,
+    _subagent_events: Task<()>,
 }
 impl Drop for ChatView {
     fn drop(&mut self) {
@@ -419,7 +439,33 @@ impl ChatView {
             }
         });
 
-        let messages = load_messages(&session);
+        let mut messages = load_messages(&session);
+        for summary in &initial_summaries {
+            subagent_card::upsert_subagent_card(
+                &mut messages,
+                &summary.id,
+                summary.name.as_deref(),
+                &summary.status,
+                false,
+            );
+        }
+        let mut events = subagents.subscribe_events();
+        let subagent_events = cx.spawn_in(window, async move |this, cx| {
+            loop {
+                let update = match events.recv().await {
+                    Ok(event) => this.update_in(cx, |this, window, cx| {
+                        this.handle_subagent_event(event, window, cx);
+                    }),
+                    Err(RecvError::Lagged(_)) => this.update_in(cx, |this, window, cx| {
+                        this.resync_subagents(window, cx);
+                    }),
+                    Err(RecvError::Closed) => break,
+                };
+                if update.is_err() {
+                    break;
+                }
+            }
+        });
         Self {
             input,
             model_picker,
@@ -456,6 +502,7 @@ impl ChatView {
                 auth_modal_sub,
                 sidebar_sub,
             ],
+            _subagent_events: subagent_events,
         }
     }
 
@@ -649,13 +696,13 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Opens focus mode for the focus thread `id`. Ids that are not focus threads are ignored.
+    /// Opens focus mode for thread `id`: a focus thread, or a worker card's child.
     fn enter_focus(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(summary) = self
             .subagents
             .list()
             .into_iter()
-            .find(|summary| summary.focus && summary.id == id)
+            .find(|summary| summary.id == id)
         else {
             return;
         };
@@ -691,6 +738,75 @@ impl ChatView {
         self.sidebar.update(cx, |sidebar, cx| {
             sidebar.sync_from_summaries(&summaries, cx);
         });
+    }
+
+    /// Applies one subagent lifecycle event: keeps its card current, refreshes the
+    /// sidebar, and wakes an idle main thread when a child finishes.
+    fn handle_subagent_event(
+        &mut self,
+        event: SubagentEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match &event {
+            SubagentEvent::Spawned {
+                id, name, status, ..
+            } => {
+                subagent_card::upsert_subagent_card(
+                    &mut self.messages,
+                    id,
+                    name.as_deref(),
+                    status,
+                    self.is_running,
+                );
+                self.scroll.scroll_to_bottom();
+            }
+            SubagentEvent::StatusChanged { id, status }
+            | SubagentEvent::Finished { id, status, .. } => {
+                subagent_card::upsert_subagent_card(
+                    &mut self.messages,
+                    id,
+                    None,
+                    status,
+                    self.is_running,
+                );
+            }
+        }
+        self.sync_subagents(cx);
+        if matches!(event, SubagentEvent::Finished { .. }) {
+            self.wake_if_idle(window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Rebuilds subagent cards from the manager after the event stream lagged and may
+    /// have dropped events. A missed finish is recovered by the idle wake.
+    fn resync_subagents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for summary in self.subagents.list() {
+            subagent_card::upsert_subagent_card(
+                &mut self.messages,
+                &summary.id,
+                summary.name.as_deref(),
+                &summary.status,
+                self.is_running,
+            );
+        }
+        self.sync_subagents(cx);
+        self.wake_if_idle(window, cx);
+        cx.notify();
+    }
+
+    /// Starts a run with completions waiting in the main inbox, when no run is active.
+    /// While a run is active the runtime steers arrivals into it instead.
+    fn wake_if_idle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_running {
+            return;
+        }
+        let arrivals = self.subagents.main_inbox().drain();
+        if arrivals.is_empty() {
+            return;
+        }
+        self.start_run(subagent_card::completion_prompt(&arrivals), window, cx);
     }
 
     #[allow(dead_code)]
@@ -732,6 +848,12 @@ impl ChatView {
         self.artifact_notice = None;
         self.scroll.scroll_to_bottom();
         self.focus_input(window, cx);
+        self.start_run(prompt, window, cx);
+    }
+
+    /// Starts a run for `prompt` and streams its events into the transcript until the
+    /// run ends. Callers record any user-visible message first.
+    fn start_run(&mut self, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
         self.is_running = true;
 
         let control = RunControl::new();
@@ -1036,6 +1158,7 @@ impl ChatView {
         self.sync_subagents(cx);
         self.scroll.scroll_to_bottom();
         self.focus_input(window, cx);
+        self.wake_if_idle(window, cx);
         cx.notify();
     }
 
@@ -1362,7 +1485,7 @@ impl ChatView {
                                         .flex()
                                         .flex_col()
                                         .gap_2()
-                                        .children(views.iter().map(render_view)),
+                                        .children(views.iter().map(|view| card_element(view, cx))),
                                 )
                             })
                     })),

@@ -7,6 +7,7 @@ mod desktop_viewer;
 mod focus_view;
 mod model_picker;
 mod sidebar;
+mod subagent_card;
 mod task_card;
 mod text_input;
 mod vcs_sidebar;

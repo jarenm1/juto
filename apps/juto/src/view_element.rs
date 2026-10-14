@@ -27,28 +27,22 @@ pub fn render_view(node: &ViewNode) -> AnyElement {
             .text_color(rgb(0xe5e7eb))
             .children(render_children(node))
             .into_any_element(),
-        "Badge" => {
-            let label = node
-                .props
-                .get("label")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default();
-            let (background, foreground) = badge_colors(
-                node.props
-                    .get("tone")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or_default(),
-            );
-            div()
-                .px_2p5()
-                .py_0p5()
-                .rounded_md()
-                .text_xs()
-                .bg(rgb(background))
-                .text_color(rgb(foreground))
-                .child(SharedString::from(label.to_string()))
-                .into_any_element()
-        }
+        "Badge" => badge(prop(node, "label"), prop(node, "tone")),
+        "Subagent" => div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_2p5()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x374151))
+            .text_sm()
+            .text_color(rgb(0xe5e7eb))
+            .child(SharedString::from(prop(node, "name").to_owned()))
+            .child(badge(prop(node, "status"), prop(node, "tone")))
+            .into_any_element(),
         unknown => div()
             .px_2p5()
             .py_1()
@@ -81,4 +75,25 @@ fn badge_colors(tone: &str) -> (u32, u32) {
         "info" => (0x1e3a8a, 0xbfdbfe),
         _ => (0x374151, 0xe5e7eb),
     }
+}
+
+/// A string prop, or `""` when the key is absent or not a string.
+fn prop<'a>(node: &'a ViewNode, key: &str) -> &'a str {
+    node.props
+        .get(key)
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+}
+
+fn badge(label: &str, tone: &str) -> AnyElement {
+    let (background, foreground) = badge_colors(tone);
+    div()
+        .px_2p5()
+        .py_0p5()
+        .rounded_md()
+        .text_xs()
+        .bg(rgb(background))
+        .text_color(rgb(foreground))
+        .child(SharedString::from(label.to_owned()))
+        .into_any_element()
 }
