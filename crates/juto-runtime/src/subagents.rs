@@ -22,7 +22,7 @@ use juto_agent::{AgentEvent, RunControl};
 use juto_ai::{Message, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex as AsyncMutex, Semaphore, mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -315,6 +315,35 @@ pub struct ChildState {
     pub outcome: Option<Result<SubagentResult, String>>,
 }
 
+/// Lifecycle notification for every child a manager owns. Observers subscribe
+/// with [`SubagentManager::subscribe_events`]. A receiver that reports `Lagged`
+/// should resynchronize from [`SubagentManager::list`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SubagentEvent {
+    /// A child was queued. `focus` children always run isolated.
+    Spawned {
+        id: String,
+        name: Option<String>,
+        status: SubagentStatus,
+        focus: bool,
+    },
+    StatusChanged {
+        id: String,
+        status: SubagentStatus,
+    },
+    /// Terminal, exactly once per turn. `result` on success, `error` otherwise.
+    Finished {
+        id: String,
+        status: SubagentStatus,
+        result: Option<SubagentResult>,
+        error: Option<String>,
+    },
+}
+
+/// Events buffered per manager before a slow receiver lags.
+const EVENT_CAPACITY: usize = 256;
+
 /// Kind of message delivered to the main agent's inbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -355,6 +384,7 @@ pub struct MainMessage {
 #[derive(Clone, Default)]
 pub struct MainInbox {
     messages: Arc<Mutex<Vec<MainMessage>>>,
+    arrived: Arc<Notify>,
 }
 
 impl MainInbox {
@@ -363,6 +393,26 @@ impl MainInbox {
             .lock()
             .expect("main inbox poisoned")
             .push(message);
+        // Stores a permit when no waiter is parked, so a push racing a drain
+        // is not missed by the next `arrived` wait.
+        self.arrived.notify_one();
+    }
+
+    /// Resolves once a message is pushed. Pending messages are read with `drain`.
+    pub async fn arrived(&self) {
+        self.arrived.notified().await;
+    }
+
+    /// Put undelivered messages back at the front, preserving arrival order.
+    pub fn requeue_front(&self, messages: Vec<MainMessage>) {
+        if messages.is_empty() {
+            return;
+        }
+        self.messages
+            .lock()
+            .expect("main inbox poisoned")
+            .splice(0..0, messages);
+        self.arrived.notify_one();
     }
 
     /// Remove and return every pending message in arrival order.
@@ -392,6 +442,8 @@ struct Child {
     control: Mutex<RunControl>,
     state: watch::Sender<ChildState>,
     status_tx: watch::Sender<SubagentStatus>,
+    /// Manager-wide event stream this child reports into.
+    events: broadcast::Sender<SubagentEvent>,
     resolution_tx: Mutex<Option<tokio::sync::oneshot::Sender<String>>>,
     resolution_rx: Mutex<Option<tokio::sync::oneshot::Receiver<String>>>,
     /// Serializes `release` calls so a retry waits for the attempt in flight.
@@ -416,6 +468,20 @@ impl Child {
             WorkspaceState::Releasing | WorkspaceState::Released
         )
     }
+
+    /// Publish a status and announce it on the manager's event stream. A repeat
+    /// of the current status is not announced again.
+    fn set_status(&self, status: SubagentStatus) {
+        if *self.status_tx.borrow() == status {
+            return;
+        }
+        self.status_tx
+            .send_modify(|current| *current = status.clone());
+        let _ = self.events.send(SubagentEvent::StatusChanged {
+            id: self.id.clone(),
+            status,
+        });
+    }
 }
 
 struct Inner {
@@ -423,6 +489,7 @@ struct Inner {
     semaphore: Arc<Semaphore>,
     parent_cancel: CancellationToken,
     main_inbox: MainInbox,
+    events: broadcast::Sender<SubagentEvent>,
     children: Mutex<HashMap<String, Arc<Child>>>,
 }
 
@@ -448,6 +515,7 @@ impl SubagentManager {
                 parent_cancel,
                 main_inbox,
                 children: Mutex::new(HashMap::new()),
+                events: broadcast::channel(EVENT_CAPACITY).0,
             }),
         }
     }
@@ -456,6 +524,12 @@ impl SubagentManager {
     /// managers so the whole run tree reports to one main thread.
     pub fn main_inbox(&self) -> MainInbox {
         self.inner.main_inbox.clone()
+    }
+
+    /// Subscribe to lifecycle events for every child this manager owns. A
+    /// receiver that lags should resynchronize from [`SubagentManager::list`].
+    pub fn subscribe_events(&self) -> broadcast::Receiver<SubagentEvent> {
+        self.inner.events.subscribe()
     }
 
     /// Queue a child run. Returns the generated child id immediately; the
@@ -502,12 +576,19 @@ impl SubagentManager {
             status_tx,
             resolution_tx: Mutex::new(None),
             resolution_rx: Mutex::new(None),
+            events: self.inner.events.clone(),
         });
         self.inner
             .children
             .lock()
             .expect("subagent registry poisoned")
             .insert(id.clone(), Arc::clone(&child));
+        let _ = self.inner.events.send(SubagentEvent::Spawned {
+            id: id.clone(),
+            name: child.spec.name.clone(),
+            status: SubagentStatus::Queued,
+            focus,
+        });
 
         let inner = Arc::clone(&self.inner);
         let task_id = id.clone();
@@ -652,9 +733,7 @@ impl SubagentManager {
         let control = control_guard.clone();
         drop(control_guard);
 
-        child.status_tx.send_modify(|status| {
-            *status = SubagentStatus::Running;
-        });
+        child.set_status(SubagentStatus::Running);
 
         let inner = Arc::clone(&self.inner);
         let task_id = id.to_string();
@@ -860,9 +939,7 @@ impl SubagentManager {
         child.state.send_modify(|state| {
             state.status = new_status.clone();
         });
-        child.status_tx.send_modify(|s| {
-            *s = new_status;
-        });
+        child.set_status(new_status);
         Ok(())
     }
 
@@ -963,9 +1040,7 @@ impl SubagentManager {
         child.state.send_modify(|state| {
             state.status = SubagentStatus::Running;
         });
-        child.status_tx.send_modify(|s| {
-            *s = SubagentStatus::Running;
-        });
+        child.set_status(SubagentStatus::Running);
 
         let control = child.control.lock().expect("mutex poisoned");
         control.resume();
@@ -994,9 +1069,7 @@ impl SubagentManager {
         child.state.send_modify(|state| {
             state.status = to.clone();
         });
-        child.status_tx.send_modify(|s| {
-            *s = to;
-        });
+        child.set_status(to);
         Ok(())
     }
 
@@ -1103,9 +1176,7 @@ async fn run_child(
     child.state.send_modify(|state| {
         state.status = SubagentStatus::Running;
     });
-    child.status_tx.send_modify(|status| {
-        *status = SubagentStatus::Running;
-    });
+    child.set_status(SubagentStatus::Running);
 
     let factory = inner.factory.clone();
     let spec = child.spec.clone();
@@ -1284,12 +1355,20 @@ fn finish(
             body,
         });
     }
+    let (result, error) = match &outcome {
+        Ok(result) => (Some(result.clone()), None),
+        Err(err) => (None, Some(err.clone())),
+    };
     child.state.send_modify(|state| {
         state.status = status.clone();
         state.outcome = Some(outcome);
     });
-    child.status_tx.send_modify(|s| {
-        *s = status;
+    child.set_status(status.clone());
+    let _ = inner.events.send(SubagentEvent::Finished {
+        id: child.id.clone(),
+        status,
+        result,
+        error,
     });
 }
 
@@ -1442,18 +1521,20 @@ mod tests {
         SubagentManager::new(factory, max_concurrency, parent, MainInbox::default())
     }
 
-    /// Poll until `running` reaches `n`.
+    /// Poll until `running` reaches `n`. Sleeps between checks so blocking
+    /// filesystem work inside the child can finish; yields alone run out.
     async fn until_running(running: &AtomicUsize, n: usize) {
-        for _ in 0..200 {
-            if running.load(Ordering::SeqCst) == n {
-                return;
+        let reached = async {
+            while running.load(Ordering::SeqCst) != n {
+                tokio::time::sleep(TokioDuration::from_millis(1)).await;
             }
-            tokio::task::yield_now().await;
+        };
+        if timeout(WAIT_TIMEOUT, reached).await.is_err() {
+            panic!(
+                "expected {n} running children, got {}",
+                running.load(Ordering::SeqCst)
+            );
         }
-        panic!(
-            "expected {n} running children, got {}",
-            running.load(Ordering::SeqCst)
-        );
     }
 
     #[tokio::test]
@@ -2716,6 +2797,67 @@ mod tests {
                 body: "again:report".into(),
             }]
         );
+    }
+
+    #[test]
+    fn requeue_front_keeps_arrival_order() {
+        let inbox = MainInbox::default();
+        let note = |body: &str| MainMessage {
+            from: "child".into(),
+            kind: MainMessageKind::Message,
+            body: body.into(),
+        };
+        inbox.push(note("third"));
+        inbox.requeue_front(vec![note("first"), note("second")]);
+        let bodies: Vec<String> = inbox.drain().into_iter().map(|m| m.body).collect();
+        assert_eq!(bodies, ["first", "second", "third"]);
+    }
+
+    #[tokio::test]
+    async fn events_report_spawn_status_and_finish() {
+        let (first, first_rx) = gate();
+        let manager = manager(
+            gate_factory(
+                first_rx,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        let mut events = manager.subscribe_events();
+        let id = manager.spawn(spec("thread")).unwrap();
+        match timeout(WAIT_TIMEOUT, events.recv())
+            .await
+            .expect("spawn event")
+            .expect("channel open")
+        {
+            SubagentEvent::Spawned { id: got, .. } => assert_eq!(got, id),
+            other => panic!("expected spawn first, got {other:?}"),
+        }
+
+        first.send(true).unwrap();
+        manager.wait(&id).await.expect("turn");
+        // Status changes may interleave; Finished is this child's terminal event.
+        loop {
+            match timeout(WAIT_TIMEOUT, events.recv())
+                .await
+                .expect("finish event")
+                .expect("channel open")
+            {
+                SubagentEvent::Finished {
+                    id: got, status, ..
+                } => {
+                    assert_eq!(got, id);
+                    assert_eq!(status, SubagentStatus::Completed);
+                    break;
+                }
+                SubagentEvent::StatusChanged { .. } => {}
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]

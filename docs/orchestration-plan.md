@@ -522,6 +522,9 @@ implemented by a dedicated subagent concurrently, and validates against its own 
   - Delegation tools are offered only below `max_recursion_depth` (default 2).
   - No intent triage, quality-gate pipeline, or remediation loop. Verification is left to the
     caller; `reviewer` is read-only and cannot run tests.
+  - Main-thread `task` is non-blocking: `TaskTool` returns `queued` ids and
+    `forward_main_inbox` steers each child's terminal `MainMessage` into the active run.
+    Child-level `task` still uses `collect_agents` and blocks.
 * **Acceptance**: `roles.rs` tests cover built-in grants, nearest-file override, and read-only
   default. `lib.rs` tests observe the advertised tool set for the main thread, read-only
   approval, a scout child, and the recursion limit, and check that `task` rejects unknown and
