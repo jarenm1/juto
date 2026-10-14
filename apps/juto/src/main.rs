@@ -10,6 +10,7 @@ mod sidebar;
 mod task_card;
 mod text_input;
 mod vcs_sidebar;
+mod view_element;
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;

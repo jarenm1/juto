@@ -13,6 +13,7 @@ use tokio::sync::watch;
 use crate::chat::{Message, MessageRole, view_messages};
 use crate::chat_input::{ChatInput, SubmitMessage};
 use crate::vcs_sidebar::VcsSidebar;
+use crate::view_element::render_view;
 
 /// Why the follow-up composer is disabled for `status`, or `None` when enabled.
 pub fn follow_up_unavailable_reason(status: &SubagentStatus) -> Option<&'static str> {
@@ -439,6 +440,7 @@ fn render_message(message: &Message) -> impl IntoElement {
         .gap_1()
         .child(div().text_xs().text_color(rgb(0x9ca3af)).child(author))
         .child(div().text_sm().child(message.text.clone()))
+        .children(message.views.iter().map(render_view))
 }
 
 #[cfg(test)]

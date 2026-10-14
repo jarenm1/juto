@@ -314,6 +314,13 @@ The chat view mounts typed desktop artifact cards with title, identifiers, and v
 Clicking **Open Desktop ↗** resolves the environment through the runtime supervisor and opens
 the embedded viewer, or explicitly reports `Unavailable` when the environment does not exist.
 
+**Element trees in tool results.** A tool result may attach a declarative tree under
+`ToolOutput.details` as `{"type":"view","view":{tag, props, children}}`. The model-facing
+`content` is unchanged. The chat and focus views render the tree in its own row after the
+result, using the primitives `Column`, `Row`, `Text`, and `Badge`. Any unknown tag renders a
+visible `Unknown element <tag>` box, never silently dropped. Trees are decoded with serde; no
+markup is parsed. The agent-facing tool that lets a model emit a tree is not shipped yet.
+
 ## Development
 
 Requires Nix with flakes enabled. The supported development system is
