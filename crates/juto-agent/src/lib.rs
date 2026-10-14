@@ -14,7 +14,10 @@ pub use control::RunControl;
 pub use error::AgentError;
 pub use events::{AgentConfig, AgentEvent, AgentHooks, RunOutcome};
 pub use tool::{Tool, ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier};
-pub use view::{VIEW_DETAILS_TYPE, ViewChild, ViewNode, view_details, view_from_details};
+pub use view::{
+    VIEW_DETAILS_TYPE, VIEW_TAGS, ViewChild, ViewNode, validate_view, view_details,
+    view_from_details,
+};
 
 #[cfg(test)]
 mod tests;

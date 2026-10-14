@@ -49,7 +49,7 @@ are handled explicitly above. The mechanism is tested against a real `cargo chec
 sandbox.
 
 **Delegating role model.** The top-level `main` role has `read`, `glob`, `grep`, `task`, `wait`,
-`agent_send`, `agent_cancel`, `agent_inbox`, and `subagent_release`; it cannot edit files. Work runs in child agents defined as
+`agent_send`, `agent_cancel`, `agent_inbox`, `subagent_release`, and `view`; it cannot edit files. Work runs in child agents defined as
 markdown roles in `crates/juto-runtime/src/roles/`: `builder` (all tools), `scout` and `reviewer`
 (read-only), and `task` (all tools, the default). A role's `tools` frontmatter takes `all`,
 `read-only`, or a list of tool names; a missing field means read-only. A `<role>.md` file in
@@ -319,7 +319,7 @@ the embedded viewer, or explicitly reports `Unavailable` when the environment do
 `content` is unchanged. The chat and focus views render the tree in its own row after the
 result, using the primitives `Column`, `Row`, `Text`, and `Badge`. Any unknown tag renders a
 visible `Unknown element <tag>` box, never silently dropped. Trees are decoded with serde; no
-markup is parsed. The agent-facing tool that lets a model emit a tree is not shipped yet.
+markup is parsed. The `view` tool lets agents emit a tree. The runtime validates it before the host renders it: allowed tags and props only, `Badge` `tone` one of success, warning, error, or info, at most 8 levels of nesting, 200 elements, and 4096 bytes per string.
 
 ## Development
 
