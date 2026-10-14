@@ -67,9 +67,10 @@ impl RunControl {
         self.shared.cancel.cancel();
     }
 
-    /// Queue a steering message for injection at the next boundary.
-    pub fn steer(&self, message: Message) {
-        let _ = self.shared.steering_tx.send(message);
+    /// Queue a steering message for injection at the next boundary. Returns
+    /// `false` when the run has already ended and cannot receive it.
+    pub fn steer(&self, message: Message) -> bool {
+        self.shared.steering_tx.send(message).is_ok()
     }
 
     /// Queue a message delivered only when the agent would otherwise stop.

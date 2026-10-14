@@ -444,8 +444,15 @@ impl Runtime {
             sender: None,
         };
         let manager = self.subagent_manager(&control);
-        self.run_depth(session, prompt.into(), events, control, placement, manager)
-            .await
+        let inbox = manager.main_inbox();
+        // Completions that landed while no main run was active enter this run first.
+        deliver_main_inbox(&inbox, &control);
+        let forwarder = tokio::spawn(forward_main_inbox(inbox, control.clone()));
+        let outcome = self
+            .run_depth(session, prompt.into(), events, control, placement, manager)
+            .await;
+        forwarder.abort();
+        outcome
     }
 
     async fn run_depth(
@@ -1101,6 +1108,7 @@ fn register_agent_tools(
         manager: manager.clone(),
         catalog,
         allow_focus: main,
+        async_results: main,
     }))?;
     registry.register(Arc::new(WaitTool {
         manager: manager.clone(),
@@ -1124,13 +1132,24 @@ struct TaskTool {
     catalog: Arc<BTreeMap<String, AgentRole>>,
     /// `task` entries may request `focus` only on the main thread.
     allow_focus: bool,
+    /// Main-thread calls return once their children are queued; results reach
+    /// the main inbox. Child calls wait, because a child's completions never
+    /// reach the main inbox.
+    async_results: bool,
 }
 #[async_trait]
 impl Tool for TaskTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "task".into(),
-            description: "Run child agents concurrently. Each child gets an independent durable transcript; optional output_schema validates its JSON result. Set schema_mode to strict (default) to fail on missing or invalid data, or permissive to preserve the result. This call waits for all children. Set agent to a role from the available agents list; omit it for the default task role. A role's tools bound what its child may use, and read_only further restricts a child to read, glob, and grep.".into(),
+            description: format!(
+                "Run child agents concurrently. Each child gets an independent durable transcript; optional output_schema validates its JSON result. Set schema_mode to strict (default) to fail on missing or invalid data, or permissive to preserve the result. {} Set agent to a role from the available agents list; omit it for the default task role. A role's tools bound what its child may use, and read_only further restricts a child to read, glob, and grep.",
+                if self.async_results {
+                    "This call returns once the children are queued, with their ids. Each child's terminal result arrives later as a message in the main thread; use `wait` to read one now."
+                } else {
+                    "This call waits for all children."
+                }
+            ),
             parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"agent":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"schema_mode":{"type":"string","enum":["strict","permissive"]},"read_only":{"type":"boolean"},"isolated_workspace":{"type":"boolean"},"focus":{"type":"boolean"},"solution_space":{"type":"string"}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false}),
         }
     }
@@ -1151,6 +1170,10 @@ impl Tool for TaskTool {
             .iter()
             .map(|value| self.parse_task(value, context))
             .collect::<Result<Vec<_>, _>>()?;
+        let queued: Vec<(Option<String>, bool)> = specs
+            .iter()
+            .map(|spec| (spec.name.clone(), spec.focus))
+            .collect();
         let mut ids = Vec::with_capacity(specs.len());
         for spec in specs {
             match self.manager.spawn(spec) {
@@ -1163,7 +1186,15 @@ impl Tool for TaskTool {
                 }
             }
         }
-        collect_agents(&self.manager, ids).await
+        if !self.async_results {
+            return collect_agents(&self.manager, ids).await;
+        }
+        let children = ids
+            .into_iter()
+            .zip(queued)
+            .map(|(id, (name, focus))| (id, name, focus))
+            .collect();
+        Ok(queued_output(children))
     }
 }
 
@@ -1277,6 +1308,54 @@ async fn collect_agents(manager: &SubagentManager, ids: Vec<String>) -> Result<T
         details: value,
         is_error: failed,
     })
+}
+
+/// Output of a non-blocking `task` call: the children are queued and their
+/// terminal results arrive later in the main inbox.
+fn queued_output(children: Vec<(String, Option<String>, bool)>) -> ToolOutput {
+    let count = children.len();
+    let entries: Vec<Value> = children
+        .into_iter()
+        .map(
+            |(id, name, focus)| json!({"id": id, "name": name, "status": "queued", "focus": focus}),
+        )
+        .collect();
+    ToolOutput {
+        content: vec![ContentBlock::Text {
+            text: format!(
+                "Queued {count} child agent(s). Their results arrive in the main thread as they finish; call `wait` with an id to read one now."
+            ),
+        }],
+        details: Value::Array(entries),
+        is_error: false,
+    }
+}
+
+/// Steer queued main-thread messages into the active run. Returns `false` once
+/// the run cannot accept them; the undelivered messages go back to the inbox.
+fn deliver_main_inbox(inbox: &subagents::MainInbox, control: &RunControl) -> bool {
+    let mut pending = inbox.drain().into_iter();
+    while let Some(message) = pending.next() {
+        let text = format!(
+            "[subagent {} {:?}]\n{}",
+            message.from, message.kind, message.body
+        );
+        if !control.steer(Message::user(text)) {
+            inbox.requeue_front(std::iter::once(message).chain(pending).collect());
+            return false;
+        }
+    }
+    true
+}
+
+/// Delivers child completions to the active main run until the run ends.
+async fn forward_main_inbox(inbox: subagents::MainInbox, control: RunControl) {
+    loop {
+        inbox.arrived().await;
+        if !deliver_main_inbox(&inbox, &control) {
+            return;
+        }
+    }
 }
 struct SendTool {
     peers: PeerBus,
@@ -2172,6 +2251,7 @@ mod tests {
             manager: manager.clone(),
             catalog: Arc::new(roles::load(&repo, &data_dir).expect("roles")),
             allow_focus: false,
+            async_results: false,
         };
         let context = ToolContext {
             cwd: repo.clone(),
@@ -2252,6 +2332,7 @@ mod tests {
             manager: manager.clone(),
             catalog: Arc::new(BTreeMap::new()),
             allow_focus: false,
+            async_results: false,
         };
         let error = tool
             .execute(arguments.clone(), context.clone())
@@ -2268,6 +2349,7 @@ mod tests {
             manager,
             catalog: Arc::new(BTreeMap::new()),
             allow_focus: true,
+            async_results: false,
         };
         tool.execute(arguments, context)
             .await

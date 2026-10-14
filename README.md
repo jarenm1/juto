@@ -64,6 +64,14 @@ concurrent builders on one tree can conflict. An isolated child's fork is delete
 finishes and its file edits are not folded back, so they never reach the parent; its returned
 result and session transcript are kept. Nothing folds subagent work back automatically.
 
+On the top-level thread, `task` does not block. It returns `queued` ids immediately, and each
+child's terminal result (completed, failed, or cancelled) reaches the running main turn as a
+steered user message headed `[subagent <id> <kind>]`. A completion that lands while no main run
+is active is delivered at the start of the next run. Waking an idle session when a child finishes
+is the host's job; the runtime does not start a run on its own. Lifecycle events (`spawned`,
+`status_changed`, `finished`) are available from `SubagentManager::subscribe_events`. Child agents
+that call `task` still wait for their own children.
+
 **Native live-change DAG and Git transfer.** Juto tracks live agent edits in its own
 version control DAG rather than synthesizing premature Git commits or depending on
 jj at runtime. Edits capture immutable trees with session/thread provenance,
