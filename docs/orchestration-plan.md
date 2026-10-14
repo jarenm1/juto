@@ -513,7 +513,7 @@ implemented by a dedicated subagent concurrently, and validates against its own 
   and the `run_depth` and `TaskTool` code in `crates/juto-runtime/src/lib.rs`
 * **Implementation Details**:
   - `main` is top-level only. It has `read`, `glob`, `grep`, `task`, `wait`, `agent_send`,
-    `agent_cancel`, `agent_inbox`, and `subagent_release`. `parse_task` rejects `main` as a child agent.
+    `agent_cancel`, `agent_inbox`, `subagent_release`, and `view`. `parse_task` rejects `main` as a child agent.
   - Built-in roles: `builder` (all tools), `scout` and `reviewer` (read-only), and `task` (all
     tools, the default). Frontmatter `tools` takes `all`, `read-only`, or a list; missing means
     read-only.

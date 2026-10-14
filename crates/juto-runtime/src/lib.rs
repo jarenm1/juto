@@ -1993,6 +1993,7 @@ mod tests {
             provider.requests(),
             vec![tool_set(&[
                 "read",
+                "view",
                 "glob",
                 "grep",
                 "task",

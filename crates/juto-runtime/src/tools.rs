@@ -22,7 +22,8 @@ use std::{
 use async_trait::async_trait;
 use globset::{Candidate, GlobBuilder};
 use juto_agent::{
-    AgentError, Tool, ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier,
+    AgentError, Tool, ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier, VIEW_TAGS,
+    ViewNode, validate_view, view_details,
 };
 use juto_ai::ContentBlock;
 use serde::{Deserialize, Serialize};
@@ -2320,7 +2321,66 @@ pub fn builtin_tools_with_limits(
         cwd: cwd.to_path_buf(),
     }))?;
     registry.register(Arc::new(DesktopArtifactTool))?;
+    registry.register(Arc::new(ViewTool))?;
     Ok(registry)
+}
+
+#[derive(Deserialize)]
+struct ViewArgs {
+    view: ViewNode,
+}
+
+/// Shows a declarative element tree in the transcript. The tree travels in
+/// `details`; the model reads only the one-line summary in `content`.
+pub struct ViewTool;
+
+#[async_trait]
+impl Tool for ViewTool {
+    fn definition(&self) -> juto_ai::ToolDefinition {
+        let tags: Vec<&str> = VIEW_TAGS.iter().map(|(tag, _)| *tag).collect();
+        juto_ai::ToolDefinition {
+            name: "view".to_string(),
+            description: "Shows a structured view in the chat transcript. A view is a tree of elements, not markup: Column (vertical stack), Row (wrapping horizontal stack), Text (children are strings or elements), Badge (props.label required; props.tone is success, warning, error, or info). Use it for status the user should scan. Limits: 8 levels of nesting, 200 elements, 4096 bytes per string.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "view": {
+                        "type": "object",
+                        "description": "Root element: {tag, props?, children?}. Children are strings or element objects.",
+                        "properties": {
+                            "tag": {"type": "string", "enum": tags},
+                            "props": {"type": "object"},
+                            "children": {
+                                "type": "array",
+                                "items": {"anyOf": [{"type": "string"}, {"type": "object"}]}
+                            }
+                        },
+                        "required": ["tag"]
+                    }
+                },
+                "required": ["view"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Read
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Shared
+    }
+
+    async fn execute(&self, arguments: Value, _ctx: ToolContext) -> Result<ToolOutput, String> {
+        let args: ViewArgs = serde_json::from_value(arguments)
+            .map_err(|e| format!("invalid view arguments: {e}"))?;
+        validate_view(&args.view)?;
+        Ok(output(
+            "Displayed the view in the transcript.".to_string(),
+            view_details(args.view),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2370,6 +2430,7 @@ mod tests {
                 "grep",
                 "read",
                 "vcs",
+                "view",
                 "write"
             ]
         );
@@ -2377,6 +2438,32 @@ mod tests {
             assert_eq!(def.parameters["type"], "object", "{}", def.name);
             assert!(def.parameters["required"].is_array(), "{}", def.name);
         }
+    }
+
+    #[tokio::test]
+    async fn view_tool_carries_tree_in_details_and_rejects_bad_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ViewTool;
+        let out = tool
+            .execute(
+                json!({"view": {"tag": "Row", "children": [
+                    {"tag": "Badge", "props": {"label": "tests pass", "tone": "success"}},
+                    "3 files"
+                ]}}),
+                ctx(dir.path()),
+            )
+            .await
+            .unwrap();
+        assert!(!out.is_error);
+        let shown = juto_agent::view_from_details(&out.details).expect("view details");
+        assert_eq!(shown.tag, "Row");
+        assert_eq!(shown.children.len(), 2);
+        let err = tool
+            .execute(json!({"view": {"tag": "Gizmo"}}), ctx(dir.path()))
+            .await
+            .unwrap_err();
+        assert!(err.contains("<Gizmo>"), "{err}");
+        assert!(tool.execute(json!({}), ctx(dir.path())).await.is_err());
     }
 
     #[test]
