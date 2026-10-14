@@ -215,7 +215,7 @@ pub enum SubagentError {
     },
     /// Operation timed out.
     Timeout(String),
-    /// The child is not a focus thread, so it has no transcript view.
+    /// The child is not a focus thread and has not completed, so it has no transcript.
     NotFocus(String),
     /// The child has no persisted transcript: it has not completed a turn, or it ended as failed/cancelled.
     NoTranscript(String),
@@ -720,13 +720,12 @@ impl SubagentManager {
             .flatten())
     }
 
-    /// Persisted transcript of a completed focus child, read from its session file.
-    /// Pending, failed, and cancelled children have no transcript.
+    /// Persisted transcript of a completed child, read from its session file.
+    /// Focus and non-focus children both qualify once they complete. Pending,
+    /// failed, and cancelled children have none: a non-focus child reports
+    /// `NotFocus`, a focus child reports `NoTranscript`.
     pub fn transcript(&self, id: &str) -> Result<Vec<Message>, SubagentError> {
         let child = self.child(id)?;
-        if !child.focus {
-            return Err(SubagentError::NotFocus(id.to_string()));
-        }
         if child.workspace_released() {
             return Err(SubagentError::WorkspaceReleased(id.to_string()));
         }
@@ -734,6 +733,7 @@ impl SubagentManager {
             let state = child.state.borrow();
             match (&state.status, &state.outcome) {
                 (SubagentStatus::Completed, Some(Ok(result))) => result.session_path.clone(),
+                _ if !child.focus => return Err(SubagentError::NotFocus(id.to_string())),
                 _ => return Err(SubagentError::NoTranscript(id.to_string())),
             }
         };
@@ -3163,16 +3163,52 @@ mod tests {
 
         let plain_id = manager.spawn(spec("plain task")).unwrap();
         manager.wait(&plain_id).await.unwrap();
-        assert_eq!(
-            manager.transcript(&plain_id).unwrap_err(),
-            SubagentError::NotFocus(plain_id.clone())
-        );
+        let plain_texts: Vec<String> = manager
+            .transcript(&plain_id)
+            .unwrap()
+            .iter()
+            .map(Message::text)
+            .collect();
+        assert_eq!(plain_texts, vec!["plain task", "reply:plain task"]);
         assert_eq!(
             manager.transcript("missing").unwrap_err(),
             SubagentError::Unknown("missing".into())
         );
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_completed_children_have_no_transcript() {
+        let (open, gate) = gate();
+        let manager = manager(
+            gate_factory(
+                gate,
+                Arc::new(AtomicUsize::new(0)),
+                Arc::new(AtomicUsize::new(0)),
+                true,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        open.send(true).unwrap();
+
+        let plain_id = manager.spawn(spec("plain task")).unwrap();
+        assert!(manager.wait(&plain_id).await.is_err());
+        assert_eq!(
+            manager.transcript(&plain_id).unwrap_err(),
+            SubagentError::NotFocus(plain_id.clone())
+        );
+
+        let mut focus = spec("focus task");
+        focus.focus = true;
+        let focus_id = manager.spawn(focus).unwrap();
+        assert!(manager.wait(&focus_id).await.is_err());
+        assert_eq!(
+            manager.transcript(&focus_id).unwrap_err(),
+            SubagentError::NoTranscript(focus_id.clone())
+        );
     }
 
     fn summary_of(manager: &SubagentManager, id: &str) -> SubagentSummary {
