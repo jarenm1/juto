@@ -322,6 +322,7 @@ visible `Unknown element <tag>` box, never silently dropped. Trees are decoded w
 markup is parsed. The `view` tool lets agents emit a tree. The runtime validates it before the host renders it: allowed tags and props only, `Badge` `tone` one of success, warning, error, or info, `Stat` only inside `Stats`, `Lane` only inside `Timeline`, `Bar` only inside `Lane`, numeric `Timeline` `max` and `tick` in seconds (at most 48 ticks), and bars with `0 <= start < end <= max`. Also at most 8 levels of nesting, 200 elements, and 4096 bytes per string.
 `Chart` `kind` is bar, line, scatter, or area; it takes 1 to 4 `Series` children with equal-length comma-separated finite values (at most 48 points), and `labels`, when present, must match that count.
 `Table` `columns` lists 1 to 8 comma-separated headers, and it takes at most 48 `TableRow` children, each with exactly one text cell per column.
+`Button` takes `label` and `prompt`, both required and non-empty, and an optional `tone` of primary, neutral, or danger; it takes no children. Clicking it submits `prompt` as the next user message. It is disabled while a run is active and inside subagent focus threads.
 
 ## Development
 

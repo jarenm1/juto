@@ -12,7 +12,7 @@ use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::subagent_card;
 use crate::theme;
-use crate::view_element::render_view;
+use crate::view_element::{ViewActions, render_view};
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Stateful,
@@ -214,9 +214,9 @@ pub fn view_row(view: ViewNode) -> Message {
 }
 
 /// Renders a view. A subagent card is clickable and opens its focus thread.
-fn card_element(view: &ViewNode, cx: &Context<ChatView>) -> AnyElement {
+fn card_element(view: &ViewNode, actions: &ViewActions, cx: &Context<ChatView>) -> AnyElement {
     let Some(id) = subagent_card::card_id(view) else {
-        return render_view(view);
+        return render_view(view, actions);
     };
     let id = id.to_owned();
     div()
@@ -225,7 +225,7 @@ fn card_element(view: &ViewNode, cx: &Context<ChatView>) -> AnyElement {
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
             this.enter_focus(&id, cx);
         }))
-        .child(render_view(view))
+        .child(render_view(view, actions))
         .into_any_element()
 }
 
@@ -816,11 +816,25 @@ impl ChatView {
     pub fn subagents(&self) -> &Arc<juto_runtime::subagents::SubagentManager> {
         &self.subagents
     }
+    /// Whether a new run may start, ignoring what the composer holds.
+    fn can_submit(&self, cx: &App) -> bool {
+        !self.is_running && !self.input.read(cx).is_composing()
+    }
+
     fn can_send(&self, cx: &App) -> bool {
         let input = self.input.read(cx);
-        !self.is_running
-            && !input.is_composing()
-            && (input.has_text() || !self.attachments.is_empty())
+        self.can_submit(cx) && (input.has_text() || !self.attachments.is_empty())
+    }
+
+    /// Actions for rendered views. A `Button` submits a turn only while one can start.
+    fn view_actions(&self, cx: &Context<Self>) -> ViewActions {
+        if !self.can_submit(cx) {
+            return ViewActions::none();
+        }
+        let chat = cx.weak_entity();
+        ViewActions::submit(move |prompt, window, cx| {
+            let _ = chat.update(cx, |this, cx| this.submit_prompt(prompt, window, cx));
+        })
     }
 
     fn focus_input(&self, window: &mut Window, cx: &App) {
@@ -834,7 +848,28 @@ impl ChatView {
         let text = self.input.update(cx, |input, cx| input.take_text(cx));
         let attachments = std::mem::take(&mut self.attachments);
         let prompt = format_prompt(&text, &attachments);
+        self.submit_turn(text, attachments, prompt, window, cx);
+    }
 
+    /// Submits a `Button` click: the prompt is shown and sent unchanged.
+    fn submit_prompt(&mut self, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_submit(cx) {
+            return;
+        }
+        let text = SharedString::from(prompt.clone());
+        self.submit_turn(text, Vec::new(), prompt, window, cx);
+    }
+
+    /// Records a user turn, then starts a run for `prompt`. `text` and
+    /// `attachments` are what the transcript shows; `prompt` is what the model gets.
+    fn submit_turn(
+        &mut self,
+        text: SharedString,
+        attachments: Vec<Attachment>,
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.messages.push(Message {
             role: MessageRole::User,
             text: if text.trim().is_empty() {
@@ -1302,6 +1337,7 @@ impl ChatView {
 
     fn message_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let messages = self.messages.clone();
+        let actions = self.view_actions(cx);
         div()
             .id("messages")
             .flex_1()
@@ -1419,14 +1455,9 @@ impl ChatView {
                                 )
                             })
                             .when(!views.is_empty(), |row| {
-                                row.child(
-                                    div()
-                                        .mt_2()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_2()
-                                        .children(views.iter().map(|view| card_element(view, cx))),
-                                )
+                                row.child(div().mt_2().flex().flex_col().gap_2().children(
+                                    views.iter().map(|view| card_element(view, &actions, cx)),
+                                ))
                             })
                     })),
             )
