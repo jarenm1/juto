@@ -2,13 +2,14 @@
 //! component; an unknown tag renders a visible fallback that names the tag, so
 //! a bad tree is never silently dropped.
 //!
-//! The look follows shadcn/ui primitives (Badge variants, Card, destructive
-//! Alert) on the shared palette in `theme.rs`. The tags and props agents may use
-//! are fixed by `juto_agent::VIEW_TAGS`; this file only decides how they look.
+//! The look follows shadcn/ui primitives (Card, destructive Alert) on the shared
+//! palette in `theme.rs`; `Badge` and subagent rows are flat status marks. The tags
+//! and props agents may use are fixed by `juto_agent::VIEW_TAGS`; this file only
+//! decides how they look.
 
 use gpui::{
-    AnyElement, FontWeight, InteractiveElement, IntoElement, ParentElement, Rgba, SharedString,
-    Styled, div, px, relative, rgb, rgba,
+    AnyElement, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString, Styled,
+    div, px, relative, rgb,
 };
 use juto_agent::{MAX_TIMELINE_TICKS, ViewChild, ViewNode};
 
@@ -82,11 +83,6 @@ fn tone_color(tone: &str) -> Option<u32> {
     }
 }
 
-/// `color` at `alpha` (0 to 255), for translucent fills and borders.
-fn tint(color: u32, alpha: u32) -> Rgba {
-    rgba((color << 8) | alpha)
-}
-
 /// A string prop, or `""` when the key is absent or not a string.
 fn prop<'a>(node: &'a ViewNode, key: &str) -> &'a str {
     node.props
@@ -121,30 +117,25 @@ fn fallback(message: String) -> AnyElement {
         .into_any_element()
 }
 
-/// Outline-style pill: a tinted fill and border in the tone's accent, with the
-/// accent as text. Unknown tones fall back to the neutral secondary style.
-fn badge(label: &str, tone: &str) -> AnyElement {
-    let base = div()
+/// Flat status mark: a tone-colored dot and an uppercase label in the same color.
+/// Shared by `Badge` and subagent rows.
+fn status_mark(label: &str, color: u32) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
         .flex_none()
-        .px_2p5()
-        .py_0p5()
-        .rounded_md()
-        .border_1()
         .text_xs()
-        .font_weight(FontWeight::SEMIBOLD);
-    let styled = match tone_color(tone) {
-        Some(color) => base
-            .border_color(tint(color, 0x4d))
-            .bg(tint(color, 0x24))
-            .text_color(rgb(color)),
-        None => base
-            .border_color(rgb(theme::BORDER_STRONG))
-            .bg(rgb(theme::BG_RAISED))
-            .text_color(rgb(theme::TEXT_MUTED)),
-    };
-    styled
-        .child(SharedString::from(label.to_owned()))
+        .text_color(rgb(color))
+        .child(div().size(px(6.0)).rounded_full().bg(rgb(color)))
+        .child(SharedString::from(label.to_uppercase()))
         .into_any_element()
+}
+
+/// Status mark for a `Badge` tone; unknown tones use the muted text color.
+fn badge(label: &str, tone: &str) -> AnyElement {
+    status_mark(label, tone_color(tone).unwrap_or(theme::TEXT_MUTED))
 }
 
 /// Column children. Each run of adjacent `Subagent` nodes becomes one list, so
@@ -203,18 +194,7 @@ fn subagent_row(node: &ViewNode) -> AnyElement {
                 .truncate()
                 .child(SharedString::from(prop(node, "name").to_owned())),
         )
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .flex_none()
-                .text_xs()
-                .text_color(rgb(tone))
-                .child(div().size(px(6.0)).rounded_full().bg(rgb(tone)))
-                .child(SharedString::from(prop(node, "status").to_uppercase())),
-        )
+        .child(status_mark(prop(node, "status"), tone))
         .into_any_element()
 }
 
