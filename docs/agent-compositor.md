@@ -289,10 +289,12 @@ Creating -> Ready -> Stopping -> Stopped
   spawn errors separate from exit status. `WindowMapped` and `FrameAvailable`
   are observations, not inferred from successful process launch. Launchers may
   spawn several processes/windows; an application handle tracks its subtree.
-- Owner heartbeat interval is 10 seconds; expiry after 60 seconds destroys the
-  environment unless the runtime has explicitly transferred retention ownership
-  to a human session. Task cancellation stops the desktop by default. A viewer
-  alone never keeps an abandoned desktop alive.
+- Owner heartbeat interval is 10 seconds for the runtime's `desktop` tool; the
+  embedded canvas heartbeats every 2 seconds while it is mounted. Expiry after
+  60 seconds destroys the environment unless the runtime has explicitly
+  transferred retention ownership to a human session. Task cancellation stops
+  the desktop by default. A mounted viewer keeps the desktop alive; once the
+  canvas unmounts, heartbeats stop and ordinary expiry applies.
 - `Destroy` first revokes grants/leases, releases held input, closes viewers,
   requests application termination, then stops the entire environment cgroup.
   Default grace period: 5 seconds, followed by forced termination. Destroy is
