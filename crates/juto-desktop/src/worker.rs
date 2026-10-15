@@ -435,7 +435,8 @@ impl WorkerCompositor {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            // Worker tracing writes to stderr; inherit it so warnings reach the daemon's log.
+            .stderr(Stdio::inherit());
 
         let child = command.spawn().map_err(|e| {
             DesktopError::Compositor(format!("cannot spawn the compositor worker: {e}"))
