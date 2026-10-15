@@ -644,20 +644,22 @@ impl Render for DesktopViewer {
                                                 this.take_control(cx);
                                             })),
                                     )
-                                    .child(
-                                        div()
-                                            .id("desktop-release-control")
-                                            .px_2()
-                                            .py_1()
-                                            .rounded_md()
-                                            .bg(rgb(0x2d2f34))
-                                            .text_color(rgb(0xe8eaed))
-                                            .cursor_pointer()
-                                            .child("Release control")
-                                            .on_click(cx.listener(|this, _, _window, cx| {
-                                                this.release_control(cx);
-                                            })),
-                                    )
+                                    .when(has_control, |row| {
+                                        row.child(
+                                            div()
+                                                .id("desktop-release-control")
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .bg(rgb(0x2d2f34))
+                                                .text_color(rgb(0xe8eaed))
+                                                .cursor_pointer()
+                                                .child("Release control")
+                                                .on_click(cx.listener(|this, _, _window, cx| {
+                                                    this.release_control(cx);
+                                                })),
+                                        )
+                                    })
                                 }),
                         )
                     }),
@@ -735,8 +737,10 @@ fn read_latest_frame(env: DesktopEnvironment) -> Option<LatestFrame> {
     })
 }
 
-/// Fits packed BGRA8 rows (stride `width * 4`) inside the shown bounds using
-/// nearest-neighbour sampling. Frames already small enough are copied as-is.
+/// Fits packed BGRA8 rows (stride `width * 4`) inside the shown bounds by
+/// averaging each destination pixel's source footprint (a box filter), so fine
+/// detail shrinks smoothly instead of aliasing. Frames already small enough are
+/// copied as-is.
 fn fit_shown(bgra: &[u8], width: u32, height: u32) -> Option<(u32, u32, Vec<u8>)> {
     if width == 0 || height == 0 {
         return None;
@@ -752,14 +756,30 @@ fn fit_shown(bgra: &[u8], width: u32, height: u32) -> Option<(u32, u32, Vec<u8>)
     let out_h = ((height as f32 * scale).round() as u32).max(1);
     let mut out = Vec::with_capacity(out_w as usize * out_h as usize * 4);
     for dy in 0..out_h as u64 {
-        let sy = (dy * height as u64 / out_h as u64) as usize;
-        let row = &src[sy * src_row..(sy + 1) * src_row];
+        let (y0, y1) = source_span(dy, height as u64, out_h as u64);
         for dx in 0..out_w as u64 {
-            let sx = (dx * width as u64 / out_w as u64) as usize * 4;
-            out.extend_from_slice(&row[sx..sx + 4]);
+            let (x0, x1) = source_span(dx, width as u64, out_w as u64);
+            let mut sum = [0u32; 4];
+            for row in src[y0 * src_row..y1 * src_row].chunks_exact(src_row) {
+                for px in row[x0 * 4..x1 * 4].chunks_exact(4) {
+                    for (acc, &channel) in sum.iter_mut().zip(px) {
+                        *acc += u32::from(channel);
+                    }
+                }
+            }
+            let count = ((y1 - y0) * (x1 - x0)) as u32;
+            out.extend(sum.iter().map(|&total| ((total + count / 2) / count) as u8));
         }
     }
     Some((out_w, out_h, out))
+}
+
+/// Source pixel span `[start, end)` covered by destination pixel `d` when `src`
+/// pixels are mapped onto `dst`. Always covers at least one pixel.
+fn source_span(d: u64, src: u64, dst: u64) -> (usize, usize) {
+    let start = d * src / dst;
+    let end = ((d + 1) * src / dst).max(start + 1);
+    (start as usize, end as usize)
 }
 
 /// Builds a gpui `RenderImage` from packed BGRA8 pixels with straight alpha.
@@ -859,4 +879,39 @@ fn evdev_keycode(key: &str) -> Option<u32> {
         _ => return None,
     };
     Some(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Alternating black and white pixels, one pixel per cell.
+    fn checkerboard_bgra(width: u32, height: u32) -> Vec<u8> {
+        let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let value = if (x + y) % 2 == 0 { 0 } else { 255 };
+                pixels.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn downscale_averages_fine_detail_instead_of_sampling_it() {
+        // 1708x960 maps onto 854x480 at exactly 1/2, so each destination pixel
+        // covers a 2x2 block holding two black and two white pixels.
+        let pixels = checkerboard_bgra(1708, 960);
+        let (width, height, out) = fit_shown(&pixels, 1708, 960).unwrap();
+        assert_eq!((width, height), (854, 480));
+        assert!(out.chunks_exact(4).all(|px| px == [128, 128, 128, 255]));
+    }
+
+    #[test]
+    fn frames_within_bounds_pass_through_unchanged() {
+        let pixels = checkerboard_bgra(640, 360);
+        let (width, height, out) = fit_shown(&pixels, 640, 360).unwrap();
+        assert_eq!((width, height), (640, 360));
+        assert_eq!(out, pixels);
+    }
 }
