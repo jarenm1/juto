@@ -317,9 +317,9 @@ the embedded viewer, or explicitly reports `Unavailable` when the environment do
 **Element trees in tool results.** A tool result may attach a declarative tree under
 `ToolOutput.details` as `{"type":"view","view":{tag, props, children}}`. The model-facing
 `content` is unchanged. The chat and focus views render the tree in its own row after the
-result, using the primitives `Column`, `Row`, `Text`, and `Badge`. Any unknown tag renders a
+result, using the primitives `Column`, `Row`, `Text`, `Badge`, `Stats` with `Stat` cells, and `Timeline` with `Lane` rows of `Bar` segments. Any unknown tag renders a
 visible `Unknown element <tag>` box, never silently dropped. Trees are decoded with serde; no
-markup is parsed. The `view` tool lets agents emit a tree. The runtime validates it before the host renders it: allowed tags and props only, `Badge` `tone` one of success, warning, error, or info, at most 8 levels of nesting, 200 elements, and 4096 bytes per string.
+markup is parsed. The `view` tool lets agents emit a tree. The runtime validates it before the host renders it: allowed tags and props only, `Badge` `tone` one of success, warning, error, or info, `Stat` only inside `Stats`, `Lane` only inside `Timeline`, `Bar` only inside `Lane`, numeric `Timeline` `max` and `tick` in seconds (at most 48 ticks), and bars with `0 <= start < end <= max`. Also at most 8 levels of nesting, 200 elements, and 4096 bytes per string.
 
 ## Development
 

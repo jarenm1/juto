@@ -2340,7 +2340,7 @@ impl Tool for ViewTool {
         let tags: Vec<&str> = VIEW_TAGS.iter().map(|(tag, _)| *tag).collect();
         juto_ai::ToolDefinition {
             name: "view".to_string(),
-            description: "Shows a structured view in the chat transcript. A view is a tree of elements, not markup: Column (vertical stack), Row (wrapping horizontal stack), Text (children are strings or elements), Badge (props.label required; props.tone is success, warning, error, or info). Use it for status the user should scan. Limits: 8 levels of nesting, 200 elements, 4096 bytes per string.".to_string(),
+            description: "Shows a structured view in the chat transcript. A view is a tree of elements, not markup: Column (vertical stack), Row (wrapping horizontal stack), Text (children are strings or elements), Badge (props.label required; props.tone is success, warning, error, or info). Stats (children are Stat elements) with Stat (props.label and props.value required) shows a KPI strip. Timeline (props.title optional; props.max and props.tick are positive seconds; children are Lane elements) with Lane (props.label required; children are Bar elements) and Bar (props.start and props.end are seconds with 0 <= start < end <= max; props.series names the legend entry, for example \"Latest\") draws a build timeline. Use it for status the user should scan. Limits: 8 levels of nesting, 200 elements, 4096 bytes per string, 48 timeline ticks.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
