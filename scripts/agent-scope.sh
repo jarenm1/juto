@@ -97,6 +97,12 @@ scope+=(--)
 # agents cannot each open a Vulkan context on it. The smoke shell's Mesa
 # software renderer does not need the lock.
 if ((gpu)); then
-    exec flock "$gpu_lock" "${scope[@]}" "$@"
+    # Hold the lock on fd 9 in this shell and close fd 9 for the command. An
+    # exec'd `flock` would pass the lock to every daemon the command starts
+    # (pipewire keeps it after the build exits).
+    exec 9>"$gpu_lock"
+    flock 9
+    "${scope[@]}" "$@" 9>&-
+else
+    exec "${scope[@]}" "$@"
 fi
-exec "${scope[@]}" "$@"
