@@ -1224,6 +1224,7 @@ impl DesktopState {
         let serial = SERIAL_COUNTER.next_serial();
         let pointer = self.pointer.clone();
         let keyboard = self.keyboard.clone();
+        tracing::debug!(?event, "input dispatched to virtual seat");
         match event {
             InputEvent::PointerMoveAbs { x, y } => {
                 let point = Point::<f64, Logical>::from((
