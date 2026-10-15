@@ -698,8 +698,18 @@ to `live 1280x720` and the client's two-tone frame appeared letterboxed in the h
 window. A 75-second paused hold kept the environment alive (the click still reached
 `live 1280x720`); the test client exits after its 60-second argument, so that run's
 post-resume canvas was empty. Process-tree CPU over 5-second windows: 1% paused,
-187–230% live at 1280×720 (live copies every frame with no change detection). No
-Wayland, hardware GPU, or provider access was exercised.
+187–230% live at 1280×720 (live copies every frame with no change detection). The
+viewer's read path is 854×480 (`SHOWN_MAX_WIDTH`/`SHOWN_MAX_HEIGHT`); at that size
+live CPU measured 129%, against 1% paused. Environment and agent desktops keep
+1280×720. No Wayland, hardware GPU, or provider access was exercised.
+
+Headless `juto --desktop xeyes` under Xvfb: the inline canvas rendered xeyes after
+a click resumed it, and the Pause button showed `Paused — click to resume`, status
+`paused`, and hid the control buttons. Pointer and keyboard forwarding into the X
+client were NOT confirmed: xeyes' pupils did not move when the pointer crossed its
+window, and an `xterm -e cat` typing check showed no visible text (the Nix xterm
+likely lacks a font in this Xvfb). The `desktop` tool's owner heartbeat and the
+mounted-canvas heartbeat keep the environment alive while the canvas is mounted.
 
 The remote path is covered by an end-to-end WebRTC test and a browser smoke:
 
