@@ -374,8 +374,8 @@ are not reported. `DesktopSupervisor::reconcile` stops orphan
 previous process; the daemon and the runtime call it at startup.
 
 **Not yet shipped: audio and the remaining profiles.** Audio (private PipeWire
-sink plus Opus), Xwayland, the hardware render-node profile, DMA-BUF
-export/import, and TURN relay configuration are not implemented.
+sink plus Opus), the hardware render-node profile, DMA-BUF export/import, and TURN
+relay configuration are not implemented.
 The embedded GPUI viewer still reads the pool in-process; wiring it to the
 daemon's `SCM_RIGHTS` attach path is a follow-up. A compile pass is not evidence of
 streaming; the shipped behavior is verified by the integration tests and the
@@ -708,9 +708,9 @@ a click resumed it, and the Pause button showed `Paused — click to resume`, st
 `paused`, and hid the control buttons. Pointer forwarding into the X client is
 confirmed: with `RUST_LOG=debug`, the compositor logged one `PointerMoveAbs` dispatch
 to the virtual seat per live move (four), none for the two moves made while paused,
-and xeyes' pupils pointed at the last live position. Keyboard forwarding is not yet
-confirmed: an `xterm -e cat` typing check showed no visible text (the Nix xterm
-likely lacks a font in this Xvfb).
+and xeyes' pupils pointed at the last live position. Keyboard forwarding is confirmed
+headless under Xvfb: `xdotool type aZ1` into the viewer delivered `aZ1` to an `xterm`
+client (captured with `head -c 3`), and Shift for `Z` reached the seat as a modifier.
 The `desktop` tool's owner heartbeat and the
 mounted-canvas heartbeat keep the environment alive while the canvas is mounted.
 
