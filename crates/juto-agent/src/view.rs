@@ -77,7 +77,7 @@ pub const MAX_CHART_SERIES: usize = 4;
 /// Most values one `Series` may hold, and so most x positions one `Chart` may draw.
 pub const MAX_CHART_POINTS: usize = 48;
 /// Kinds a `Chart` accepts.
-pub const CHART_KINDS: &[&str] = &["bar", "line"];
+pub const CHART_KINDS: &[&str] = &["bar", "line", "scatter", "area"];
 /// Most columns a `Table` may declare.
 pub const MAX_TABLE_COLUMNS: usize = 8;
 /// Most body rows a `Table` may hold.
@@ -597,13 +597,22 @@ mod tests {
     }
 
     #[test]
+    fn validator_accepts_scatter_and_area_charts() {
+        for kind in ["scatter", "area"] {
+            let node = parse(json!({"tag": "Chart", "props": {"kind": kind},
+                "children": [{"tag": "Series", "props": {"name": "Latency", "values": "3,1,2.5"}}]}));
+            assert_eq!(validate_view(&node), Ok(()), "{kind}");
+        }
+    }
+
+    #[test]
     fn validator_rejects_unknown_chart_kind_and_missing_series() {
         let pie = parse(json!({"tag": "Chart", "props": {"kind": "pie"},
             "children": [{"tag": "Series", "props": {"name": "x", "values": "1"}}]}));
         assert!(
             validate_view(&pie)
                 .unwrap_err()
-                .contains("kind must be one of: bar, line")
+                .contains("kind must be one of: bar, line, scatter, area")
         );
         let empty = parse(json!({"tag": "Chart", "props": {"kind": "bar"}}));
         assert!(

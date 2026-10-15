@@ -7,9 +7,12 @@
 //! and props agents may use are fixed by `juto_agent::VIEW_TAGS`; this file only
 //! decides how they look.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use gpui::{
-    AnyElement, Div, FontWeight, InteractiveElement, IntoElement, ParentElement, PathBuilder,
-    Pixels, Point, SharedString, Styled, canvas, div, point, px, relative, rgb,
+    AnyElement, AnyView, App, Bounds, Corners, Div, FontWeight, Hsla, PathBuilder, Pixels, Point,
+    SharedString, Window, canvas, div, fill, point, prelude::*, px, relative, rgb, size,
 };
 use juto_agent::{
     MAX_TIMELINE_TICKS, ViewChild, ViewNode, parse_chart_labels, parse_chart_values,
@@ -40,6 +43,12 @@ const CHART_MIN_WIDTH: f32 = 300.0;
 const CHART_GRID_STEPS: usize = 4;
 /// Stroke width of a line series, in pixels.
 const LINE_WIDTH: f32 = 2.0;
+/// Diameter of a scatter dot and of a hover marker, in pixels.
+const MARKER_SIZE: f32 = 7.0;
+/// Opacity of an area chart's fill under its line.
+const AREA_FILL_ALPHA: f32 = 0.2;
+/// Opacity of the column tint under a hovered x position.
+const HOVER_BAND_ALPHA: f32 = 0.05;
 
 /// Renders one element and its subtree.
 pub fn render_view(node: &ViewNode) -> AnyElement {
@@ -363,9 +372,18 @@ fn timeline(node: &ViewNode) -> AnyElement {
         .collect();
     let lane_height = BAR_PITCH * series.len().max(1) as f32 + LANE_PAD * 2.0;
 
+    let key = view_key(node);
     let mut body = div().flex().flex_col();
-    for lane in &lanes {
-        body = body.child(lane_row(lane, &series, max, &ticks, lane_height));
+    for (lane_index, lane) in lanes.iter().enumerate() {
+        body = body.child(lane_row(
+            lane,
+            lane_index,
+            &key,
+            &series,
+            max,
+            &ticks,
+            lane_height,
+        ));
     }
     div()
         .flex()
@@ -415,9 +433,12 @@ fn timeline_header(node: &ViewNode, series: &[String]) -> AnyElement {
 }
 
 /// One lane: its label, then a track holding the tick grid and each bar. Bars
-/// stack by series, one row per series.
+/// stack by series, one row per series. Each bar shows its span on hover, and the
+/// lane tints as a whole.
 fn lane_row(
     lane: &ViewNode,
+    lane_index: usize,
+    key: &str,
     series: &[String],
     max: f64,
     ticks: &[f64],
@@ -435,21 +456,37 @@ fn lane_row(
                 .bg(rgb(theme::BORDER)),
         );
     }
-    for bar in lane.children.iter().filter_map(node_child) {
+    for (bar_index, bar) in lane.children.iter().filter_map(node_child).enumerate() {
         let start = number(bar, "start");
         let end = number(bar, "end");
-        let index = series_index(series, prop(bar, "series"));
+        let name = prop(bar, "series");
+        let index = series_index(series, name);
         let left = (start / max).clamp(0.0, 1.0);
         let width = ((end - start) / max).clamp(0.0, 1.0 - left);
+        let label = if name.is_empty() { "Bar" } else { name };
+        let span = format!(
+            "{label}: {}s-{}s ({}s)",
+            format_value(start),
+            format_value(end),
+            format_value(end - start)
+        );
         track = track.child(
             div()
+                .id(SharedString::from(format!(
+                    "{key}-lane{lane_index}-bar{bar_index}"
+                )))
                 .absolute()
                 .top(px(LANE_PAD + index as f32 * BAR_PITCH))
                 .h(px(BAR_HEIGHT))
                 .left(relative(left as f32))
                 .w(relative(width as f32))
                 .rounded_sm()
-                .bg(rgb(series_color(index))),
+                .bg(rgb(series_color(index)))
+                .hover(|bar| bar.border_1().border_color(rgb(theme::TEXT)))
+                .tooltip(tip_builder(Tip {
+                    header: span,
+                    rows: Vec::new(),
+                })),
         );
     }
     div()
@@ -458,6 +495,7 @@ fn lane_row(
         .items_center()
         .border_t_1()
         .border_color(rgb(theme::BORDER))
+        .hover(|lane| lane.bg(rgb(theme::BG_HOVER)))
         .child(
             div()
                 .w(px(LANE_LABEL_WIDTH))
@@ -503,20 +541,116 @@ fn format_time(seconds: f64) -> String {
     format!("{}:{:02}", total / 60, total % 60)
 }
 
-/// A `Chart` the host can draw: bar or line, optional x labels, and its series.
+/// How a `Chart` draws its series.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChartKind {
+    Bar,
+    Line,
+    Area,
+    Scatter,
+}
+
+/// A `Chart` the host can draw: its kind, optional x labels, and its series.
 struct ChartData {
-    line: bool,
+    kind: ChartKind,
     labels: Vec<String>,
     series: Vec<(String, Vec<f64>)>,
+}
+
+/// Hover tooltip body: a header line and one row per series.
+#[derive(Clone)]
+struct Tip {
+    header: String,
+    rows: Vec<TipRow>,
+}
+
+/// One series row in a `Tip`: a colored dot, the series name when it has one, and
+/// the value.
+#[derive(Clone)]
+struct TipRow {
+    color: u32,
+    name: String,
+    value: String,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1p5()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(theme::BORDER_STRONG))
+            .bg(rgb(theme::BG_RAISED))
+            .text_xs()
+            .child(
+                div()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(theme::TEXT))
+                    .child(SharedString::from(self.header.clone())),
+            );
+        for row in &self.rows {
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1p5()
+                    .child(div().size(px(6.0)).rounded_full().bg(rgb(row.color)))
+                    .when(!row.name.is_empty(), |line| {
+                        line.child(
+                            div()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child(SharedString::from(row.name.clone())),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_color(rgb(theme::TEXT))
+                            .child(SharedString::from(row.value.clone())),
+                    ),
+            );
+        }
+        body
+    }
+}
+
+/// A chart or timeline value for display: rounded to two decimals, half away from
+/// zero, with trailing zeros and a bare decimal point dropped. `3` shows as `3`,
+/// `2.50` as `2.5`, `0.125` as `0.13`, and `-0.001` as `0`.
+fn format_value(value: f64) -> String {
+    let rounded = (value * 100.0).round() / 100.0;
+    if rounded == 0.0 {
+        return "0".to_owned();
+    }
+    format!("{rounded:.2}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+/// Centre of slot `index` out of `points`, as a fraction of the plot width. Lines,
+/// markers, and hover slots all use it, so they line up.
+fn slot_center(index: usize, points: usize) -> f32 {
+    (index as f32 + 0.5) / points as f32
 }
 
 /// Parses a `Chart` and its `Series` children. The validator rejects these
 /// trees before they reach the host; this guards persisted sessions that skip it.
 fn chart_data(node: &ViewNode) -> Result<ChartData, String> {
-    let line = match prop(node, "kind") {
-        "bar" => false,
-        "line" => true,
-        other => return Err(format!("<Chart> kind `{other}` is not bar or line")),
+    let kind = match prop(node, "kind") {
+        "bar" => ChartKind::Bar,
+        "line" => ChartKind::Line,
+        "area" => ChartKind::Area,
+        "scatter" => ChartKind::Scatter,
+        other => {
+            return Err(format!(
+                "<Chart> kind `{other}` is not bar, line, scatter, or area"
+            ));
+        }
     };
     let series = node
         .children
@@ -544,7 +678,7 @@ fn chart_data(node: &ViewNode) -> Result<ChartData, String> {
         return Err("<Chart> labels must match the number of values".into());
     }
     Ok(ChartData {
-        line,
+        kind,
         labels,
         series,
     })
@@ -559,6 +693,7 @@ fn chart(node: &ViewNode) -> AnyElement {
         Err(message) => return fallback(message),
     };
     let (lo, hi) = value_domain(&data.series);
+    let key = view_key(node);
     let mut card = div()
         .flex_1()
         .min_w(px(CHART_MIN_WIDTH))
@@ -583,11 +718,20 @@ fn chart(node: &ViewNode) -> AnyElement {
             .map(|(s, (name, _))| legend_item(name, series_color(s)));
         card = card.child(div().flex().flex_row().flex_wrap().gap_3().children(legend));
     }
-    card = card.child(if data.line {
-        line_plot(&data.series, lo, hi)
-    } else {
-        bar_plot(&data.series, lo, hi)
-    });
+    let plot = match data.kind {
+        ChartKind::Bar => bar_plot(&data.series, lo, hi),
+        kind => curve_plot(kind, &data.series, lo, hi),
+    };
+    let curve = data.kind != ChartKind::Bar;
+    card = card.child(hover_layer(
+        plot,
+        &data.series,
+        &data.labels,
+        lo,
+        hi,
+        &key,
+        curve,
+    ));
     if !data.labels.is_empty() {
         card = card.child(x_labels(&data.labels));
     }
@@ -640,7 +784,7 @@ fn plot_box(zero: f32) -> Div {
 
 /// Grouped columns: each x position holds one bar per series, centered in its
 /// slot with a 20% margin on each side.
-fn bar_plot(series: &[(String, Vec<f64>)], lo: f64, hi: f64) -> AnyElement {
+fn bar_plot(series: &[(String, Vec<f64>)], lo: f64, hi: f64) -> Div {
     let points = series[0].1.len();
     let slot = 1.0 / points as f32;
     let group = 0.6 * slot;
@@ -663,14 +807,15 @@ fn bar_plot(series: &[(String, Vec<f64>)], lo: f64, hi: f64) -> AnyElement {
             );
         }
     }
-    plot.into_any_element()
+    plot
 }
 
-/// One polyline per series, stroked on a canvas laid over the plot. Points sit at
-/// the centre of their slot, matching the bar and label positions.
-fn line_plot(series: &[(String, Vec<f64>)], lo: f64, hi: f64) -> AnyElement {
+/// Line, area, or scatter series drawn on a canvas laid over the plot. Points sit
+/// at the centre of their slot, matching the bar and label positions.
+fn curve_plot(kind: ChartKind, series: &[(String, Vec<f64>)], lo: f64, hi: f64) -> Div {
     let points = series[0].1.len();
-    let lines: Vec<(u32, Vec<f32>)> = series
+    let zero = value_fraction(0.0, lo, hi);
+    let curves: Vec<(u32, Vec<f32>)> = series
         .iter()
         .enumerate()
         .map(|(s, (_, values))| {
@@ -684,47 +829,181 @@ fn line_plot(series: &[(String, Vec<f64>)], lo: f64, hi: f64) -> AnyElement {
     let overlay = canvas(
         |_, _, _| (),
         move |bounds, (), window, _cx| {
-            for (color, fractions) in &lines {
-                let mut dots: Vec<Point<Pixels>> = fractions
+            for (color, fractions) in &curves {
+                let dots: Vec<Point<Pixels>> = fractions
                     .iter()
                     .enumerate()
                     .map(|(i, fraction)| {
                         point(
-                            bounds.origin.x
-                                + bounds.size.width * ((i as f32 + 0.5) / points as f32),
+                            bounds.origin.x + bounds.size.width * slot_center(i, points),
                             bounds.origin.y + bounds.size.height * *fraction,
                         )
                     })
                     .collect();
-                // A single point has no segment; a short dash marks it.
-                if dots.len() == 1 {
-                    dots.push(dots[0] + point(px(LINE_WIDTH * 2.0), px(0.0)));
-                }
-                let Some((first, rest)) = dots.split_first() else {
-                    continue;
-                };
-                let mut builder = PathBuilder::stroke(px(LINE_WIDTH));
-                builder.move_to(*first);
-                for dot in rest {
-                    builder.line_to(*dot);
-                }
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, rgb(*color));
+                match kind {
+                    ChartKind::Scatter => {
+                        let radius = px(MARKER_SIZE / 2.0);
+                        for dot in &dots {
+                            let dot_box = Bounds::new(
+                                point(dot.x - radius, dot.y - radius),
+                                size(px(MARKER_SIZE), px(MARKER_SIZE)),
+                            );
+                            window.paint_quad(
+                                fill(dot_box, rgb(*color)).corner_radii(Corners::all(radius)),
+                            );
+                        }
+                    }
+                    ChartKind::Area => {
+                        let baseline = bounds.origin.y + bounds.size.height * zero;
+                        fill_area(window, &dots, baseline, *color);
+                        stroke_line(window, &dots, *color);
+                    }
+                    ChartKind::Line => stroke_line(window, &dots, *color),
+                    // Columns are drawn by `bar_plot`, not on this canvas.
+                    ChartKind::Bar => {}
                 }
             }
         },
     );
-    plot_box(value_fraction(0.0, lo, hi))
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .w_full()
-                .h(px(CHART_PLOT_HEIGHT))
-                .child(overlay.size_full()),
-        )
-        .into_any_element()
+    plot_box(zero).child(
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .w_full()
+            .h(px(CHART_PLOT_HEIGHT))
+            .child(overlay.size_full()),
+    )
+}
+
+/// Strokes a polyline through `dots`. A single point gets a short dash so it stays
+/// visible.
+fn stroke_line(window: &mut Window, dots: &[Point<Pixels>], color: u32) {
+    let mut builder = PathBuilder::stroke(px(LINE_WIDTH));
+    match dots {
+        [] => return,
+        [only] => {
+            builder.move_to(*only);
+            builder.line_to(*only + point(px(LINE_WIDTH * 2.0), px(0.0)));
+        }
+        [first, rest @ ..] => {
+            builder.move_to(*first);
+            for dot in rest {
+                builder.line_to(*dot);
+            }
+        }
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, rgb(color));
+    }
+}
+
+/// Fills the region between the curve through `dots` and the `baseline` row.
+fn fill_area(window: &mut Window, dots: &[Point<Pixels>], baseline: Pixels, color: u32) {
+    let (Some(first), Some(last)) = (dots.first(), dots.last()) else {
+        return;
+    };
+    let mut builder = PathBuilder::fill();
+    builder.move_to(point(first.x, baseline));
+    for dot in dots {
+        builder.line_to(*dot);
+    }
+    builder.line_to(point(last.x, baseline));
+    builder.close();
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, tint(color, AREA_FILL_ALPHA));
+    }
+}
+
+/// Transparent hover slots, one per x position, laid over the plot. Hovering a slot
+/// tints its column and opens a tooltip with each series' value there. Curve charts
+/// also show a guide line and a marker on each series. Every slot is its own group,
+/// so only its own guide and markers react.
+fn hover_layer(
+    mut plot: Div,
+    series: &[(String, Vec<f64>)],
+    labels: &[String],
+    lo: f64,
+    hi: f64,
+    key: &str,
+    curve: bool,
+) -> Div {
+    let points = series[0].1.len();
+    for i in 0..points {
+        let slot_name = format!("{key}-{i}");
+        let tip = Tip {
+            header: labels
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| (i + 1).to_string()),
+            rows: series
+                .iter()
+                .enumerate()
+                .map(|(s, (name, values))| TipRow {
+                    color: series_color(s),
+                    name: name.clone(),
+                    value: format_value(values[i]),
+                })
+                .collect(),
+        };
+        let mut slot = div()
+            .id(SharedString::from(slot_name.clone()))
+            .group(SharedString::from(slot_name.clone()))
+            .absolute()
+            .top_0()
+            .h_full()
+            .left(relative(i as f32 / points as f32))
+            .w(relative(1.0 / points as f32))
+            .hover(|slot| slot.bg(tint(theme::TEXT, HOVER_BAND_ALPHA)))
+            .tooltip(tip_builder(tip));
+        if curve {
+            slot = slot.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .h_full()
+                    .left(relative(0.5))
+                    .w(px(1.0))
+                    .group_hover(slot_name.clone(), |guide| guide.bg(rgb(theme::TEXT_FAINT))),
+            );
+            for (s, (_, values)) in series.iter().enumerate() {
+                let top = value_fraction(values[i], lo, hi) * CHART_PLOT_HEIGHT - MARKER_SIZE / 2.0;
+                slot = slot.child(
+                    div()
+                        .absolute()
+                        .top(px(top))
+                        .left(relative(0.5))
+                        .ml(px(-MARKER_SIZE / 2.0))
+                        .size(px(MARKER_SIZE))
+                        .rounded_full()
+                        .group_hover(slot_name.clone(), move |marker| {
+                            marker.bg(rgb(series_color(s)))
+                        }),
+                );
+            }
+        }
+        plot = plot.child(slot);
+    }
+    plot
+}
+
+/// `color` at `alpha`, for translucent fills over the plot.
+fn tint(color: u32, alpha: f32) -> Hsla {
+    Hsla::from(rgb(color)).alpha(alpha)
+}
+
+/// Tooltip builder that opens `tip` in a fresh view each time it is shown.
+fn tip_builder(tip: Tip) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+    move |_window, cx| cx.new(|_| tip.clone()).into()
+}
+
+/// Element-id prefix for one `Chart` or `Timeline`, derived from its contents so
+/// hover state stays attached across frames. Two identical trees in one message
+/// share it, so their hover state can overlap.
+fn view_key(node: &ViewNode) -> String {
+    let mut hasher = DefaultHasher::new();
+    format!("{node:?}").hash(&mut hasher);
+    format!("view-{:x}", hasher.finish())
 }
 
 /// Labels under the plot, one per x position and centered in its slot.
@@ -760,4 +1039,41 @@ fn legend_item(name: &str, color: u32) -> AnyElement {
         .child(div().size(px(6.0)).rounded_full().bg(rgb(color)))
         .child(SharedString::from(name.to_owned()))
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use juto_agent::MAX_CHART_POINTS;
+
+    use super::*;
+
+    #[test]
+    fn format_value_rounds_to_two_decimals_and_trims() {
+        assert_eq!(format_value(3.0), "3");
+        assert_eq!(format_value(2.5), "2.5");
+        assert_eq!(format_value(0.125), "0.13");
+        assert_eq!(format_value(-2.0), "-2");
+        assert_eq!(format_value(100.0), "100");
+        assert_eq!(format_value(1234.5678), "1234.57");
+    }
+
+    #[test]
+    fn format_value_never_shows_negative_zero() {
+        assert_eq!(format_value(-0.001), "0");
+        assert_eq!(format_value(-0.0), "0");
+    }
+
+    #[test]
+    fn slot_centers_fall_inside_their_own_slot() {
+        for points in 1..=MAX_CHART_POINTS {
+            for index in 0..points {
+                let center = slot_center(index, points);
+                assert_eq!(
+                    (center * points as f32).floor() as usize,
+                    index,
+                    "slot {index} of {points}"
+                );
+            }
+        }
+    }
 }
