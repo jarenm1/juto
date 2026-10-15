@@ -16,7 +16,9 @@ use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3, zwp_text_input_v3,
 };
-use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::shell::client::{
+    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+};
 
 /// Width of the test client's toplevel in pixels.
 pub const WIDTH: u32 = 320;
@@ -29,6 +31,13 @@ pub const RED: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
 /// Opaque blue, ARGB8888 little-endian (`[B, G, R, A]` in memory).
 #[allow(dead_code)]
 pub const BLUE: [u8; 4] = [0xFF, 0x00, 0x00, 0xFF];
+/// Popup edge length in pixels.
+pub const POPUP_SIZE: u32 = 64;
+/// Popup anchor offset from the toplevel origin, in pixels.
+pub const POPUP_OFFSET: i32 = 100;
+/// Opaque green, ARGB8888 little-endian (`[B, G, R, A]` in memory).
+#[allow(dead_code)]
+pub const GREEN: [u8; 4] = [0x00, 0xFF, 0x00, 0xFF];
 
 #[derive(Default)]
 struct State {
@@ -68,6 +77,8 @@ ignore_events! {
     wl_callback::WlCallback => (),
     wl_seat::WlSeat => (),
     zwp_text_input_manager_v3::ZwpTextInputManagerV3 => (),
+    xdg_popup::XdgPopup => (),
+    xdg_positioner::XdgPositioner => (),
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -198,9 +209,90 @@ fn paint(fd: &OwnedFd, width: u32, height: u32) {
     unsafe { libc::munmap(ptr, size) };
 }
 
+/// Creates a child popup of `parent` anchored at (`POPUP_OFFSET`, `POPUP_OFFSET`)
+/// and attaches a `GREEN` buffer after the compositor's initial configure.
+fn create_popup(
+    compositor: &wl_compositor::WlCompositor,
+    shm: &wl_shm::WlShm,
+    wm_base: &xdg_wm_base::XdgWmBase,
+    parent: &xdg_surface::XdgSurface,
+    event_queue: &mut EventQueue<State>,
+    state: &mut State,
+) -> Result<(wl_surface::WlSurface, wl_buffer::WlBuffer), Box<dyn std::error::Error + Send + Sync>>
+{
+    let qh = event_queue.handle();
+    let positioner = wm_base.create_positioner(&qh, ());
+    positioner.set_size(POPUP_SIZE as i32, POPUP_SIZE as i32);
+    positioner.set_anchor_rect(POPUP_OFFSET, POPUP_OFFSET, 1, 1);
+    positioner.set_anchor(xdg_positioner::Anchor::TopLeft);
+    positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
+    let surface = compositor.create_surface(&qh, ());
+    let xdg = wm_base.get_xdg_surface(&surface, &qh, ());
+    let _popup = xdg.get_popup(Some(parent), &positioner, &qh, ());
+    surface.commit();
+    // The compositor configures the popup on creation; attach only after that.
+    event_queue.roundtrip(state)?;
+
+    let stride = POPUP_SIZE * 4;
+    let size = (stride * POPUP_SIZE) as usize;
+    let fd = create_shm_fd(size)?;
+    fill(&fd, POPUP_SIZE, POPUP_SIZE, 0xFF00_FF00);
+    let pool = shm.create_pool(fd.as_fd(), size as i32, &qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        POPUP_SIZE as i32,
+        POPUP_SIZE as i32,
+        stride as i32,
+        wl_shm::Format::Argb8888,
+        &qh,
+        (),
+    );
+    surface.attach(Some(&buffer), 0, 0);
+    surface.damage(0, 0, POPUP_SIZE as i32, POPUP_SIZE as i32);
+    surface.commit();
+    Ok((surface, buffer))
+}
+
+fn fill(fd: &OwnedFd, width: u32, height: u32, color: u32) {
+    let size = (width * height * 4) as usize;
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd.as_fd().as_raw_fd(),
+            0,
+        )
+    };
+    assert!(ptr != libc::MAP_FAILED, "mmap failed");
+    let pixels = ptr as *mut u32;
+    for i in 0..(width * height) as usize {
+        unsafe { *pixels.add(i) = color };
+    }
+    unsafe { libc::munmap(ptr, size) };
+}
+
 /// Connects to `socket`, maps one toplevel, paints the two-tone pattern, and
 /// dispatches events for `seconds`. Returns the number of frames presented.
 pub fn run(socket: &str, seconds: u64) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    run_client(socket, seconds, false)
+}
+
+/// Like [`run`], plus a child xdg popup anchored at (`POPUP_OFFSET`, `POPUP_OFFSET`)
+/// filled with `GREEN`.
+pub fn run_with_popup(
+    socket: &str,
+    seconds: u64,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    run_client(socket, seconds, true)
+}
+
+fn run_client(
+    socket: &str,
+    seconds: u64,
+    with_popup: bool,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
     let stream = UnixStream::connect(socket)?;
     let conn = Connection::from_socket(stream)?;
 
@@ -247,6 +339,19 @@ pub fn run(socket: &str, seconds: u64) -> Result<u32, Box<dyn std::error::Error 
     surface.damage(0, 0, WIDTH as i32, HEIGHT as i32);
     surface.commit();
 
+    let popup = if with_popup {
+        Some(create_popup(
+            &compositor,
+            &shm,
+            &wm_base,
+            &xdg_surface,
+            &mut event_queue,
+            &mut state,
+        )?)
+    } else {
+        None
+    };
+
     let deadline = Instant::now() + Duration::from_secs(seconds);
     while Instant::now() < deadline {
         if let Some(guard) = event_queue.prepare_read() {
@@ -268,6 +373,11 @@ pub fn run(socket: &str, seconds: u64) -> Result<u32, Box<dyn std::error::Error 
             surface.attach(Some(&buffer), 0, 0);
             surface.damage(0, 0, WIDTH as i32, HEIGHT as i32);
             surface.commit();
+            if let Some((popup_surface, popup_buffer)) = &popup {
+                popup_surface.attach(Some(popup_buffer), 0, 0);
+                popup_surface.damage(0, 0, POPUP_SIZE as i32, POPUP_SIZE as i32);
+                popup_surface.commit();
+            }
             state.frames += 1;
         }
         event_queue.flush()?;
