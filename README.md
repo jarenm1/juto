@@ -705,10 +705,13 @@ live CPU measured 129%, against 1% paused. Environment and agent desktops keep
 
 Headless `juto --desktop xeyes` under Xvfb: the inline canvas rendered xeyes after
 a click resumed it, and the Pause button showed `Paused — click to resume`, status
-`paused`, and hid the control buttons. Pointer and keyboard forwarding into the X
-client were NOT confirmed: xeyes' pupils did not move when the pointer crossed its
-window, and an `xterm -e cat` typing check showed no visible text (the Nix xterm
-likely lacks a font in this Xvfb). The `desktop` tool's owner heartbeat and the
+`paused`, and hid the control buttons. Pointer forwarding into the X client is
+confirmed: with `RUST_LOG=debug`, the compositor logged one `PointerMoveAbs` dispatch
+to the virtual seat per live move (four), none for the two moves made while paused,
+and xeyes' pupils pointed at the last live position. Keyboard forwarding is not yet
+confirmed: an `xterm -e cat` typing check showed no visible text (the Nix xterm
+likely lacks a font in this Xvfb).
+The `desktop` tool's owner heartbeat and the
 mounted-canvas heartbeat keep the environment alive while the canvas is mounted.
 
 The remote path is covered by an end-to-end WebRTC test and a browser smoke:
