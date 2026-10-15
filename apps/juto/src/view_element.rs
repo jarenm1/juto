@@ -36,7 +36,7 @@ pub fn render_view(node: &ViewNode) -> AnyElement {
             .flex()
             .flex_col()
             .gap_3()
-            .children(render_children(node))
+            .children(column_children(node))
             .into_any_element(),
         "Row" => div()
             .flex()
@@ -55,19 +55,20 @@ pub fn render_view(node: &ViewNode) -> AnyElement {
         "Stats" => stats(node),
         "Stat" => stat(prop(node, "label"), prop(node, "value")),
         "Timeline" => timeline(node),
-        "Subagent" => subagent_card(node),
+        "Subagent" => subagent_list(vec![node]),
         unknown => fallback(format!("Unknown element <{unknown}>")),
     }
 }
 
 fn render_children(node: &ViewNode) -> Vec<AnyElement> {
-    node.children
-        .iter()
-        .map(|child| match child {
-            ViewChild::Text(text) => SharedString::from(text.clone()).into_any_element(),
-            ViewChild::Node(node) => render_view(node),
-        })
-        .collect()
+    node.children.iter().map(render_child).collect()
+}
+
+fn render_child(child: &ViewChild) -> AnyElement {
+    match child {
+        ViewChild::Text(text) => SharedString::from(text.clone()).into_any_element(),
+        ViewChild::Node(node) => render_view(node),
+    }
 }
 
 /// Accent for a `Badge` tone, or `None` for an unknown tone (rendered neutral).
@@ -107,16 +108,14 @@ fn node_child(child: &ViewChild) -> Option<&ViewNode> {
     }
 }
 
-/// Destructive alert for an element the host cannot draw.
+/// Red-ruled row for an element the host cannot draw.
 fn fallback(message: String) -> AnyElement {
     div()
         .px_3()
-        .py_2()
-        .rounded_lg()
-        .border_1()
-        .border_color(tint(theme::DANGER, 0x66))
-        .bg(tint(theme::DANGER, 0x14))
-        .text_xs()
+        .py_2p5()
+        .border_l_2()
+        .border_color(rgb(theme::DANGER))
+        .text_sm()
         .text_color(rgb(theme::DANGER))
         .child(SharedString::from(message))
         .into_any_element()
@@ -148,10 +147,43 @@ fn badge(label: &str, tone: &str) -> AnyElement {
         .into_any_element()
 }
 
-/// Subagent summary card: name on the left, status badge on the right. Hover
-/// lifts the surface and tints the border in the accent, since the card opens
-/// its focus thread when clicked.
-fn subagent_card(node: &ViewNode) -> AnyElement {
+/// Column children. Each run of adjacent `Subagent` nodes becomes one list, so
+/// the rows sit flush with hairline dividers instead of gapped cards.
+fn column_children(node: &ViewNode) -> Vec<AnyElement> {
+    let mut out = Vec::new();
+    let mut run: Vec<&ViewNode> = Vec::new();
+    for child in &node.children {
+        match node_child(child) {
+            Some(subagent) if subagent.tag == "Subagent" => run.push(subagent),
+            _ => {
+                if !run.is_empty() {
+                    out.push(subagent_list(std::mem::take(&mut run)));
+                }
+                out.push(render_child(child));
+            }
+        }
+    }
+    if !run.is_empty() {
+        out.push(subagent_list(run));
+    }
+    out
+}
+
+/// Top-ruled list of subagent rows; each row draws its own bottom divider.
+fn subagent_list(rows: Vec<&ViewNode>) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .border_t_1()
+        .border_color(rgb(theme::BORDER))
+        .children(rows.into_iter().map(subagent_row))
+        .into_any_element()
+}
+
+/// Subagent row: name on the left; status dot and uppercase status on the
+/// right, both in the tone's color. Hover tints the row.
+fn subagent_row(node: &ViewNode) -> AnyElement {
+    let tone = tone_color(prop(node, "tone")).unwrap_or(theme::TEXT_MUTED);
     div()
         .flex()
         .flex_row()
@@ -160,25 +192,29 @@ fn subagent_card(node: &ViewNode) -> AnyElement {
         .gap_3()
         .px_3()
         .py_2p5()
-        .rounded_lg()
-        .border_1()
-        .border_color(rgb(theme::BORDER_STRONG))
-        .bg(rgb(theme::BG_HOVER))
-        .shadow_sm()
-        .hover(|card| {
-            card.bg(rgb(theme::BG_RAISED))
-                .border_color(tint(theme::ACCENT, 0x80))
-        })
+        .border_b_1()
+        .border_color(rgb(theme::BORDER))
+        .hover(|row| row.bg(rgb(theme::BG_HOVER)))
         .text_sm()
         .text_color(rgb(theme::TEXT))
         .child(
             div()
                 .min_w_0()
                 .truncate()
-                .font_weight(FontWeight::MEDIUM)
                 .child(SharedString::from(prop(node, "name").to_owned())),
         )
-        .child(badge(prop(node, "status"), prop(node, "tone")))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .flex_none()
+                .text_xs()
+                .text_color(rgb(tone))
+                .child(div().size(px(6.0)).rounded_full().bg(rgb(tone)))
+                .child(SharedString::from(prop(node, "status").to_uppercase())),
+        )
         .into_any_element()
 }
 
