@@ -409,11 +409,7 @@ impl ShmReader {
     pub fn latest_frame(&self) -> Result<Option<ShmFrame>, DesktopError> {
         let mut best: Option<ShmFrame> = None;
         for slot in 0..POOL_SLOT_COUNT {
-            let offset = slot * self.slot_size;
-            if offset + self.slot_size > self.size {
-                break;
-            }
-            let header = unsafe { *(self.mmap_ptr.add(offset) as *const ShmSlotHeader) };
+            let (offset, header) = self.checked_slot(slot, self.slot_size)?;
             if header.size_bytes == 0 {
                 continue;
             }
@@ -434,24 +430,53 @@ impl ShmReader {
         Ok(best)
     }
 
+    /// Validates slot `slot` of `slot_size` bytes and returns its byte offset and
+    /// header. The producer writes the header into shared memory, so `size_bytes`
+    /// is untrusted until the payload is checked to lie inside the slot.
+    fn checked_slot(
+        &self,
+        slot: usize,
+        slot_size: usize,
+    ) -> Result<(usize, ShmSlotHeader), DesktopError> {
+        let header_size = std::mem::size_of::<ShmSlotHeader>();
+        let offset = slot
+            .checked_mul(slot_size)
+            .filter(|offset| {
+                offset
+                    .checked_add(slot_size)
+                    .is_some_and(|end| end <= self.size)
+            })
+            .ok_or_else(|| DesktopError::Shm("slot offset out of bounds".to_string()))?;
+        if slot_size < header_size {
+            return Err(DesktopError::Shm(
+                "slot smaller than its header".to_string(),
+            ));
+        }
+        let header =
+            unsafe { std::ptr::read_unaligned(self.mmap_ptr.add(offset) as *const ShmSlotHeader) };
+        if header.size_bytes as usize > slot_size - header_size {
+            return Err(DesktopError::Shm(format!(
+                "slot {slot} payload of {} bytes exceeds the slot",
+                header.size_bytes
+            )));
+        }
+        Ok((offset, header))
+    }
+
     pub fn read_slot(
         &self,
         slot: usize,
         slot_size: usize,
     ) -> Result<(ShmSlotHeader, &[u8]), DesktopError> {
-        let offset = slot * slot_size;
-        if offset + slot_size > self.size {
-            return Err(DesktopError::Shm("slot offset out of bounds".to_string()));
-        }
-
+        let (offset, header) = self.checked_slot(slot, slot_size)?;
         let header_size = std::mem::size_of::<ShmSlotHeader>();
-        unsafe {
-            let ptr = self.mmap_ptr.add(offset);
-            let header = *(ptr as *const ShmSlotHeader);
-            let pixel_ptr = ptr.add(header_size);
-            let pixel_slice = std::slice::from_raw_parts(pixel_ptr, header.size_bytes as usize);
-            Ok((header, pixel_slice))
-        }
+        let pixel_slice = unsafe {
+            std::slice::from_raw_parts(
+                self.mmap_ptr.add(offset + header_size),
+                header.size_bytes as usize,
+            )
+        };
+        Ok((header, pixel_slice))
     }
 }
 
@@ -467,3 +492,32 @@ impl Drop for ShmReader {
 }
 
 pub type ShmWriter = Arc<ShmFramePool>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reader_refuses_slot_header_whose_payload_exceeds_slot() {
+        let pool = ShmFramePool::create_unsealed("corrupt-header-test", 4, 4).unwrap();
+        // Claim a 4 GiB payload in slot 0 through the still-writable memfd.
+        let claimed = u32::MAX.to_ne_bytes();
+        let written = unsafe {
+            libc::pwrite(
+                pool.raw_fd(),
+                claimed.as_ptr() as *const libc::c_void,
+                claimed.len(),
+                std::mem::offset_of!(ShmSlotHeader, size_bytes) as libc::off_t,
+            )
+        };
+        assert_eq!(written, claimed.len() as isize);
+        // ShmReader closes the fd it owns, so hand it a duplicate.
+        let reader = ShmReader::attach(unsafe { libc::dup(pool.raw_fd()) }, pool.size()).unwrap();
+        let slot_size = reader.slot_size();
+        assert!(matches!(
+            reader.read_slot(0, slot_size),
+            Err(DesktopError::Shm(_))
+        ));
+        assert!(matches!(reader.latest_frame(), Err(DesktopError::Shm(_))));
+    }
+}
