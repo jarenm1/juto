@@ -831,6 +831,8 @@ struct DesktopState {
     /// X11 surface geometries saved when a window is maximized or fullscreened,
     /// so unmaximize/unfullscreen restore the previous layout.
     x11_saved_geometries: HashMap<u32, Rectangle<i32, Logical>>,
+    /// Xdg toplevel layouts saved when maximized or fullscreened, restored on exit.
+    xdg_saved_geometries: HashMap<u32, Rectangle<i32, Logical>>,
     /// In-progress X11 interactive move/resize grab, if any.
     x11_grab: Option<X11Grab>,
     next_window_id: u32,
@@ -1119,7 +1121,62 @@ impl DesktopState {
         self.dirty = true;
     }
 
+    /// Remembers an xdg toplevel's layout before maximize or fullscreen moves it to
+    /// the output origin. Only the first save is kept until the matching restore.
+    fn save_xdg_placement(&mut self, surface: &ToplevelSurface) {
+        let Some(id) = self.window_id_for_surface(surface.wl_surface()) else {
+            return;
+        };
+        let Some(mapped) = self.windows.get(&id) else {
+            return;
+        };
+        let Some(location) = self.space.element_location(&mapped.window) else {
+            return;
+        };
+        let size = mapped.window.geometry().size;
+        self.xdg_saved_geometries
+            .entry(id)
+            .or_insert_with(|| Rectangle::new(location, size));
+    }
+
+    /// Takes the layout saved by `save_xdg_placement`, with the window to map back.
+    fn take_xdg_placement(
+        &mut self,
+        surface: &ToplevelSurface,
+    ) -> Option<(Window, Rectangle<i32, Logical>)> {
+        let id = self.window_id_for_surface(surface.wl_surface())?;
+        let geometry = self.xdg_saved_geometries.remove(&id)?;
+        let window = self.windows.get(&id)?.window.clone();
+        Some((window, geometry))
+    }
+
+    /// Clears one layout state (maximized or fullscreen). The saved layout returns
+    /// only once no other layout state still holds the window.
+    fn leave_layout_state(&mut self, surface: &ToplevelSurface, exited: xdg_toplevel::State) {
+        let size = self.logical_size();
+        let still_constrained = surface.with_pending_state(|state| {
+            state.states.unset(exited);
+            state.states.contains(xdg_toplevel::State::Maximized)
+                || state.states.contains(xdg_toplevel::State::Fullscreen)
+        });
+        if still_constrained {
+            surface.with_pending_state(|state| state.size = Some(size));
+            surface.send_configure();
+        } else {
+            let saved = self.take_xdg_placement(surface);
+            surface.with_pending_state(|state| {
+                state.size = saved.as_ref().map(|(_, geometry)| geometry.size);
+            });
+            surface.send_configure();
+            if let Some((window, geometry)) = saved {
+                self.space.map_element(window, geometry.loc, true);
+            }
+        }
+        self.dirty = true;
+    }
+
     fn unmap_window(&mut self, id: u32) {
+        self.xdg_saved_geometries.remove(&id);
         if let Some(mapped) = self.windows.remove(&id) {
             let was_focused = match (
                 self.keyboard.current_focus(),
@@ -1822,6 +1879,7 @@ impl XdgShellHandler for DesktopState {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
+        self.save_xdg_placement(&surface);
         let size = self.logical_size();
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
@@ -1838,11 +1896,7 @@ impl XdgShellHandler for DesktopState {
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        surface.with_pending_state(|state| {
-            state.states.unset(xdg_toplevel::State::Maximized);
-        });
-        surface.send_configure();
-        self.dirty = true;
+        self.leave_layout_state(&surface, xdg_toplevel::State::Maximized);
     }
 
     fn fullscreen_request(
@@ -1850,6 +1904,7 @@ impl XdgShellHandler for DesktopState {
         surface: ToplevelSurface,
         _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
     ) {
+        self.save_xdg_placement(&surface);
         let size = self.logical_size();
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Fullscreen);
@@ -1866,11 +1921,7 @@ impl XdgShellHandler for DesktopState {
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        surface.with_pending_state(|state| {
-            state.states.unset(xdg_toplevel::State::Fullscreen);
-        });
-        surface.send_configure();
-        self.dirty = true;
+        self.leave_layout_state(&surface, xdg_toplevel::State::Fullscreen);
     }
 
     fn title_changed(&mut self, surface: ToplevelSurface) {
@@ -2079,6 +2130,7 @@ pub(crate) fn run_compositor(
         x11_windows: HashMap::new(),
         xwm: None,
         x11_saved_geometries: HashMap::new(),
+        xdg_saved_geometries: HashMap::new(),
         x11_grab: None,
         xwayland_shell_state,
         next_window_id: 1,
