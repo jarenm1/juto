@@ -1181,8 +1181,10 @@ impl DesktopState {
     fn send_frame_callbacks(&self) {
         let time = self.start_time.elapsed().as_millis() as u32;
         for mapped in self.windows.values() {
-            if let Some(toplevel) = mapped.window.toplevel() {
-                send_frames_surface_tree(toplevel.wl_surface(), time);
+            // X11 windows have no xdg toplevel, but Xwayland paces its commits
+            // on wl_surface frame callbacks, so they need them too.
+            if let Some(surface) = mapped.window.wl_surface() {
+                send_frames_surface_tree(surface.as_ref(), time);
             }
         }
     }
