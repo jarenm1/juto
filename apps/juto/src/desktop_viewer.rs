@@ -11,9 +11,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Bounds, Context, FocusHandle, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Render, RenderImage, ScrollWheelEvent, Task,
-    Window, canvas, div, img, prelude::*, px, rgb, rgba,
+    Bounds, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Render,
+    RenderImage, ScrollWheelEvent, Task, Window, canvas, div, img, prelude::*, px, rgb, rgba,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use juto_runtime::DesktopEnvironment;
@@ -23,6 +23,25 @@ use juto_runtime::protocol::{GrantRole, InputBatch, InputEvent};
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// Control lease renewal interval (spec section 8: heartbeat 2s, expiry 6s).
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(2);
+/// Evdev codes for the modifier keys forwarded to the seat.
+const KEY_LEFTSHIFT: u32 = 42;
+const KEY_LEFTCTRL: u32 = 29;
+const KEY_LEFTALT: u32 = 56;
+const KEY_LEFTMETA: u32 = 125;
+
+/// Seat key events for modifiers whose state differs between two GPUI snapshots.
+fn modifier_events(previous: Modifiers, current: Modifiers) -> Vec<InputEvent> {
+    [
+        (previous.shift, current.shift, KEY_LEFTSHIFT),
+        (previous.control, current.control, KEY_LEFTCTRL),
+        (previous.alt, current.alt, KEY_LEFTALT),
+        (previous.platform, current.platform, KEY_LEFTMETA),
+    ]
+    .into_iter()
+    .filter(|(before, after, _)| before != after)
+    .map(|(_, pressed, keycode)| InputEvent::Key { keycode, pressed })
+    .collect()
+}
 
 /// The authenticated principal this interactive session acts as: the local
 /// human viewing the desktop. Grants and artifact resolution are bound to it.
@@ -89,6 +108,8 @@ pub struct DesktopViewer {
     snapshot_task: Option<Task<()>>,
     /// Set when a left press starts while paused; its release resumes the canvas.
     press_started_paused: bool,
+    /// Modifier state last reported by GPUI; only changes are sent to the seat.
+    modifiers: Modifiers,
 }
 
 impl DesktopViewer {
@@ -125,6 +146,7 @@ impl DesktopViewer {
             poll_task: None,
             snapshot_task: None,
             press_started_paused: false,
+            modifiers: Modifiers::default(),
             heartbeat_task: None,
         };
         viewer.start_heartbeat(cx);
@@ -211,6 +233,7 @@ impl DesktopViewer {
         if self.paused {
             return;
         }
+        self.release_modifiers(cx);
         self.paused = true;
         self.poll_task = None;
         if self.has_control {
@@ -263,6 +286,7 @@ impl DesktopViewer {
 
     /// Releases the human control lease.
     pub fn release_control(&mut self, cx: &mut Context<Self>) {
+        self.release_modifiers(cx);
         let result = self.env.set_control(SESSION_PRINCIPAL, "release", true);
         // Drop the local flag even when the release call fails: the lease may
         // already be gone, and keeping `has_control` would render a stale state.
@@ -365,6 +389,7 @@ impl DesktopViewer {
         if !self.can_control {
             return false;
         }
+        self.release_modifiers(cx);
         self.can_control = false;
         self.has_control = false;
         self.error = Some("control grant expired".to_string());
@@ -406,6 +431,22 @@ impl DesktopViewer {
             Err(err) => self.error = Some(err.to_string()),
         }
         cx.notify();
+    }
+
+    /// Forwards modifier changes as seat key events. The modifier state is
+    /// updated even while paused, so it stays accurate for the next event.
+    fn on_modifiers_changed(&mut self, event: &ModifiersChangedEvent, cx: &mut Context<Self>) {
+        let events = modifier_events(self.modifiers, event.modifiers);
+        self.modifiers = event.modifiers;
+        self.send_events(events, cx);
+    }
+
+    /// Releases modifiers still down on the seat before input stops being forwarded.
+    fn release_modifiers(&mut self, cx: &mut Context<Self>) {
+        let previous = std::mem::take(&mut self.modifiers);
+        if self.has_control {
+            self.send_events(modifier_events(previous, Modifiers::default()), cx);
+        }
     }
 
     /// Geometry of the letterboxed image inside the surface container:
@@ -497,6 +538,11 @@ impl Render for DesktopViewer {
             .on_key_up(cx.listener(|this, event: &KeyUpEvent, _window, cx| {
                 this.on_key_up(event, cx);
             }))
+            .on_modifiers_changed(cx.listener(
+                |this, event: &ModifiersChangedEvent, _window, cx| {
+                    this.on_modifiers_changed(event, cx);
+                },
+            ))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 if let Some((x, y)) = this.pointer_position(&event.position) {
                     this.send_events(vec![InputEvent::PointerMoveAbs { x, y }], cx);
