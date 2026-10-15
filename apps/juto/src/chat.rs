@@ -682,12 +682,6 @@ impl ChatView {
                 return;
             }
         };
-        if let Err(err) = env.launch("desktop-app", &argv, None, &[], &request_id) {
-            self.artifact_notice = Some(format!("cannot launch desktop application: {err}").into());
-            env.destroy();
-            cx.notify();
-            return;
-        }
         let artifact = DesktopSessionArtifact {
             version: 1,
             artifact_id: format!("dev-{env_id}"),
@@ -696,7 +690,31 @@ impl ChatView {
             environment_id: env_id.clone(),
             grant_id: "dev".to_string(),
         };
+        let launch_env = env.clone();
+        let launch_argv = argv;
+        let launch_request = request_id.clone();
         let viewer = cx.new(|cx| crate::desktop_viewer::DesktopViewer::new(env, window, cx));
+        cx.spawn(async move |this, cx| {
+            let launched = cx
+                .background_executor()
+                .spawn(async move {
+                    let result =
+                        launch_env.launch("desktop-app", &launch_argv, None, &[], &launch_request);
+                    if result.is_err() {
+                        launch_env.destroy();
+                    }
+                    result.map(|_| ()).map_err(|err| err.to_string())
+                })
+                .await;
+            if let Err(message) = launched {
+                let _ = this.update(cx, |this, cx| {
+                    this.artifact_notice =
+                        Some(format!("cannot launch desktop application: {message}").into());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
         self.desktop_canvases
             .insert(artifact.artifact_id.clone(), DesktopCanvas::Live(viewer));
         self.messages.push(Message {
