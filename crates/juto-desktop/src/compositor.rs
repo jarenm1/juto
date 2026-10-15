@@ -561,6 +561,13 @@ impl XWaylandShellHandler for DesktopState {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.xwayland_shell_state
     }
+
+    fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, surface: X11Surface) {
+        // XWayland binds the wl_surface after mapping, so map-time focus can be a no-op.
+        if let Some(window) = self.x11_windows.get(&surface.window_id()).cloned() {
+            self.focus_window(&window);
+        }
+    }
 }
 
 impl XwmHandler for DesktopState {
@@ -899,6 +906,7 @@ impl DesktopState {
         let geometry = surface.geometry();
         self.space.map_element(window.clone(), geometry.loc, true);
         self.x11_windows.insert(x11_id, window.clone());
+        self.focus_window(&window);
         let id = self.next_window_id;
         self.next_window_id = self.next_window_id.wrapping_add(1);
         let mut mapped = MappedWindow {
@@ -1308,7 +1316,8 @@ impl DesktopState {
                 };
                 keyboard.input::<(), _>(
                     self,
-                    Keycode::new(keycode),
+                    // Wire keycodes are evdev; the seat expects XKB codes (evdev + 8).
+                    Keycode::new(keycode.saturating_add(8)),
                     state,
                     serial,
                     time,
