@@ -17,12 +17,18 @@ use crate::text_input::{TextInputManagerState, TextInputUserData};
 use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::{Axis, ButtonState, KeyState};
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::surface::{
+    WaylandSurfaceRenderElement, render_elements_from_surface_tree,
+};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::pixman::PixmanRenderer;
 use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_handler};
-use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer};
-use smithay::desktop::Window;
+use smithay::backend::renderer::{
+    Bind, Color32F, ExportMem, Frame, ImportAll, Offscreen, Renderer,
+};
 use smithay::desktop::space::Space;
+use smithay::desktop::{PopupKind, PopupManager, Window};
 use smithay::input::keyboard::{
     FilterResult, KeyboardHandle, KeyboardTarget, Keycode, KeysymHandle, ModifiersState, XkbConfig,
 };
@@ -469,6 +475,7 @@ impl FrameRenderer {
     fn compose(
         &mut self,
         space: &Space<Window>,
+        popups: &[(WlSurface, Point<i32, Logical>)],
         logical: &Rectangle<i32, Logical>,
         physical: Size<i32, Physical>,
         scale: u32,
@@ -479,6 +486,7 @@ impl FrameRenderer {
             Self::Pixman { renderer, image } => {
                 let elements =
                     space.render_elements_for_region(renderer, logical, scale as f64, 1.0);
+                let popup_elements = popup_render_elements(renderer, popups, scale);
                 let mut target = renderer
                     .bind(image)
                     .map_err(|e| DesktopError::Compositor(format!("bind target: {e}")))?;
@@ -490,6 +498,8 @@ impl FrameRenderer {
                     .map_err(|e| DesktopError::Compositor(format!("clear: {e}")))?;
                 draw_render_elements(&mut frame, 1.0, &elements, &damage)
                     .map_err(|e| DesktopError::Compositor(format!("draw: {e}")))?;
+                draw_render_elements(&mut frame, 1.0, &popup_elements, &damage)
+                    .map_err(|e| DesktopError::Compositor(format!("draw popups: {e}")))?;
                 let _ = frame
                     .finish()
                     .map_err(|e| DesktopError::Compositor(format!("finish: {e}")))?;
@@ -522,6 +532,7 @@ impl FrameRenderer {
             } => {
                 let elements =
                     space.render_elements_for_region(renderer, logical, scale as f64, 1.0);
+                let popup_elements = popup_render_elements(renderer, popups, scale);
                 {
                     let mut target = renderer
                         .bind(texture)
@@ -534,6 +545,8 @@ impl FrameRenderer {
                         .map_err(|e| DesktopError::Compositor(format!("clear: {e}")))?;
                     draw_render_elements(&mut frame, 1.0, &elements, &damage)
                         .map_err(|e| DesktopError::Compositor(format!("draw: {e}")))?;
+                    draw_render_elements(&mut frame, 1.0, &popup_elements, &damage)
+                        .map_err(|e| DesktopError::Compositor(format!("draw popups: {e}")))?;
                     let _ = frame
                         .finish()
                         .map_err(|e| DesktopError::Compositor(format!("finish: {e}")))?;
@@ -555,6 +568,34 @@ impl FrameRenderer {
             }
         }
     }
+}
+
+/// Render elements for popup surface trees at region-relative logical positions.
+fn popup_render_elements<R>(
+    renderer: &mut R,
+    popups: &[(WlSurface, Point<i32, Logical>)],
+    scale: u32,
+) -> Vec<WaylandSurfaceRenderElement<R>>
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    let mut elements = Vec::new();
+    for (surface, loc) in popups {
+        let location = Point::<i32, Physical>::from((loc.x * scale as i32, loc.y * scale as i32));
+        elements.extend(render_elements_from_surface_tree::<
+            R,
+            WaylandSurfaceRenderElement<R>,
+        >(
+            renderer,
+            surface,
+            location,
+            scale as f64,
+            1.0,
+            Kind::Unspecified,
+        ));
+    }
+    elements
 }
 
 smithay::delegate_xwayland_shell!(DesktopState);
@@ -754,6 +795,7 @@ struct DesktopState {
     text_input_manager_state: TextInputManagerState,
 
     space: Space<Window>,
+    popups: PopupManager,
     output: Output,
     /// Kept alive so the virtual seat stays registered for the environment.
     _seat: Seat<Self>,
@@ -1149,15 +1191,40 @@ impl DesktopState {
         })
     }
 
+    /// Surface origins of every mapped window's popups, relative to `region`, in the
+    /// same coordinate space as `Space::render_elements_for_region`.
+    fn popup_placements(
+        &self,
+        region: &Rectangle<i32, Logical>,
+    ) -> Vec<(WlSurface, Point<i32, Logical>)> {
+        let mut placements = Vec::new();
+        for window in self.space.elements() {
+            let Some(root) = window.wl_surface() else {
+                continue;
+            };
+            let Some(location) = self.space.element_location(window) else {
+                continue;
+            };
+            let origin = location - window.geometry().loc;
+            for (popup, offset) in PopupManager::popups_for_surface(&root) {
+                let loc = origin + offset - popup.geometry().loc - region.loc;
+                placements.push((popup.wl_surface().clone(), loc));
+            }
+        }
+        placements
+    }
+
     /// Compose the desktop into the memory image and copy it into the pool.
     fn render_frame(&mut self) -> Result<SnapshotInfo, DesktopError> {
         let started = Instant::now();
         let physical = Size::<i32, Physical>::from((self.width as i32, self.height as i32));
         let logical = Rectangle::from_size(self.logical_size());
 
+        self.popups.cleanup();
+        let popups = self.popup_placements(&logical);
         let pixels = self
             .renderer
-            .compose(&self.space, &logical, physical, self.scale)?;
+            .compose(&self.space, &popups, &logical, physical, self.scale)?;
         let composed_micros = started.elapsed().as_micros() as u64;
 
         self.frame_counter = self.frame_counter.wrapping_add(1);
@@ -1423,6 +1490,13 @@ impl CompositorHandler for DesktopState {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        self.popups.commit(surface);
+        if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
+            && !popup.is_initial_configure_sent()
+            && let Err(err) = popup.send_configure()
+        {
+            tracing::warn!(error = %err, "initial popup configure failed");
+        }
         let mut updated: Vec<u32> = Vec::new();
         for (id, mapped) in self.windows.iter() {
             let mut belongs = false;
@@ -1605,7 +1679,16 @@ impl XdgShellHandler for DesktopState {
         self.map_toplevel(surface);
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        if let Err(err) = self.popups.track_popup(PopupKind::from(surface)) {
+            tracing::warn!(error = %err, "failed to track popup");
+        }
+        self.dirty = true;
+    }
 
     fn grab(
         &mut self,
@@ -1617,10 +1700,19 @@ impl XdgShellHandler for DesktopState {
 
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
     ) {
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        surface.send_repositioned(token);
+        if let Err(err) = surface.send_configure() {
+            tracing::warn!(error = %err, "failed to configure repositioned popup");
+        }
+        self.dirty = true;
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -1862,6 +1954,7 @@ pub(crate) fn run_compositor(
         output_manager_state,
         text_input_manager_state,
         space,
+        popups: PopupManager::default(),
         output,
         _seat: seat,
         keyboard,
