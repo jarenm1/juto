@@ -422,7 +422,7 @@ fn fill(fd: &OwnedFd, width: u32, height: u32, color: u32) {
 /// Connects to `socket`, maps one toplevel, paints the two-tone pattern, and
 /// dispatches events for `seconds`. Returns the number of frames presented.
 pub fn run(socket: &str, seconds: u64) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, PopupMode::None)
+    run_client(socket, seconds, PopupMode::None, false)
 }
 
 /// Like [`run`], plus a child xdg popup mapped at startup, anchored at
@@ -431,7 +431,7 @@ pub fn run_with_popup(
     socket: &str,
     seconds: u64,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, PopupMode::Mapped)
+    run_client(socket, seconds, PopupMode::Mapped, false)
 }
 
 /// Like [`run`], plus a menu popup. The first press over the toplevel creates the
@@ -441,13 +441,24 @@ pub fn run_with_menu(
     socket: &str,
     seconds: u64,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, PopupMode::OnPress)
+    run_client(socket, seconds, PopupMode::OnPress, false)
+}
+
+/// Like [`run`], plus a toplevel that maximizes about 1.5 s after its first frame
+/// and unmaximizes 2 s later. Used to check that unmaximize restores the layout the
+/// window had before maximize.
+pub fn run_with_maximize_cycle(
+    socket: &str,
+    seconds: u64,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    run_client(socket, seconds, PopupMode::None, true)
 }
 
 fn run_client(
     socket: &str,
     seconds: u64,
     popup_mode: PopupMode,
+    cycle_maximize: bool,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
     let stream = UnixStream::connect(socket)?;
     let conn = Connection::from_socket(stream)?;
@@ -509,6 +520,10 @@ fn run_client(
         None
     };
 
+    // Maximize/restore script for `cycle_maximize`, timed from the first frame.
+    let mut cycle_started: Option<Instant> = None;
+    let mut cycle_step = 0u8;
+
     let deadline = Instant::now() + Duration::from_secs(seconds);
     while Instant::now() < deadline {
         if let Some(guard) = event_queue.prepare_read() {
@@ -542,6 +557,20 @@ fn run_client(
                 &mut state,
                 Some((&seat, serial)),
             )?);
+        }
+        if cycle_maximize && state.frames > 0 {
+            let started = *cycle_started.get_or_insert_with(Instant::now);
+            match cycle_step {
+                0 if started.elapsed() >= Duration::from_millis(1500) => {
+                    toplevel.set_maximized();
+                    cycle_step = 1;
+                }
+                1 if started.elapsed() >= Duration::from_millis(3500) => {
+                    toplevel.unset_maximized();
+                    cycle_step = 2;
+                }
+                _ => {}
+            }
         }
         if state.configured {
             state.configured = false;

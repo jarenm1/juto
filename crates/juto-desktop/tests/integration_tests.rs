@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use juto_desktop::DesktopError;
+use juto_desktop::WindowInfo;
 use juto_desktop::protocol::*;
 use juto_desktop::shm::{ShmFramePool, ShmReader};
 use juto_desktop::supervisor::{
@@ -355,6 +356,74 @@ fn compositor_renders_xdg_popup_above_its_parent() {
     let frames = client.join().expect("client thread").expect("client run");
     assert!(frames > 0, "client presented at least one frame");
 
+    env.destroy();
+}
+
+#[test]
+fn xdg_toplevel_restores_its_layout_after_unmaximize() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(
+            test_config(&unique_env_id("maximize")),
+            &unique_env_id("req"),
+        )
+        .expect("create environment");
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    // The first client takes the origin cascade slot, so the second starts away
+    // from (0, 0). A restore must return it to that start, not to the origin.
+    let first_socket = socket.clone();
+    let first = std::thread::spawn(move || common::run(&first_socket, 10));
+    let wait_for = |accept: &dyn Fn(&WindowInfo) -> bool| -> WindowInfo {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let found = env
+                .get_status()
+                .mapped_windows
+                .into_iter()
+                .find(|window| accept(window));
+            if let Some(window) = found {
+                return window;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected window layout never appeared"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    let first_window = wait_for(&|_: &WindowInfo| true);
+    let second = std::thread::spawn(move || common::run_with_maximize_cycle(&socket, 10));
+    let start = wait_for(&|window: &WindowInfo| {
+        window.window_id != first_window.window_id && window.width > 0
+    });
+    assert_ne!(
+        (start.x, start.y),
+        (0, 0),
+        "second window must start away from the origin"
+    );
+    let id = start.window_id;
+
+    // Maximize moves the window to the output origin.
+    wait_for(&|window: &WindowInfo| window.window_id == id && (window.x, window.y) == (0, 0));
+    // Unmaximize must return it to where it was before maximize, at its old size.
+    let restored = wait_for(&|window: &WindowInfo| {
+        window.window_id == id && (window.x, window.y) == (start.x, start.y)
+    });
+    assert_eq!(
+        (restored.width, restored.height),
+        (start.width, start.height)
+    );
+
+    first
+        .join()
+        .expect("first client thread")
+        .expect("first client run");
+    second
+        .join()
+        .expect("second client thread")
+        .expect("second client run");
     env.destroy();
 }
 
