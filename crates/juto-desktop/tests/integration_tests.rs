@@ -359,6 +359,120 @@ fn compositor_renders_xdg_popup_above_its_parent() {
 }
 
 #[test]
+fn popup_receives_pointer_and_dismisses_on_outside_click() {
+    const BTN_LEFT: u32 = 0x110;
+
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(
+            test_config(&unique_env_id("popup-input")),
+            &unique_env_id("req"),
+        )
+        .expect("create environment");
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    let client = std::thread::spawn(move || common::run_with_menu(&socket, 20));
+
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
+    let pool = env.frame_pool();
+
+    let mut seq = 0;
+    let mut send = |events: Vec<InputEvent>| {
+        seq += 1;
+        env.dispatch_input(
+            "agent:test",
+            lease.epoch,
+            env.generation(),
+            InputBatch {
+                seq,
+                client_timestamp_us: 0,
+                events,
+            },
+        )
+        .expect("input accepted");
+    };
+
+    // Waits until every `(x, y, color)` in `want` matches the latest frame.
+    let await_frame = |want: &[(u32, u32, [u8; 4])], what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let info = env
+                .observe(Duration::from_secs(2))
+                .unwrap_or_else(|err| panic!("observe failed: {err}"));
+            if want
+                .iter()
+                .all(|&(x, y, color)| read_pixel(&pool, info.slot, x, y, info.width) == color)
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    // Input before the toplevel maps would hit no surface and produce no enter.
+    await_frame(&[(10, 10, common::RED)], "toplevel mapped");
+
+    // A press on the toplevel opens the menu: the client creates the popup and
+    // grabs with that press's serial, so the popup must appear before any hover.
+    send(vec![InputEvent::PointerMoveAbs { x: 10, y: 10 }]);
+    send(vec![InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: true,
+    }]);
+    send(vec![InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: false,
+    }]);
+    await_frame(
+        &[(10, 10, common::RED), (120, 120, common::GREEN)],
+        "menu opened by press",
+    );
+
+    // Hover over the popup: pointer input is routed to the popup, not the parent.
+    send(vec![InputEvent::PointerMoveAbs { x: 120, y: 120 }]);
+    await_frame(&[(120, 120, common::BLUE)], "menu hovered");
+
+    // A click inside the grabbed popup must not dismiss it. Settle first, so a
+    // wrongful popup_done would have arrived before the check.
+    send(vec![InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: true,
+    }]);
+    send(vec![InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: false,
+    }]);
+    std::thread::sleep(Duration::from_millis(200));
+    await_frame(&[(120, 120, common::BLUE)], "menu open after inside click");
+
+    // Click on empty desktop, outside the popup's client. Smithay dismisses a
+    // grabbed popup on a press whose focus is not the grab's client; a press on the
+    // parent (same client) keeps the grab. The client sees popup_done and unmaps.
+    send(vec![InputEvent::PointerMoveAbs { x: 500, y: 400 }]);
+    send(vec![InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: true,
+    }]);
+    send(vec![InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: false,
+    }]);
+    await_frame(
+        &[(120, 120, common::RED)],
+        "menu dismissed by outside click",
+    );
+
+    let frames = client.join().expect("client thread").expect("client run");
+    assert!(frames > 0, "client presented at least one frame");
+
+    env.destroy();
+}
+
+#[test]
 fn hardware_profile_renders_and_serializes_on_the_shared_device() {
     let supervisor = DesktopSupervisor::new();
     let mut config = test_config(&unique_env_id("hardware"));
