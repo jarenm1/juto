@@ -281,15 +281,16 @@ The daemon serves a length-prefixed JSON control protocol over a private Unix
 socket (`Create`, `Launch`, `Describe`, `Observe`, `ConfigureOutput`, `Grant`,
 `Revoke`, `Control`, `Input`, `AutomationQuiesced`, `Destroy`, `Subscribe`).
 
-**Embedded viewer.** The `desktop_artifact` card's **Open Desktop ↗** resolves the
-environment through the runtime supervisor and opens a modal that renders
-composed frames from the environment's sealed shared-memory pool — no video
-codec on this path — and forwards pointer, scroll, and keyboard input to the
-virtual seat. The viewer letterboxes the frame, maps pointer coordinates to
-desktop pixels, holds a human control lease with a 2-second heartbeat, and
-reports connection state and errors instead of showing a stale frame as live.
-`juto --desktop <command> [args...]` opens the same viewer directly for
-development.
+**Embedded viewer.** A `desktop_artifact` card mounts the environment's canvas inline in
+the chat message. The canvas renders composed frames from the environment's sealed
+shared-memory pool, with no video codec on this path. It starts **paused**: it shows one
+still captured at mount and forwards no input. Clicking the canvas resumes live
+rendering; **Pause** returns to the still and releases any control lease. While live,
+pointer, scroll, and keyboard input goes to the virtual seat, and **Take control** /
+**Release control** manage the human control lease. The viewer letterboxes the frame,
+maps pointer coordinates to desktop pixels, and reports connection state and errors
+instead of showing a stale frame as live. `juto --desktop <command> [args...]` mounts
+the same canvas directly for development.
 
 **Resize gating.** A resize publishes a new geometry generation and clears every
 viewer's acknowledgement; pointer input is rejected with `StaleGeneration` until a
@@ -309,9 +310,10 @@ stream — only received frames establish that.
 current epoch), and input traffic never renews either implicitly. A reaper retires
 an environment whose heartbeat has lapsed, so an abandoned desktop does not
 outlive its task. `Retain` transfers lifetime responsibility to an authenticated
-human session with a host-bounded deadline (default maximum 30 minutes). The
-runtime's `desktop` tool heartbeats on every action, and the embedded viewer
-heartbeats while it is open.
+human session with a host-bounded deadline (default maximum 30 minutes).
+The runtime's `desktop` tool heartbeats on every action. The embedded canvas renews the
+owner heartbeat every 2 seconds for as long as it is mounted, paused or live, and renews
+the human control lease only while the human holds control.
 
 **Compositor worker process.** The compositor runs in its own process inside the
 environment slice (`juto-desktop-<env>-compositor.scope`), so its CPU and memory
@@ -383,9 +385,9 @@ smokes described below.
 sessions in chat conversations via the `desktop_artifact` tool. Artifact descriptors persist
 as IDs-only `DesktopSessionArtifact` records (`version`, `artifact_id`, `title`, `host_id`,
 `environment_id`, `grant_id`) without embedding bearer tokens, SDP payloads, or local paths.
-The chat view mounts typed desktop artifact cards with title, identifiers, and version badge.
-Clicking **Open Desktop ↗** resolves the environment through the runtime supervisor and opens
-the embedded viewer, or explicitly reports `Unavailable` when the environment does not exist.
+The chat view mounts each same-host artifact as an inline canvas (see **Embedded viewer**)
+that starts paused. A remote-host artifact shows an explicit notice instead of a canvas,
+and a resolver failure shows `Desktop '<title>' cannot be opened: <reason>` in its place.
 
 **Element trees in tool results.** A tool result may attach a declarative tree under
 `ToolOutput.details` as `{"type":"view","view":{tag, props, children}}`. The model-facing
@@ -690,11 +692,14 @@ scripts/agent-scope.sh -- nix develop .#smoke -c xvfb-run -a -s "-screen 0 1280x
 Observed: the `desktop` tool created an environment, launched `sleep` in a
 systemd scope, wrote a lossless PNG snapshot that begins with the PNG signature,
 reported one running application, issued a loopback viewer URL, and destroyed the
-environment. Under Xvfb/Mesa software Vulkan the `--desktop` mode opened the
-embedded viewer, which rendered the client's two-tone frame letterboxed inside
-the harness window (`live 1280x720`), and a click inside the surface acquired the
-human control lease (the button changed from **Take control** to **Renew
-control**) with no error reported.
+environment. Under Xvfb/Mesa software Vulkan the `--desktop` mode mounted the canvas
+paused: one still captured at mount, `paused` status, no frame loop. A click resumed it
+to `live 1280x720` and the client's two-tone frame appeared letterboxed in the harness
+window. A 75-second paused hold kept the environment alive (the click still reached
+`live 1280x720`); the test client exits after its 60-second argument, so that run's
+post-resume canvas was empty. Process-tree CPU over 5-second windows: 1% paused,
+187–230% live at 1280×720 (live copies every frame with no change detection). No
+Wayland, hardware GPU, or provider access was exercised.
 
 The remote path is covered by an end-to-end WebRTC test and a browser smoke:
 
@@ -760,8 +765,8 @@ attached file chips, message with attachment submission, attachment-only submiss
 chip removal (×), copy/cut/paste, multi-line draft wrapping with vertical scrolling past eight rows, wrapped messages, history
 scrolling, streaming assistant responses, durable append-only JSONL session creation
 and persistence, existing session loading via `--session`, model selection via `--model`,
-mounting and rendering of `DesktopSessionArtifact` remote-sharing cards, explicit
-unavailable streaming notice on desktop open attempt, 560×480 resizing, and Ctrl-Q exit
+mounting `DesktopSessionArtifact` cards as inline paused canvases with click-to-resume,
+560×480 resizing, and Ctrl-Q exit
 status 0 under Xvfb/Mesa software Vulkan.
 Host Wayland, hardware acceleration, live provider network transport, and live video streaming backend
 were not exercised.
