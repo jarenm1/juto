@@ -59,7 +59,7 @@ impl DesktopViewer {
             frame_size: (output.width, output.height),
             surface_bounds: Rc::new(Cell::new(Bounds::default())),
             focus_handle: cx.focus_handle(),
-            status: "paused".to_string(),
+            status: "waiting for first frame".to_string(),
             error: None,
             has_control: false,
             paused: true,
@@ -80,6 +80,10 @@ impl DesktopViewer {
         self.poll_task = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(FRAME_INTERVAL).await;
+                if !env.is_alive() {
+                    let _ = this.update_in(cx, |this, _window, cx| this.mark_stopped(cx));
+                    break;
+                }
                 let read_env = env.clone();
                 let read = cx
                     .background_executor()
@@ -123,8 +127,12 @@ impl DesktopViewer {
         // Input is mapped in environment pixels, not the downscaled image.
         let (width, height) = frame.source;
         self.frame_size = (width, height);
-        if self.error.is_none() && !self.paused {
-            self.status = format!("live {width}x{height}");
+        if self.error.is_none() {
+            self.status = if self.paused {
+                "paused".to_string()
+            } else {
+                format!("live {width}x{height}")
+            };
         }
         cx.notify();
     }
@@ -150,6 +158,10 @@ impl DesktopViewer {
         if !self.paused {
             return;
         }
+        if !self.env.is_alive() {
+            self.mark_stopped(cx);
+            return;
+        }
         self.paused = false;
         self.status = "connecting".to_string();
         // A pending still must not overwrite live frames.
@@ -160,6 +172,9 @@ impl DesktopViewer {
 
     /// Acquires (or renews) the human control lease.
     pub fn take_control(&mut self, cx: &mut Context<Self>) {
+        if self.paused {
+            return;
+        }
         match self.env.set_control(SESSION_PRINCIPAL, "acquire", true) {
             Ok(Some(lease)) => {
                 self.has_control = true;
@@ -180,14 +195,27 @@ impl DesktopViewer {
 
     /// Releases the human control lease.
     pub fn release_control(&mut self, cx: &mut Context<Self>) {
-        match self.env.set_control(SESSION_PRINCIPAL, "release", true) {
+        let result = self.env.set_control(SESSION_PRINCIPAL, "release", true);
+        // Drop the local flag even when the release call fails: the lease may
+        // already be gone, and keeping `has_control` would render a stale state.
+        self.has_control = false;
+        match result {
             Ok(_) => {
-                self.has_control = false;
                 self.status = "control released".to_string();
                 self.error = None;
             }
             Err(err) => self.error = Some(err.to_string()),
         }
+        cx.notify();
+    }
+
+    /// Ends the session after the environment was destroyed underneath the
+    /// viewer. The last frame stays on screen; input is no longer forwarded.
+    fn mark_stopped(&mut self, cx: &mut Context<Self>) {
+        self.poll_task = None;
+        self.has_control = false;
+        self.status = "stopped".to_string();
+        self.error = Some("desktop stopped".to_string());
         cx.notify();
     }
 
@@ -199,18 +227,34 @@ impl DesktopViewer {
         self.heartbeat_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(LEASE_HEARTBEAT).await;
-                let _ = env.heartbeat("owner", None);
+                if !env.is_alive() {
+                    let _ = this.update(cx, |this, cx| this.mark_stopped(cx));
+                    break;
+                }
+                if let Err(err) = env.heartbeat("owner", None) {
+                    let _ = this.update(cx, |this, cx| {
+                        this.error = Some(format!("heartbeat failed: {err}"));
+                        cx.notify();
+                    });
+                }
                 let Ok(holding) = this.update(cx, |this, _| this.has_control) else {
                     break;
                 };
                 if !holding {
                     continue;
                 }
-                let renewed = env
-                    .set_control(SESSION_PRINCIPAL, "acquire", true)
-                    .ok()
-                    .flatten()
-                    .is_some();
+                // Renew only a lease this viewer already holds. Acquiring while
+                // an agent holds control would take that lease over.
+                let ours = matches!(
+                    env.get_status().active_control_lease,
+                    Some(lease) if lease.holder == SESSION_PRINCIPAL
+                );
+                let renewed = ours
+                    && env
+                        .set_control(SESSION_PRINCIPAL, "acquire", true)
+                        .ok()
+                        .flatten()
+                        .is_some();
                 if this
                     .update(cx, |this, cx| {
                         this.has_control = renewed;
@@ -229,7 +273,7 @@ impl DesktopViewer {
 
     fn send_events(&mut self, events: Vec<InputEvent>, cx: &mut Context<Self>) {
         // A paused viewer forwards no input; the first click resumes it instead.
-        if self.paused || events.is_empty() {
+        if self.paused || events.is_empty() || !self.env.is_alive() {
             return;
         }
         let lease = match self.env.get_status().active_control_lease {
