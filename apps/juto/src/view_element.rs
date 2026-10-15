@@ -8,10 +8,10 @@
 //! decides how they look.
 
 use gpui::{
-    AnyElement, FontWeight, InteractiveElement, IntoElement, ParentElement, SharedString, Styled,
-    div, px, relative, rgb,
+    AnyElement, Div, FontWeight, InteractiveElement, IntoElement, ParentElement, PathBuilder,
+    Pixels, Point, SharedString, Styled, canvas, div, point, px, relative, rgb,
 };
-use juto_agent::{MAX_TIMELINE_TICKS, ViewChild, ViewNode};
+use juto_agent::{MAX_TIMELINE_TICKS, ViewChild, ViewNode, parse_chart_labels, parse_chart_values};
 
 use crate::theme;
 
@@ -29,6 +29,14 @@ const BAR_HEIGHT: f32 = 6.0;
 const BAR_PITCH: f32 = 8.0;
 /// Space above the first bar row inside a lane.
 const LANE_PAD: f32 = 4.0;
+/// Plot height of a `Chart`, in pixels.
+const CHART_PLOT_HEIGHT: f32 = 180.0;
+/// Narrowest a `Chart` may get before its `Row` wraps it onto a new line.
+const CHART_MIN_WIDTH: f32 = 300.0;
+/// Gridline intervals across a chart plot.
+const CHART_GRID_STEPS: usize = 4;
+/// Stroke width of a line series, in pixels.
+const LINE_WIDTH: f32 = 2.0;
 
 /// Renders one element and its subtree.
 pub fn render_view(node: &ViewNode) -> AnyElement {
@@ -56,6 +64,7 @@ pub fn render_view(node: &ViewNode) -> AnyElement {
         "Stats" => stats(node),
         "Stat" => stat(prop(node, "label"), prop(node, "value")),
         "Timeline" => timeline(node),
+        "Chart" => chart(node),
         "Subagent" => subagent_list(vec![node]),
         unknown => fallback(format!("Unknown element <{unknown}>")),
     }
@@ -423,4 +432,263 @@ fn axis_row(ticks: &[f64], max: f64) -> AnyElement {
 fn format_time(seconds: f64) -> String {
     let total = seconds.round() as u64;
     format!("{}:{:02}", total / 60, total % 60)
+}
+
+/// A `Chart` the host can draw: bar or line, optional x labels, and its series.
+struct ChartData {
+    line: bool,
+    labels: Vec<String>,
+    series: Vec<(String, Vec<f64>)>,
+}
+
+/// Parses a `Chart` and its `Series` children. The validator rejects these
+/// trees before they reach the host; this guards persisted sessions that skip it.
+fn chart_data(node: &ViewNode) -> Result<ChartData, String> {
+    let line = match prop(node, "kind") {
+        "bar" => false,
+        "line" => true,
+        other => return Err(format!("<Chart> kind `{other}` is not bar or line")),
+    };
+    let series = node
+        .children
+        .iter()
+        .filter_map(node_child)
+        .filter(|child| child.tag == "Series")
+        .map(|child| {
+            let values = parse_chart_values(prop(child, "values"))
+                .ok_or_else(|| "<Series> values must be comma-separated numbers".to_owned())?;
+            Ok((prop(child, "name").to_owned(), values))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let points = series.first().map(|(_, values)| values.len()).unwrap_or(0);
+    if series.is_empty() || series.iter().any(|(_, values)| values.len() != points) {
+        return Err(
+            "<Chart> needs at least one <Series>, all with the same number of values".into(),
+        );
+    }
+    let labels = if prop(node, "labels").is_empty() {
+        Vec::new()
+    } else {
+        parse_chart_labels(prop(node, "labels"))
+    };
+    if !labels.is_empty() && labels.len() != points {
+        return Err("<Chart> labels must match the number of values".into());
+    }
+    Ok(ChartData {
+        line,
+        labels,
+        series,
+    })
+}
+
+/// Titled chart: a legend when there are several series, the plot, and x labels.
+/// Each chart is `flex_1` with a minimum width, so a `Row` puts two side by side
+/// when they fit and wraps them otherwise.
+fn chart(node: &ViewNode) -> AnyElement {
+    let data = match chart_data(node) {
+        Ok(data) => data,
+        Err(message) => return fallback(message),
+    };
+    let (lo, hi) = value_domain(&data.series);
+    let mut card = div()
+        .flex_1()
+        .min_w(px(CHART_MIN_WIDTH))
+        .flex()
+        .flex_col()
+        .gap_2();
+    let title = prop(node, "title");
+    if !title.is_empty() {
+        card = card.child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(theme::TEXT))
+                .child(SharedString::from(title.to_owned())),
+        );
+    }
+    if data.series.len() > 1 {
+        let legend = data
+            .series
+            .iter()
+            .enumerate()
+            .map(|(s, (name, _))| legend_item(name, series_color(s)));
+        card = card.child(div().flex().flex_row().flex_wrap().gap_3().children(legend));
+    }
+    card = card.child(if data.line {
+        line_plot(&data.series, lo, hi)
+    } else {
+        bar_plot(&data.series, lo, hi)
+    });
+    if !data.labels.is_empty() {
+        card = card.child(x_labels(&data.labels));
+    }
+    card.into_any_element()
+}
+
+/// Shared y range covering every value and zero, so bars rise from a baseline.
+fn value_domain(series: &[(String, Vec<f64>)]) -> (f64, f64) {
+    let (mut lo, mut hi) = (0.0_f64, 0.0_f64);
+    for value in series.iter().flat_map(|(_, values)| values) {
+        lo = lo.min(*value);
+        hi = hi.max(*value);
+    }
+    if hi == lo {
+        hi = lo + 1.0;
+    }
+    (lo, hi)
+}
+
+/// Distance from the top of the plot, as a fraction of its height, for `value`.
+fn value_fraction(value: f64, lo: f64, hi: f64) -> f32 {
+    ((hi - value) / (hi - lo)) as f32
+}
+
+/// Plot box with horizontal gridlines and a stronger baseline at `zero`, the
+/// fraction of the height where value 0 sits.
+fn plot_box(zero: f32) -> Div {
+    let mut plot = div().relative().w_full().h(px(CHART_PLOT_HEIGHT));
+    for step in 0..=CHART_GRID_STEPS {
+        plot = plot.child(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(relative(step as f32 / CHART_GRID_STEPS as f32))
+                .h(px(1.0))
+                .bg(rgb(theme::BORDER)),
+        );
+    }
+    plot.child(
+        div()
+            .absolute()
+            .left_0()
+            .right_0()
+            .top(relative(zero))
+            .h(px(1.0))
+            .bg(rgb(theme::BORDER_STRONG)),
+    )
+}
+
+/// Grouped columns: each x position holds one bar per series, centered in its
+/// slot with a 20% margin on each side.
+fn bar_plot(series: &[(String, Vec<f64>)], lo: f64, hi: f64) -> AnyElement {
+    let points = series[0].1.len();
+    let slot = 1.0 / points as f32;
+    let group = 0.6 * slot;
+    let bar_width = group / series.len() as f32;
+    let zero = value_fraction(0.0, lo, hi);
+    let mut plot = plot_box(zero);
+    for (s, (_, values)) in series.iter().enumerate() {
+        for (i, value) in values.iter().enumerate() {
+            let edge = value_fraction(*value, lo, hi);
+            plot = plot.child(
+                div()
+                    .absolute()
+                    .top(relative(edge.min(zero)))
+                    .h(relative((edge - zero).abs()))
+                    .left(relative(
+                        i as f32 * slot + 0.2 * slot + s as f32 * bar_width,
+                    ))
+                    .w(relative(bar_width))
+                    .bg(rgb(series_color(s))),
+            );
+        }
+    }
+    plot.into_any_element()
+}
+
+/// One polyline per series, stroked on a canvas laid over the plot. Points sit at
+/// the centre of their slot, matching the bar and label positions.
+fn line_plot(series: &[(String, Vec<f64>)], lo: f64, hi: f64) -> AnyElement {
+    let points = series[0].1.len();
+    let lines: Vec<(u32, Vec<f32>)> = series
+        .iter()
+        .enumerate()
+        .map(|(s, (_, values))| {
+            let fractions = values
+                .iter()
+                .map(|value| value_fraction(*value, lo, hi))
+                .collect();
+            (series_color(s), fractions)
+        })
+        .collect();
+    let overlay = canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _cx| {
+            for (color, fractions) in &lines {
+                let mut dots: Vec<Point<Pixels>> = fractions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, fraction)| {
+                        point(
+                            bounds.origin.x
+                                + bounds.size.width * ((i as f32 + 0.5) / points as f32),
+                            bounds.origin.y + bounds.size.height * *fraction,
+                        )
+                    })
+                    .collect();
+                // A single point has no segment; a short dash marks it.
+                if dots.len() == 1 {
+                    dots.push(dots[0] + point(px(LINE_WIDTH * 2.0), px(0.0)));
+                }
+                let Some((first, rest)) = dots.split_first() else {
+                    continue;
+                };
+                let mut builder = PathBuilder::stroke(px(LINE_WIDTH));
+                builder.move_to(*first);
+                for dot in rest {
+                    builder.line_to(*dot);
+                }
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, rgb(*color));
+                }
+            }
+        },
+    );
+    plot_box(value_fraction(0.0, lo, hi))
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .w_full()
+                .h(px(CHART_PLOT_HEIGHT))
+                .child(overlay.size_full()),
+        )
+        .into_any_element()
+}
+
+/// Labels under the plot, one per x position and centered in its slot.
+fn x_labels(labels: &[String]) -> AnyElement {
+    let points = labels.len() as f32;
+    let mut row = div().relative().w_full().h(px(16.0));
+    for (i, label) in labels.iter().enumerate() {
+        row = row.child(
+            div()
+                .absolute()
+                .top_0()
+                .left(relative(i as f32 / points))
+                .w(relative(1.0 / points))
+                .text_xs()
+                .text_center()
+                .truncate()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(SharedString::from(label.clone())),
+        );
+    }
+    row.into_any_element()
+}
+
+/// Legend entry: a series-colored dot and the series name.
+fn legend_item(name: &str, color: u32) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_1()
+        .text_xs()
+        .text_color(rgb(theme::TEXT_MUTED))
+        .child(div().size(px(6.0)).rounded_full().bg(rgb(color)))
+        .child(SharedString::from(name.to_owned()))
+        .into_any_element()
 }
