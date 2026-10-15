@@ -33,8 +33,9 @@ pub(crate) const SESSION_PRINCIPAL: &str = "human:viewer";
 pub enum ControlAccess {
     /// The grant carries no Control role: the canvas is read-only.
     ViewOnly,
-    /// The grant carries Control; control ends when the grant expires.
-    Granted,
+    /// The grant carries Control and ends at `expires_at` (unix seconds); the
+    /// viewer stops offering control once it lapses.
+    Granted { expires_at: u64 },
     /// Local developer session that created the environment. It issues and
     /// renews its own grant, since the host caps grant lifetime.
     LocalOwner,
@@ -76,8 +77,11 @@ pub struct DesktopViewer {
     /// Whether the viewer's grant permits control. A view-only grant gets a
     /// read-only canvas: no control buttons and no input forwarding.
     can_control: bool,
-    /// Expiry of the local owner grant, when this viewer issues its own.
-    local_grant_expires_at: Option<u64>,
+    /// How control was granted; only a local owner grant is renewed here.
+    access: ControlAccess,
+    /// Expiry of the grant that authorizes control: renewed for a local owner,
+    /// fixed for a resolved grant, None when view-only.
+    grant_expires_at: Option<u64>,
     paused: bool,
     input_seq: u64,
     poll_task: Option<Task<()>>,
@@ -98,10 +102,11 @@ impl DesktopViewer {
         cx: &mut Context<Self>,
     ) -> Self {
         let output = env.output();
-        let (can_control, local_grant_expires_at) = match access {
-            ControlAccess::ViewOnly => (false, None),
-            ControlAccess::Granted => (true, None),
-            ControlAccess::LocalOwner => (true, Some(issue_local_grant(&env))),
+        let can_control = access != ControlAccess::ViewOnly;
+        let grant_expires_at = match access {
+            ControlAccess::ViewOnly => None,
+            ControlAccess::Granted { expires_at } => Some(expires_at),
+            ControlAccess::LocalOwner => Some(issue_local_grant(&env)),
         };
         let mut viewer = Self {
             env,
@@ -113,7 +118,8 @@ impl DesktopViewer {
             error: None,
             has_control: false,
             can_control,
-            local_grant_expires_at,
+            access,
+            grant_expires_at,
             paused: true,
             input_seq: 0,
             poll_task: None,
@@ -158,14 +164,24 @@ impl DesktopViewer {
     pub fn capture_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let env = self.env.clone();
         self.snapshot_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let read = cx
-                .background_executor()
-                .spawn(async move { read_latest_frame(env) })
-                .await;
-            if let Some(frame) = read {
-                let _ = this.update_in(cx, |this, window, cx| {
-                    this.set_frame(frame, window, cx);
-                });
+            // The worker may not have produced its first frame yet: keep trying
+            // until one exists or the environment ends.
+            loop {
+                let read_env = env.clone();
+                let read = cx
+                    .background_executor()
+                    .spawn(async move { read_latest_frame(read_env) })
+                    .await;
+                if let Some(frame) = read {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.set_frame(frame, window, cx);
+                    });
+                    break;
+                }
+                if !env.is_alive() {
+                    break;
+                }
+                cx.background_executor().timer(FRAME_INTERVAL).await;
             }
         }));
     }
@@ -276,7 +292,8 @@ impl DesktopViewer {
     /// or live. While control is held it also renews the control lease.
     fn start_heartbeat(&mut self, cx: &mut Context<Self>) {
         let env = self.env.clone();
-        let mut grant_expires_at = self.local_grant_expires_at;
+        let access = self.access;
+        let mut grant_expires_at = self.grant_expires_at;
         self.heartbeat_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(LEASE_HEARTBEAT).await;
@@ -292,10 +309,21 @@ impl DesktopViewer {
                 }
                 // A local owner session keeps its own grant alive before the host
                 // cap expires it; otherwise control could not be renewed.
-                if grant_expires_at
-                    .is_some_and(|expires_at| expires_at <= unix_now() + LOCAL_GRANT_RENEW_SECS)
+                if access == ControlAccess::LocalOwner
+                    && grant_expires_at
+                        .is_some_and(|expires_at| expires_at <= unix_now() + LOCAL_GRANT_RENEW_SECS)
                 {
                     grant_expires_at = Some(issue_local_grant(&env));
+                }
+                // A resolved grant ends at its own expiry, which the host enforces
+                // too. Stop offering control and release the lease it authorized.
+                if matches!(access, ControlAccess::Granted { expires_at } if expires_at <= unix_now()) {
+                    let Ok(ended) = this.update(cx, |this, cx| this.end_control_grant(cx)) else {
+                        break;
+                    };
+                    if ended {
+                        let _ = env.set_control(SESSION_PRINCIPAL, "release", true);
+                    }
                 }
                 let Ok(holding) = this.update(cx, |this, _| this.has_control) else {
                     break;
@@ -329,6 +357,19 @@ impl DesktopViewer {
                 }
             }
         }));
+    }
+
+    /// Ends control when its resolved grant lapses. Returns whether control was
+    /// still offered, so the caller releases the lease only once.
+    fn end_control_grant(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.can_control {
+            return false;
+        }
+        self.can_control = false;
+        self.has_control = false;
+        self.error = Some("control grant expired".to_string());
+        cx.notify();
+        true
     }
 
     fn send_events(&mut self, events: Vec<InputEvent>, cx: &mut Context<Self>) {

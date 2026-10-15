@@ -696,7 +696,11 @@ impl ChatView {
             .desktop_artifact_resolver()
             .resolve(crate::desktop_viewer::SESSION_PRINCIPAL, artifact)
         {
-            Ok(juto_runtime::ViewerRoute::Local { env_id, roles, .. }) => {
+            Ok(juto_runtime::ViewerRoute::Local {
+                env_id,
+                roles,
+                expires_at,
+            }) => {
                 let control = roles.iter().any(|role| {
                     matches!(
                         role,
@@ -705,7 +709,7 @@ impl ChatView {
                     )
                 });
                 let access = if control {
-                    crate::desktop_viewer::ControlAccess::Granted
+                    crate::desktop_viewer::ControlAccess::Granted { expires_at }
                 } else {
                     crate::desktop_viewer::ControlAccess::ViewOnly
                 };
