@@ -1,18 +1,19 @@
-//! GPUI Sidebar "Mission Control" tracking subagent states, Zed live diffs, and steering controls.
+//! Left sidebar listing focus threads (subagents that own an orchestrated task).
 //!
-//! Specifications from docs/orchestration-plan.md Slice D:
-//! - Visual task list displaying badge per SubagentStatus (Queued, Running, Blocked, Verifying, Reviewing, Completed, Failed, Cancelled).
+//! - One row per focus thread: title, status, and lifecycle stage bar (see
+//!   `task_card`). Clicking a row selects it and opens focus mode.
 //! - Direct integration with `juto_runtime::subagents::{BlockerReason, SubagentStatus, SubagentSummary}`.
 //! - Filter tabs: All, Active, Blocked, Done.
-//! - Search/filter bar for tasks.
-//! - Expandable task cards: duration, token count, active tool log, live delta preview.
-//! - Interactive steering buttons: Pause, Abort, Resume/Unblock, Guidance Injection.
+//! - Search/filter over title, task, agent, workspace, and id.
+//! - Blocked rows always expose their prompt and a resume field; expanding a
+//!   row reveals steering (Pause, Steer, Abort), usage, step log, and diffs.
 //! - Error banner surfaced with visible failure reason on rejected steering or unblock.
-//! - Zed Delta unified diff viewer anchored to conversation turn metadata.
+
+use std::collections::HashMap;
 
 use gpui::{
-    App, ClickEvent, Context, FocusHandle, Focusable, IntoElement, KeyBinding, Render,
-    ScrollHandle, SharedString, Window, actions, div, prelude::*, rgb,
+    App, ClickEvent, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Render,
+    ScrollHandle, SharedString, Subscription, Window, actions, div, prelude::*, rgb,
 };
 use juto_runtime::subagents::{BlockerReason, SubagentStatus, SubagentSummary};
 
@@ -20,6 +21,7 @@ use crate::task_card::{
     DiffFileModel, DiffHunkModel, DiffLineKind, DiffLineModel, TaskCard, TaskCardEvent,
     TaskCardModel, TokenUsageModel, ToolLogEntry, is_status_active,
 };
+use crate::theme;
 
 actions!(
     sidebar,
@@ -68,7 +70,7 @@ pub enum SidebarEvent {
     Close,
 }
 
-/// GPUI Sidebar Mission Control.
+/// Left sidebar listing focus threads.
 pub struct Sidebar {
     focus_handle: Option<FocusHandle>,
     scroll_handle: ScrollHandle,
@@ -77,6 +79,8 @@ pub struct Sidebar {
     filter: TaskFilter,
     search_query: String,
     error_message: Option<SharedString>,
+    /// Live row views by task id, with the subscription forwarding their events.
+    cards: HashMap<String, (Entity<TaskCard>, Subscription)>,
 }
 
 impl gpui::EventEmitter<SidebarEvent> for Sidebar {}
@@ -92,6 +96,7 @@ impl Sidebar {
             filter: TaskFilter::All,
             search_query: String::new(),
             error_message: None,
+            cards: HashMap::new(),
         }
     }
 
@@ -333,6 +338,13 @@ impl Sidebar {
         cx.notify();
     }
 
+    /// Drops the row highlight without emitting a selection event, e.g. when
+    /// focus mode closes.
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.selected_task = None;
+        cx.notify();
+    }
+
     pub fn close(&mut self, cx: &mut Context<Self>) {
         cx.emit(SidebarEvent::Close);
         cx.notify();
@@ -410,106 +422,49 @@ impl Sidebar {
             .flex()
             .flex_col()
             .gap_2p5()
-            .p_3p5()
-            .bg(rgb(0x18181b))
-            .border_b_1()
-            .border_color(rgb(0x27272a))
+            .px_5()
+            .pt_5()
+            .pb_2()
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(0xf4f4f5))
-                                    .child("⚡ MISSION CONTROL"),
-                            )
-                            .child(
-                                div()
-                                    .px_1p5()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(if blocked > 0 {
-                                        rgb(0x451a03)
-                                    } else if active > 0 {
-                                        rgb(0x1e3a5f)
-                                    } else {
-                                        rgb(0x27272a)
-                                    })
-                                    .border_1()
-                                    .border_color(if blocked > 0 {
-                                        rgb(0xd97706)
-                                    } else if active > 0 {
-                                        rgb(0x2563eb)
-                                    } else {
-                                        rgb(0x3f3f46)
-                                    })
-                                    .text_xs()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(if blocked > 0 {
-                                        rgb(0xfbbf24)
-                                    } else if active > 0 {
-                                        rgb(0x60a5fa)
-                                    } else {
-                                        rgb(0xa1a1aa)
-                                    })
-                                    .child(format!("{}", total)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .id("close-sidebar-btn")
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(0x71717a))
-                            .hover(|s| s.text_color(rgb(0xe4e4e7)))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.close(cx);
-                            }))
-                            .child("✕"),
-                    ),
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child("FOCUS THREADS"),
             )
-            .child(
-                // Filter Tab Pills
-                div()
-                    .flex()
-                    .gap_1p5()
-                    .child(self.filter_pill(TaskFilter::All, format!("All ({})", total), cx))
-                    .child(self.filter_pill(TaskFilter::Active, format!("Active ({})", active), cx))
-                    .child(self.filter_pill(
-                        TaskFilter::Blocked,
-                        format!("Blocked ({})", blocked),
-                        cx,
-                    ))
-                    .child(self.filter_pill(TaskFilter::Done, format!("Done ({})", done), cx)),
-            )
+            .when(total > 0, |hdr| {
+                hdr.child(
+                    div()
+                        .flex()
+                        .gap_3()
+                        .child(self.filter_tab(TaskFilter::All, total, cx))
+                        .child(self.filter_tab(TaskFilter::Active, active, cx))
+                        .child(self.filter_tab(TaskFilter::Blocked, blocked, cx))
+                        .child(self.filter_tab(TaskFilter::Done, done, cx)),
+                )
+            })
             .when_some(self.error_message.clone(), |hdr, err| {
                 hdr.child(
                     div()
                         .flex()
-                        .items_center()
+                        .items_start()
                         .justify_between()
+                        .gap_2()
                         .p_2()
-                        .rounded_xs()
-                        .bg(rgb(0x450a0a))
-                        .border_1()
-                        .border_color(rgb(0xdc2626))
+                        .rounded_sm()
+                        .bg(rgb(theme::BG_RAISED))
+                        .border_l_2()
+                        .border_color(rgb(theme::DANGER))
                         .text_xs()
-                        .text_color(rgb(0xfca5a5))
-                        .child(err)
+                        .text_color(rgb(theme::TEXT))
+                        .child(div().flex_1().min_w_0().child(err))
                         .child(
                             div()
                                 .id("dismiss-sidebar-error-btn")
+                                .flex_none()
                                 .cursor_pointer()
-                                .text_color(rgb(0xf87171))
-                                .hover(|s| s.text_color(rgb(0xffffff)))
+                                .text_color(rgb(theme::TEXT_FAINT))
+                                .hover(|s| s.text_color(rgb(theme::TEXT)))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.set_error(None, cx);
                                 }))
@@ -519,48 +474,39 @@ impl Sidebar {
             })
     }
 
-    fn filter_pill(
+    fn filter_tab(
         &self,
         filter: TaskFilter,
-        label: String,
+        count: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_active = self.filter == filter;
-        let pill_id = format!("filter-pill-{:?}", filter);
 
         div()
-            .id(SharedString::from(pill_id))
+            .id(SharedString::from(format!("filter-pill-{:?}", filter)))
+            .flex()
+            .gap_1()
             .cursor_pointer()
-            .px_2()
-            .py_0p5()
-            .rounded_xs()
-            .bg(if is_active {
-                rgb(0x27272a)
-            } else {
-                rgb(0x18181b)
-            })
-            .border_1()
-            .border_color(if is_active {
-                rgb(0x3f3f46)
-            } else {
-                rgb(0x27272a)
-            })
             .text_xs()
-            .font_weight(if is_active {
-                gpui::FontWeight::BOLD
-            } else {
-                gpui::FontWeight::NORMAL
-            })
             .text_color(if is_active {
-                rgb(0xf4f4f5)
+                rgb(theme::TEXT)
             } else {
-                rgb(0x71717a)
+                rgb(theme::TEXT_FAINT)
             })
-            .hover(|s| s.bg(rgb(0x27272a)).text_color(rgb(0xe4e4e7)))
+            .hover(|s| s.text_color(rgb(theme::TEXT)))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.set_filter(filter, cx);
             }))
-            .child(label)
+            .child(filter.label())
+            .child(
+                div()
+                    .text_color(if is_active {
+                        rgb(theme::ACCENT)
+                    } else {
+                        rgb(theme::TEXT_FAINT)
+                    })
+                    .child(count.to_string()),
+            )
     }
 
     fn render_summary_footer(&self) -> impl IntoElement {
@@ -570,27 +516,28 @@ impl Sidebar {
             .flex()
             .items_center()
             .justify_between()
-            .px_3p5()
-            .py_2()
-            .bg(rgb(0x18181b))
+            .px_5()
+            .py_2p5()
             .border_t_1()
-            .border_color(rgb(0x27272a))
+            .border_color(rgb(theme::BORDER))
             .text_xs()
-            .text_color(rgb(0x71717a))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(format!("Tokens: {} total", total_tokens)),
-            )
+            .text_color(rgb(theme::TEXT_FAINT))
+            .child(format!("{total_tokens} tokens"))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .child(div().text_color(rgb(0x34d399)).child(format!("+{}", adds)))
-                    .child(div().text_color(rgb(0xf87171)).child(format!("-{}", dels))),
+                    .child(
+                        div()
+                            .text_color(rgb(theme::DIFF_ADD))
+                            .child(format!("+{adds}")),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(theme::DANGER))
+                            .child(format!("-{dels}")),
+                    ),
             )
     }
 
@@ -598,23 +545,20 @@ impl Sidebar {
         div()
             .flex()
             .flex_col()
-            .items_center()
-            .justify_center()
-            .p_6()
-            .gap_2()
-            .text_center()
+            .gap_1p5()
+            .px_5()
+            .py_2()
             .child(
                 div()
                     .text_sm()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgb(0x71717a))
-                    .child("No subagents active"),
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child("No focus threads"),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(rgb(0x52525b))
-                    .child("When child runs are spawned or queued, Mission Control streams status badges, blocker taxonomy, live Zed deltas, and steering controls here."),
+                    .text_color(rgb(theme::TEXT_FAINT))
+                    .child("Threads the agent starts for orchestrated tasks appear here."),
             )
     }
 }
@@ -627,17 +571,74 @@ impl Focusable for Sidebar {
     }
 }
 
+impl Sidebar {
+    /// Returns the live card for `task`, creating it on first sight. Cards
+    /// persist across renders so click state, focus, and typed resume/steer
+    /// text survive re-renders.
+    fn card_for(
+        &mut self,
+        task: TaskCardModel,
+        is_selected: bool,
+        cx: &mut Context<Self>,
+    ) -> Entity<TaskCard> {
+        if let Some((card, _)) = self.cards.get(&task.id) {
+            card.update(cx, |card, _| card.sync(task, is_selected));
+            return card.clone();
+        }
+        let id = task.id.clone();
+        let card = cx.new(|cx| TaskCard::new(task, is_selected, cx));
+        let subscription = cx.subscribe(&card, Self::on_card_event);
+        self.cards.insert(id, (card.clone(), subscription));
+        card
+    }
+
+    fn on_card_event(
+        &mut self,
+        _: Entity<TaskCard>,
+        event: &TaskCardEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            TaskCardEvent::Selected(id) => self.select_task(id, cx),
+            TaskCardEvent::Pause(id) => cx.emit(SidebarEvent::PauseTask(id.clone())),
+            TaskCardEvent::Resume { id, resolution } => cx.emit(SidebarEvent::ResumeTask {
+                id: id.clone(),
+                resolution: resolution.clone(),
+            }),
+            TaskCardEvent::Abort(id) => cx.emit(SidebarEvent::AbortTask(id.clone())),
+            TaskCardEvent::Steer { id, guidance } => cx.emit(SidebarEvent::SteerTask {
+                id: id.clone(),
+                guidance: guidance.clone(),
+            }),
+            TaskCardEvent::ToggleExpanded(id) => {
+                if let Some(task) = self.tasks.iter_mut().find(|t| &t.id == id) {
+                    task.expanded = !task.expanded;
+                    cx.notify();
+                }
+            }
+        }
+    }
+}
+
 impl Render for Sidebar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tasks = &self.tasks;
+        self.cards
+            .retain(|id, _| tasks.iter().any(|task| &task.id == id));
+
         let matching_tasks: Vec<TaskCardModel> = self
             .tasks
             .iter()
             .filter(|t| self.matches_filter(t) && self.matches_search(t))
             .cloned()
             .collect();
-
-        let is_empty = matching_tasks.is_empty();
-        let selected_id = self.selected_task.clone();
+        let cards: Vec<Entity<TaskCard>> = matching_tasks
+            .into_iter()
+            .map(|task| {
+                let is_selected = self.selected_task.as_deref() == Some(task.id.as_str());
+                self.card_for(task, is_selected, cx)
+            })
+            .collect();
 
         div()
             .id("sidebar-mission-control")
@@ -645,9 +646,6 @@ impl Render for Sidebar {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0x141416))
-            .border_l_1()
-            .border_color(rgb(0x27272a))
             .child(self.render_header(cx))
             .child(
                 div()
@@ -656,63 +654,20 @@ impl Render for Sidebar {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
-                    .p_3()
                     .child(
                         div()
                             .flex()
                             .flex_col()
-                            .gap_2p5()
-                            .when(is_empty, |list| list.child(self.render_empty_state()))
-                            .when(!is_empty, |list| {
-                                list.children(matching_tasks.into_iter().map(|task_model| {
-                                    let task_id = task_model.id.clone();
-                                    let is_selected = selected_id.as_deref() == Some(&task_id);
-                                    let card_view =
-                                        cx.new(|cx| TaskCard::new(task_model, is_selected, cx));
-
-                                    // Forward task card events
-                                    cx.subscribe(
-                                        &card_view,
-                                        |this, _, event: &TaskCardEvent, cx| match event {
-                                            TaskCardEvent::Selected(id) => {
-                                                this.select_task(id, cx);
-                                            }
-                                            TaskCardEvent::Pause(id) => {
-                                                cx.emit(SidebarEvent::PauseTask(id.clone()));
-                                            }
-                                            TaskCardEvent::Resume { id, resolution } => {
-                                                cx.emit(SidebarEvent::ResumeTask {
-                                                    id: id.clone(),
-                                                    resolution: resolution.clone(),
-                                                });
-                                            }
-                                            TaskCardEvent::Abort(id) => {
-                                                cx.emit(SidebarEvent::AbortTask(id.clone()));
-                                            }
-                                            TaskCardEvent::Steer { id, guidance } => {
-                                                cx.emit(SidebarEvent::SteerTask {
-                                                    id: id.clone(),
-                                                    guidance: guidance.clone(),
-                                                });
-                                            }
-                                            TaskCardEvent::ToggleExpanded(id) => {
-                                                if let Some(t) =
-                                                    this.tasks.iter_mut().find(|t| &t.id == id)
-                                                {
-                                                    t.expanded = !t.expanded;
-                                                    cx.notify();
-                                                }
-                                            }
-                                        },
-                                    )
-                                    .detach();
-
-                                    card_view
-                                }))
-                            }),
+                            .gap_0p5()
+                            .when(cards.is_empty(), |list| {
+                                list.child(self.render_empty_state())
+                            })
+                            .children(cards),
                     ),
             )
-            .child(self.render_summary_footer())
+            .when(!self.tasks.is_empty(), |sidebar| {
+                sidebar.child(self.render_summary_footer())
+            })
     }
 }
 
@@ -733,6 +688,7 @@ mod tests {
             filter: TaskFilter::All,
             search_query: String::new(),
             error_message: None,
+            cards: HashMap::new(),
         };
 
         let (total, active, blocked, done) = sidebar.filter_counts();
@@ -766,6 +722,7 @@ mod tests {
             filter: TaskFilter::All,
             search_query: String::new(),
             error_message: None,
+            cards: HashMap::new(),
         };
 
         // Truthful initial empty state
@@ -886,6 +843,7 @@ mod tests {
             filter: TaskFilter::All,
             search_query: String::new(),
             error_message: None,
+            cards: HashMap::new(),
         };
 
         assert!(sidebar.error_message.is_none());
@@ -909,6 +867,7 @@ mod tests {
             filter: TaskFilter::All,
             search_query: String::new(),
             error_message: None,
+            cards: HashMap::new(),
         };
         let summary = |id: &str, focus: bool| SubagentSummary {
             id: id.into(),
@@ -941,6 +900,7 @@ mod tests {
             filter: TaskFilter::All,
             search_query: String::new(),
             error_message: None,
+            cards: HashMap::new(),
         };
         let summary = SubagentSummary {
             id: "focus-1".into(),
