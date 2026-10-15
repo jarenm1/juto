@@ -779,7 +779,8 @@ impl ChatView {
         let launch_argv = argv;
         let launch_request = request_id.clone();
         let viewer = cx.new(|cx| crate::desktop_viewer::DesktopViewer::new(env, window, cx));
-        cx.spawn(async move |this, cx| {
+        let still_viewer = viewer.clone();
+        cx.spawn_in(window, async move |this, cx| {
             let launched = cx
                 .background_executor()
                 .spawn(async move {
@@ -791,12 +792,19 @@ impl ChatView {
                     result.map(|_| ()).map_err(|err| err.to_string())
                 })
                 .await;
-            if let Err(message) = launched {
-                let _ = this.update(cx, |this, cx| {
-                    this.artifact_notice =
-                        Some(format!("cannot launch desktop application: {message}").into());
-                    cx.notify();
-                });
+            match launched {
+                Ok(()) => {
+                    // The mount still was taken before the app existed; retake it now.
+                    let _ = still_viewer
+                        .update_in(cx, |viewer, window, cx| viewer.capture_snapshot(window, cx));
+                }
+                Err(message) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.artifact_notice =
+                            Some(format!("cannot launch desktop application: {message}").into());
+                        cx.notify();
+                    });
+                }
             }
         })
         .detach();
