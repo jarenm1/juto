@@ -638,9 +638,19 @@ impl DesktopEnvironment {
         action: &str,
         is_human: bool,
     ) -> Result<Option<ControlLease>, DesktopError> {
+        // Lock order matches `revoke_grant`: grants, then lease.
+        let grants = self.inner.grants.lock();
         let mut lease = self.inner.lease.lock();
         match action {
             "acquire" => {
+                // Human control needs a live grant; agent control is unchanged.
+                if is_human && !grants_permit_control(&grants, caller) {
+                    return Err(DesktopError::Unauthorized {
+                        caller: caller.to_string(),
+                        role: "Control".to_string(),
+                        environment: self.env_id().to_string(),
+                    });
+                }
                 if let Some(current) = lease.as_ref() {
                     if current.holder == caller && current.is_human == is_human {
                         // Renewal: same holder keeps its epoch and extends the
@@ -948,6 +958,8 @@ impl DesktopEnvironment {
         generation: GeometryGeneration,
         batch: InputBatch,
     ) -> Result<u64, DesktopError> {
+        // Lock order matches `revoke_grant`: grants, then lease.
+        let grants = self.inner.grants.lock();
         let lease = self.inner.lease.lock();
         let current_lease = lease.as_ref().ok_or_else(|| DesktopError::Unauthorized {
             caller: caller.to_string(),
@@ -964,6 +976,13 @@ impl DesktopEnvironment {
             return Err(DesktopError::StaleLease {
                 expected: current_lease.epoch,
                 received: epoch,
+            });
+        }
+        if current_lease.is_human && !grants_permit_control(&grants, caller) {
+            return Err(DesktopError::Unauthorized {
+                caller: caller.to_string(),
+                role: "Control".to_string(),
+                environment: self.env_id().to_string(),
             });
         }
         let current_gen = self.generation();
@@ -993,6 +1012,7 @@ impl DesktopEnvironment {
             }
         }
         drop(lease);
+        drop(grants);
 
         let compositor = self.compositor()?;
         for event in batch.events {
@@ -2013,6 +2033,20 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Whether `caller` holds an unexpired grant that permits interactive control.
+/// Expired grants stay in the table for lookup, so the deadline is checked here.
+fn grants_permit_control(grants: &HashMap<String, Grant>, caller: &str) -> bool {
+    let now = now_secs();
+    grants.values().any(|grant| {
+        grant.principal == caller
+            && grant.expires_at > now
+            && grant
+                .roles
+                .iter()
+                .any(|role| matches!(role, GrantRole::Owner | GrantRole::Control))
+    })
 }
 
 /// Whether per-environment systemd scopes are enforced.

@@ -611,11 +611,23 @@ impl ChatView {
             .desktop_artifact_resolver()
             .resolve(crate::desktop_viewer::SESSION_PRINCIPAL, artifact)
         {
-            Ok(juto_runtime::ViewerRoute::Local { env_id, .. }) => {
+            Ok(juto_runtime::ViewerRoute::Local { env_id, roles, .. }) => {
+                let control = roles.iter().any(|role| {
+                    matches!(
+                        role,
+                        juto_runtime::protocol::GrantRole::Owner
+                            | juto_runtime::protocol::GrantRole::Control
+                    )
+                });
+                let access = if control {
+                    crate::desktop_viewer::ControlAccess::Granted
+                } else {
+                    crate::desktop_viewer::ControlAccess::ViewOnly
+                };
                 match self.runtime.desktop_supervisor().get_environment(&env_id) {
-                    Ok(env) => DesktopCanvas::Live(
-                        cx.new(|cx| crate::desktop_viewer::DesktopViewer::new(env, window, cx)),
-                    ),
+                    Ok(env) => DesktopCanvas::Live(cx.new(|cx| {
+                        crate::desktop_viewer::DesktopViewer::new(env, access, window, cx)
+                    })),
                     Err(err) => DesktopCanvas::Unavailable(
                         format!("Desktop environment '{env_id}' is unavailable: {err}").into(),
                     ),
@@ -693,7 +705,14 @@ impl ChatView {
         let launch_env = env.clone();
         let launch_argv = argv;
         let launch_request = request_id.clone();
-        let viewer = cx.new(|cx| crate::desktop_viewer::DesktopViewer::new(env, window, cx));
+        let viewer = cx.new(|cx| {
+            crate::desktop_viewer::DesktopViewer::new(
+                env,
+                crate::desktop_viewer::ControlAccess::LocalOwner,
+                window,
+                cx,
+            )
+        });
         let still_viewer = viewer.clone();
         cx.spawn_in(window, async move |this, cx| {
             let launched = cx

@@ -133,7 +133,13 @@ fn control_lease_and_human_preemption() {
     // A second agent cannot steal control.
     assert!(env.set_control("agent:other", "acquire", false).is_err());
 
-    // A human preempts the agent and increments the epoch.
+    // A human with an Owner grant preempts the agent and increments the epoch.
+    env.issue_grant(
+        "human:test".to_string(),
+        vec![juto_desktop::protocol::GrantRole::Owner],
+        "session".to_string(),
+        60,
+    );
     let human = env
         .set_control("human:test", "acquire", true)
         .expect("human preempts")
@@ -148,6 +154,74 @@ fn control_lease_and_human_preemption() {
             .is_none()
     );
     assert!(env.get_status().active_control_lease.is_none());
+
+    env.destroy();
+}
+
+#[test]
+fn human_control_requires_live_grant() {
+    use juto_desktop::protocol::GrantRole;
+
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("grant")), &unique_env_id("req"))
+        .expect("create environment");
+
+    // No grant: a human cannot take control.
+    assert!(matches!(
+        env.set_control("human:none", "acquire", true),
+        Err(DesktopError::Unauthorized { .. })
+    ));
+
+    // A View-only grant does not confer control.
+    env.issue_grant(
+        "human:viewer-only".to_string(),
+        vec![GrantRole::View],
+        "session".to_string(),
+        60,
+    );
+    assert!(matches!(
+        env.set_control("human:viewer-only", "acquire", true),
+        Err(DesktopError::Unauthorized { .. })
+    ));
+
+    // A lapsed grant is refused although it stays in the grant table.
+    env.issue_grant(
+        "human:lapsed".to_string(),
+        vec![GrantRole::Owner],
+        "session".to_string(),
+        0,
+    );
+    assert!(matches!(
+        env.set_control("human:lapsed", "acquire", true),
+        Err(DesktopError::Unauthorized { .. })
+    ));
+
+    // A live Owner grant acquires control.
+    let owner_grant = env.issue_grant(
+        "human:owner".to_string(),
+        vec![GrantRole::Owner],
+        "session".to_string(),
+        60,
+    );
+    let lease = env
+        .set_control("human:owner", "acquire", true)
+        .expect("owner acquires")
+        .expect("lease present");
+    assert!(lease.is_human);
+
+    // Revoking the grant releases the lease, so the holder's input is refused.
+    assert!(env.revoke_grant(&owner_grant.grant_id));
+    assert!(env.get_status().active_control_lease.is_none());
+    let batch = InputBatch {
+        seq: 1,
+        client_timestamp_us: 0,
+        events: Vec::new(),
+    };
+    assert!(matches!(
+        env.dispatch_input("human:owner", lease.epoch, env.generation(), batch),
+        Err(DesktopError::Unauthorized { .. })
+    ));
 
     env.destroy();
 }
