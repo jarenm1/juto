@@ -760,6 +760,16 @@ impl DesktopEnvironment {
         // benign host variables plus environment-private paths and explicit
         // overrides. No host display, session bus, SSH agent, or provider
         // secrets are inherited.
+        // Launching before Xwayland reports ready would start X11 clients
+        // without `DISPLAY`; wait briefly for the environment's X server.
+        let x11_display = self.wait_for_x11(Duration::from_secs(10));
+        if x11_display.is_none() {
+            tracing::warn!(
+                env_id = %self.env_id(),
+                app_id,
+                "launching application before Xwayland is ready; no DISPLAY"
+            );
+        }
         let home = self.inner.runtime_dir.join("home");
         let mut app_env: Vec<(String, String)> = Vec::new();
         for key in ENV_ALLOWLIST {
@@ -812,7 +822,7 @@ impl DesktopEnvironment {
         ));
         // X11 applications reach the environment's private Xwayland instance
         // with the environment's own authorization cookie.
-        if let Some(display_number) = *self.inner.x11_display.lock() {
+        if let Some(display_number) = x11_display {
             app_env.push(("DISPLAY".to_string(), format!(":{display_number}")));
             app_env.push((
                 "XAUTHORITY".to_string(),
@@ -1137,6 +1147,20 @@ impl DesktopEnvironment {
         *self.inner.x11_display.lock()
     }
 
+    /// Waits up to `timeout` for the environment's Xwayland to report ready.
+    pub fn wait_for_x11(&self, timeout: Duration) -> Option<u32> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(display_number) = self.x11_display() {
+                return Some(display_number);
+            }
+            if self.inner.destroyed.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Number of viewers currently admitted to the environment.
     pub fn active_viewers(&self) -> usize {
         self.inner.viewers.lock().len()
@@ -1194,6 +1218,11 @@ impl DesktopEnvironment {
         // Every viewer must present a new-generation frame before input resumes.
         self.inner.geometry_ready.lock().clear();
         Ok(new_gen)
+    }
+
+    /// False once the environment has been destroyed.
+    pub fn is_alive(&self) -> bool {
+        !self.inner.destroyed.load(Ordering::SeqCst)
     }
 
     pub fn get_status(&self) -> EnvironmentStatus {
