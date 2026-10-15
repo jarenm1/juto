@@ -17,7 +17,7 @@ use gpui::{
 };
 use image::{Frame, ImageBuffer, Rgba};
 use juto_runtime::DesktopEnvironment;
-use juto_runtime::protocol::{InputBatch, InputEvent};
+use juto_runtime::protocol::{GrantRole, InputBatch, InputEvent};
 
 /// Frame polling interval (~30 fps).
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -27,6 +27,41 @@ const LEASE_HEARTBEAT: Duration = Duration::from_secs(2);
 /// The authenticated principal this interactive session acts as: the local
 /// human viewing the desktop. Grants and artifact resolution are bound to it.
 pub(crate) const SESSION_PRINCIPAL: &str = "human:viewer";
+
+/// How a viewer may act on its environment, derived from its resolved grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlAccess {
+    /// The grant carries no Control role: the canvas is read-only.
+    ViewOnly,
+    /// The grant carries Control; control ends when the grant expires.
+    Granted,
+    /// Local developer session that created the environment. It issues and
+    /// renews its own grant, since the host caps grant lifetime.
+    LocalOwner,
+}
+
+/// Requested lifetime of a local owner grant; the host clamps it to its cap.
+const LOCAL_GRANT_SECS: u64 = 1800;
+/// Re-issue a local owner grant once less than this much lifetime remains.
+const LOCAL_GRANT_RENEW_SECS: u64 = 60;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
+/// Issues the local owner's Owner/View/Control grant and returns its expiry.
+fn issue_local_grant(env: &DesktopEnvironment) -> u64 {
+    env.issue_grant(
+        SESSION_PRINCIPAL.to_string(),
+        vec![GrantRole::Owner, GrantRole::View, GrantRole::Control],
+        "session".to_string(),
+        LOCAL_GRANT_SECS,
+    )
+    .expires_at
+}
 
 /// An embedded viewer for one agent-owned desktop environment.
 pub struct DesktopViewer {
@@ -38,6 +73,11 @@ pub struct DesktopViewer {
     status: String,
     error: Option<String>,
     has_control: bool,
+    /// Whether the viewer's grant permits control. A view-only grant gets a
+    /// read-only canvas: no control buttons and no input forwarding.
+    can_control: bool,
+    /// Expiry of the local owner grant, when this viewer issues its own.
+    local_grant_expires_at: Option<u64>,
     paused: bool,
     input_seq: u64,
     poll_task: Option<Task<()>>,
@@ -51,8 +91,18 @@ impl DesktopViewer {
     /// Creates a paused viewer for `env`. It captures one still of the newest
     /// frame and runs no frame loop until resumed. The owner heartbeat starts
     /// now so the environment is not retired as abandoned.
-    pub fn new(env: DesktopEnvironment, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        env: DesktopEnvironment,
+        access: ControlAccess,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let output = env.output();
+        let (can_control, local_grant_expires_at) = match access {
+            ControlAccess::ViewOnly => (false, None),
+            ControlAccess::Granted => (true, None),
+            ControlAccess::LocalOwner => (true, Some(issue_local_grant(&env))),
+        };
         let mut viewer = Self {
             env,
             frame: None,
@@ -62,6 +112,8 @@ impl DesktopViewer {
             status: "waiting for first frame".to_string(),
             error: None,
             has_control: false,
+            can_control,
+            local_grant_expires_at,
             paused: true,
             input_seq: 0,
             poll_task: None,
@@ -172,7 +224,7 @@ impl DesktopViewer {
 
     /// Acquires (or renews) the human control lease.
     pub fn take_control(&mut self, cx: &mut Context<Self>) {
-        if self.paused {
+        if self.paused || !self.can_control {
             return;
         }
         match self.env.set_control(SESSION_PRINCIPAL, "acquire", true) {
@@ -224,6 +276,7 @@ impl DesktopViewer {
     /// or live. While control is held it also renews the control lease.
     fn start_heartbeat(&mut self, cx: &mut Context<Self>) {
         let env = self.env.clone();
+        let mut grant_expires_at = self.local_grant_expires_at;
         self.heartbeat_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(LEASE_HEARTBEAT).await;
@@ -236,6 +289,13 @@ impl DesktopViewer {
                         this.error = Some(format!("heartbeat failed: {err}"));
                         cx.notify();
                     });
+                }
+                // A local owner session keeps its own grant alive before the host
+                // cap expires it; otherwise control could not be renewed.
+                if grant_expires_at
+                    .is_some_and(|expires_at| expires_at <= unix_now() + LOCAL_GRANT_RENEW_SECS)
+                {
+                    grant_expires_at = Some(issue_local_grant(&env));
                 }
                 let Ok(holding) = this.update(cx, |this, _| this.has_control) else {
                     break;
@@ -272,8 +332,8 @@ impl DesktopViewer {
     }
 
     fn send_events(&mut self, events: Vec<InputEvent>, cx: &mut Context<Self>) {
-        // A paused viewer forwards no input; the first click resumes it instead.
-        if self.paused || events.is_empty() || !self.env.is_alive() {
+        // A paused or view-only viewer forwards no input; a paused click resumes instead.
+        if self.paused || !self.can_control || events.is_empty() || !self.env.is_alive() {
             return;
         }
         let lease = match self.env.get_status().active_control_lease {
@@ -370,6 +430,7 @@ impl Render for DesktopViewer {
         let error = self.error.clone();
         let has_control = self.has_control;
         let paused = self.paused;
+        let can_control = self.can_control;
 
         let surface = match frame {
             Some(frame) => img(frame)
@@ -523,38 +584,40 @@ impl Render for DesktopViewer {
                                             this.pause(window, cx);
                                         })),
                                 )
-                                .child(
-                                    div()
-                                        .id("desktop-take-control")
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(rgb(0x2d2f34))
-                                        .text_color(rgb(0xe8eaed))
-                                        .cursor_pointer()
-                                        .child(if has_control {
-                                            "Renew control"
-                                        } else {
-                                            "Take control"
-                                        })
-                                        .on_click(cx.listener(|this, _, _window, cx| {
-                                            this.take_control(cx);
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .id("desktop-release-control")
-                                        .px_2()
-                                        .py_1()
-                                        .rounded_md()
-                                        .bg(rgb(0x2d2f34))
-                                        .text_color(rgb(0xe8eaed))
-                                        .cursor_pointer()
-                                        .child("Release control")
-                                        .on_click(cx.listener(|this, _, _window, cx| {
-                                            this.release_control(cx);
-                                        })),
-                                ),
+                                .when(can_control, |row| {
+                                    row.child(
+                                        div()
+                                            .id("desktop-take-control")
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .bg(rgb(0x2d2f34))
+                                            .text_color(rgb(0xe8eaed))
+                                            .cursor_pointer()
+                                            .child(if has_control {
+                                                "Renew control"
+                                            } else {
+                                                "Take control"
+                                            })
+                                            .on_click(cx.listener(|this, _, _window, cx| {
+                                                this.take_control(cx);
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("desktop-release-control")
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .bg(rgb(0x2d2f34))
+                                            .text_color(rgb(0xe8eaed))
+                                            .cursor_pointer()
+                                            .child("Release control")
+                                            .on_click(cx.listener(|this, _, _window, cx| {
+                                                this.release_control(cx);
+                                            })),
+                                    )
+                                }),
                         )
                     }),
             )

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use juto_desktop::protocol::{DesktopCommand, DesktopRequest, DesktopResponse};
+use juto_desktop::protocol::{DesktopCommand, DesktopRequest, DesktopResponse, GrantRole};
 use juto_desktop::viewer::ViewerClient;
 
 struct Daemon {
@@ -485,6 +485,18 @@ fn viewer_attaches_over_scm_rights_and_reads_composed_frames() {
     }
     let header = verified.expect("the viewer never saw the client's two-tone frame");
     assert_eq!(header.generation, 1);
+
+    // Human control requires a live grant for the environment owner principal.
+    match daemon.call(DesktopCommand::Grant {
+        env_id: env_id.clone(),
+        principal: "agent:test".to_string(),
+        roles: vec![GrantRole::Owner, GrantRole::Control],
+        audience: "session".to_string(),
+        expiry_seconds: 60,
+    }) {
+        DesktopResponse::GrantIssued(_) => {}
+        other => panic!("expected a grant, got {other:?}"),
+    }
 
     // The viewer can take the human control lease and send input.
     let epoch = viewer.take_control().expect("take control");
