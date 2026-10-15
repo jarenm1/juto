@@ -13,7 +13,7 @@ use std::time::Duration;
 use gpui::{
     Bounds, Context, FocusHandle, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Render, RenderImage, ScrollWheelEvent, Task,
-    Window, canvas, div, img, prelude::*, px, rgb,
+    Window, canvas, div, img, prelude::*, px, rgb, rgba,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use juto_runtime::DesktopEnvironment;
@@ -31,7 +31,6 @@ pub(crate) const SESSION_PRINCIPAL: &str = "human:viewer";
 /// An embedded viewer for one agent-owned desktop environment.
 pub struct DesktopViewer {
     env: DesktopEnvironment,
-    title: String,
     frame: Option<Arc<RenderImage>>,
     frame_size: (u32, u32),
     surface_bounds: Rc<Cell<Bounds<Pixels>>>,
@@ -39,60 +38,58 @@ pub struct DesktopViewer {
     status: String,
     error: Option<String>,
     has_control: bool,
+    paused: bool,
     input_seq: u64,
     poll_task: Option<Task<()>>,
     heartbeat_task: Option<Task<()>>,
+    snapshot_task: Option<Task<()>>,
+    /// Set when a left press starts while paused; its release resumes the canvas.
+    press_started_paused: bool,
 }
 
 impl DesktopViewer {
-    /// Creates a viewer for `env` and starts polling frames.
-    pub fn new(
-        env: DesktopEnvironment,
-        title: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    /// Creates a paused viewer for `env`. It captures one still of the newest
+    /// frame and runs no frame loop until resumed. The owner heartbeat starts
+    /// now so the environment is not retired as abandoned.
+    pub fn new(env: DesktopEnvironment, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let output = env.output();
         let mut viewer = Self {
             env,
-            title,
             frame: None,
             frame_size: (output.width, output.height),
             surface_bounds: Rc::new(Cell::new(Bounds::default())),
             focus_handle: cx.focus_handle(),
-            status: "connecting".to_string(),
+            status: "paused".to_string(),
             error: None,
             has_control: false,
+            paused: true,
             input_seq: 0,
             poll_task: None,
+            snapshot_task: None,
+            press_started_paused: false,
             heartbeat_task: None,
         };
-        viewer.start_polling(window, cx);
+        viewer.start_heartbeat(cx);
+        viewer.capture_snapshot(window, cx);
         viewer
     }
 
+    /// Starts the ~30 fps frame loop. Only a live viewer runs it.
     fn start_polling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let env = self.env.clone();
         self.poll_task = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(FRAME_INTERVAL).await;
-                let pool = env.frame_pool();
+                let read_env = env.clone();
                 let read = cx
                     .background_executor()
-                    .spawn(async move {
-                        let frame = pool.latest_frame().ok()??;
-                        pool.acquire_slot(frame.slot);
-                        let read = pool.read_slot(frame.slot, pool.slot_size());
-                        pool.release_slot(frame.slot);
-                        let (header, pixels) = read.ok()?;
-                        Some((header, pixels.to_vec()))
-                    })
+                    .spawn(async move { read_latest_frame(read_env) })
                     .await;
-                let Some((header, pixels)) = read else {
+                let Some(frame) = read else {
                     continue;
                 };
                 let updated = this.update_in(cx, |this, window, cx| {
-                    this.set_frame(header.width, header.height, pixels, window, cx);
+                    this.set_frame(frame, window, cx);
                 });
                 if updated.is_err() {
                     break;
@@ -101,23 +98,63 @@ impl DesktopViewer {
         }));
     }
 
-    fn set_frame(
-        &mut self,
-        width: u32,
-        height: u32,
-        pixels: Vec<u8>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let image = render_image_from_bgra(&pixels, width, height);
+    /// Captures one still of the newest frame without starting the frame loop.
+    fn capture_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let env = self.env.clone();
+        self.snapshot_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move { read_latest_frame(env) })
+                .await;
+            if let Some(frame) = read {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.set_frame(frame, window, cx);
+                });
+            }
+        }));
+    }
+
+    fn set_frame(&mut self, frame: LatestFrame, window: &mut Window, cx: &mut Context<Self>) {
+        let image = render_image_from_bgra(frame.pixels, frame.width, frame.height);
         let previous = self.frame.replace(image);
         if let Some(previous) = previous {
             cx.drop_image(previous, Some(window));
         }
+        // Input is mapped in environment pixels, not the downscaled image.
+        let (width, height) = frame.source;
         self.frame_size = (width, height);
-        if self.error.is_none() {
+        if self.error.is_none() && !self.paused {
             self.status = format!("live {width}x{height}");
         }
+        cx.notify();
+    }
+
+    /// Stops the frame loop and releases control. The last frame stays on
+    /// screen as a still; input is not forwarded until the next resume.
+    fn pause(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.paused {
+            return;
+        }
+        self.paused = true;
+        self.poll_task = None;
+        if self.has_control {
+            self.release_control(cx);
+        }
+        self.status = "paused".to_string();
+        self.capture_snapshot(window, cx);
+        cx.notify();
+    }
+
+    /// Restarts the frame loop; the next frame arrives within one interval.
+    fn resume(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.paused {
+            return;
+        }
+        self.paused = false;
+        self.status = "connecting".to_string();
+        // A pending still must not overwrite live frames.
+        self.snapshot_task = None;
+        self.start_polling(window, cx);
         cx.notify();
     }
 
@@ -128,7 +165,6 @@ impl DesktopViewer {
                 self.has_control = true;
                 self.error = None;
                 self.status = format!("control held (epoch {})", lease.epoch);
-                self.start_heartbeat(cx);
             }
             Ok(None) => {
                 self.has_control = false;
@@ -144,7 +180,6 @@ impl DesktopViewer {
 
     /// Releases the human control lease.
     pub fn release_control(&mut self, cx: &mut Context<Self>) {
-        self.heartbeat_task = None;
         match self.env.set_control(SESSION_PRINCIPAL, "release", true) {
             Ok(_) => {
                 self.has_control = false;
@@ -156,17 +191,21 @@ impl DesktopViewer {
         cx.notify();
     }
 
+    /// Runs for the viewer's whole lifetime. Each tick it renews the owner
+    /// heartbeat, so an open viewer keeps its environment alive whether paused
+    /// or live. While control is held it also renews the control lease.
     fn start_heartbeat(&mut self, cx: &mut Context<Self>) {
-        if self.heartbeat_task.is_some() {
-            return;
-        }
         let env = self.env.clone();
         self.heartbeat_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(LEASE_HEARTBEAT).await;
-                // The viewer is the human owner while it is open, so the
-                // environment is not retired as abandoned.
                 let _ = env.heartbeat("owner", None);
+                let Ok(holding) = this.update(cx, |this, _| this.has_control) else {
+                    break;
+                };
+                if !holding {
+                    continue;
+                }
                 let renewed = env
                     .set_control(SESSION_PRINCIPAL, "acquire", true)
                     .ok()
@@ -184,24 +223,20 @@ impl DesktopViewer {
                 {
                     break;
                 }
-                if !renewed {
-                    break;
-                }
             }
         }));
     }
 
     fn send_events(&mut self, events: Vec<InputEvent>, cx: &mut Context<Self>) {
-        if events.is_empty() {
+        // A paused viewer forwards no input; the first click resumes it instead.
+        if self.paused || events.is_empty() {
             return;
         }
-        let owner = self.env.get_status().owner_principal;
         let lease = match self.env.get_status().active_control_lease {
             Some(lease) if lease.holder == SESSION_PRINCIPAL => lease,
             _ => match self.env.set_control(SESSION_PRINCIPAL, "acquire", true) {
                 Ok(Some(lease)) => {
                     self.has_control = true;
-                    self.start_heartbeat(cx);
                     lease
                 }
                 Ok(None) => return,
@@ -212,7 +247,6 @@ impl DesktopViewer {
                 }
             },
         };
-        let _ = owner;
         self.input_seq = self.input_seq.wrapping_add(1);
         let batch = InputBatch {
             seq: self.input_seq,
@@ -291,7 +325,7 @@ impl Render for DesktopViewer {
         let status = self.status.clone();
         let error = self.error.clone();
         let has_control = self.has_control;
-        let title = self.title.clone();
+        let paused = self.paused;
 
         let surface = match frame {
             Some(frame) => img(frame)
@@ -325,6 +359,7 @@ impl Render for DesktopViewer {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    this.press_started_paused = this.paused;
                     window.focus(&this.focus_handle);
                     if let Some((x, y)) = this.pointer_position(&event.position) {
                         this.send_events(
@@ -342,7 +377,16 @@ impl Render for DesktopViewer {
             )
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, event: &MouseUpEvent, _window, cx| {
+                cx.listener(|this, event: &MouseUpEvent, window, cx| {
+                    // Resume only when this press began while paused, so the
+                    // Pause button's own click does not resume the canvas.
+                    let started_paused = std::mem::take(&mut this.press_started_paused);
+                    if this.paused {
+                        if started_paused {
+                            this.resume(window, cx);
+                        }
+                        return;
+                    }
                     if let Some((x, y)) = this.pointer_position(&event.position) {
                         this.send_events(
                             vec![
@@ -405,9 +449,8 @@ impl Render for DesktopViewer {
                     );
                 }
             }))
-            .size_full()
-            .w(px(900.))
-            .h(px(620.))
+            .w_full()
+            .h(px(405.))
             .flex()
             .flex_col()
             .gap_2()
@@ -415,48 +458,64 @@ impl Render for DesktopViewer {
                 div()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .child(div().text_color(rgb(0xe8eaed)).child(title))
-                    .child(
-                        div()
-                            .flex()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .id("desktop-take-control")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(rgb(0x2d2f34))
-                                    .text_color(rgb(0xe8eaed))
-                                    .cursor_pointer()
-                                    .child(if has_control {
-                                        "Renew control"
-                                    } else {
-                                        "Take control"
-                                    })
-                                    .on_click(cx.listener(|this, _, _window, cx| {
-                                        this.take_control(cx);
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .id("desktop-release-control")
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_md()
-                                    .bg(rgb(0x2d2f34))
-                                    .text_color(rgb(0xe8eaed))
-                                    .cursor_pointer()
-                                    .child("Release control")
-                                    .on_click(cx.listener(|this, _, _window, cx| {
-                                        this.release_control(cx);
-                                    })),
-                            ),
-                    ),
+                    .justify_end()
+                    .when(!paused, |row| {
+                        row.child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("desktop-pause")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(0x2d2f34))
+                                        .text_color(rgb(0xe8eaed))
+                                        .cursor_pointer()
+                                        .child("Pause")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.pause(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("desktop-take-control")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(0x2d2f34))
+                                        .text_color(rgb(0xe8eaed))
+                                        .cursor_pointer()
+                                        .child(if has_control {
+                                            "Renew control"
+                                        } else {
+                                            "Take control"
+                                        })
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.take_control(cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("desktop-release-control")
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(0x2d2f34))
+                                        .text_color(rgb(0xe8eaed))
+                                        .cursor_pointer()
+                                        .child("Release control")
+                                        .on_click(cx.listener(|this, _, _window, cx| {
+                                            this.release_control(cx);
+                                        })),
+                                ),
+                        )
+                    }),
             )
             .child(
                 div()
+                    .relative()
                     .flex_1()
                     .min_h_0()
                     .bg(rgb(0x000000))
@@ -470,7 +529,20 @@ impl Render for DesktopViewer {
                         .absolute()
                         .size_full(),
                     )
-                    .child(surface),
+                    .child(surface)
+                    .when(paused, |container| {
+                        container.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(rgba(0x00000080))
+                                .text_color(rgb(0xe8eaed))
+                                .child("Paused — click to resume"),
+                        )
+                    }),
             )
             .child(div().text_color(rgb(0x9aa0a6)).child(match &error {
                 Some(error) => format!("{status} — {error}"),
@@ -479,16 +551,74 @@ impl Render for DesktopViewer {
     }
 }
 
-/// Builds a gpui `RenderImage` from BGRA8 pixels with straight alpha.
+/// Longest shown edges are 854x480 (480p, 16:9). Larger frames are shrunk
+/// before upload; the environment keeps its resolution and input is still
+/// mapped to environment pixels.
+const SHOWN_MAX_WIDTH: u32 = 854;
+const SHOWN_MAX_HEIGHT: u32 = 480;
+
+/// A composed frame ready for display.
+struct LatestFrame {
+    /// Environment resolution; input coordinates are mapped to this.
+    source: (u32, u32),
+    /// Displayed resolution after fitting within the shown bounds.
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+/// Reads the newest composed frame, copying its pixels out of the shared slot
+/// and shrinking them for display. Called from a background task, never from
+/// the foreground thread.
+fn read_latest_frame(env: DesktopEnvironment) -> Option<LatestFrame> {
+    let pool = env.frame_pool();
+    let frame = pool.latest_frame().ok()??;
+    pool.acquire_slot(frame.slot);
+    let read = pool.read_slot(frame.slot, pool.slot_size());
+    pool.release_slot(frame.slot);
+    let (header, pixels) = read.ok()?;
+    let (width, height, pixels) = fit_shown(pixels, header.width, header.height)?;
+    Some(LatestFrame {
+        source: (header.width, header.height),
+        width,
+        height,
+        pixels,
+    })
+}
+
+/// Fits packed BGRA8 rows (stride `width * 4`) inside the shown bounds using
+/// nearest-neighbour sampling. Frames already small enough are copied as-is.
+fn fit_shown(bgra: &[u8], width: u32, height: u32) -> Option<(u32, u32, Vec<u8>)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let src_row = width as usize * 4;
+    let src = bgra.get(..src_row * height as usize)?;
+    if width <= SHOWN_MAX_WIDTH && height <= SHOWN_MAX_HEIGHT {
+        return Some((width, height, src.to_vec()));
+    }
+    let scale =
+        (SHOWN_MAX_WIDTH as f32 / width as f32).min(SHOWN_MAX_HEIGHT as f32 / height as f32);
+    let out_w = ((width as f32 * scale).round() as u32).max(1);
+    let out_h = ((height as f32 * scale).round() as u32).max(1);
+    let mut out = Vec::with_capacity(out_w as usize * out_h as usize * 4);
+    for dy in 0..out_h as u64 {
+        let sy = (dy * height as u64 / out_h as u64) as usize;
+        let row = &src[sy * src_row..(sy + 1) * src_row];
+        for dx in 0..out_w as u64 {
+            let sx = (dx * width as u64 / out_w as u64) as usize * 4;
+            out.extend_from_slice(&row[sx..sx + 4]);
+        }
+    }
+    Some((out_w, out_h, out))
+}
+
+/// Builds a gpui `RenderImage` from packed BGRA8 pixels with straight alpha.
 ///
-/// gpui's texture atlas is `Bgra8Unorm`, so the bytes are handed over
-/// unchanged; only the row stride is normalized.
-fn render_image_from_bgra(bgra: &[u8], width: u32, height: u32) -> Arc<RenderImage> {
-    let row = width as usize * 4;
-    let mut packed = Vec::with_capacity(row * height as usize);
-    packed.extend_from_slice(&bgra[..row * height as usize]);
+/// gpui's texture atlas is `Bgra8Unorm`, so the bytes are handed over unchanged.
+fn render_image_from_bgra(bgra: Vec<u8>, width: u32, height: u32) -> Arc<RenderImage> {
     let buffer: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_raw(width, height, packed).expect("pixel buffer size mismatch");
+        ImageBuffer::from_raw(width, height, bgra).expect("pixel buffer size mismatch");
     Arc::new(RenderImage::new(vec![Frame::new(buffer)]))
 }
 

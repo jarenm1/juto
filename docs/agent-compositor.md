@@ -82,7 +82,9 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Same-host embedded viewer in the harness: composes from the sealed pool with no
   codec, letterboxes, maps pointer coordinates to desktop pixels, forwards
   pointer/scroll/keyboard input, and holds a human control lease with a
-  heartbeat.
+  heartbeat. The harness mounts it inline in chat as a canvas that starts paused
+  (one still, no input) and resumes on click; the owner heartbeat runs for the
+  viewer's lifetime, and the control lease renews only while held.
 - Remote presentation: a GStreamer `webrtcbin` sender (VP8 default, H.264
   available) fed from the composed pool, a one-time-token signaling server that
   serves a browser viewer page and relays SDP/ICE over a WebSocket, pointer and
