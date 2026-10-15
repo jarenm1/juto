@@ -55,7 +55,14 @@ pub enum ActiveModal {
     None,
     ModelPicker,
     AuthModal,
-    DesktopViewer,
+}
+
+/// The inline canvas for one desktop artifact, mounted once per artifact.
+enum DesktopCanvas {
+    /// A live viewer for an environment this process owns.
+    Live(Entity<crate::desktop_viewer::DesktopViewer>),
+    /// Why no canvas can be shown; rendered in the canvas's place.
+    Unavailable(SharedString),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -393,7 +400,7 @@ pub struct ChatView {
     active_control: Option<RunControl>,
     run_task: Option<Task<()>>,
     artifact_notice: Option<SharedString>,
-    desktop_viewer: Option<Entity<crate::desktop_viewer::DesktopViewer>>,
+    desktop_canvases: HashMap<String, DesktopCanvas>,
     approval_requests: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalRequest>>>,
     pending_approvals: HashMap<u64, ApprovalRequest>,
     next_approval_id: u64,
@@ -569,7 +576,7 @@ impl ChatView {
             menu_just_dismissed: false,
             attachment_error: None,
             artifact_notice: None,
-            desktop_viewer: None,
+            desktop_canvases: HashMap::new(),
             picker: None,
             scroll: ScrollHandle::new(),
             runtime,
@@ -658,67 +665,71 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Resolves a desktop artifact and opens the viewer it authorizes.
-    ///
-    /// Resolution is explicit: an unknown host, environment, or grant reports
-    /// `Unsupported`, `Unavailable`, `Unauthorized`, `Expired`, or `Stopped`
-    /// rather than fabricating a live stream.
-    pub fn open_desktop_artifact(
-        &mut self,
-        artifact: &DesktopSessionArtifact,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let resolver = self.runtime.desktop_artifact_resolver();
-        // Resolution is bound to this session's authenticated principal, not
-        // to whoever issued the grant: a grant issued to another principal
-        // must be rejected, and one issued to this session must be honored.
-        match resolver.resolve(crate::desktop_viewer::SESSION_PRINCIPAL, artifact) {
-            Ok(juto_runtime::ViewerRoute::Local { env_id, .. }) => {
-                self.open_desktop_viewer(&env_id, window, cx);
-            }
-            Ok(juto_runtime::ViewerRoute::Remote { url, .. }) => {
-                self.artifact_notice = Some(
-                    format!(
-                        "Desktop '{}' is available remotely at {url} (one-time token, 60s). \
-                         External-browser play is not inline GPUI interaction.",
-                        artifact.title
-                    )
-                    .into(),
-                );
-                cx.notify();
-            }
-            Err(err) => {
-                self.artifact_notice =
-                    Some(format!("Desktop '{}' cannot be opened: {err}", artifact.title).into());
-                cx.notify();
-            }
+    /// Mounts an inline canvas for each artifact that does not have one yet.
+    /// Resolution runs once per artifact; its outcome, including a refusal, is
+    /// cached so rendering does not re-resolve on every frame.
+    fn mount_desktop_canvases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending: Vec<DesktopSessionArtifact> = self
+            .messages
+            .iter()
+            .flat_map(|message| message.desktop_artifacts.iter())
+            .filter(|artifact| !self.desktop_canvases.contains_key(&artifact.artifact_id))
+            .cloned()
+            .collect();
+        for artifact in pending {
+            let canvas = self.resolve_desktop_canvas(&artifact, window, cx);
+            self.desktop_canvases
+                .insert(artifact.artifact_id.clone(), canvas);
         }
     }
 
-    /// Opens the embedded viewer for an existing desktop environment.
-    pub fn open_desktop_viewer(
-        &mut self,
-        env_id: &str,
+    fn resolve_desktop_canvas(
+        &self,
+        artifact: &DesktopSessionArtifact,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
-        let supervisor = self.runtime.desktop_supervisor();
-        match supervisor.get_environment(env_id) {
-            Ok(env) => {
-                let title = format!("Desktop {env_id}");
-                let viewer =
-                    cx.new(|cx| crate::desktop_viewer::DesktopViewer::new(env, title, window, cx));
-                self.desktop_viewer = Some(viewer);
-                self.active_modal = ActiveModal::DesktopViewer;
-                self.artifact_notice = None;
+    ) -> DesktopCanvas {
+        // Resolution is bound to this session's principal, not to whoever issued
+        // the grant: a grant issued to another principal is rejected.
+        match self
+            .runtime
+            .desktop_artifact_resolver()
+            .resolve(crate::desktop_viewer::SESSION_PRINCIPAL, artifact)
+        {
+            Ok(juto_runtime::ViewerRoute::Local { env_id, .. }) => {
+                match self.runtime.desktop_supervisor().get_environment(&env_id) {
+                    Ok(env) => DesktopCanvas::Live(
+                        cx.new(|cx| crate::desktop_viewer::DesktopViewer::new(env, window, cx)),
+                    ),
+                    Err(err) => DesktopCanvas::Unavailable(
+                        format!("Desktop environment '{env_id}' is unavailable: {err}").into(),
+                    ),
+                }
             }
-            Err(err) => {
-                self.artifact_notice =
-                    Some(format!("Desktop environment '{env_id}' is unavailable: {err}").into());
-            }
+            Ok(juto_runtime::ViewerRoute::Remote { .. }) => DesktopCanvas::Unavailable(
+                "Remote desktop sessions cannot be shown inline yet.".into(),
+            ),
+            Err(err) => DesktopCanvas::Unavailable(
+                format!("Desktop '{}' cannot be opened: {err}", artifact.title).into(),
+            ),
         }
-        cx.notify();
+    }
+
+    /// The inline body of an artifact card: its live canvas, or why it has none.
+    fn desktop_canvas_body(&self, artifact: &DesktopSessionArtifact) -> AnyElement {
+        match self.desktop_canvases.get(&artifact.artifact_id) {
+            Some(DesktopCanvas::Live(viewer)) => viewer.clone().into_any_element(),
+            Some(DesktopCanvas::Unavailable(reason)) => div()
+                .text_sm()
+                .text_color(rgb(0xcbd5e1))
+                .child(reason.clone())
+                .into_any_element(),
+            None => div()
+                .text_sm()
+                .text_color(rgb(0xcbd5e1))
+                .child("Desktop canvas is not mounted.")
+                .into_any_element(),
+        }
     }
 
     /// Creates a desktop environment, launches `argv` into it, and opens the
@@ -762,15 +773,32 @@ impl ChatView {
             cx.notify();
             return;
         }
-        self.open_desktop_viewer(&env_id, window, cx);
+        let artifact = DesktopSessionArtifact {
+            version: 1,
+            artifact_id: format!("dev-{env_id}"),
+            title: "Developer compositor session".to_string(),
+            host_id: "local".to_string(),
+            environment_id: env_id.clone(),
+            grant_id: "dev".to_string(),
+        };
+        let viewer = cx.new(|cx| crate::desktop_viewer::DesktopViewer::new(env, window, cx));
+        self.desktop_canvases
+            .insert(artifact.artifact_id.clone(), DesktopCanvas::Live(viewer));
+        self.messages.push(Message {
+            role: MessageRole::Assistant,
+            text: SharedString::default(),
+            attachments: Vec::new(),
+            desktop_artifacts: vec![artifact],
+            approval: None,
+            views: Vec::new(),
+        });
+        self.scroll.scroll_to_bottom();
+        cx.notify();
     }
 
     pub fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_modal == ActiveModal::AuthModal {
             self.auth_modal.update(cx, |modal, cx| modal.dismiss(cx));
-        }
-        if self.active_modal == ActiveModal::DesktopViewer {
-            self.desktop_viewer = None;
         }
         self.active_modal = ActiveModal::None;
         self.focus_input(window, cx);
@@ -1562,41 +1590,12 @@ impl ChatView {
                                 ))
                             })
                             .when(!artifacts.is_empty(), |row| {
-                                row.child(
-                                    div().mt_3().flex().flex_col().gap_2().children(
-                                        artifacts.into_iter().enumerate().map(
-                                            |(art_idx, artifact)| {
-                                                let card_artifact = artifact.clone();
-                                                let click_artifact = artifact.clone();
-                                                let btn = div()
-                                                    .id((
-                                                        "open-desktop-btn",
-                                                        (index * 1000 + art_idx) as u32,
-                                                    ))
-                                                    .px_2p5()
-                                                    .py_1()
-                                                    .rounded_md()
-                                                    .bg(rgb(0x2563eb))
-                                                    .hover(|s| s.bg(rgb(0x1d4ed8)))
-                                                    .text_xs()
-                                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                                    .text_color(rgb(0xffffff))
-                                                    .cursor_pointer()
-                                                    .on_click(cx.listener(
-                                                        move |this, _: &ClickEvent, window, cx| {
-                                                            this.open_desktop_artifact(
-                                                                &click_artifact,
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        },
-                                                    ))
-                                                    .child("Open Desktop ↗");
-                                                desktop_artifact_card(&card_artifact, btn)
-                                            },
-                                        ),
-                                    ),
-                                )
+                                row.child(div().mt_3().flex().flex_col().gap_2().children(
+                                    artifacts.into_iter().map(|artifact| {
+                                        let body = self.desktop_canvas_body(&artifact);
+                                        desktop_artifact_card(&artifact, body)
+                                    }),
+                                ))
                             })
                             .when(!views.is_empty(), |row| {
                                 row.child(div().mt_2().flex().flex_col().gap_2().children(
@@ -1935,7 +1934,6 @@ impl ChatView {
         match self.active_modal {
             ActiveModal::ModelPicker => Some(self.model_picker.clone().into()),
             ActiveModal::AuthModal => Some(self.auth_modal.clone().into()),
-            ActiveModal::DesktopViewer => self.desktop_viewer.clone().map(|viewer| viewer.into()),
             ActiveModal::None => None,
         }
     }
@@ -2019,13 +2017,14 @@ fn menu_item(
         .child(div().text_xs().text_color(rgb(0x909090)).child(detail))
 }
 
-fn desktop_artifact_card(artifact: &DesktopSessionArtifact, open_button: impl IntoElement) -> Div {
+fn desktop_artifact_card(artifact: &DesktopSessionArtifact, body: AnyElement) -> Div {
     div()
         .flex()
         .flex_col()
         .gap_2()
         .p_3()
-        .max_w(px(460.))
+        .w_full()
+        .max_w(px(720.))
         .rounded_lg()
         .border_1()
         .border_color(rgb(0x3b82f6))
@@ -2060,34 +2059,7 @@ fn desktop_artifact_card(artifact: &DesktopSessionArtifact, open_button: impl In
                         .child(format!("v{}", artifact.version)),
                 ),
         )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .text_xs()
-                .text_color(rgb(0xcbd5e1))
-                .child(div().child(format!("Artifact ID: {}", artifact.artifact_id)))
-                .child(div().child(format!("Environment ID: {}", artifact.environment_id)))
-                .child(div().child(format!("Host ID: {}", artifact.host_id)))
-                .child(div().child(format!("Grant ID: {}", artifact.grant_id))),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .pt_1()
-                .border_t_1()
-                .border_color(rgb(0x334155))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x94a3b8))
-                        .child("Remote Sharing Session (IDs-only)"),
-                )
-                .child(open_button),
-        )
+        .child(body)
 }
 
 fn app_title() -> impl IntoElement {
@@ -2122,6 +2094,7 @@ fn header_button(id: &'static str, active: bool) -> Stateful<Div> {
 
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.mount_desktop_canvases(window, cx);
         div()
             .relative()
             .flex()
