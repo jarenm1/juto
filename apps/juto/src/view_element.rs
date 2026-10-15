@@ -9,10 +9,12 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
 use gpui::{
     AnyElement, AnyView, App, Bounds, Corners, Div, FontWeight, Hsla, PathBuilder, Pixels, Point,
-    SharedString, Window, canvas, div, fill, point, prelude::*, px, relative, rgb, size,
+    SharedString, StatefulInteractiveElement, Window, canvas, div, fill, point, prelude::*, px,
+    relative, rgb, size,
 };
 use juto_agent::{
     MAX_TIMELINE_TICKS, ViewChild, ViewNode, parse_chart_labels, parse_chart_values,
@@ -50,14 +52,38 @@ const AREA_FILL_ALPHA: f32 = 0.2;
 /// Opacity of the column tint under a hovered x position.
 const HOVER_BAND_ALPHA: f32 = 0.05;
 
+/// Host callbacks a rendered view can invoke. A `Button` click goes through
+/// `on_submit`; without it every `Button` renders disabled.
+#[derive(Clone, Default)]
+pub struct ViewActions {
+    on_submit: Option<Rc<SubmitFn>>,
+}
+
+/// Callback a `Button` click invokes with the button's `prompt`.
+type SubmitFn = dyn Fn(String, &mut Window, &mut App);
+
+impl ViewActions {
+    /// No actions: buttons render disabled.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Clicking a button calls `on_submit` with that button's `prompt`.
+    pub fn submit(on_submit: impl Fn(String, &mut Window, &mut App) + 'static) -> Self {
+        Self {
+            on_submit: Some(Rc::new(on_submit)),
+        }
+    }
+}
+
 /// Renders one element and its subtree.
-pub fn render_view(node: &ViewNode) -> AnyElement {
+pub fn render_view(node: &ViewNode, actions: &ViewActions) -> AnyElement {
     match node.tag.as_str() {
         "Column" => div()
             .flex()
             .flex_col()
             .gap_3()
-            .children(column_children(node))
+            .children(column_children(node, actions))
             .into_any_element(),
         "Row" => div()
             .flex()
@@ -65,15 +91,16 @@ pub fn render_view(node: &ViewNode) -> AnyElement {
             .flex_wrap()
             .items_center()
             .gap_2()
-            .children(render_children(node))
+            .children(render_children(node, actions))
             .into_any_element(),
         "Text" => div()
             .text_sm()
             .text_color(rgb(theme::TEXT))
-            .children(render_children(node))
+            .children(render_children(node, actions))
             .into_any_element(),
         "Badge" => badge(prop(node, "label"), prop(node, "tone")),
-        "Stats" => stats(node),
+        "Button" => button(node, actions),
+        "Stats" => stats(node, actions),
         "Stat" => stat(prop(node, "label"), prop(node, "value")),
         "Timeline" => timeline(node),
         "Chart" => chart(node),
@@ -83,14 +110,17 @@ pub fn render_view(node: &ViewNode) -> AnyElement {
     }
 }
 
-fn render_children(node: &ViewNode) -> Vec<AnyElement> {
-    node.children.iter().map(render_child).collect()
+fn render_children(node: &ViewNode, actions: &ViewActions) -> Vec<AnyElement> {
+    node.children
+        .iter()
+        .map(|child| render_child(child, actions))
+        .collect()
 }
 
-fn render_child(child: &ViewChild) -> AnyElement {
+fn render_child(child: &ViewChild, actions: &ViewActions) -> AnyElement {
     match child {
         ViewChild::Text(text) => SharedString::from(text.clone()).into_any_element(),
-        ViewChild::Node(node) => render_view(node),
+        ViewChild::Node(node) => render_view(node, actions),
     }
 }
 
@@ -160,9 +190,84 @@ fn badge(label: &str, tone: &str) -> AnyElement {
     status_mark(label, tone_color(tone).unwrap_or(theme::TEXT_MUTED))
 }
 
+/// Colors of a `Button` tone: background, text, border, and hover background.
+/// Primary has no hover background and dims to 85% opacity instead.
+struct ButtonTone {
+    bg: u32,
+    text: u32,
+    border: u32,
+    hover_bg: Option<u32>,
+}
+
+/// Palette for a `Button` tone. The validator admits only `primary`, `neutral`,
+/// `danger`, or no tone, so everything else is neutral.
+fn button_tone(tone: &str) -> ButtonTone {
+    match tone {
+        "primary" => ButtonTone {
+            bg: theme::ACCENT,
+            text: theme::ON_ACCENT,
+            border: theme::ACCENT,
+            hover_bg: None,
+        },
+        "danger" => ButtonTone {
+            bg: 0x450a0a,
+            text: 0xfca5a5,
+            border: 0x7f1d1d,
+            hover_bg: Some(0x7f1d1d),
+        },
+        _ => ButtonTone {
+            bg: theme::BG_RAISED,
+            text: theme::TEXT,
+            border: theme::BORDER_STRONG,
+            hover_bg: Some(theme::BG_HOVER),
+        },
+    }
+}
+
+/// Clickable button. A click submits the `prompt` prop as the next user turn.
+/// Without a submit action the button renders disabled and inert.
+fn button(node: &ViewNode, actions: &ViewActions) -> AnyElement {
+    let label = prop(node, "label").to_owned();
+    let base = div()
+        .id(SharedString::from(format!(
+            "view-button-{label}-{}",
+            prop(node, "prompt")
+        )))
+        .flex_none()
+        .px_3()
+        .py_1()
+        .rounded_sm()
+        .border_1()
+        .text_xs()
+        .font_weight(FontWeight::SEMIBOLD);
+    let Some(on_submit) = actions.on_submit.clone() else {
+        return base
+            .bg(rgb(theme::BG_RAISED))
+            .border_color(rgb(theme::BORDER))
+            .text_color(rgb(theme::TEXT_FAINT))
+            .child(SharedString::from(label))
+            .into_any_element();
+    };
+    let tone = button_tone(prop(node, "tone"));
+    let prompt = prop(node, "prompt").to_owned();
+    let styled = base
+        .cursor_pointer()
+        .bg(rgb(tone.bg))
+        .border_color(rgb(tone.border))
+        .text_color(rgb(tone.text));
+    let styled = match tone.hover_bg {
+        Some(hover) => styled.hover(move |s| s.bg(rgb(hover))),
+        None => styled.hover(|s| s.opacity(0.85)),
+    };
+    styled
+        .on_click(move |_, window, cx| on_submit(prompt.clone(), window, cx))
+        .child(SharedString::from(label))
+        .into_any_element()
+}
+
 /// Column children. Each run of adjacent `Subagent` nodes becomes one list, so
 /// the rows sit flush with hairline dividers instead of gapped cards.
-fn column_children(node: &ViewNode) -> Vec<AnyElement> {
+fn column_children(node: &ViewNode, actions: &ViewActions) -> Vec<AnyElement> {
     let mut out = Vec::new();
     let mut run: Vec<&ViewNode> = Vec::new();
     for child in &node.children {
@@ -172,7 +277,7 @@ fn column_children(node: &ViewNode) -> Vec<AnyElement> {
                 if !run.is_empty() {
                     out.push(subagent_list(std::mem::take(&mut run)));
                 }
-                out.push(render_child(child));
+                out.push(render_child(child, actions));
             }
         }
     }
@@ -221,7 +326,7 @@ fn subagent_row(node: &ViewNode) -> AnyElement {
 }
 
 /// Horizontal strip of `Stat` cells split by hairline dividers, closed by a rule.
-fn stats(node: &ViewNode) -> AnyElement {
+fn stats(node: &ViewNode, actions: &ViewActions) -> AnyElement {
     let mut strip = div()
         .flex()
         .flex_row()
@@ -232,7 +337,7 @@ fn stats(node: &ViewNode) -> AnyElement {
         if index > 0 {
             strip = strip.child(div().w(px(1.0)).my_3().bg(rgb(theme::BORDER)));
         }
-        strip = strip.child(div().flex_1().min_w_0().child(render_view(cell)));
+        strip = strip.child(div().flex_1().min_w_0().child(render_view(cell, actions)));
     }
     strip.into_any_element()
 }

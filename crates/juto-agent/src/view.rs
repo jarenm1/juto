@@ -57,11 +57,16 @@ pub const VIEW_TAGS: &[(&str, &[&str])] = &[
     ("Series", &["name", "values"]),
     ("Table", &["columns"]),
     ("TableRow", &[]),
+    ("Button", &["label", "prompt", "tone"]),
 ];
 
 /// Tones a `Badge` accepts. The renderer shows any other tone as neutral, so the
 /// validator rejects it instead.
 pub const BADGE_TONES: &[&str] = &["success", "warning", "error", "info"];
+
+/// Tones a `Button` accepts. The renderer shows the tone as its style; `primary`
+/// is the accent, `danger` the destructive style, and `neutral` the default.
+pub const BUTTON_TONES: &[&str] = &["primary", "neutral", "danger"];
 
 /// Deepest allowed nesting, counting the root as depth 1.
 pub const MAX_VIEW_DEPTH: usize = 8;
@@ -152,9 +157,12 @@ fn validate_node(
         "Series" => check_series(node)?,
         "Table" => check_table(node)?,
         "TableRow" => check_table_row(node)?,
+        "Button" => check_button(node)?,
         _ => {}
     }
-    if matches!(node.tag.as_str(), "Stat" | "Bar" | "Series") && !node.children.is_empty() {
+    if matches!(node.tag.as_str(), "Stat" | "Bar" | "Series" | "Button")
+        && !node.children.is_empty()
+    {
         return Err(format!("<{}> takes no children", node.tag));
     }
     let required_child = NESTING
@@ -223,6 +231,23 @@ fn check_bar(node: &ViewNode) -> Result<(), String> {
     let end = number_prop(node, "end")?;
     if start < 0.0 || end <= start {
         return Err("<Bar> needs 0 <= start < end".into());
+    }
+    Ok(())
+}
+
+fn check_button(node: &ViewNode) -> Result<(), String> {
+    for key in ["label", "prompt"] {
+        if required_text(node, key)?.trim().is_empty() {
+            return Err(format!("<Button> prop `{key}` must not be empty"));
+        }
+    }
+    if let Some(tone) = node.props.get("tone").and_then(Value::as_str)
+        && !BUTTON_TONES.contains(&tone)
+    {
+        return Err(format!(
+            "<Button> tone must be one of: {}",
+            BUTTON_TONES.join(", ")
+        ));
     }
     Ok(())
 }
@@ -736,5 +761,60 @@ mod tests {
                 .unwrap_err()
                 .contains("must be inside <Table>")
         );
+    }
+
+    #[test]
+    fn validator_accepts_buttons_in_any_position() {
+        let tree = parse(json!({"tag": "Row", "children": [
+            {"tag": "Button", "props": {"label": "Ship", "prompt": "Ship the build", "tone": "primary"}},
+            {"tag": "Button", "props": {"label": "Explain", "prompt": "Explain the diff"}},
+            {"tag": "Button", "props": {"label": "Delete", "prompt": "Delete it", "tone": "danger"}}
+        ]}));
+        assert_eq!(validate_view(&tree), Ok(()));
+    }
+
+    #[test]
+    fn validator_requires_nonblank_button_label_and_prompt() {
+        for props in [
+            json!({"prompt": "Run"}),
+            json!({"label": "Run"}),
+            json!({"label": "", "prompt": "Run"}),
+            json!({"label": "Run", "prompt": "  "}),
+        ] {
+            let err = validate_view(&with_props("Button", props.clone())).unwrap_err();
+            assert!(err.contains("<Button>"), "{props}: {err}");
+        }
+    }
+
+    #[test]
+    fn validator_rejects_unknown_button_tone() {
+        let node = with_props(
+            "Button",
+            json!({"label": "Run", "prompt": "Run", "tone": "success"}),
+        );
+        let err = validate_view(&node).unwrap_err();
+        assert!(
+            err.contains("tone must be one of: primary, neutral, danger"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn validator_rejects_button_children() {
+        let mut node = with_props("Button", json!({"label": "Run", "prompt": "Run"}));
+        node.children.push(ViewChild::Text("extra".into()));
+        assert!(
+            validate_view(&node)
+                .unwrap_err()
+                .contains("takes no children")
+        );
+    }
+
+    #[test]
+    fn validator_bounds_button_prompt_length() {
+        let button =
+            |len: usize| with_props("Button", json!({"label": "Run", "prompt": "x".repeat(len)}));
+        assert_eq!(validate_view(&button(MAX_VIEW_TEXT_BYTES)), Ok(()));
+        assert!(validate_view(&button(MAX_VIEW_TEXT_BYTES + 1)).is_err());
     }
 }
