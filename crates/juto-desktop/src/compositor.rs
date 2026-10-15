@@ -28,11 +28,14 @@ use smithay::backend::renderer::{
     Bind, Color32F, ExportMem, Frame, ImportAll, Offscreen, Renderer,
 };
 use smithay::desktop::space::Space;
-use smithay::desktop::{PopupKind, PopupManager, Window};
+use smithay::desktop::{
+    PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy, Window,
+    WindowSurfaceType, find_popup_root_surface, utils::under_from_surface_tree,
+};
 use smithay::input::keyboard::{
     FilterResult, KeyboardHandle, KeyboardTarget, Keycode, KeysymHandle, ModifiersState, XkbConfig,
 };
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle};
+use smithay::input::pointer::{AxisFrame, ButtonEvent, Focus, MotionEvent, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::channel::{
@@ -873,7 +876,9 @@ impl DesktopState {
                 .unwrap_or((None, None)),
         };
         let is_focused = match (
-            self.keyboard.current_focus(),
+            self.keyboard
+                .current_focus()
+                .map(|focus| self.owning_target(focus)),
             keyboard_target(&mapped.window),
         ) {
             (Some(focus), Some(target)) => focus == target,
@@ -1191,11 +1196,51 @@ impl DesktopState {
         })
     }
 
-    /// Surface origins of every mapped window's popups, relative to `region`, in the
-    /// same coordinate space as `Space::render_elements_for_region`.
+    /// The popup surface under `point` in global logical coordinates, with its global
+    /// surface origin. Popups sit above their parent windows, so they are checked first.
+    fn popup_under(&self, point: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.popup_placements(Point::from((0, 0)))
+            .into_iter()
+            .rev()
+            .find_map(|(surface, origin)| {
+                under_from_surface_tree(&surface, point, origin, WindowSurfaceType::ALL)
+                    .map(|(hit, loc)| (hit, loc.to_f64()))
+            })
+    }
+
+    /// Pointer target at `point`: a popup surface above its parent, else the topmost window.
+    fn pointer_focus_at(
+        &self,
+        point: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.popup_under(point).or_else(|| {
+            self.space.element_under(point).and_then(|(window, loc)| {
+                window
+                    .wl_surface()
+                    .map(|s| (s.as_ref().clone(), loc.to_f64()))
+            })
+        })
+    }
+
+    /// Maps a keyboard focus to the window-level target that owns it: a popup's focus
+    /// belongs to its root toplevel surface.
+    fn owning_target(&self, focus: KeyboardFocusTarget) -> KeyboardFocusTarget {
+        let root = match &focus {
+            KeyboardFocusTarget::Wayland(surface) => self
+                .popups
+                .find_popup(surface)
+                .and_then(|popup| find_popup_root_surface(&popup).ok()),
+            KeyboardFocusTarget::X11(_) => None,
+        };
+        root.map_or(focus, KeyboardFocusTarget::Wayland)
+    }
+
+    /// Surface origins of every popup under the window tree, relative to `region_origin`
+    /// (pass `(0, 0)` for global coordinates), in the same space as
+    /// `Space::render_elements_for_region`.
     fn popup_placements(
         &self,
-        region: &Rectangle<i32, Logical>,
+        region_origin: Point<i32, Logical>,
     ) -> Vec<(WlSurface, Point<i32, Logical>)> {
         let mut placements = Vec::new();
         for window in self.space.elements() {
@@ -1207,7 +1252,7 @@ impl DesktopState {
             };
             let origin = location - window.geometry().loc;
             for (popup, offset) in PopupManager::popups_for_surface(&root) {
-                let loc = origin + offset - popup.geometry().loc - region.loc;
+                let loc = origin + offset - popup.geometry().loc - region_origin;
                 placements.push((popup.wl_surface().clone(), loc));
             }
         }
@@ -1221,7 +1266,7 @@ impl DesktopState {
         let logical = Rectangle::from_size(self.logical_size());
 
         self.popups.cleanup();
-        let popups = self.popup_placements(&logical);
+        let popups = self.popup_placements(logical.loc);
         let pixels = self
             .renderer
             .compose(&self.space, &popups, &logical, physical, self.scale)?;
@@ -1332,11 +1377,7 @@ impl DesktopState {
                     x as f64 / self.scale.max(1) as f64,
                     y as f64 / self.scale.max(1) as f64,
                 ));
-                let focus = self.space.element_under(point).and_then(|(window, loc)| {
-                    window
-                        .wl_surface()
-                        .map(|s| (s.as_ref().clone(), loc.to_f64()))
-                });
+                let focus = self.pointer_focus_at(point);
                 pointer.motion(
                     self,
                     focus,
@@ -1353,11 +1394,7 @@ impl DesktopState {
                 let current = self.pointer.current_location();
                 let point =
                     Point::<f64, Logical>::from((current.x + dx as f64, current.y + dy as f64));
-                let focus = self.space.element_under(point).and_then(|(window, loc)| {
-                    window
-                        .wl_surface()
-                        .map(|s| (s.as_ref().clone(), loc.to_f64()))
-                });
+                let focus = self.pointer_focus_at(point);
                 pointer.motion(
                     self,
                     focus,
@@ -1541,6 +1578,24 @@ impl WaylandFocus for KeyboardFocusTarget {
     }
 }
 
+impl From<PopupKind> for KeyboardFocusTarget {
+    fn from(popup: PopupKind) -> Self {
+        Self::Wayland(popup.wl_surface().clone())
+    }
+}
+
+impl From<KeyboardFocusTarget> for WlSurface {
+    fn from(target: KeyboardFocusTarget) -> Self {
+        match target {
+            KeyboardFocusTarget::Wayland(surface) => surface,
+            // Popup grabs are rooted at xdg toplevels, so X11 never reaches this conversion.
+            KeyboardFocusTarget::X11(surface) => surface
+                .wl_surface()
+                .expect("popup grab focus is always a Wayland surface"),
+        }
+    }
+}
+
 impl IsAlive for KeyboardFocusTarget {
     fn alive(&self) -> bool {
         match self {
@@ -1692,10 +1747,55 @@ impl XdgShellHandler for DesktopState {
 
     fn grab(
         &mut self,
-        _surface: PopupSurface,
-        _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
-        _serial: Serial,
+        surface: PopupSurface,
+        seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
+        serial: Serial,
     ) {
+        let Some(seat) = Seat::<Self>::from_resource(&seat) else {
+            tracing::warn!("popup grab requested for an unknown seat");
+            return;
+        };
+        let kind = PopupKind::from(surface);
+        let root = match find_popup_root_surface(&kind) {
+            Ok(root) => root,
+            Err(err) => {
+                tracing::warn!(error = ?err, "popup grab without a live root surface");
+                return;
+            }
+        };
+        let mut grab = match self.popups.grab_popup::<Self>(
+            KeyboardFocusTarget::Wayland(root),
+            kind,
+            &seat,
+            serial,
+        ) {
+            Ok(grab) => grab,
+            Err(err) => {
+                tracing::warn!(error = ?err, "popup grab rejected");
+                return;
+            }
+        };
+        if let Some(keyboard) = seat.get_keyboard() {
+            if keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial)
+                    || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
     }
 
     fn reposition_request(

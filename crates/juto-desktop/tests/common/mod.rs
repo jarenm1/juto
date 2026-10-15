@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
+    wl_surface,
 };
-use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle};
+use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3, zwp_text_input_v3,
 };
@@ -39,6 +40,18 @@ pub const POPUP_OFFSET: i32 = 100;
 #[allow(dead_code)]
 pub const GREEN: [u8; 4] = [0x00, 0xFF, 0x00, 0xFF];
 
+/// Which popup the test client creates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PopupMode {
+    /// No popup.
+    None,
+    /// A popup mapped at startup with no grab.
+    Mapped,
+    /// A menu: created on a press over the toplevel and grabbed with that press's
+    /// serial before its first buffer commit, as xdg-shell requires.
+    OnPress,
+}
+
 #[derive(Default)]
 struct State {
     configured: bool,
@@ -47,6 +60,14 @@ struct State {
     /// Text committed to the focused text-input instance.
     committed_text: String,
     text_enabled: bool,
+    /// Pointer created once the seat advertises the pointer capability.
+    pointer: Option<wl_pointer::WlPointer>,
+    /// Surface the pointer is over, from the latest enter/leave pair.
+    hovered: Option<wl_surface::WlSurface>,
+    /// Serial and surface of the latest button press.
+    press: Option<(u32, wl_surface::WlSurface)>,
+    /// Set when the compositor dismisses a popup with `popup_done`.
+    popup_dismissed: bool,
 }
 
 macro_rules! ignore_events {
@@ -75,10 +96,71 @@ ignore_events! {
     xdg_wm_base::XdgWmBase => (),
     xdg_toplevel::XdgToplevel => (),
     wl_callback::WlCallback => (),
-    wl_seat::WlSeat => (),
     zwp_text_input_manager_v3::ZwpTextInputManagerV3 => (),
-    xdg_popup::XdgPopup => (),
     xdg_positioner::XdgPositioner => (),
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for State {
+    fn event(
+        state: &mut Self,
+        seat: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _data: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(capabilities),
+        } = event
+            && capabilities.contains(wl_seat::Capability::Pointer)
+            && state.pointer.is_none()
+        {
+            state.pointer = Some(seat.get_pointer(qh, ()));
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_pointer::Event::Enter { surface, .. } => state.hovered = Some(surface),
+            wl_pointer::Event::Leave { surface, .. } => {
+                if state.hovered.as_ref() == Some(&surface) {
+                    state.hovered = None;
+                }
+            }
+            wl_pointer::Event::Button {
+                serial,
+                state: WEnum::Value(wl_pointer::ButtonState::Pressed),
+                ..
+            } => {
+                state.press = state.hovered.clone().map(|surface| (serial, surface));
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<xdg_popup::XdgPopup, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &xdg_popup::XdgPopup,
+        event: xdg_popup::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let xdg_popup::Event::PopupDone = event {
+            state.popup_dismissed = true;
+        }
+    }
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -209,8 +291,54 @@ fn paint(fd: &OwnedFd, width: u32, height: u32) {
     unsafe { libc::munmap(ptr, size) };
 }
 
-/// Creates a child popup of `parent` anchored at (`POPUP_OFFSET`, `POPUP_OFFSET`)
-/// and attaches a `GREEN` buffer after the compositor's initial configure.
+/// A child xdg popup: green at rest, blue while hovered, and unmapped once the
+/// compositor dismisses it.
+struct TestPopup {
+    surface: wl_surface::WlSurface,
+    xdg_popup: xdg_popup::XdgPopup,
+    green: wl_buffer::WlBuffer,
+    blue: wl_buffer::WlBuffer,
+    shown_blue: bool,
+    dismissed: bool,
+}
+
+impl TestPopup {
+    fn show(&self) {
+        let buffer = if self.shown_blue {
+            &self.blue
+        } else {
+            &self.green
+        };
+        self.surface.attach(Some(buffer), 0, 0);
+        self.surface
+            .damage(0, 0, POPUP_SIZE as i32, POPUP_SIZE as i32);
+        self.surface.commit();
+    }
+
+    /// Applies compositor events: dismissal, then the hover color.
+    fn sync(&mut self, state: &State) {
+        if self.dismissed {
+            return;
+        }
+        if state.popup_dismissed {
+            self.dismissed = true;
+            self.surface.attach(None, 0, 0);
+            self.surface.commit();
+            return;
+        }
+        let hovered = state.hovered.as_ref() == Some(&self.surface);
+        if hovered != self.shown_blue {
+            self.shown_blue = hovered;
+            self.show();
+        }
+    }
+}
+
+/// Creates a child popup of `parent` anchored at (`POPUP_OFFSET`, `POPUP_OFFSET`).
+///
+/// With `grab`, the popup requests a pointer grab with that serial before its first
+/// buffer commit, since xdg-shell rejects grabs on mapped popups. The popup maps
+/// with a `GREEN` buffer after the compositor's initial configure.
 fn create_popup(
     compositor: &wl_compositor::WlCompositor,
     shm: &wl_shm::WlShm,
@@ -218,8 +346,8 @@ fn create_popup(
     parent: &xdg_surface::XdgSurface,
     event_queue: &mut EventQueue<State>,
     state: &mut State,
-) -> Result<(wl_surface::WlSurface, wl_buffer::WlBuffer), Box<dyn std::error::Error + Send + Sync>>
-{
+    grab: Option<(&wl_seat::WlSeat, u32)>,
+) -> Result<TestPopup, Box<dyn std::error::Error + Send + Sync>> {
     let qh = event_queue.handle();
     let positioner = wm_base.create_positioner(&qh, ());
     positioner.set_size(POPUP_SIZE as i32, POPUP_SIZE as i32);
@@ -228,29 +356,47 @@ fn create_popup(
     positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
     let surface = compositor.create_surface(&qh, ());
     let xdg = wm_base.get_xdg_surface(&surface, &qh, ());
-    let _popup = xdg.get_popup(Some(parent), &positioner, &qh, ());
+    let xdg_popup = xdg.get_popup(Some(parent), &positioner, &qh, ());
+    // xdg-shell: a grab must precede the popup's first commit, or it is rejected
+    // as already mapped. The initial commit then yields the configure to ack.
+    if let Some((seat, serial)) = grab {
+        xdg_popup.grab(seat, serial);
+    }
     surface.commit();
-    // The compositor configures the popup on creation; attach only after that.
     event_queue.roundtrip(state)?;
 
+    let popup = TestPopup {
+        surface,
+        xdg_popup,
+        green: popup_buffer(shm, &qh, 0xFF00_FF00)?,
+        blue: popup_buffer(shm, &qh, 0xFF00_00FF)?,
+        shown_blue: false,
+        dismissed: false,
+    };
+    popup.show();
+    Ok(popup)
+}
+
+/// A `POPUP_SIZE` square ARGB8888 buffer filled with `color`.
+fn popup_buffer(
+    shm: &wl_shm::WlShm,
+    qh: &QueueHandle<State>,
+    color: u32,
+) -> Result<wl_buffer::WlBuffer, Box<dyn std::error::Error + Send + Sync>> {
     let stride = POPUP_SIZE * 4;
     let size = (stride * POPUP_SIZE) as usize;
     let fd = create_shm_fd(size)?;
-    fill(&fd, POPUP_SIZE, POPUP_SIZE, 0xFF00_FF00);
-    let pool = shm.create_pool(fd.as_fd(), size as i32, &qh, ());
-    let buffer = pool.create_buffer(
+    fill(&fd, POPUP_SIZE, POPUP_SIZE, color);
+    let pool = shm.create_pool(fd.as_fd(), size as i32, qh, ());
+    Ok(pool.create_buffer(
         0,
         POPUP_SIZE as i32,
         POPUP_SIZE as i32,
         stride as i32,
         wl_shm::Format::Argb8888,
-        &qh,
+        qh,
         (),
-    );
-    surface.attach(Some(&buffer), 0, 0);
-    surface.damage(0, 0, POPUP_SIZE as i32, POPUP_SIZE as i32);
-    surface.commit();
-    Ok((surface, buffer))
+    ))
 }
 
 fn fill(fd: &OwnedFd, width: u32, height: u32, color: u32) {
@@ -276,22 +422,32 @@ fn fill(fd: &OwnedFd, width: u32, height: u32, color: u32) {
 /// Connects to `socket`, maps one toplevel, paints the two-tone pattern, and
 /// dispatches events for `seconds`. Returns the number of frames presented.
 pub fn run(socket: &str, seconds: u64) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, false)
+    run_client(socket, seconds, PopupMode::None)
 }
 
-/// Like [`run`], plus a child xdg popup anchored at (`POPUP_OFFSET`, `POPUP_OFFSET`)
-/// filled with `GREEN`.
+/// Like [`run`], plus a child xdg popup mapped at startup, anchored at
+/// (`POPUP_OFFSET`, `POPUP_OFFSET`). It is green, and blue while hovered.
 pub fn run_with_popup(
     socket: &str,
     seconds: u64,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, true)
+    run_client(socket, seconds, PopupMode::Mapped)
+}
+
+/// Like [`run`], plus a menu popup. The first press over the toplevel creates the
+/// popup at (`POPUP_OFFSET`, `POPUP_OFFSET`) with a grab on that press. The popup is
+/// green, and blue while hovered. The compositor dismisses it with `popup_done`.
+pub fn run_with_menu(
+    socket: &str,
+    seconds: u64,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    run_client(socket, seconds, PopupMode::OnPress)
 }
 
 fn run_client(
     socket: &str,
     seconds: u64,
-    with_popup: bool,
+    popup_mode: PopupMode,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
     let stream = UnixStream::connect(socket)?;
     let conn = Connection::from_socket(stream)?;
@@ -339,7 +495,7 @@ fn run_client(
     surface.damage(0, 0, WIDTH as i32, HEIGHT as i32);
     surface.commit();
 
-    let popup = if with_popup {
+    let mut popup = if popup_mode == PopupMode::Mapped {
         Some(create_popup(
             &compositor,
             &shm,
@@ -347,6 +503,7 @@ fn run_client(
             &xdg_surface,
             &mut event_queue,
             &mut state,
+            None,
         )?)
     } else {
         None
@@ -368,17 +525,36 @@ fn run_client(
             }
         }
         event_queue.dispatch_pending(&mut state)?;
+        if popup.is_none()
+            && popup_mode == PopupMode::OnPress
+            && state
+                .press
+                .as_ref()
+                .is_some_and(|(_, pressed)| *pressed == surface)
+        {
+            let (serial, _) = state.press.take().expect("press checked above");
+            popup = Some(create_popup(
+                &compositor,
+                &shm,
+                &wm_base,
+                &xdg_surface,
+                &mut event_queue,
+                &mut state,
+                Some((&seat, serial)),
+            )?);
+        }
         if state.configured {
             state.configured = false;
             surface.attach(Some(&buffer), 0, 0);
             surface.damage(0, 0, WIDTH as i32, HEIGHT as i32);
             surface.commit();
-            if let Some((popup_surface, popup_buffer)) = &popup {
-                popup_surface.attach(Some(popup_buffer), 0, 0);
-                popup_surface.damage(0, 0, POPUP_SIZE as i32, POPUP_SIZE as i32);
-                popup_surface.commit();
+            if let Some(popup) = popup.as_ref().filter(|popup| !popup.dismissed) {
+                popup.show();
             }
             state.frames += 1;
+        }
+        if let Some(popup) = popup.as_mut() {
+            popup.sync(&state);
         }
         event_queue.flush()?;
     }
