@@ -323,6 +323,42 @@ fn compositor_renders_real_client_frame() {
 }
 
 #[test]
+fn compositor_renders_xdg_popup_above_its_parent() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("popup")), &unique_env_id("req"))
+        .expect("create environment");
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    let client = std::thread::spawn(move || common::run_with_popup(&socket, 10));
+
+    let pool = env.frame_pool();
+    let popup_px = common::POPUP_OFFSET as u32 + 20;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut verified = None;
+    while Instant::now() < deadline {
+        let info = match env.observe(Duration::from_secs(2)) {
+            Ok(info) => info,
+            Err(err) => panic!("observe failed: {err}"),
+        };
+        let parent = read_pixel(&pool, info.slot, 10, 10, info.width);
+        let popup = read_pixel(&pool, info.slot, popup_px, popup_px, info.width);
+        if parent == common::RED && popup == common::GREEN {
+            verified = Some(info);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    verified.expect("compositor never drew the child popup over its parent");
+
+    let frames = client.join().expect("client thread").expect("client run");
+    assert!(frames > 0, "client presented at least one frame");
+
+    env.destroy();
+}
+
+#[test]
 fn hardware_profile_renders_and_serializes_on_the_shared_device() {
     let supervisor = DesktopSupervisor::new();
     let mut config = test_config(&unique_env_id("hardware"));
