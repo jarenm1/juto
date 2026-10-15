@@ -53,6 +53,8 @@ pub const VIEW_TAGS: &[(&str, &[&str])] = &[
     ("Timeline", &["title", "max", "tick"]),
     ("Lane", &["label"]),
     ("Bar", &["start", "end", "series"]),
+    ("Chart", &["kind", "title", "labels"]),
+    ("Series", &["name", "values"]),
 ];
 
 /// Tones a `Badge` accepts. The renderer shows any other tone as neutral, so the
@@ -68,9 +70,21 @@ pub const MAX_VIEW_TEXT_BYTES: usize = 4096;
 /// Most tick marks a `Timeline` may draw.
 pub const MAX_TIMELINE_TICKS: usize = 48;
 
+/// Most series one `Chart` may draw.
+pub const MAX_CHART_SERIES: usize = 4;
+/// Most values one `Series` may hold, and so most x positions one `Chart` may draw.
+pub const MAX_CHART_POINTS: usize = 48;
+/// Kinds a `Chart` accepts.
+pub const CHART_KINDS: &[&str] = &["bar", "line"];
+
 /// Tags that exist only inside another tag, as `(parent, child)` pairs. A parent
 /// accepts only that child, and the child must sit directly under the parent.
-const NESTING: &[(&str, &str)] = &[("Stats", "Stat"), ("Timeline", "Lane"), ("Lane", "Bar")];
+const NESTING: &[(&str, &str)] = &[
+    ("Stats", "Stat"),
+    ("Timeline", "Lane"),
+    ("Lane", "Bar"),
+    ("Chart", "Series"),
+];
 
 /// Checks a tree before the host renders it. Errors name the offending tag or prop
 /// so the model can correct the tree.
@@ -127,9 +141,11 @@ fn validate_node(
         }
         "Timeline" => check_timeline(node)?,
         "Bar" => check_bar(node)?,
+        "Chart" => check_chart(node)?,
+        "Series" => check_series(node)?,
         _ => {}
     }
-    if matches!(node.tag.as_str(), "Stat" | "Bar") && !node.children.is_empty() {
+    if matches!(node.tag.as_str(), "Stat" | "Bar" | "Series") && !node.children.is_empty() {
         return Err(format!("<{}> takes no children", node.tag));
     }
     let required_child = NESTING
@@ -198,6 +214,60 @@ fn check_bar(node: &ViewNode) -> Result<(), String> {
     let end = number_prop(node, "end")?;
     if start < 0.0 || end <= start {
         return Err("<Bar> needs 0 <= start < end".into());
+    }
+    Ok(())
+}
+
+/// Parses a `Series` `values` prop: comma-separated finite numbers, or `None`.
+pub fn parse_chart_values(text: &str) -> Option<Vec<f64>> {
+    text.split(',')
+        .map(|part| part.trim().parse::<f64>().ok().filter(|n| n.is_finite()))
+        .collect()
+}
+
+/// Parses a `Chart` `labels` prop: comma-separated x-axis labels.
+pub fn parse_chart_labels(text: &str) -> Vec<String> {
+    text.split(',').map(|part| part.trim().to_owned()).collect()
+}
+
+/// A `Series` node's parsed values.
+fn series_values(node: &ViewNode) -> Result<Vec<f64>, String> {
+    parse_chart_values(required_text(node, "values")?)
+        .ok_or_else(|| "<Series> values must be comma-separated numbers".to_owned())
+}
+
+fn check_series(node: &ViewNode) -> Result<(), String> {
+    required_text(node, "name")?;
+    if series_values(node)?.len() > MAX_CHART_POINTS {
+        return Err(format!("<Series> needs 1 to {MAX_CHART_POINTS} values"));
+    }
+    Ok(())
+}
+
+fn check_chart(node: &ViewNode) -> Result<(), String> {
+    let kind = required_text(node, "kind")?;
+    if !CHART_KINDS.contains(&kind) {
+        return Err(format!(
+            "<Chart> kind must be one of: {}",
+            CHART_KINDS.join(", ")
+        ));
+    }
+    let series: Vec<&ViewNode> = node.children.iter().filter_map(child_node).collect();
+    if series.is_empty() || series.len() > MAX_CHART_SERIES {
+        return Err(format!("<Chart> needs 1 to {MAX_CHART_SERIES} <Series>"));
+    }
+    let mut points = None;
+    for item in &series {
+        let count = series_values(item)?.len();
+        if points.is_some_and(|expected| expected != count) {
+            return Err("every <Series> in a <Chart> needs the same number of values".into());
+        }
+        points = Some(count);
+    }
+    if let Some(labels) = node.props.get("labels").and_then(Value::as_str)
+        && Some(parse_chart_labels(labels).len()) != points
+    {
+        return Err("<Chart> labels must match the number of values".into());
     }
     Ok(())
 }
@@ -464,5 +534,91 @@ mod tests {
         );
         let too_many = parse(json!({"tag": "Timeline", "props": {"max": "1000", "tick": "1"}}));
         assert!(validate_view(&too_many).unwrap_err().contains("ticks"));
+    }
+
+    #[test]
+    fn validator_accepts_aligned_bar_and_line_charts() {
+        let bar = parse(
+            json!({"tag": "Chart", "props": {"kind": "bar", "labels": "Mon, Tue,Wed"},
+            "children": [
+                {"tag": "Series", "props": {"name": "Steps", "values": "1, 2.5,3"}},
+                {"tag": "Series", "props": {"name": "Errors", "values": "0,-1,4"}}
+            ]}),
+        );
+        assert_eq!(validate_view(&bar), Ok(()));
+        let line = parse(json!({"tag": "Chart", "props": {"kind": "line"},
+            "children": [{"tag": "Series", "props": {"name": "Reward", "values": "0.1,0.4"}}]}));
+        assert_eq!(validate_view(&line), Ok(()));
+    }
+
+    #[test]
+    fn validator_rejects_unknown_chart_kind_and_missing_series() {
+        let pie = parse(json!({"tag": "Chart", "props": {"kind": "pie"},
+            "children": [{"tag": "Series", "props": {"name": "x", "values": "1"}}]}));
+        assert!(
+            validate_view(&pie)
+                .unwrap_err()
+                .contains("kind must be one of: bar, line")
+        );
+        let empty = parse(json!({"tag": "Chart", "props": {"kind": "bar"}}));
+        assert!(
+            validate_view(&empty)
+                .unwrap_err()
+                .contains("<Chart> needs 1 to")
+        );
+    }
+
+    #[test]
+    fn validator_rejects_ragged_or_mislabelled_charts() {
+        let ragged = parse(json!({"tag": "Chart", "props": {"kind": "line"},
+        "children": [
+            {"tag": "Series", "props": {"name": "a", "values": "1,2"}},
+            {"tag": "Series", "props": {"name": "b", "values": "1,2,3"}}
+        ]}));
+        assert!(
+            validate_view(&ragged)
+                .unwrap_err()
+                .contains("same number of values")
+        );
+        let labels = parse(
+            json!({"tag": "Chart", "props": {"kind": "bar", "labels": "a,b,c"},
+            "children": [{"tag": "Series", "props": {"name": "a", "values": "1,2"}}]}),
+        );
+        assert!(
+            validate_view(&labels)
+                .unwrap_err()
+                .contains("labels must match")
+        );
+    }
+
+    #[test]
+    fn validator_rejects_non_finite_or_oversized_series_values() {
+        for values in ["", "1,abc", "1,NaN", "1,inf"] {
+            let node = parse(json!({"tag": "Chart", "props": {"kind": "bar"},
+                "children": [{"tag": "Series", "props": {"name": "a", "values": values}}]}));
+            let err = validate_view(&node).unwrap_err();
+            assert!(err.contains("comma-separated numbers"), "{values:?}: {err}");
+        }
+        let many = (0..=MAX_CHART_POINTS)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let too_many = parse(json!({"tag": "Chart", "props": {"kind": "bar"},
+            "children": [{"tag": "Series", "props": {"name": "a", "values": many}}]}));
+        assert!(
+            validate_view(&too_many)
+                .unwrap_err()
+                .contains("<Series> needs 1 to")
+        );
+    }
+
+    #[test]
+    fn validator_places_series_inside_chart() {
+        let loose = parse(json!({"tag": "Series", "props": {"name": "a", "values": "1"}}));
+        assert!(
+            validate_view(&loose)
+                .unwrap_err()
+                .contains("must be inside <Chart>")
+        );
     }
 }

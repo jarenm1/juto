@@ -15,8 +15,8 @@ pub use error::AgentError;
 pub use events::{AgentConfig, AgentEvent, AgentHooks, RunOutcome};
 pub use tool::{Tool, ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier};
 pub use view::{
-    MAX_TIMELINE_TICKS, VIEW_DETAILS_TYPE, VIEW_TAGS, ViewChild, ViewNode, validate_view,
-    view_details, view_from_details,
+    MAX_TIMELINE_TICKS, VIEW_DETAILS_TYPE, VIEW_TAGS, ViewChild, ViewNode, parse_chart_labels,
+    parse_chart_values, validate_view, view_details, view_from_details,
 };
 
 #[cfg(test)]
