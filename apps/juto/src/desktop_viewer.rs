@@ -103,7 +103,7 @@ impl DesktopViewer {
     }
 
     /// Captures one still of the newest frame without starting the frame loop.
-    fn capture_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn capture_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let env = self.env.clone();
         self.snapshot_task = Some(cx.spawn_in(window, async move |this, cx| {
             let read = cx
