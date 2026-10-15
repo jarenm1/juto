@@ -503,6 +503,7 @@ impl Render for DesktopViewer {
                     .flex()
                     .items_center()
                     .justify_end()
+                    .h(px(30.))
                     .when(!paused, |row| {
                         row.child(
                             div()
