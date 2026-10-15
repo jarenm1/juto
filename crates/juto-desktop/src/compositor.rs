@@ -23,7 +23,9 @@ use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_h
 use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer};
 use smithay::desktop::Window;
 use smithay::desktop::space::Space;
-use smithay::input::keyboard::{FilterResult, KeyboardHandle, Keycode, XkbConfig};
+use smithay::input::keyboard::{
+    FilterResult, KeyboardHandle, KeyboardTarget, Keycode, KeysymHandle, ModifiersState, XkbConfig,
+};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
@@ -47,7 +49,7 @@ use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, Display, GlobalDispatch, ListeningSocket, New, Resource,
 };
 use smithay::utils::{
-    Buffer, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform,
+    Buffer, IsAlive, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform,
 };
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -828,17 +830,13 @@ impl DesktopState {
                 .map(toplevel_identity)
                 .unwrap_or((None, None)),
         };
-        let is_focused = self
-            .keyboard
-            .current_focus()
-            .map(|focus| {
-                mapped
-                    .window
-                    .wl_surface()
-                    .map(|s| s.as_ref() == &focus)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
+        let is_focused = match (
+            self.keyboard.current_focus(),
+            keyboard_target(&mapped.window),
+        ) {
+            (Some(focus), Some(target)) => focus == target,
+            _ => false,
+        };
         WindowInfo {
             window_id: mapped.id,
             title: title.unwrap_or_default(),
@@ -852,13 +850,9 @@ impl DesktopState {
     }
 
     fn focus_window(&mut self, window: &Window) {
-        if let Some(surface) = window.wl_surface() {
+        if let Some(target) = keyboard_target(window) {
             let keyboard = self.keyboard.clone();
-            keyboard.set_focus(
-                self,
-                Some(surface.as_ref().clone()),
-                SERIAL_COUNTER.next_serial(),
-            );
+            keyboard.set_focus(self, Some(target), SERIAL_COUNTER.next_serial());
         }
     }
 
@@ -1080,12 +1074,42 @@ impl DesktopState {
 
     fn unmap_window(&mut self, id: u32) {
         if let Some(mapped) = self.windows.remove(&id) {
+            let was_focused = match (
+                self.keyboard.current_focus(),
+                keyboard_target(&mapped.window),
+            ) {
+                (Some(focus), Some(target)) => focus == target,
+                _ => false,
+            };
             self.space.unmap_elem(&mapped.window);
+            if was_focused {
+                self.focus_topmost_window();
+            }
             self.dirty = true;
             let _ = self.events.send(DesktopEvent::WindowUnmapped {
                 env_id: self.env_id.clone(),
                 window_id: id,
             });
+        }
+    }
+
+    /// Moves keyboard focus to the topmost remaining window, or clears it.
+    ///
+    /// Smithay keeps keyboard focus on a destroyed surface and drops input
+    /// sent to it, so a closed window must hand focus off explicitly.
+    fn focus_topmost_window(&mut self) {
+        let next = self
+            .space
+            .elements()
+            .rev()
+            .find(|window| keyboard_target(window).is_some())
+            .cloned();
+        match next {
+            Some(window) => self.focus_window(&window),
+            None => {
+                let keyboard = self.keyboard.clone();
+                keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+            }
         }
     }
 
@@ -1425,8 +1449,101 @@ impl ShmHandler for DesktopState {
     }
 }
 
+/// Keyboard focus target. X11 windows focus through `X11Surface`, so its
+/// `KeyboardTarget` impl sets X input focus with the seat. A bare `WlSurface`
+/// leaves X input focus on PointerRoot, so keys follow the pointer instead.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyboardFocusTarget {
+    Wayland(WlSurface),
+    X11(X11Surface),
+}
+
+impl WaylandFocus for KeyboardFocusTarget {
+    fn wl_surface(&self) -> Option<std::borrow::Cow<'_, WlSurface>> {
+        match self {
+            Self::Wayland(surface) => Some(std::borrow::Cow::Borrowed(surface)),
+            Self::X11(surface) => surface.wl_surface().map(std::borrow::Cow::Owned),
+        }
+    }
+}
+
+impl IsAlive for KeyboardFocusTarget {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Wayland(surface) => surface.alive(),
+            Self::X11(surface) => surface.alive(),
+        }
+    }
+}
+
+impl KeyboardTarget<DesktopState> for KeyboardFocusTarget {
+    fn enter(
+        &self,
+        seat: &Seat<DesktopState>,
+        data: &mut DesktopState,
+        keys: Vec<KeysymHandle<'_>>,
+        serial: Serial,
+    ) {
+        match self {
+            Self::Wayland(surface) => KeyboardTarget::enter(surface, seat, data, keys, serial),
+            Self::X11(surface) => KeyboardTarget::enter(surface, seat, data, keys, serial),
+        }
+    }
+
+    fn leave(&self, seat: &Seat<DesktopState>, data: &mut DesktopState, serial: Serial) {
+        match self {
+            Self::Wayland(surface) => KeyboardTarget::leave(surface, seat, data, serial),
+            Self::X11(surface) => KeyboardTarget::leave(surface, seat, data, serial),
+        }
+    }
+
+    fn key(
+        &self,
+        seat: &Seat<DesktopState>,
+        data: &mut DesktopState,
+        key: KeysymHandle<'_>,
+        state: KeyState,
+        serial: Serial,
+        time: u32,
+    ) {
+        match self {
+            Self::Wayland(surface) => {
+                KeyboardTarget::key(surface, seat, data, key, state, serial, time)
+            }
+            Self::X11(surface) => {
+                KeyboardTarget::key(surface, seat, data, key, state, serial, time)
+            }
+        }
+    }
+
+    fn modifiers(
+        &self,
+        seat: &Seat<DesktopState>,
+        data: &mut DesktopState,
+        modifiers: ModifiersState,
+        serial: Serial,
+    ) {
+        match self {
+            Self::Wayland(surface) => {
+                KeyboardTarget::modifiers(surface, seat, data, modifiers, serial)
+            }
+            Self::X11(surface) => KeyboardTarget::modifiers(surface, seat, data, modifiers, serial),
+        }
+    }
+}
+
+/// The keyboard target for a window: its X11 surface when it is one.
+fn keyboard_target(window: &Window) -> Option<KeyboardFocusTarget> {
+    match window.x11_surface() {
+        Some(surface) => Some(KeyboardFocusTarget::X11(surface.clone())),
+        None => window
+            .wl_surface()
+            .map(|surface| KeyboardFocusTarget::Wayland(surface.into_owned())),
+    }
+}
+
 impl SeatHandler for DesktopState {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = KeyboardFocusTarget;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -1434,8 +1551,12 @@ impl SeatHandler for DesktopState {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        self.text_input_manager_state.set_focus(focused.cloned());
+    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&KeyboardFocusTarget>) {
+        self.text_input_manager_state.set_focus(
+            focused
+                .and_then(WaylandFocus::wl_surface)
+                .map(|surface| surface.into_owned()),
+        );
     }
     fn cursor_image(
         &mut self,
