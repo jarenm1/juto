@@ -55,6 +55,8 @@ pub const VIEW_TAGS: &[(&str, &[&str])] = &[
     ("Bar", &["start", "end", "series"]),
     ("Chart", &["kind", "title", "labels"]),
     ("Series", &["name", "values"]),
+    ("Table", &["columns"]),
+    ("TableRow", &[]),
 ];
 
 /// Tones a `Badge` accepts. The renderer shows any other tone as neutral, so the
@@ -76,6 +78,10 @@ pub const MAX_CHART_SERIES: usize = 4;
 pub const MAX_CHART_POINTS: usize = 48;
 /// Kinds a `Chart` accepts.
 pub const CHART_KINDS: &[&str] = &["bar", "line"];
+/// Most columns a `Table` may declare.
+pub const MAX_TABLE_COLUMNS: usize = 8;
+/// Most body rows a `Table` may hold.
+pub const MAX_TABLE_ROWS: usize = 48;
 
 /// Tags that exist only inside another tag, as `(parent, child)` pairs. A parent
 /// accepts only that child, and the child must sit directly under the parent.
@@ -84,6 +90,7 @@ const NESTING: &[(&str, &str)] = &[
     ("Timeline", "Lane"),
     ("Lane", "Bar"),
     ("Chart", "Series"),
+    ("Table", "TableRow"),
 ];
 
 /// Checks a tree before the host renders it. Errors name the offending tag or prop
@@ -143,6 +150,8 @@ fn validate_node(
         "Bar" => check_bar(node)?,
         "Chart" => check_chart(node)?,
         "Series" => check_series(node)?,
+        "Table" => check_table(node)?,
+        "TableRow" => check_table_row(node)?,
         _ => {}
     }
     if matches!(node.tag.as_str(), "Stat" | "Bar" | "Series") && !node.children.is_empty() {
@@ -268,6 +277,42 @@ fn check_chart(node: &ViewNode) -> Result<(), String> {
         && Some(parse_chart_labels(labels).len()) != points
     {
         return Err("<Chart> labels must match the number of values".into());
+    }
+    Ok(())
+}
+
+/// Column labels of a `Table` `columns` prop: comma-separated, trimmed.
+pub fn parse_table_columns(text: &str) -> Vec<String> {
+    text.split(',').map(|part| part.trim().to_owned()).collect()
+}
+
+fn check_table(node: &ViewNode) -> Result<(), String> {
+    let columns = parse_table_columns(required_text(node, "columns")?);
+    if columns.len() > MAX_TABLE_COLUMNS || columns.iter().any(String::is_empty) {
+        return Err(format!(
+            "<Table> needs 1 to {MAX_TABLE_COLUMNS} non-empty columns"
+        ));
+    }
+    let rows: Vec<&ViewNode> = node.children.iter().filter_map(child_node).collect();
+    if rows.len() > MAX_TABLE_ROWS {
+        return Err(format!("<Table> has more than {MAX_TABLE_ROWS} rows"));
+    }
+    if rows.iter().any(|row| row.children.len() != columns.len()) {
+        return Err(format!(
+            "every <TableRow> in a <Table> needs {} cells",
+            columns.len()
+        ));
+    }
+    Ok(())
+}
+
+fn check_table_row(node: &ViewNode) -> Result<(), String> {
+    if node
+        .children
+        .iter()
+        .any(|child| matches!(child, ViewChild::Node(_)))
+    {
+        return Err("<TableRow> cells must be text".into());
     }
     Ok(())
 }
@@ -619,6 +664,68 @@ mod tests {
             validate_view(&loose)
                 .unwrap_err()
                 .contains("must be inside <Chart>")
+        );
+    }
+
+    #[test]
+    fn validator_accepts_table_with_matching_rows() {
+        let table = parse(
+            json!({"tag": "Table", "props": {"columns": "Name, Status, Time"},
+            "children": [
+                {"tag": "TableRow", "children": ["build", "ok", "12s"]},
+                {"tag": "TableRow", "children": ["test", "failed", "40s"]}
+            ]}),
+        );
+        assert_eq!(validate_view(&table), Ok(()));
+    }
+
+    #[test]
+    fn validator_rejects_ragged_table_rows() {
+        let ragged = parse(json!({"tag": "Table", "props": {"columns": "a,b"},
+            "children": [{"tag": "TableRow", "children": ["only one"]}]}));
+        assert!(
+            validate_view(&ragged)
+                .unwrap_err()
+                .contains("needs 2 cells")
+        );
+    }
+
+    #[test]
+    fn validator_rejects_oversized_or_empty_tables() {
+        let names = (0..=MAX_TABLE_COLUMNS)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let wide = parse(json!({"tag": "Table", "props": {"columns": names}}));
+        assert!(validate_view(&wide).unwrap_err().contains("needs 1 to"));
+        let blank = parse(json!({"tag": "Table", "props": {"columns": "a,,b"}}));
+        assert!(
+            validate_view(&blank)
+                .unwrap_err()
+                .contains("non-empty columns")
+        );
+        let rows = (0..=MAX_TABLE_ROWS)
+            .map(|_| json!({"tag": "TableRow", "children": ["x"]}))
+            .collect::<Vec<_>>();
+        let tall = parse(json!({"tag": "Table", "props": {"columns": "a"}, "children": rows}));
+        assert!(validate_view(&tall).unwrap_err().contains("more than"));
+    }
+
+    #[test]
+    fn validator_rejects_element_in_table_cell_and_loose_row() {
+        let nested = parse(json!({"tag": "Table", "props": {"columns": "a"},
+            "children": [{"tag": "TableRow",
+                "children": [{"tag": "Badge", "props": {"label": "x"}}]}]}));
+        assert!(
+            validate_view(&nested)
+                .unwrap_err()
+                .contains("cells must be text")
+        );
+        let loose = parse(json!({"tag": "TableRow", "children": ["x"]}));
+        assert!(
+            validate_view(&loose)
+                .unwrap_err()
+                .contains("must be inside <Table>")
         );
     }
 }
