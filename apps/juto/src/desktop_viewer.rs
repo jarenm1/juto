@@ -6,6 +6,7 @@
 //! video codec is involved on this path (`docs/agent-compositor.md` section 7).
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,8 @@ use std::time::Duration;
 use gpui::{
     Bounds, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Render,
-    RenderImage, ScrollWheelEvent, Task, Window, canvas, div, img, prelude::*, px, rgb, rgba,
+    RenderImage, ScrollWheelEvent, Subscription, Task, Window, canvas, div, img, prelude::*, px,
+    rgb, rgba,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use juto_runtime::DesktopEnvironment;
@@ -110,6 +112,10 @@ pub struct DesktopViewer {
     press_started_paused: bool,
     /// Modifier state last reported by GPUI; only changes are sent to the seat.
     modifiers: Modifiers,
+    /// Keys currently down on the seat; auto-repeat presses are not re-sent.
+    held_keys: HashSet<u32>,
+    /// Releases held input on focus or window-activation loss.
+    _input_guards: Vec<Subscription>,
 }
 
 impl DesktopViewer {
@@ -148,7 +154,19 @@ impl DesktopViewer {
             press_started_paused: false,
             modifiers: Modifiers::default(),
             heartbeat_task: None,
+            held_keys: HashSet::new(),
+            _input_guards: Vec::new(),
         };
+        viewer._input_guards = vec![
+            cx.on_focus_out(&viewer.focus_handle, window, |this, _event, _window, cx| {
+                this.release_held_input(cx);
+            }),
+            cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.release_held_input(cx);
+                }
+            }),
+        ];
         viewer.start_heartbeat(cx);
         viewer.capture_snapshot(window, cx);
         viewer
@@ -233,7 +251,7 @@ impl DesktopViewer {
         if self.paused {
             return;
         }
-        self.release_modifiers(cx);
+        self.release_held_input(cx);
         self.paused = true;
         self.poll_task = None;
         if self.has_control {
@@ -286,7 +304,7 @@ impl DesktopViewer {
 
     /// Releases the human control lease.
     pub fn release_control(&mut self, cx: &mut Context<Self>) {
-        self.release_modifiers(cx);
+        self.release_held_input(cx);
         let result = self.env.set_control(SESSION_PRINCIPAL, "release", true);
         // Drop the local flag even when the release call fails: the lease may
         // already be gone, and keeping `has_control` would render a stale state.
@@ -389,7 +407,7 @@ impl DesktopViewer {
         if !self.can_control {
             return false;
         }
-        self.release_modifiers(cx);
+        self.release_held_input(cx);
         self.can_control = false;
         self.has_control = false;
         self.error = Some("control grant expired".to_string());
@@ -441,11 +459,21 @@ impl DesktopViewer {
         self.send_events(events, cx);
     }
 
-    /// Releases modifiers still down on the seat before input stops being forwarded.
-    fn release_modifiers(&mut self, cx: &mut Context<Self>) {
+    /// Releases every key and modifier still down on the seat before input stops
+    /// being forwarded: pause, control release, grant expiry, or focus loss.
+    fn release_held_input(&mut self, cx: &mut Context<Self>) {
         let previous = std::mem::take(&mut self.modifiers);
+        let mut events: Vec<InputEvent> = self
+            .held_keys
+            .drain()
+            .map(|keycode| InputEvent::Key {
+                keycode,
+                pressed: false,
+            })
+            .collect();
+        events.extend(modifier_events(previous, Modifiers::default()));
         if self.has_control {
-            self.send_events(modifier_events(previous, Modifiers::default()), cx);
+            self.send_events(events, cx);
         }
     }
 
@@ -486,9 +514,23 @@ impl DesktopViewer {
     }
 
     fn on_key(&mut self, event: &KeyDownEvent, pressed: bool, cx: &mut Context<Self>) {
+        // Only a live controlling viewer forwards keys. Held keys are tracked and
+        // released on pause, so a forwarded press always gets its release.
+        if self.paused || !self.has_control {
+            return;
+        }
         let Some(keycode) = evdev_keycode(&event.keystroke.key) else {
             return;
         };
+        if pressed {
+            // Repeats arrive as further key-downs: the X server's repeat on X11,
+            // GPUI's is_held repeat on Wayland. The seat's repeat governs them.
+            if !self.held_keys.insert(keycode) {
+                return;
+            }
+        } else if !self.held_keys.remove(&keycode) {
+            return;
+        }
         self.send_events(vec![InputEvent::Key { keycode, pressed }], cx);
     }
 

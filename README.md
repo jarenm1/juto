@@ -287,7 +287,10 @@ shared-memory pool, with no video codec on this path. It starts **paused**: it s
 still captured at mount and forwards no input. Clicking the canvas resumes live
 rendering; **Pause** returns to the still and releases any control lease. While live,
 pointer, scroll, and keyboard input goes to the virtual seat, and **Take control** /
-**Release control** manage the human control lease. The viewer letterboxes the frame,
+**Release control** manage the human control lease. Keys still held when input stops
+(pause, control release, or window focus loss) are released on the seat; auto-repeat
+comes from the seat, not from the viewer.
+The viewer letterboxes the frame,
 maps pointer coordinates to desktop pixels, and reports connection state and errors
 instead of showing a stale frame as live. `juto --desktop <command> [args...]` mounts
 the same canvas directly for development.
