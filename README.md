@@ -464,9 +464,26 @@ with text, attachments, or attachments alone. The composer supports cursor movem
 selection, Backspace/Delete, clipboard copy/cut/paste. Long drafts wrap onto new rows; the
 composer grows to eight rows, then scrolls vertically. Sent messages wrap naturally.
 
-The UI is styled with neutral grays throughout—including backgrounds, borders,
-hover states, focus borders, caret, selection, and active/disabled button states.
-Messages have no bubble backgrounds or borders.
+Surfaces are neutral grays—backgrounds, borders, hover states, focus borders,
+caret, selection, and disabled states—with one blue accent (`#7aa2f7`) for
+selection, active toggles, and primary actions, amber for blocked threads, and
+red for failures and destructive actions. `apps/juto/src/theme.rs` holds the
+shell and sidebar palette. Messages have no bubble backgrounds or borders.
+
+The window is a full-height left sidebar beside the chat column. The sidebar
+(`sidebar.rs`, rows in `task_card.rs`) lists **focus threads** only; the main
+chat is not a row. Each row shows the thread title, its status, and a thin bar
+marking its lifecycle stage (queued → running → verifying → reviewing → done).
+The bar is a stage indicator, not a completion percentage: the runtime reports
+no progress measure. Clicking a row selects it and opens focus mode, with the
+sidebar still visible; leaving focus clears the selection. Blocked rows always
+show the blocker prompt with a resume field. A row's chevron reveals its agent,
+duration, workspace, current step, Pause/Steer/Abort, token usage, step log,
+and diffs. Filter tabs (All, Active, Blocked, Done) sit under the heading. The
+chat header keeps the model picker, **Providers**, and the **Threads** sidebar
+toggle at the top right; with the sidebar hidden, the header shows the app
+title. The transcript and composer stay capped at 800 px wide.
+
 The input component adapts [GPUI 0.2.2's input example](https://docs.rs/crate/gpui/0.2.2/source/examples/input.rs);
 its upstream Apache-2.0 license is retained in
 `apps/juto/licenses/GPUI-APACHE-2.0.txt`. Unicode grapheme navigation uses

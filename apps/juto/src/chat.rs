@@ -11,10 +11,11 @@ use crate::focus_view::{FocusEvent, FocusView};
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::subagent_card;
+use crate::theme;
 use crate::view_element::render_view;
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding,
-    MouseButton, MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString,
+    MouseButton, MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Stateful,
     Subscription, Task, Window, actions, deferred, div, prelude::*, px, rgb, rgba,
 };
 use juto_agent::{AgentEvent, RunControl, RunOutcome, ToolTier, ViewNode, view_from_details};
@@ -730,6 +731,8 @@ impl ChatView {
     fn exit_focus(&mut self, cx: &mut Context<Self>) {
         self.focus = None;
         self._focus_subscription = None;
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.clear_selection(cx));
         cx.notify();
     }
 
@@ -1218,45 +1221,18 @@ impl ChatView {
             .items_center()
             .justify_between()
             .flex_none()
+            .h(px(theme::HEADER_HEIGHT))
             .px_6()
-            .py_3p5()
             .border_b_1()
-            .border_color(rgb(0x333333))
-            .bg(rgb(0x1a1a1a))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_size(px(20.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("Juto"),
-                    )
-                    .child(div().text_sm().text_color(rgb(0xa0a0a0)).child("Chat")),
-            )
+            .border_color(rgb(theme::BORDER))
+            .child(div().when(!self.show_sidebar, |title| title.child(app_title())))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
                     .child(
-                        div()
-                            .id("header-model-btn")
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .px_3()
-                            .py_1p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(0x3f3f46))
-                            .bg(rgb(0x27272a))
-                            .text_xs()
-                            .text_color(rgb(0xe4e4e7))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x3f3f46)).border_color(rgb(0x52525b)))
+                        header_button("header-model-btn", false)
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 if this.active_modal == ActiveModal::ModelPicker {
                                     this.close_modal(window, cx);
@@ -1267,21 +1243,7 @@ impl ChatView {
                             .child(format!("🤖 {} ▾", self.active_model)),
                     )
                     .child(
-                        div()
-                            .id("header-auth-btn")
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_3()
-                            .py_1p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(0x3f3f46))
-                            .bg(rgb(0x27272a))
-                            .text_xs()
-                            .text_color(rgb(0xd4d4d8))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x3f3f46)).text_color(rgb(0xffffff)))
+                        header_button("header-auth-btn", false)
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 if this.active_modal == ActiveModal::AuthModal {
                                     this.close_modal(window, cx);
@@ -1292,72 +1254,50 @@ impl ChatView {
                             .child("Providers"),
                     )
                     .child(
-                        div()
-                            .id("header-sidebar-btn")
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .px_3()
-                            .py_1p5()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(if self.show_sidebar {
-                                rgb(0x2563eb)
-                            } else {
-                                rgb(0x3f3f46)
-                            })
-                            .bg(if self.show_sidebar {
-                                rgb(0x1e3a5f)
-                            } else {
-                                rgb(0x27272a)
-                            })
-                            .text_xs()
-                            .text_color(if self.show_sidebar {
-                                rgb(0x60a5fa)
-                            } else {
-                                rgb(0xd4d4d8)
-                            })
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(0x3f3f46)).text_color(rgb(0xffffff)))
+                        header_button("header-sidebar-btn", self.show_sidebar)
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.toggle_sidebar(cx);
                             }))
-                            .child("⚡ Mission Control"),
+                            .child("Threads"),
                     ),
             )
     }
 
-    /// The main transcript and composer, with the Mission Control sidebar when shown.
-    fn main_body(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Full-height left column: app title aligned with the chat header, then
+    /// the focus-thread list.
+    fn sidebar_column(&self) -> impl IntoElement {
         div()
+            .w(px(300.))
+            .flex_none()
+            .h_full()
             .flex()
-            .flex_1()
-            .min_h_0()
-            .w_full()
+            .flex_col()
+            .border_r_1()
+            .border_color(rgb(theme::BORDER))
             .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(self.message_list(cx))
-                    .child(self.composer(window, cx)),
+                    .items_center()
+                    .flex_none()
+                    .h(px(theme::HEADER_HEIGHT))
+                    .px_5()
+                    .border_b_1()
+                    .border_color(rgb(theme::BORDER))
+                    .child(app_title()),
             )
-            .when(self.show_sidebar, |row| {
-                row.child(
-                    div()
-                        .w(px(380.0))
-                        .flex_none()
-                        .h_full()
-                        .flex()
-                        .flex_col()
-                        .bg(rgb(0x18181b))
-                        .border_l_1()
-                        .border_color(rgb(0x27272a))
-                        .child(self.sidebar.clone()),
-                )
-            })
+            .child(div().flex_1().min_h_0().child(self.sidebar.clone()))
+    }
+
+    /// The main transcript and composer.
+    fn main_body(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(self.message_list(cx))
+            .child(self.composer(window, cx))
     }
 
     fn message_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1974,15 +1914,44 @@ fn desktop_artifact_card(artifact: &DesktopSessionArtifact, open_button: impl In
         )
 }
 
+fn app_title() -> impl IntoElement {
+    div()
+        .text_size(px(20.))
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .child("Juto")
+}
+
+/// Outlined header control; `active` marks a toggled-on state with the accent.
+fn header_button(id: &'static str, active: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .px_3()
+        .py_1p5()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(theme::BORDER_STRONG))
+        .when(active, |button| button.bg(rgb(theme::BG_RAISED)))
+        .text_xs()
+        .text_color(if active {
+            rgb(theme::ACCENT)
+        } else {
+            rgb(theme::TEXT)
+        })
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(theme::BG_HOVER)))
+}
+
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .relative()
             .flex()
-            .flex_col()
             .size_full()
-            .bg(rgb(0x181818))
-            .text_color(rgb(0xe7e7e7))
+            .bg(rgb(theme::BG))
+            .text_color(rgb(theme::TEXT))
             .key_context("ChatView")
             .on_action(|_: &Quit, _, cx| cx.quit())
             .on_action(cx.listener(Self::close_attachment_menu))
@@ -2003,11 +1972,20 @@ impl Render for ChatView {
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.toggle_sidebar(cx);
             }))
-            .child(self.header(cx))
-            .child(match self.focus.clone() {
-                Some(focus) => focus.into_any_element(),
-                None => self.main_body(window, cx).into_any_element(),
-            })
+            .when(self.show_sidebar, |root| root.child(self.sidebar_column()))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(self.header(cx))
+                    .child(match self.focus.clone() {
+                        Some(focus) => focus.into_any_element(),
+                        None => self.main_body(window, cx).into_any_element(),
+                    }),
+            )
             .when_some(self.modal_content(), |view, content| {
                 view.child(self.modal_overlay(content, cx))
             })

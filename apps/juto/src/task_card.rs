@@ -1,20 +1,19 @@
-//! Subagent task card component for GPUI Sidebar Mission Control.
+//! Focus-thread row for the sidebar.
 //!
-//! Implements the Zed Delta-inspired model and subagent state lifecycle:
-//! - Visual status badges: Queued, Running, Blocked, Verifying, Reviewing, Completed, Failed, Cancelled.
-//! - Direct integration with `juto_runtime::subagents::{BlockerReason, SubagentStatus}`.
-//! - Expandable metrics: duration, token usage (input/output/cache), estimated cost.
-//! - Active step & tool execution log.
-//! - Unified diff preview pane rendering hunks attached to conversational turn metadata.
-//! - Interactive steering controls: Pause, Abort, and Resume/Unblock prompt input.
+//! Collapsed, a row shows the thread title, its status, and a thin lifecycle
+//! stage bar. Blocked threads always show their blocker prompt and a resume
+//! field. Expanding a row reveals metadata, steering controls (Pause, Steer,
+//! Abort), token usage, the step log, and attached diffs. Clicking the row
+//! selects the thread.
 
 use gpui::{
-    App, ClickEvent, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Render,
-    Rgba, SharedString, Window, actions, div, prelude::*, rgb,
+    App, ClickEvent, Context, Div, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Render,
+    Rgba, SharedString, Stateful, Window, actions, div, prelude::*, px, relative, rgb,
 };
 use juto_runtime::subagents::{BlockerReason, SubagentStatus};
 
 use crate::text_input::TextInput;
+use crate::theme;
 
 actions!(
     task_card,
@@ -37,41 +36,41 @@ pub fn init(cx: &mut App) {
 
 pub fn status_label(status: &SubagentStatus) -> &'static str {
     match status {
-        SubagentStatus::Queued => "QUEUED",
-        SubagentStatus::Running => "RUNNING",
-        SubagentStatus::Blocked { .. } => "BLOCKED",
-        SubagentStatus::Verifying => "VERIFYING",
-        SubagentStatus::Reviewing => "REVIEWING",
-        SubagentStatus::Completed => "COMPLETED",
-        SubagentStatus::Failed => "FAILED",
-        SubagentStatus::Cancelled => "CANCELLED",
+        SubagentStatus::Queued => "Queued",
+        SubagentStatus::Running => "Running",
+        SubagentStatus::Blocked { .. } => "Blocked",
+        SubagentStatus::Verifying => "Verifying",
+        SubagentStatus::Reviewing => "Reviewing",
+        SubagentStatus::Completed => "Done",
+        SubagentStatus::Failed => "Failed",
+        SubagentStatus::Cancelled => "Cancelled",
     }
 }
 
-pub fn status_badge_colors(status: &SubagentStatus) -> (Rgba, Rgba, Rgba) {
-    // (background, border, text)
+/// Color of a status label and its stage-bar fill.
+pub fn status_color(status: &SubagentStatus) -> Rgba {
     match status {
-        SubagentStatus::Queued => (rgb(0x27272a), rgb(0x3f3f46), rgb(0xa1a1aa)),
-        SubagentStatus::Running => (rgb(0x1e3a5f), rgb(0x2563eb), rgb(0x60a5fa)),
-        SubagentStatus::Blocked { .. } => (rgb(0x451a03), rgb(0xd97706), rgb(0xfbbf24)),
-        SubagentStatus::Verifying => (rgb(0x3b1a45), rgb(0x9333ea), rgb(0xc084fc)),
-        SubagentStatus::Reviewing => (rgb(0x143a3a), rgb(0x0d9488), rgb(0x2dd4bf)),
-        SubagentStatus::Completed => (rgb(0x064e3b), rgb(0x059669), rgb(0x34d399)),
-        SubagentStatus::Failed => (rgb(0x450a0a), rgb(0xdc2626), rgb(0xf87171)),
-        SubagentStatus::Cancelled => (rgb(0x27272a), rgb(0x52525b), rgb(0x71717a)),
+        SubagentStatus::Blocked { .. } => rgb(theme::WARNING),
+        SubagentStatus::Failed => rgb(theme::DANGER),
+        SubagentStatus::Queued | SubagentStatus::Cancelled => rgb(theme::TEXT_FAINT),
+        SubagentStatus::Running
+        | SubagentStatus::Verifying
+        | SubagentStatus::Reviewing
+        | SubagentStatus::Completed => rgb(theme::ACCENT),
     }
 }
 
-pub fn status_dot_color(status: &SubagentStatus) -> Rgba {
+/// Position in the lifecycle queued → running → verifying → reviewing →
+/// completed, as a fraction in `0.0..=1.0`. This is a stage indicator, not a
+/// work-completion estimate: the runtime reports no progress measure. Blocked
+/// threads hold the running position; failed and cancelled threads are over.
+pub fn lifecycle_stage(status: &SubagentStatus) -> f32 {
     match status {
-        SubagentStatus::Queued => rgb(0x71717a),
-        SubagentStatus::Running => rgb(0x3b82f6),
-        SubagentStatus::Blocked { .. } => rgb(0xf59e0b),
-        SubagentStatus::Verifying => rgb(0xa855f7),
-        SubagentStatus::Reviewing => rgb(0x14b8a6),
-        SubagentStatus::Completed => rgb(0x10b981),
-        SubagentStatus::Failed => rgb(0xef4444),
-        SubagentStatus::Cancelled => rgb(0x6b7280),
+        SubagentStatus::Queued => 0.0,
+        SubagentStatus::Running | SubagentStatus::Blocked { .. } => 0.25,
+        SubagentStatus::Verifying => 0.5,
+        SubagentStatus::Reviewing => 0.75,
+        SubagentStatus::Completed | SubagentStatus::Failed | SubagentStatus::Cancelled => 1.0,
     }
 }
 
@@ -291,7 +290,7 @@ impl TaskCard {
     pub fn new(model: TaskCardModel, is_selected: bool, cx: &mut Context<Self>) -> Self {
         let resolution_input = cx.new(|cx| {
             let mut input = TextInput::new(cx);
-            input.set_placeholder("Provide guidance or confirmation to resume…", cx);
+            input.set_placeholder("Reply to resume…", cx);
             if !model.resolution_input.is_empty() {
                 input.set_text(&model.resolution_input, cx);
             }
@@ -299,7 +298,7 @@ impl TaskCard {
         });
         let steer_input = cx.new(|cx| {
             let mut input = TextInput::new(cx);
-            input.set_placeholder("Inject live guidance to agent…", cx);
+            input.set_placeholder("Guidance for this thread…", cx);
             if !model.steer_input.is_empty() {
                 input.set_text(&model.steer_input, cx);
             }
@@ -316,6 +315,16 @@ impl TaskCard {
 
     pub fn id(&self) -> &str {
         &self.model.id
+    }
+
+    /// Applies the sidebar's latest model and selection while keeping
+    /// row-local state: the steer box toggle and any unsent input text.
+    pub fn sync(&mut self, mut model: TaskCardModel, is_selected: bool) {
+        model.show_steer_box = self.model.show_steer_box;
+        model.resolution_input = std::mem::take(&mut self.model.resolution_input);
+        model.steer_input = std::mem::take(&mut self.model.steer_input);
+        self.model = model;
+        self.is_selected = is_selected;
     }
 
     pub fn toggle_expand(&mut self, cx: &mut Context<Self>) {
@@ -381,331 +390,285 @@ impl TaskCard {
         cx.notify();
     }
 
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Title, status, and stage bar. Clicking anywhere here selects the thread.
+    fn render_summary(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status = &self.model.status;
-        let (bg, border, text) = status_badge_colors(status);
-        let dot_color = status_dot_color(status);
-        let is_expanded = self.model.expanded;
-        let title = self.model.display_title();
-        let agent = self.model.agent.clone();
-        let duration = self.model.format_duration();
-        let status_label = status_label(status);
+        let color = status_color(status);
+        let stage = lifecycle_stage(status);
 
         div()
+            .id(SharedString::from(format!("task-row-{}", self.model.id)))
             .flex()
-            .items_center()
-            .justify_between()
+            .flex_col()
             .gap_2()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.select(cx)))
             .child(
                 div()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .gap_2()
-                    .min_w_0()
                     .child(
-                        // Persona chip
                         div()
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded_xs()
-                            .bg(rgb(0x27272a))
-                            .border_1()
-                            .border_color(rgb(0x3f3f46))
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xd4d4d8))
-                            .child(agent),
-                    )
-                    .child(
-                        // Title
-                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_sm()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(rgb(0xf4f4f5))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .child(title),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .flex_none()
-                    .child(
-                        // Duration
-                        div().text_xs().text_color(rgb(0xa1a1aa)).child(duration),
+                            .text_color(rgb(theme::TEXT))
+                            .child(self.model.display_title()),
                     )
                     .child(
-                        // Status badge
                         div()
                             .flex()
+                            .flex_none()
                             .items_center()
                             .gap_1p5()
-                            .px_2()
-                            .py_0p5()
-                            .rounded_sm()
-                            .bg(bg)
-                            .border_1()
-                            .border_color(border)
-                            .child(div().size_2().rounded_full().bg(dot_color))
                             .child(
                                 div()
                                     .text_xs()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(text)
-                                    .child(status_label),
+                                    .text_color(color)
+                                    .child(status_label(status)),
+                            )
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("expand-btn-{}", self.model.id)))
+                                    .px_1()
+                                    .text_xs()
+                                    .text_color(rgb(theme::TEXT_FAINT))
+                                    .hover(|s| s.text_color(rgb(theme::TEXT)))
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.toggle_expand(cx);
+                                    }))
+                                    .child(if self.model.expanded { "▾" } else { "▸" }),
                             ),
-                    )
-                    .child(
-                        // Expand/collapse indicator button
-                        div()
-                            .id(SharedString::from(format!("expand-btn-{}", self.model.id)))
-                            .cursor_pointer()
-                            .text_xs()
-                            .text_color(rgb(0x71717a))
-                            .hover(|s| s.text_color(rgb(0xe4e4e7)))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.toggle_expand(cx);
-                            }))
-                            .child(if is_expanded { "▼" } else { "▶" }),
                     ),
+            )
+            .child(
+                div()
+                    .h(px(3.))
+                    .w_full()
+                    .rounded_full()
+                    .bg(rgb(theme::BORDER_STRONG))
+                    .child(div().h_full().w(relative(stage)).rounded_full().bg(color)),
             )
     }
 
-    fn render_subline(&self) -> impl IntoElement {
+    fn render_blocker_callout(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let SubagentStatus::Blocked { reason, prompt } = &self.model.status else {
+            return div();
+        };
+        let reason_label = match reason {
+            BlockerReason::UserInput => "Input needed".to_string(),
+            BlockerReason::Credential => "Provider credential missing".to_string(),
+            BlockerReason::Environment => "Environment dependency blocked".to_string(),
+            BlockerReason::Approval => "Approval needed".to_string(),
+            BlockerReason::Custom(s) => s.clone(),
+        };
+        let card_id = &self.model.id;
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .mt_3()
+            .p_2p5()
+            .rounded_md()
+            .bg(rgb(theme::BG_RAISED))
+            .border_l_2()
+            .border_color(rgb(theme::WARNING))
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(rgb(theme::WARNING))
+                    .child(reason_label),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT))
+                    .child(prompt.clone()),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("blocker-input-{card_id}")))
+                    .w_full()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(rgb(theme::BG))
+                    .border_1()
+                    .border_color(rgb(theme::BORDER_STRONG))
+                    .overflow_hidden()
+                    .text_xs()
+                    .child(self.resolution_input.clone()),
+            )
+            .child(
+                div().flex().justify_end().child(
+                    div()
+                        .id(SharedString::from(format!("resume-btn-{card_id}")))
+                        .cursor_pointer()
+                        .px_3()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(theme::ACCENT))
+                        .hover(|s| s.opacity(0.85))
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(theme::ON_ACCENT))
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.resume(cx);
+                        }))
+                        .child("Resume"),
+                ),
+            )
+    }
+
+    fn render_expanded(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .mt_3()
+            .child(self.render_meta())
+            .child(self.render_steering_bar(cx))
+            .child(self.render_details())
+    }
+
+    fn render_meta(&self) -> impl IntoElement {
         let (adds, dels) = self.model.total_diff_stats();
-        let ws = self.model.workspace.clone();
-        let step = self.model.current_step.clone();
 
         div()
             .flex()
             .flex_col()
             .gap_1()
-            .mt_1()
-            .when_some(ws, |this, workspace| {
-                this.child(
+            .text_xs()
+            .text_color(rgb(theme::TEXT_MUTED))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(self.model.agent.clone())
+                    .child(div().text_color(rgb(theme::TEXT_FAINT)).child("·"))
+                    .child(self.model.format_duration())
+                    .when(adds > 0 || dels > 0, |row| {
+                        row.child(div().text_color(rgb(theme::TEXT_FAINT)).child("·"))
+                            .child(
+                                div()
+                                    .text_color(rgb(theme::DIFF_ADD))
+                                    .child(format!("+{adds}")),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(theme::DANGER))
+                                    .child(format!("-{dels}")),
+                            )
+                    }),
+            )
+            .when_some(self.model.workspace.clone(), |meta, workspace| {
+                meta.child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .text_xs()
-                        .text_color(rgb(0x71717a))
-                        .child("📁")
+                        .truncate()
+                        .text_color(rgb(theme::TEXT_FAINT))
                         .child(workspace),
                 )
             })
-            .when_some(step, |this, current_step| {
-                this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .text_xs()
-                        .text_color(rgb(0x93c5fd))
-                        .child("⚙")
-                        .child(current_step),
-                )
+            .when_some(self.model.current_step.clone(), |meta, step| {
+                meta.child(div().truncate().child(format!("› {step}")))
             })
-            .when(adds > 0 || dels > 0, |this| {
-                this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .text_xs()
-                        .child(div().text_color(rgb(0x34d399)).child(format!("+{}", adds)))
-                        .child(div().text_color(rgb(0xf87171)).child(format!("-{}", dels))),
-                )
-            })
-    }
-
-    fn render_blocker_callout(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        if let SubagentStatus::Blocked { reason, prompt } = &self.model.status {
-            let reason_label = match reason {
-                BlockerReason::UserInput => "User Input Required".to_string(),
-                BlockerReason::Credential => "Provider Credential Missing".to_string(),
-                BlockerReason::Environment => "Environment Dependency Blocked".to_string(),
-                BlockerReason::Approval => "Operation Approval Required".to_string(),
-                BlockerReason::Custom(s) => s.clone(),
-            };
-            let prompt = prompt.clone();
-            let card_id = self.model.id.clone();
-
-            div()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .mt_2()
-                .p_2p5()
-                .rounded_md()
-                .bg(rgb(0x2a1a08))
-                .border_1()
-                .border_color(rgb(0xb45309))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(rgb(0xfbbf24))
-                        .child("⚠️ ACTION REQUIRED:")
-                        .child(reason_label),
-                )
-                .child(div().text_xs().text_color(rgb(0xfef3c7)).child(prompt))
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .mt_1()
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("blocker-input-{}", card_id)))
-                                .flex_1()
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(0x18181b))
-                                .border_1()
-                                .border_color(rgb(0x78350f))
-                                .text_xs()
-                                .child(self.resolution_input.clone()),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("resume-btn-{}", card_id)))
-                                .cursor_pointer()
-                                .px_3()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(rgb(0xd97706))
-                                .hover(|s| s.bg(rgb(0xb45309)))
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(0x18181b))
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.resume(cx);
-                                }))
-                                .child("▶ Resume"),
-                        ),
-                )
-        } else {
-            div()
-        }
     }
 
     fn render_steering_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let is_active = is_status_active(&self.model.status);
         let is_blocked = self.model.status.is_blocked();
-        let card_id = self.model.id.clone();
-        let show_steer = self.model.show_steer_box;
+        let card_id = &self.model.id;
 
         div()
             .flex()
             .flex_col()
-            .gap_1p5()
-            .mt_2()
-            .child(
-                div().flex().items_center().justify_between().gap_2().child(
+            .gap_2()
+            .when(is_active, |bar| {
+                bar.child(
                     div()
                         .flex()
                         .items_center()
                         .gap_1p5()
-                        .when(is_active && !is_blocked, |bar| {
-                            bar.child(
-                                div()
-                                    .id(SharedString::from(format!("pause-btn-{}", card_id)))
-                                    .cursor_pointer()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_xs()
-                                    .bg(rgb(0x27272a))
-                                    .border_1()
-                                    .border_color(rgb(0x3f3f46))
-                                    .text_xs()
-                                    .text_color(rgb(0xe4e4e7))
-                                    .hover(|s| s.bg(rgb(0x3f3f46)))
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        .when(!is_blocked, |row| {
+                            row.child(
+                                control_button(
+                                    format!("pause-btn-{card_id}"),
+                                    "Pause",
+                                    rgb(theme::TEXT),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _: &ClickEvent, _, cx| {
                                         this.pause(cx);
-                                    }))
-                                    .child("⏸ Pause"),
+                                    },
+                                )),
                             )
                         })
-                        .when(is_active, |bar| {
-                            bar.child(
-                                div()
-                                    .id(SharedString::from(format!("steer-toggle-btn-{}", card_id)))
-                                    .cursor_pointer()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_xs()
-                                    .bg(rgb(0x27272a))
-                                    .border_1()
-                                    .border_color(rgb(0x3f3f46))
-                                    .text_xs()
-                                    .text_color(rgb(0x60a5fa))
-                                    .hover(|s| s.bg(rgb(0x3f3f46)))
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                        this.toggle_steer_box(cx);
-                                    }))
-                                    .child("💬 Steer"),
+                        .child(
+                            control_button(
+                                format!("steer-toggle-btn-{card_id}"),
+                                "Steer",
+                                rgb(theme::TEXT),
                             )
-                        })
-                        .when(is_active, |bar| {
-                            bar.child(
-                                div()
-                                    .id(SharedString::from(format!("abort-btn-{}", card_id)))
-                                    .cursor_pointer()
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded_xs()
-                                    .bg(rgb(0x27272a))
-                                    .border_1()
-                                    .border_color(rgb(0x3f3f46))
-                                    .text_xs()
-                                    .text_color(rgb(0xf87171))
-                                    .hover(|s| s.bg(rgb(0x450a0a)).border_color(rgb(0xdc2626)))
-                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                        this.abort(cx);
-                                    }))
-                                    .child("⏹ Abort"),
+                            .on_click(cx.listener(
+                                |this, _: &ClickEvent, _, cx| {
+                                    this.toggle_steer_box(cx);
+                                },
+                            )),
+                        )
+                        .child(
+                            control_button(
+                                format!("abort-btn-{card_id}"),
+                                "Abort",
+                                rgb(theme::DANGER),
                             )
-                        }),
-                ),
-            )
-            .when(show_steer, |bar| {
+                            .on_click(cx.listener(
+                                |this, _: &ClickEvent, _, cx| {
+                                    this.abort(cx);
+                                },
+                            )),
+                        ),
+                )
+            })
+            .when(is_active && self.model.show_steer_box, |bar| {
                 bar.child(
                     div()
                         .flex()
+                        .items_center()
                         .gap_2()
-                        .mt_1()
                         .child(
                             div()
-                                .id(SharedString::from(format!("steer-input-{}", card_id)))
+                                .id(SharedString::from(format!("steer-input-{card_id}")))
                                 .flex_1()
+                                .min_w_0()
                                 .px_2()
                                 .py_1()
                                 .rounded_sm()
-                                .bg(rgb(0x18181b))
+                                .bg(rgb(theme::BG))
                                 .border_1()
-                                .border_color(rgb(0x3b82f6))
+                                .border_color(rgb(theme::BORDER_STRONG))
+                                .overflow_hidden()
                                 .text_xs()
                                 .child(self.steer_input.clone()),
                         )
                         .child(
                             div()
-                                .id(SharedString::from(format!("send-steer-btn-{}", card_id)))
+                                .id(SharedString::from(format!("send-steer-btn-{card_id}")))
                                 .cursor_pointer()
                                 .px_2p5()
                                 .py_1()
                                 .rounded_sm()
-                                .bg(rgb(0x2563eb))
-                                .hover(|s| s.bg(rgb(0x1d4ed8)))
+                                .bg(rgb(theme::ACCENT))
+                                .hover(|s| s.opacity(0.85))
                                 .text_xs()
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(0xffffff))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(rgb(theme::ON_ACCENT))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.steer(cx);
                                 }))
@@ -715,75 +678,27 @@ impl TaskCard {
             })
     }
 
-    fn render_expanded_details(&self) -> impl IntoElement {
+    fn render_details(&self) -> impl IntoElement {
         let usage = &self.model.usage;
         let diffs = &self.model.diffs;
         let logs = &self.model.logs;
+        let mut usage_line = format!(
+            "In {} · Out {} · Total {} tok",
+            usage.input_tokens, usage.output_tokens, usage.total_tokens
+        );
+        if let Some(cost) = self.model.cost_estimate {
+            usage_line.push_str(&format!(" · ${cost:.4}"));
+        }
 
         div()
             .flex()
             .flex_col()
             .gap_3()
-            .mt_3()
-            .pt_3()
-            .border_t_1()
-            .border_color(rgb(0x27272a))
             .child(
-                // Metrics Pill Bar
                 div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_xs()
-                            .bg(rgb(0x1c1917))
-                            .border_1()
-                            .border_color(rgb(0x292524))
-                            .text_xs()
-                            .text_color(rgb(0xa8a29e))
-                            .child(format!("In: {} tok", usage.input_tokens)),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_xs()
-                            .bg(rgb(0x1c1917))
-                            .border_1()
-                            .border_color(rgb(0x292524))
-                            .text_xs()
-                            .text_color(rgb(0xa8a29e))
-                            .child(format!("Out: {} tok", usage.output_tokens)),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_xs()
-                            .bg(rgb(0x1c1917))
-                            .border_1()
-                            .border_color(rgb(0x292524))
-                            .text_xs()
-                            .text_color(rgb(0x38bdf8))
-                            .child(format!("Total: {} tok", usage.total_tokens)),
-                    )
-                    .when_some(self.model.cost_estimate, |bar, cost| {
-                        bar.child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_xs()
-                                .bg(rgb(0x1c1917))
-                                .border_1()
-                                .border_color(rgb(0x292524))
-                                .text_xs()
-                                .text_color(rgb(0x34d399))
-                                .child(format!("${:.4}", cost)),
-                        )
-                    }),
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_FAINT))
+                    .child(usage_line),
             )
             .when(!logs.is_empty(), |details| {
                 details.child(
@@ -791,43 +706,39 @@ impl TaskCard {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_weight(gpui::FontWeight::BOLD)
-                                .text_color(rgb(0x71717a))
-                                .child("STEP EXECUTION LOG"),
-                        )
+                        .child(section_label("STEPS"))
                         .children(logs.iter().map(|log| {
                             div()
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .px_2()
-                                .py_1()
-                                .rounded_xs()
-                                .bg(rgb(0x18181b))
                                 .text_xs()
                                 .child(
                                     div()
-                                        .text_color(rgb(0x71717a))
+                                        .flex_none()
+                                        .text_color(rgb(theme::TEXT_FAINT))
                                         .child(format!("#{}", log.step)),
                                 )
                                 .child(
                                     div()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .text_color(rgb(0x38bdf8))
+                                        .flex_none()
+                                        .text_color(rgb(theme::ACCENT))
                                         .child(log.tool_name.clone()),
                                 )
                                 .child(
                                     div()
                                         .flex_1()
-                                        .text_color(rgb(0xd4d4d8))
-                                        .overflow_hidden()
-                                        .whitespace_nowrap()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(rgb(theme::TEXT_MUTED))
                                         .child(log.summary.clone()),
                                 )
-                                .child(div().text_color(rgb(0xa1a1aa)).child(log.status.clone()))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_color(rgb(theme::TEXT_FAINT))
+                                        .child(log.status.clone()),
+                                )
                         })),
                 )
             })
@@ -837,136 +748,123 @@ impl TaskCard {
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .font_weight(gpui::FontWeight::BOLD)
-                                        .text_color(rgb(0x71717a))
-                                        .child("LIVE DELTAS (ZED MODEL)"),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(0xa1a1aa))
-                                        .child(format!("{} file(s)", diffs.len())),
-                                ),
-                        )
-                        .children(diffs.iter().map(|file_diff| {
-                            div()
-                                .flex()
-                                .flex_col()
-                                .rounded_sm()
-                                .bg(rgb(0x141416))
-                                .border_1()
-                                .border_color(rgb(0x27272a))
-                                .overflow_hidden()
-                                .child(
-                                    // File diff header
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .px_2()
-                                        .py_1()
-                                        .bg(rgb(0x1f1f23))
-                                        .border_b_1()
-                                        .border_color(rgb(0x27272a))
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .font_weight(gpui::FontWeight::MEDIUM)
-                                                .text_color(rgb(0xe4e4e7))
-                                                .child(file_diff.path.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .gap_1p5()
-                                                .text_xs()
-                                                .child(
-                                                    div()
-                                                        .text_color(rgb(0x34d399))
-                                                        .child(format!("+{}", file_diff.additions)),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_color(rgb(0xf87171))
-                                                        .child(format!("-{}", file_diff.deletions)),
-                                                ),
-                                        ),
-                                )
-                                .children(file_diff.hunks.iter().map(|hunk| {
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .child(
-                                            // Hunk header + turn anchor
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .px_2()
-                                                .py_0p5()
-                                                .bg(rgb(0x1c1917))
-                                                .text_xs()
-                                                .child(
-                                                    div()
-                                                        .text_color(rgb(0x78716c))
-                                                        .child(hunk.header.clone()),
-                                                )
-                                                .when_some(
-                                                    hunk.turn_anchor.clone(),
-                                                    |h, anchor| {
-                                                        h.child(
-                                                            div()
-                                                                .px_1()
-                                                                .rounded_xs()
-                                                                .bg(rgb(0x292524))
-                                                                .text_xs()
-                                                                .text_color(rgb(0xf59e0b))
-                                                                .child(anchor),
-                                                        )
-                                                    },
-                                                ),
-                                        )
-                                        .children(hunk.lines.iter().map(|line| {
-                                            let (line_bg, line_text, prefix) = match line.kind {
-                                                DiffLineKind::Add => {
-                                                    (rgb(0x064e3b), rgb(0x6ee7b7), "+")
-                                                }
-                                                DiffLineKind::Remove => {
-                                                    (rgb(0x450a0a), rgb(0xfca5a5), "-")
-                                                }
-                                                DiffLineKind::Context => {
-                                                    (rgb(0x141416), rgb(0xa1a1aa), " ")
-                                                }
-                                            };
-                                            div()
-                                                .flex()
-                                                .items_center()
-                                                .px_2()
-                                                .bg(line_bg)
-                                                .text_xs()
-                                                .text_color(line_text)
-                                                .child(div().w_4().flex_none().child(prefix))
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .whitespace_nowrap()
-                                                        .overflow_hidden()
-                                                        .child(line.content.clone()),
-                                                )
-                                        }))
-                                }))
-                        })),
+                        .child(section_label("CHANGES"))
+                        .children(diffs.iter().map(render_diff_file)),
                 )
             })
     }
+}
+
+fn section_label(label: &'static str) -> impl IntoElement {
+    div()
+        .text_xs()
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(rgb(theme::TEXT_FAINT))
+        .child(label)
+}
+
+fn control_button(id: String, label: &'static str, text: Rgba) -> Stateful<Div> {
+    div()
+        .id(SharedString::from(id))
+        .cursor_pointer()
+        .px_2()
+        .py_0p5()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(theme::BORDER_STRONG))
+        .text_xs()
+        .text_color(text)
+        .hover(|s| s.bg(rgb(theme::BG_HOVER)))
+        .child(label)
+}
+
+fn render_diff_file(file_diff: &DiffFileModel) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(theme::BORDER))
+        .overflow_hidden()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .bg(rgb(theme::BG_RAISED))
+                .text_xs()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_color(rgb(theme::TEXT))
+                        .child(file_diff.path.clone()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .text_color(rgb(theme::DIFF_ADD))
+                                .child(format!("+{}", file_diff.additions)),
+                        )
+                        .child(
+                            div()
+                                .text_color(rgb(theme::DANGER))
+                                .child(format!("-{}", file_diff.deletions)),
+                        ),
+                ),
+        )
+        .children(file_diff.hunks.iter().map(|hunk| {
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .px_2()
+                        .py_0p5()
+                        .text_xs()
+                        .text_color(rgb(theme::TEXT_FAINT))
+                        .child(hunk.header.clone())
+                        .when_some(hunk.turn_anchor.clone(), |h, anchor| {
+                            h.child(div().min_w_0().truncate().child(anchor))
+                        }),
+                )
+                .children(hunk.lines.iter().map(|line| {
+                    let (line_bg, line_text, prefix) = match line.kind {
+                        DiffLineKind::Add => (rgb(theme::DIFF_ADD_BG), rgb(theme::DIFF_ADD), "+"),
+                        DiffLineKind::Remove => {
+                            (rgb(theme::DIFF_REMOVE_BG), rgb(theme::DANGER), "-")
+                        }
+                        DiffLineKind::Context => (rgb(theme::BG), rgb(theme::TEXT_MUTED), " "),
+                    };
+                    div()
+                        .flex()
+                        .items_center()
+                        .px_2()
+                        .bg(line_bg)
+                        .text_xs()
+                        .text_color(line_text)
+                        .child(div().w_4().flex_none().child(prefix))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(line.content.clone()),
+                        )
+                }))
+        }))
 }
 
 impl Focusable for TaskCard {
@@ -978,38 +876,34 @@ impl Focusable for TaskCard {
 impl Render for TaskCard {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_selected = self.is_selected;
-        let is_blocked = self.model.status.is_blocked();
-        let border_color = if is_selected {
-            rgb(0x3b82f6)
-        } else if is_blocked {
-            rgb(0xb45309)
-        } else {
-            rgb(0x27272a)
-        };
 
         div()
             .id(SharedString::from(format!("task-card-{}", self.model.id)))
             .key_context("TaskCard")
+            .relative()
             .flex()
             .flex_col()
-            .p_3()
-            .rounded_md()
-            .bg(rgb(0x18181b))
-            .border_1()
-            .border_color(border_color)
-            .hover(|s| {
-                s.border_color(if is_selected {
-                    rgb(0x60a5fa)
-                } else {
-                    rgb(0x3f3f46)
-                })
+            .pl_5()
+            .pr_4()
+            .py_3()
+            .when(is_selected, |row| {
+                row.bg(rgb(theme::BG_RAISED)).child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(3.))
+                        .bg(rgb(theme::ACCENT)),
+                )
             })
-            .child(self.render_header(cx))
-            .child(self.render_subline())
+            .when(!is_selected, |row| {
+                row.hover(|s| s.bg(rgb(theme::BG_HOVER)))
+            })
+            .child(self.render_summary(cx))
             .child(self.render_blocker_callout(cx))
-            .child(self.render_steering_bar(cx))
-            .when(self.model.expanded, |card| {
-                card.child(self.render_expanded_details())
+            .when(self.model.expanded, |row| {
+                row.child(self.render_expanded(cx))
             })
     }
 }
@@ -1019,26 +913,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_status_labels_and_colors() {
-        let queued = SubagentStatus::Queued;
-        assert_eq!(status_label(&queued), "QUEUED");
-        assert!(!is_status_active(&queued));
-
-        let running = SubagentStatus::Running;
-        assert_eq!(status_label(&running), "RUNNING");
-        assert!(is_status_active(&running));
+    fn test_status_activity() {
+        assert!(!is_status_active(&SubagentStatus::Queued));
+        assert!(is_status_active(&SubagentStatus::Running));
 
         let blocked = SubagentStatus::Blocked {
             reason: BlockerReason::UserInput,
             prompt: "Please clarify".into(),
         };
-        assert_eq!(status_label(&blocked), "BLOCKED");
         assert!(is_status_active(&blocked));
         assert!(blocked.is_blocked());
 
-        let completed = SubagentStatus::Completed;
-        assert_eq!(status_label(&completed), "COMPLETED");
-        assert!(!is_status_active(&completed));
+        assert!(!is_status_active(&SubagentStatus::Completed));
+    }
+
+    #[test]
+    fn lifecycle_stage_advances_through_the_pipeline() {
+        let blocked = SubagentStatus::Blocked {
+            reason: BlockerReason::Approval,
+            prompt: "Approve?".into(),
+        };
+        let pipeline = [
+            SubagentStatus::Queued,
+            SubagentStatus::Running,
+            SubagentStatus::Verifying,
+            SubagentStatus::Reviewing,
+            SubagentStatus::Completed,
+        ];
+        let stages: Vec<f32> = pipeline.iter().map(lifecycle_stage).collect();
+        assert_eq!(stages.first(), Some(&0.0));
+        assert_eq!(stages.last(), Some(&1.0));
+        assert!(stages.windows(2).all(|pair| pair[0] < pair[1]));
+        // Blocking pauses a running thread; it does not move it backward or forward.
+        assert_eq!(
+            lifecycle_stage(&blocked),
+            lifecycle_stage(&SubagentStatus::Running)
+        );
+        // Terminal failures fill the bar so they never read as "still queued".
+        assert_eq!(lifecycle_stage(&SubagentStatus::Failed), 1.0);
+        assert_eq!(lifecycle_stage(&SubagentStatus::Cancelled), 1.0);
     }
 
     #[test]

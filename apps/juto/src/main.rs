@@ -10,6 +10,7 @@ mod sidebar;
 mod subagent_card;
 mod task_card;
 mod text_input;
+mod theme;
 mod vcs_sidebar;
 mod view_element;
 use std::env;
