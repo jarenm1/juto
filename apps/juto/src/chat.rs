@@ -665,15 +665,21 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Mounts an inline canvas for each artifact that does not have one yet.
-    /// Resolution runs once per artifact; its outcome, including a refusal, is
-    /// cached so rendering does not re-resolve on every frame.
+    /// Mounts an inline canvas for each artifact that has no live canvas yet.
+    /// A live viewer is cached so rendering does not re-resolve it on every
+    /// frame. An unavailable outcome is re-resolved on each pass, because its
+    /// cause (for example, an environment that is not ready yet) can clear.
     fn mount_desktop_canvases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pending: Vec<DesktopSessionArtifact> = self
             .messages
             .iter()
             .flat_map(|message| message.desktop_artifacts.iter())
-            .filter(|artifact| !self.desktop_canvases.contains_key(&artifact.artifact_id))
+            .filter(|artifact| {
+                !matches!(
+                    self.desktop_canvases.get(&artifact.artifact_id),
+                    Some(DesktopCanvas::Live(_))
+                )
+            })
             .cloned()
             .collect();
         for artifact in pending {
