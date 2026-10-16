@@ -35,7 +35,7 @@ uuid = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 wayland-client = "0.31"
-wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable", "staging"] }
 
 [[bin]]
 name = "juto-desktop"

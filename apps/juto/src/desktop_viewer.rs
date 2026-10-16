@@ -12,14 +12,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Bounds, Context, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers, ModifiersChangedEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Render,
-    RenderImage, ScrollWheelEvent, Subscription, Task, Window, canvas, div, img, prelude::*, px,
-    rgb, rgba,
+    Bounds, Context, CursorStyle, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    Pixels, Render, RenderImage, ScrollWheelEvent, Subscription, Task, Window, canvas, div, img,
+    prelude::*, px, rgb, rgba,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use juto_runtime::DesktopEnvironment;
-use juto_runtime::protocol::{GrantRole, InputBatch, InputEvent};
+use juto_runtime::protocol::{DesktopEvent, GrantRole, InputBatch, InputEvent};
+use tokio::sync::broadcast::error::RecvError;
 
 /// Frame polling interval (~30 fps).
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -43,6 +44,35 @@ fn modifier_events(previous: Modifiers, current: Modifiers) -> Vec<InputEvent> {
     .filter(|(before, after, _)| before != after)
     .map(|(_, pressed, keycode)| InputEvent::Key { keycode, pressed })
     .collect()
+}
+
+/// Maps a CSS cursor name sent by the compositor to a GPUI cursor. Names GPUI has
+/// no cursor for fall back to the arrow.
+fn cursor_style_for_shape(shape: &str) -> CursorStyle {
+    match shape {
+        "none" => CursorStyle::None,
+        "pointer" => CursorStyle::PointingHand,
+        "text" => CursorStyle::IBeam,
+        "vertical-text" => CursorStyle::IBeamCursorForVerticalLayout,
+        "crosshair" => CursorStyle::Crosshair,
+        "grab" => CursorStyle::OpenHand,
+        "grabbing" => CursorStyle::ClosedHand,
+        "not-allowed" | "no-drop" => CursorStyle::OperationNotAllowed,
+        "copy" => CursorStyle::DragCopy,
+        "alias" => CursorStyle::DragLink,
+        "context-menu" => CursorStyle::ContextualMenu,
+        "e-resize" => CursorStyle::ResizeRight,
+        "w-resize" => CursorStyle::ResizeLeft,
+        "n-resize" => CursorStyle::ResizeUp,
+        "s-resize" => CursorStyle::ResizeDown,
+        "ew-resize" => CursorStyle::ResizeLeftRight,
+        "ns-resize" => CursorStyle::ResizeUpDown,
+        "nesw-resize" => CursorStyle::ResizeUpRightDownLeft,
+        "nwse-resize" => CursorStyle::ResizeUpLeftDownRight,
+        "col-resize" => CursorStyle::ResizeColumn,
+        "row-resize" => CursorStyle::ResizeRow,
+        _ => CursorStyle::Arrow,
+    }
 }
 
 /// The authenticated principal this interactive session acts as: the local
@@ -116,6 +146,10 @@ pub struct DesktopViewer {
     held_keys: HashSet<u32>,
     /// Releases held input on focus or window-activation loss.
     _input_guards: Vec<Subscription>,
+    /// Application cursor shape, mirrored onto the canvas while live.
+    cursor: CursorStyle,
+    /// Listener that keeps `cursor` current for the viewer's whole life.
+    cursor_task: Option<Task<()>>,
 }
 
 impl DesktopViewer {
@@ -156,6 +190,8 @@ impl DesktopViewer {
             heartbeat_task: None,
             held_keys: HashSet::new(),
             _input_guards: Vec::new(),
+            cursor: CursorStyle::Arrow,
+            cursor_task: None,
         };
         viewer._input_guards = vec![
             cx.on_focus_out(&viewer.focus_handle, window, |this, _event, _window, cx| {
@@ -168,6 +204,7 @@ impl DesktopViewer {
             }),
         ];
         viewer.start_heartbeat(cx);
+        viewer.start_cursor_listener(window, cx);
         viewer.capture_snapshot(window, cx);
         viewer
     }
@@ -198,6 +235,37 @@ impl DesktopViewer {
                 }
             }
         }));
+    }
+
+    /// Mirrors the application's cursor shape onto the canvas. Runs for the
+    /// viewer's whole life, so a resume shows the shape current at that point.
+    fn start_cursor_listener(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut events = self.env.subscribe();
+        self.cursor_task = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                let update = match events.recv().await {
+                    Ok(DesktopEvent::CursorShapeChanged { shape, .. }) => {
+                        this.update_in(cx, |this, _window, cx| this.set_cursor_shape(&shape, cx))
+                    }
+                    Ok(_) => continue,
+                    // Missed shape changes leave the last known shape in place: the
+                    // compositor cannot re-send it, and guessing a default would be wrong too.
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => break,
+                };
+                if update.is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn set_cursor_shape(&mut self, shape: &str, cx: &mut Context<Self>) {
+        let style = cursor_style_for_shape(shape);
+        if style != self.cursor {
+            self.cursor = style;
+            cx.notify();
+        }
     }
 
     /// Captures one still of the newest frame without starting the frame loop.
@@ -555,6 +623,11 @@ impl Render for DesktopViewer {
         let has_control = self.has_control;
         let paused = self.paused;
         let can_control = self.can_control;
+        let canvas_cursor = if paused {
+            CursorStyle::Arrow
+        } else {
+            self.cursor
+        };
 
         let surface = match frame {
             Some(frame) => img(frame)
@@ -758,6 +831,7 @@ impl Render for DesktopViewer {
                     .flex_1()
                     .min_h_0()
                     .bg(rgb(0x000000))
+                    .cursor(canvas_cursor)
                     .child(
                         canvas(
                             move |bounds, _window, _cx| {

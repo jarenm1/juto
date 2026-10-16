@@ -542,6 +542,102 @@ fn popup_receives_pointer_and_dismisses_on_outside_click() {
 }
 
 #[test]
+fn application_cursor_shape_is_forwarded_once_per_change() {
+    use tokio::sync::broadcast::error::TryRecvError;
+    use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
+
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("cursor")), &unique_env_id("req"))
+        .expect("create environment");
+    let mut events = env.subscribe();
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    let client = std::thread::spawn(move || common::run_with_cursor(&socket, 20, Shape::Pointer));
+
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
+    let pool = env.frame_pool();
+
+    let mut seq = 0;
+    let mut send = |batch: Vec<InputEvent>| {
+        seq += 1;
+        env.dispatch_input(
+            "agent:test",
+            lease.epoch,
+            env.generation(),
+            InputBatch {
+                seq,
+                client_timestamp_us: 0,
+                events: batch,
+            },
+        )
+        .expect("input accepted");
+    };
+
+    // Wait for the toplevel to map; input before that hits no surface and no enter.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let info = env
+            .observe(Duration::from_secs(2))
+            .unwrap_or_else(|err| panic!("observe failed: {err}"));
+        if read_pixel(&pool, info.slot, 10, 10, info.width) == common::RED {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for toplevel");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Entering the toplevel: the client answers the enter with its shape request.
+    send(vec![InputEvent::PointerMoveAbs { x: 10, y: 10 }]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let first = loop {
+        match events.try_recv() {
+            Ok(DesktopEvent::CursorShapeChanged { shape, .. }) => break shape,
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "no cursor shape event after pointer enter"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(TryRecvError::Lagged(n)) => panic!("event subscriber lagged by {n}"),
+            Err(TryRecvError::Closed) => panic!("event channel closed"),
+        }
+    };
+    assert_eq!(first, "pointer");
+
+    // Motion over the same shape must not re-emit it.
+    for (x, y) in [(11, 11), (12, 12), (13, 13), (14, 14), (15, 15)] {
+        send(vec![InputEvent::PointerMoveAbs { x, y }]);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let mut repeats = Vec::new();
+    loop {
+        match events.try_recv() {
+            Ok(DesktopEvent::CursorShapeChanged { shape, .. }) => repeats.push(shape),
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Lagged(n)) => panic!("event subscriber lagged by {n}"),
+            Err(TryRecvError::Closed) => panic!("event channel closed"),
+        }
+    }
+    assert_eq!(
+        repeats,
+        Vec::<String>::new(),
+        "identical cursor shape re-emitted after motion"
+    );
+
+    let frames = client.join().expect("client thread").expect("client run");
+    assert!(frames > 0, "client presented at least one frame");
+
+    env.destroy();
+}
+
+#[test]
 fn hardware_profile_renders_and_serializes_on_the_shared_device() {
     let supervisor = DesktopSupervisor::new();
     let mut config = test_config(&unique_env_id("hardware"));

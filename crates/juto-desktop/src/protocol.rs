@@ -359,6 +359,11 @@ pub enum DesktopEvent {
         env_id: String,
         lease: Option<ControlLease>,
     },
+    /// Pointer shape the application requested: a CSS cursor name, or `none` when hidden.
+    CursorShapeChanged {
+        env_id: String,
+        shape: String,
+    },
     ViewerStateChanged {
         env_id: String,
         viewer_id: String,
