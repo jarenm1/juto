@@ -35,7 +35,9 @@ use smithay::desktop::{
 use smithay::input::keyboard::{
     FilterResult, KeyboardHandle, KeyboardTarget, Keycode, KeysymHandle, ModifiersState, XkbConfig,
 };
-use smithay::input::pointer::{AxisFrame, ButtonEvent, Focus, MotionEvent, PointerHandle};
+use smithay::input::pointer::{
+    AxisFrame, ButtonEvent, CursorImageStatus, Focus, MotionEvent, PointerHandle,
+};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::channel::{
@@ -65,6 +67,7 @@ use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
     with_states, with_surface_tree_downward,
 };
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::SelectionHandler;
@@ -77,6 +80,7 @@ use smithay::wayland::shell::xdg::{
     XdgToplevelSurfaceData,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{
     Reorder, ResizeEdge, WmWindowProperty, X11Surface, X11Wm, XwmHandler, XwmId,
@@ -804,6 +808,8 @@ struct DesktopState {
     _seat: Seat<Self>,
     keyboard: KeyboardHandle<Self>,
     pointer: PointerHandle<Self>,
+    /// Last pointer shape sent to the viewer; `cursor_image` fires on every change.
+    last_cursor_shape: &'static str,
 
     renderer: FrameRenderer,
     pool: Arc<ShmFramePool>,
@@ -1728,6 +1734,18 @@ fn keyboard_target(window: &Window) -> Option<KeyboardFocusTarget> {
     }
 }
 
+/// CSS cursor name for the viewer, or `none` when the client hid the cursor.
+///
+/// A client-drawn cursor surface has no name, so it reports `default`; the viewer
+/// draws its own arrow for that case.
+fn cursor_shape_name(image: &CursorImageStatus) -> &'static str {
+    match image {
+        CursorImageStatus::Hidden => "none",
+        CursorImageStatus::Named(icon) => icon.name(),
+        CursorImageStatus::Surface(_) => "default",
+    }
+}
+
 impl SeatHandler for DesktopState {
     type KeyboardFocus = KeyboardFocusTarget;
     type PointerFocus = WlSurface;
@@ -1744,13 +1762,20 @@ impl SeatHandler for DesktopState {
                 .map(|surface| surface.into_owned()),
         );
     }
-    fn cursor_image(
-        &mut self,
-        _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
-    ) {
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        let shape = cursor_shape_name(&image);
+        if shape == self.last_cursor_shape {
+            return;
+        }
+        self.last_cursor_shape = shape;
+        let _ = self.events.send(DesktopEvent::CursorShapeChanged {
+            env_id: self.env_id.clone(),
+            shape: shape.to_string(),
+        });
     }
 }
+
+impl TabletSeatHandler for DesktopState {}
 
 impl OutputHandler for DesktopState {
     fn output_bound(
@@ -1937,6 +1962,7 @@ smithay::delegate_seat!(DesktopState);
 smithay::delegate_xdg_shell!(DesktopState);
 smithay::delegate_data_device!(DesktopState);
 smithay::delegate_output!(DesktopState);
+smithay::delegate_cursor_shape!(DesktopState);
 impl GlobalDispatch<ZwpTextInputManagerV3, (), DesktopState> for DesktopState {
     fn bind(
         _state: &mut DesktopState,
@@ -2052,6 +2078,7 @@ pub(crate) fn run_compositor(
     let output_manager_state = OutputManagerState::new_with_xdg_output::<DesktopState>(&dh);
     let text_input_manager_state = TextInputManagerState::default();
     dh.create_global::<DesktopState, ZwpTextInputManagerV3, _>(1, ());
+    CursorShapeManagerState::new::<DesktopState>(&dh);
 
     let mut seat_state = SeatState::new();
     let mut seat = seat_state.new_wl_seat(&dh, "juto-seat");
@@ -2131,6 +2158,7 @@ pub(crate) fn run_compositor(
         xwm: None,
         x11_saved_geometries: HashMap::new(),
         xdg_saved_geometries: HashMap::new(),
+        last_cursor_shape: "default",
         x11_grab: None,
         xwayland_shell_state,
         next_window_id: 1,
