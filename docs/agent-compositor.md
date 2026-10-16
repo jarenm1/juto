@@ -346,7 +346,8 @@ Retention requires authenticated human acceptance and a host-approved deadline
 
 Events carry monotonic sequence numbers and include `Ready`, `ApplicationExited`,
 `WindowMapped/Unmapped`, `OutputChanged`, `ControlChanged`, `ViewerStateChanged`,
-`TextFocusChanged`, `LimitPressure`, `Failed`, and `Stopped`.
+`TextFocusChanged`, `CursorShapeChanged` (CSS cursor name, `none` when hidden),
+`LimitPressure`, `Failed`, and `Stopped`.
 Use a bounded 256-event replay ring;
 a lagging consumer gets `ResyncRequired` and must call `Describe`, not silently
 lose exits. Images/media are not JSON events. Terminal state remains queryable

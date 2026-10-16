@@ -14,6 +14,9 @@ use wayland_client::protocol::{
     wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy, QueueHandle, WEnum};
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1,
+};
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3, zwp_text_input_v3,
 };
@@ -68,6 +71,12 @@ struct State {
     press: Option<(u32, wl_surface::WlSurface)>,
     /// Set when the compositor dismisses a popup with `popup_done`.
     popup_dismissed: bool,
+    /// Cursor shape manager, bound at startup.
+    cursor_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
+    /// Shape device for the pointer, created on the first enter.
+    cursor_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
+    /// Shape requested on every pointer enter, when the test asks for one.
+    cursor_shape: Option<wp_cursor_shape_device_v1::Shape>,
 }
 
 macro_rules! ignore_events {
@@ -98,6 +107,8 @@ ignore_events! {
     wl_callback::WlCallback => (),
     zwp_text_input_manager_v3::ZwpTextInputManagerV3 => (),
     xdg_positioner::XdgPositioner => (),
+    wp_cursor_shape_manager_v1::WpCursorShapeManagerV1 => (),
+    wp_cursor_shape_device_v1::WpCursorShapeDeviceV1 => (),
 }
 
 impl Dispatch<wl_seat::WlSeat, ()> for State {
@@ -123,14 +134,24 @@ impl Dispatch<wl_seat::WlSeat, ()> for State {
 impl Dispatch<wl_pointer::WlPointer, ()> for State {
     fn event(
         state: &mut Self,
-        _proxy: &wl_pointer::WlPointer,
+        proxy: &wl_pointer::WlPointer,
         event: wl_pointer::Event,
         _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         match event {
-            wl_pointer::Event::Enter { surface, .. } => state.hovered = Some(surface),
+            wl_pointer::Event::Enter {
+                serial, surface, ..
+            } => {
+                state.hovered = Some(surface);
+                if let (Some(shape), Some(manager)) = (state.cursor_shape, &state.cursor_manager) {
+                    let device = state
+                        .cursor_device
+                        .get_or_insert_with(|| manager.get_pointer(proxy, qh, ()));
+                    device.set_shape(serial, shape);
+                }
+            }
             wl_pointer::Event::Leave { surface, .. } => {
                 if state.hovered.as_ref() == Some(&surface) {
                     state.hovered = None;
@@ -422,7 +443,7 @@ fn fill(fd: &OwnedFd, width: u32, height: u32, color: u32) {
 /// Connects to `socket`, maps one toplevel, paints the two-tone pattern, and
 /// dispatches events for `seconds`. Returns the number of frames presented.
 pub fn run(socket: &str, seconds: u64) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, PopupMode::None, false)
+    run_client(socket, seconds, PopupMode::None, false, None)
 }
 
 /// Like [`run`], plus a child xdg popup mapped at startup, anchored at
@@ -431,7 +452,7 @@ pub fn run_with_popup(
     socket: &str,
     seconds: u64,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, PopupMode::Mapped, false)
+    run_client(socket, seconds, PopupMode::Mapped, false, None)
 }
 
 /// Like [`run`], plus a menu popup. The first press over the toplevel creates the
@@ -441,7 +462,7 @@ pub fn run_with_menu(
     socket: &str,
     seconds: u64,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, PopupMode::OnPress, false)
+    run_client(socket, seconds, PopupMode::OnPress, false, None)
 }
 
 /// Like [`run`], plus a toplevel that maximizes about 1.5 s after its first frame
@@ -451,7 +472,16 @@ pub fn run_with_maximize_cycle(
     socket: &str,
     seconds: u64,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, PopupMode::None, true)
+    run_client(socket, seconds, PopupMode::None, true, None)
+}
+
+/// Like [`run`], plus a cursor shape requested on every pointer enter over the toplevel.
+pub fn run_with_cursor(
+    socket: &str,
+    seconds: u64,
+    shape: wp_cursor_shape_device_v1::Shape,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    run_client(socket, seconds, PopupMode::None, false, Some(shape))
 }
 
 fn run_client(
@@ -459,6 +489,7 @@ fn run_client(
     seconds: u64,
     popup_mode: PopupMode,
     cycle_maximize: bool,
+    cursor_shape: Option<wp_cursor_shape_device_v1::Shape>,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
     let stream = UnixStream::connect(socket)?;
     let conn = Connection::from_socket(stream)?;
@@ -472,6 +503,8 @@ fn run_client(
     let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=9, ())?;
     let text_input_manager: zwp_text_input_manager_v3::ZwpTextInputManagerV3 =
         globals.bind(&qh, 1..=1, ())?;
+    let cursor_manager: wp_cursor_shape_manager_v1::WpCursorShapeManagerV1 =
+        globals.bind(&qh, 1..=2, ())?;
     let text_input = text_input_manager.get_text_input(&seat, &qh, ());
 
     let surface = compositor.create_surface(&qh, ());
@@ -481,7 +514,11 @@ fn run_client(
     toplevel.set_app_id("dev.juto.test-client".to_string());
     surface.commit();
 
-    let mut state = State::default();
+    let mut state = State {
+        cursor_manager: Some(cursor_manager),
+        cursor_shape,
+        ..State::default()
+    };
     event_queue.roundtrip(&mut state)?;
     // Request text input for the surface we are about to map.
     text_input.set_cursor_rectangle(0, 0, 1, 1);
