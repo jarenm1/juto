@@ -42,6 +42,10 @@ pub const POPUP_OFFSET: i32 = 100;
 /// Opaque green, ARGB8888 little-endian (`[B, G, R, A]` in memory).
 #[allow(dead_code)]
 pub const GREEN: [u8; 4] = [0x00, 0xFF, 0x00, 0xFF];
+/// Client cursor surface edge length in pixels.
+pub const CURSOR_SIZE: u32 = 16;
+/// Client cursor hotspot offset from its top-left corner, in pixels.
+pub const CURSOR_HOTSPOT: i32 = 3;
 
 /// Which popup the test client creates.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,6 +57,15 @@ enum PopupMode {
     /// A menu: created on a press over the toplevel and grabbed with that press's
     /// serial before its first buffer commit, as xdg-shell requires.
     OnPress,
+}
+
+/// Cursor the test client requests on every pointer enter over the toplevel.
+#[derive(Clone, Copy)]
+enum CursorRequest {
+    /// A named `wp_cursor_shape_v1` shape.
+    Shape(wp_cursor_shape_device_v1::Shape),
+    /// A client-drawn `CURSOR_SIZE` square cursor surface.
+    Bitmap,
 }
 
 #[derive(Default)]
@@ -75,8 +88,10 @@ struct State {
     cursor_manager: Option<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>,
     /// Shape device for the pointer, created on the first enter.
     cursor_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
-    /// Shape requested on every pointer enter, when the test asks for one.
-    cursor_shape: Option<wp_cursor_shape_device_v1::Shape>,
+    /// Cursor requested on every pointer enter, when the test asks for one.
+    cursor_request: Option<CursorRequest>,
+    /// Red cursor surface attached on enter when the request is `Bitmap`.
+    cursor_surface: Option<wl_surface::WlSurface>,
 }
 
 macro_rules! ignore_events {
@@ -145,11 +160,21 @@ impl Dispatch<wl_pointer::WlPointer, ()> for State {
                 serial, surface, ..
             } => {
                 state.hovered = Some(surface);
-                if let (Some(shape), Some(manager)) = (state.cursor_shape, &state.cursor_manager) {
-                    let device = state
-                        .cursor_device
-                        .get_or_insert_with(|| manager.get_pointer(proxy, qh, ()));
-                    device.set_shape(serial, shape);
+                match (
+                    state.cursor_request,
+                    &state.cursor_manager,
+                    &state.cursor_surface,
+                ) {
+                    (Some(CursorRequest::Bitmap), _, Some(cursor)) => {
+                        proxy.set_cursor(serial, Some(cursor), CURSOR_HOTSPOT, CURSOR_HOTSPOT);
+                    }
+                    (Some(CursorRequest::Shape(shape)), Some(manager), _) => {
+                        let device = state
+                            .cursor_device
+                            .get_or_insert_with(|| manager.get_pointer(proxy, qh, ()));
+                        device.set_shape(serial, shape);
+                    }
+                    _ => {}
                 }
             }
             wl_pointer::Event::Leave { surface, .. } => {
@@ -481,7 +506,28 @@ pub fn run_with_cursor(
     seconds: u64,
     shape: wp_cursor_shape_device_v1::Shape,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, PopupMode::None, false, Some(shape))
+    run_client(
+        socket,
+        seconds,
+        PopupMode::None,
+        false,
+        Some(CursorRequest::Shape(shape)),
+    )
+}
+
+/// Like [`run`], plus a `CURSOR_SIZE` square red client cursor with hotspot
+/// (`CURSOR_HOTSPOT`, `CURSOR_HOTSPOT`) set on every pointer enter over the toplevel.
+pub fn run_with_cursor_bitmap(
+    socket: &str,
+    seconds: u64,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    run_client(
+        socket,
+        seconds,
+        PopupMode::None,
+        false,
+        Some(CursorRequest::Bitmap),
+    )
 }
 
 fn run_client(
@@ -489,7 +535,7 @@ fn run_client(
     seconds: u64,
     popup_mode: PopupMode,
     cycle_maximize: bool,
-    cursor_shape: Option<wp_cursor_shape_device_v1::Shape>,
+    cursor_request: Option<CursorRequest>,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
     let stream = UnixStream::connect(socket)?;
     let conn = Connection::from_socket(stream)?;
@@ -516,10 +562,32 @@ fn run_client(
 
     let mut state = State {
         cursor_manager: Some(cursor_manager),
-        cursor_shape,
+        cursor_request,
         ..State::default()
     };
     event_queue.roundtrip(&mut state)?;
+
+    if matches!(state.cursor_request, Some(CursorRequest::Bitmap)) {
+        let cursor = compositor.create_surface(&qh, ());
+        let stride = CURSOR_SIZE * 4;
+        let size = (stride * CURSOR_SIZE) as usize;
+        let fd = create_shm_fd(size)?;
+        fill(&fd, CURSOR_SIZE, CURSOR_SIZE, 0xFFFF_0000);
+        let pool = shm.create_pool(fd.as_fd(), size as i32, &qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            CURSOR_SIZE as i32,
+            CURSOR_SIZE as i32,
+            stride as i32,
+            wl_shm::Format::Argb8888,
+            &qh,
+            (),
+        );
+        cursor.attach(Some(&buffer), 0, 0);
+        cursor.damage(0, 0, CURSOR_SIZE as i32, CURSOR_SIZE as i32);
+        cursor.commit();
+        state.cursor_surface = Some(cursor);
+    }
     // Request text input for the surface we are about to map.
     text_input.set_cursor_rectangle(0, 0, 1, 1);
     text_input.commit();

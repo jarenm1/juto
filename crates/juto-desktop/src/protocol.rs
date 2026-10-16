@@ -364,6 +364,20 @@ pub enum DesktopEvent {
         env_id: String,
         shape: String,
     },
+    /// Client cursor bitmap as straight-alpha BGRA. `width`/`height` are buffer
+    /// pixels; `display_*` and the hotspot are environment pixels. `width: 0`
+    /// means no bitmap, so the viewer shows the named arrow.
+    CursorImageChanged {
+        env_id: String,
+        width: u32,
+        height: u32,
+        display_width: u32,
+        display_height: u32,
+        hotspot_x: i32,
+        hotspot_y: i32,
+        #[serde(with = "base64_pixels")]
+        pixels: Vec<u8>,
+    },
     ViewerStateChanged {
         env_id: String,
         viewer_id: String,
@@ -382,4 +396,20 @@ pub enum DesktopEvent {
     Stopped {
         env_id: String,
     },
+}
+
+/// Base64 transport for pixel bytes, keeping remote JSON compact.
+mod base64_pixels {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(pixels: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&STANDARD.encode(pixels))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
+    }
 }
