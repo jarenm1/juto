@@ -767,6 +767,22 @@ impl Render for DesktopViewer {
                     .items_center()
                     .justify_end()
                     .h(px(30.))
+                    .when(paused, |row| {
+                        row.child(
+                            div()
+                                .id("desktop-resume")
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(rgb(0x2d2f34))
+                                .text_color(rgb(0xe8eaed))
+                                .cursor_pointer()
+                                .child("Resume")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.resume(window, cx);
+                                })),
+                        )
+                    })
                     .when(!paused, |row| {
                         row.child(
                             div()
