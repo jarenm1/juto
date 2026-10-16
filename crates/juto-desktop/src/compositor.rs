@@ -23,7 +23,9 @@ use smithay::backend::renderer::element::surface::{
 };
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::pixman::PixmanRenderer;
-use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_handler};
+use smithay::backend::renderer::utils::{
+    draw_render_elements, on_commit_buffer_handler, with_renderer_surface_state,
+};
 use smithay::backend::renderer::{
     Bind, Color32F, ExportMem, Frame, ImportAll, Offscreen, Renderer,
 };
@@ -36,7 +38,8 @@ use smithay::input::keyboard::{
     FilterResult, KeyboardHandle, KeyboardTarget, Keycode, KeysymHandle, ModifiersState, XkbConfig,
 };
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, CursorImageStatus, Focus, MotionEvent, PointerHandle,
+    AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, Focus, MotionEvent,
+    PointerHandle,
 };
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
@@ -55,6 +58,7 @@ use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::{
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_buffer;
+use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, Display, GlobalDispatch, ListeningSocket, New, Resource,
@@ -79,7 +83,7 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
 };
-use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::wayland::shm::{BufferData, ShmHandler, ShmState, with_buffer_contents};
 use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{
@@ -810,6 +814,10 @@ struct DesktopState {
     pointer: PointerHandle<Self>,
     /// Last pointer shape sent to the viewer; `cursor_image` fires on every change.
     last_cursor_shape: &'static str,
+    /// Client cursor surface the viewer should draw, if the client set one.
+    cursor_surface: Option<WlSurface>,
+    /// Last cursor bitmap sent to the viewer; `None` means the viewer has no bitmap.
+    last_cursor_bitmap: Option<CursorBitmap>,
 
     renderer: FrameRenderer,
     pool: Arc<ShmFramePool>,
@@ -1532,6 +1540,42 @@ impl DesktopState {
             }
         }
     }
+
+    /// Sends the client cursor bitmap to the viewer when it changed. A missing
+    /// cursor surface, or one without drawable pixels, clears the viewer's bitmap.
+    fn sync_cursor_bitmap(&mut self) {
+        let bitmap = self
+            .cursor_surface
+            .as_ref()
+            .and_then(|surface| read_cursor_bitmap(surface, self.scale));
+        if bitmap == self.last_cursor_bitmap {
+            return;
+        }
+        self.last_cursor_bitmap = bitmap.clone();
+        let event = match bitmap {
+            Some(bitmap) => DesktopEvent::CursorImageChanged {
+                env_id: self.env_id.clone(),
+                width: bitmap.width,
+                height: bitmap.height,
+                display_width: bitmap.display_width,
+                display_height: bitmap.display_height,
+                hotspot_x: bitmap.hotspot_x,
+                hotspot_y: bitmap.hotspot_y,
+                pixels: bitmap.pixels,
+            },
+            None => DesktopEvent::CursorImageChanged {
+                env_id: self.env_id.clone(),
+                width: 0,
+                height: 0,
+                display_width: 0,
+                display_height: 0,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                pixels: Vec::new(),
+            },
+        };
+        let _ = self.events.send(event);
+    }
 }
 
 fn toplevel_identity(toplevel: &ToplevelSurface) -> (Option<String>, Option<String>) {
@@ -1612,6 +1656,9 @@ impl CompositorHandler for DesktopState {
         }
         for id in updated {
             self.refresh_window_info(id);
+        }
+        if self.cursor_surface.as_ref() == Some(surface) {
+            self.sync_cursor_bitmap();
         }
         self.dirty = true;
     }
@@ -1746,6 +1793,129 @@ fn cursor_shape_name(image: &CursorImageStatus) -> &'static str {
     }
 }
 
+/// Largest client cursor bitmap forwarded to the viewer, per side in buffer pixels.
+const MAX_CURSOR_BITMAP_SIDE: u32 = 256;
+
+/// A client cursor surface's pixels and placement, as the viewer draws them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CursorBitmap {
+    /// Buffer size in pixels; the viewer draws the bitmap at `display_*` instead.
+    width: u32,
+    height: u32,
+    /// Size on the environment output, in environment pixels.
+    display_width: u32,
+    display_height: u32,
+    /// Hotspot in environment pixels.
+    hotspot_x: i32,
+    hotspot_y: i32,
+    /// Straight-alpha BGRA rows, `width * 4` bytes each, tightly packed.
+    pixels: Vec<u8>,
+}
+
+/// Reads the cursor surface's current SHM buffer and hotspot, placed at the
+/// environment's output scale. `None` when the surface has no drawable buffer;
+/// the viewer then falls back to the named arrow.
+fn read_cursor_bitmap(surface: &WlSurface, output_scale: u32) -> Option<CursorBitmap> {
+    if !surface.alive() {
+        return None;
+    }
+    // Smithay's commit handler moves the attached buffer out of `SurfaceAttributes`
+    // into `RendererSurfaceState`, so the buffer must be read from there.
+    let buffer = with_renderer_surface_state(surface, |state| state.buffer().cloned()).flatten()?;
+    let (buffer_scale, hotspot) = with_states(surface, |states| {
+        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+        let buffer_scale = attributes.current().buffer_scale.max(1) as u32;
+        let hotspot = states
+            .data_map
+            .get::<CursorImageSurfaceData>()?
+            .lock()
+            .ok()?
+            .hotspot;
+        Some((buffer_scale, hotspot))
+    })?;
+    let (width, height, pixels) = match with_buffer_contents(&buffer, copy_cursor_pixels) {
+        Ok(Some(bitmap)) => bitmap,
+        Ok(None) => return None,
+        Err(err) => {
+            tracing::debug!(error = %err, "cursor buffer is not readable shared memory");
+            return None;
+        }
+    };
+    // Buffer pixels are `buffer_scale` per logical unit; the hotspot is already logical.
+    Some(CursorBitmap {
+        width,
+        height,
+        display_width: width * output_scale / buffer_scale,
+        display_height: height * output_scale / buffer_scale,
+        hotspot_x: hotspot.x.saturating_mul(output_scale as i32),
+        hotspot_y: hotspot.y.saturating_mul(output_scale as i32),
+        pixels,
+    })
+}
+
+/// Copies an SHM cursor buffer into a tight straight-alpha BGRA buffer. Every
+/// row is bounds-checked against the pool before it is read.
+fn copy_cursor_pixels(ptr: *const u8, len: usize, data: BufferData) -> Option<(u32, u32, Vec<u8>)> {
+    let premultiplied = match data.format {
+        wl_shm::Format::Argb8888 => true,
+        wl_shm::Format::Xrgb8888 => false,
+        _ => return None,
+    };
+    let side = 1..=MAX_CURSOR_BITMAP_SIDE;
+    let width = u32::try_from(data.width)
+        .ok()
+        .filter(|w| side.contains(w))?;
+    let height = u32::try_from(data.height)
+        .ok()
+        .filter(|h| side.contains(h))?;
+    let offset = usize::try_from(data.offset).ok()?;
+    let stride = usize::try_from(data.stride).ok()?;
+    let row_bytes = width as usize * 4;
+    if stride < row_bytes {
+        return None;
+    }
+    let last_row_end = offset
+        .checked_add((height as usize - 1).checked_mul(stride)?)?
+        .checked_add(row_bytes)?;
+    if last_row_end > len {
+        return None;
+    }
+    let mut pixels = vec![0u8; row_bytes * height as usize];
+    for (row, dst) in pixels.chunks_exact_mut(row_bytes).enumerate() {
+        // SAFETY: `last_row_end <= len` keeps this row inside the pool mapping that
+        // `with_buffer_contents` keeps alive for the callback; `dst` is a separate
+        // allocation of exactly `row_bytes` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ptr.add(offset + row * stride),
+                dst.as_mut_ptr(),
+                row_bytes,
+            );
+        }
+    }
+    for px in pixels.chunks_exact_mut(4) {
+        straighten_bgra(px, premultiplied);
+    }
+    Some((width, height, pixels))
+}
+
+/// Converts one BGRA pixel to straight alpha in place. Xrgb8888 has no alpha,
+/// so its pixels become opaque.
+fn straighten_bgra(px: &mut [u8], premultiplied: bool) {
+    if !premultiplied {
+        px[3] = u8::MAX;
+        return;
+    }
+    let alpha = u32::from(px[3]);
+    if alpha == 0 {
+        px[..3].fill(0);
+    } else if alpha < 255 {
+        for channel in &mut px[..3] {
+            *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+        }
+    }
+}
+
 impl SeatHandler for DesktopState {
     type KeyboardFocus = KeyboardFocusTarget;
     type PointerFocus = WlSurface;
@@ -1763,6 +1933,11 @@ impl SeatHandler for DesktopState {
         );
     }
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        self.cursor_surface = match &image {
+            CursorImageStatus::Surface(surface) => Some(surface.clone()),
+            _ => None,
+        };
+        self.sync_cursor_bitmap();
         let shape = cursor_shape_name(&image);
         if shape == self.last_cursor_shape {
             return;
@@ -2159,6 +2334,8 @@ pub(crate) fn run_compositor(
         x11_saved_geometries: HashMap::new(),
         xdg_saved_geometries: HashMap::new(),
         last_cursor_shape: "default",
+        cursor_surface: None,
+        last_cursor_bitmap: None,
         x11_grab: None,
         xwayland_shell_state,
         next_window_id: 1,

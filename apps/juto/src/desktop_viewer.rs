@@ -12,10 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    Bounds, Context, CursorStyle, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
+    AnyElement, Bounds, Context, CursorStyle, FocusHandle, KeyDownEvent, KeyUpEvent, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    Pixels, Render, RenderImage, ScrollWheelEvent, Subscription, Task, Window, canvas, div, img,
-    prelude::*, px, rgb, rgba,
+    Pixels, Point, Render, RenderImage, ScrollWheelEvent, Subscription, Task, Window, canvas, div,
+    img, prelude::*, px, rgb, rgba,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use juto_runtime::DesktopEnvironment;
@@ -115,6 +115,15 @@ fn issue_local_grant(env: &DesktopEnvironment) -> u64 {
     .expires_at
 }
 
+/// Client cursor bitmap drawn over the canvas at the local pointer.
+struct CursorOverlay {
+    image: Arc<RenderImage>,
+    /// Drawn size in environment pixels.
+    display_size: (u32, u32),
+    /// Hotspot in environment pixels.
+    hotspot: (i32, i32),
+}
+
 /// An embedded viewer for one agent-owned desktop environment.
 pub struct DesktopViewer {
     env: DesktopEnvironment,
@@ -150,6 +159,11 @@ pub struct DesktopViewer {
     cursor: CursorStyle,
     /// Listener that keeps `cursor` current for the viewer's whole life.
     cursor_task: Option<Task<()>>,
+    /// Client cursor bitmap drawn at the local pointer while live; `None` means the
+    /// named shape above applies.
+    cursor_overlay: Option<CursorOverlay>,
+    /// Pointer position in window coordinates while over the image.
+    cursor_pointer: Option<Point<Pixels>>,
 }
 
 impl DesktopViewer {
@@ -192,6 +206,8 @@ impl DesktopViewer {
             _input_guards: Vec::new(),
             cursor: CursorStyle::Arrow,
             cursor_task: None,
+            cursor_overlay: None,
+            cursor_pointer: None,
         };
         viewer._input_guards = vec![
             cx.on_focus_out(&viewer.focus_handle, window, |this, _event, _window, cx| {
@@ -237,8 +253,8 @@ impl DesktopViewer {
         }));
     }
 
-    /// Mirrors the application's cursor shape onto the canvas. Runs for the
-    /// viewer's whole life, so a resume shows the shape current at that point.
+    /// Mirrors the application's cursor shape and client cursor bitmap onto the
+    /// canvas. Runs for the viewer's whole life, so a resume shows the current cursor.
     fn start_cursor_listener(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut events = self.env.subscribe();
         self.cursor_task = Some(cx.spawn_in(window, async move |this, cx| {
@@ -246,6 +262,27 @@ impl DesktopViewer {
                 let update = match events.recv().await {
                     Ok(DesktopEvent::CursorShapeChanged { shape, .. }) => {
                         this.update_in(cx, |this, _window, cx| this.set_cursor_shape(&shape, cx))
+                    }
+                    Ok(DesktopEvent::CursorImageChanged {
+                        width,
+                        height,
+                        display_width,
+                        display_height,
+                        hotspot_x,
+                        hotspot_y,
+                        pixels,
+                        ..
+                    }) => {
+                        let overlay = cursor_overlay_from_event(
+                            width,
+                            height,
+                            display_width,
+                            display_height,
+                            hotspot_x,
+                            hotspot_y,
+                            pixels,
+                        );
+                        this.update_in(cx, |this, _window, cx| this.set_cursor_overlay(overlay, cx))
                     }
                     Ok(_) => continue,
                     // Missed shape changes leave the last known shape in place: the
@@ -266,6 +303,45 @@ impl DesktopViewer {
             self.cursor = style;
             cx.notify();
         }
+    }
+
+    fn set_cursor_overlay(&mut self, overlay: Option<CursorOverlay>, cx: &mut Context<Self>) {
+        self.cursor_overlay = overlay;
+        cx.notify();
+    }
+
+    /// Records the pointer while it is over the image; `None` once it leaves.
+    fn track_cursor_pointer(&mut self, position: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        if self.cursor_pointer != position {
+            self.cursor_pointer = position;
+            cx.notify();
+        }
+    }
+
+    /// The client cursor bitmap at the pointer, positioned in the canvas container.
+    /// `None` while paused, with no bitmap, or with the pointer off the image.
+    fn cursor_overlay_element(&self) -> Option<AnyElement> {
+        if self.paused {
+            return None;
+        }
+        let overlay = self.cursor_overlay.as_ref()?;
+        let pointer = self.cursor_pointer?;
+        let (_, _, scale) = self.fitted_geometry()?;
+        let bounds = self.surface_bounds.get();
+        let (display_width, display_height) = overlay.display_size;
+        let (hotspot_x, hotspot_y) = overlay.hotspot;
+        let left = f32::from(pointer.x) - f32::from(bounds.origin.x) - hotspot_x as f32 * scale;
+        let top = f32::from(pointer.y) - f32::from(bounds.origin.y) - hotspot_y as f32 * scale;
+        Some(
+            img(overlay.image.clone())
+                .absolute()
+                .left(px(left))
+                .top(px(top))
+                .w(px(display_width as f32 * scale))
+                .h(px(display_height as f32 * scale))
+                .object_fit(ObjectFit::Fill)
+                .into_any_element(),
+        )
     }
 
     /// Captures one still of the newest frame without starting the frame loop.
@@ -623,8 +699,11 @@ impl Render for DesktopViewer {
         let has_control = self.has_control;
         let paused = self.paused;
         let can_control = self.can_control;
+        let cursor_overlay = self.cursor_overlay_element();
         let canvas_cursor = if paused {
             CursorStyle::Arrow
+        } else if cursor_overlay.is_some() {
+            CursorStyle::None
         } else {
             self.cursor
         };
@@ -659,9 +738,11 @@ impl Render for DesktopViewer {
                 },
             ))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                if let Some((x, y)) = this.pointer_position(&event.position) {
+                let pointer = this.pointer_position(&event.position);
+                if let Some((x, y)) = pointer {
                     this.send_events(vec![InputEvent::PointerMoveAbs { x, y }], cx);
                 }
+                this.track_cursor_pointer(pointer.map(|_| event.position), cx);
             }))
             .on_mouse_down(
                 MouseButton::Left,
@@ -843,11 +924,17 @@ impl Render for DesktopViewer {
             )
             .child(
                 div()
+                    .id("desktop-canvas")
                     .relative()
                     .flex_1()
                     .min_h_0()
                     .bg(rgb(0x000000))
                     .cursor(canvas_cursor)
+                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                        if !*hovered {
+                            this.track_cursor_pointer(None, cx);
+                        }
+                    }))
                     .child(
                         canvas(
                             move |bounds, _window, _cx| {
@@ -859,6 +946,9 @@ impl Render for DesktopViewer {
                         .size_full(),
                     )
                     .child(surface)
+                    .when_some(cursor_overlay, |container, overlay| {
+                        container.child(overlay)
+                    })
                     .when(paused, |container| {
                         container.child(
                             div()
@@ -967,6 +1057,33 @@ fn render_image_from_bgra(bgra: Vec<u8>, width: u32, height: u32) -> Arc<RenderI
     let buffer: ImageBuffer<Rgba<u8>, Vec<u8>> =
         ImageBuffer::from_raw(width, height, bgra).expect("pixel buffer size mismatch");
     Arc::new(RenderImage::new(vec![Frame::new(buffer)]))
+}
+
+/// Builds the cursor overlay from a `CursorImageChanged` payload. Empty or
+/// inconsistent payloads yield `None`, so the viewer shows the named cursor.
+fn cursor_overlay_from_event(
+    width: u32,
+    height: u32,
+    display_width: u32,
+    display_height: u32,
+    hotspot_x: i32,
+    hotspot_y: i32,
+    pixels: Vec<u8>,
+) -> Option<CursorOverlay> {
+    let expected = width as usize * height as usize * 4;
+    if width == 0
+        || height == 0
+        || display_width == 0
+        || display_height == 0
+        || pixels.len() != expected
+    {
+        return None;
+    }
+    Some(CursorOverlay {
+        image: render_image_from_bgra(pixels, width, height),
+        display_size: (display_width, display_height),
+        hotspot: (hotspot_x, hotspot_y),
+    })
 }
 
 /// Maps a gpui key name to a Linux evdev keycode.

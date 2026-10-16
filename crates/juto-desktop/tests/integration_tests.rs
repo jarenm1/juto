@@ -638,6 +638,121 @@ fn application_cursor_shape_is_forwarded_once_per_change() {
 }
 
 #[test]
+fn application_cursor_bitmap_is_forwarded_with_hotspot() {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(
+            test_config(&unique_env_id("cursor-bitmap")),
+            &unique_env_id("req"),
+        )
+        .expect("create environment");
+    let mut events = env.subscribe();
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    let client = std::thread::spawn(move || common::run_with_cursor_bitmap(&socket, 20));
+
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
+    let pool = env.frame_pool();
+
+    let mut seq = 0;
+    let mut send = |batch: Vec<InputEvent>| {
+        seq += 1;
+        env.dispatch_input(
+            "agent:test",
+            lease.epoch,
+            env.generation(),
+            InputBatch {
+                seq,
+                client_timestamp_us: 0,
+                events: batch,
+            },
+        )
+        .expect("input accepted");
+    };
+
+    // Wait for the toplevel to map; input before that hits no surface and no enter.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let info = env
+            .observe(Duration::from_secs(2))
+            .unwrap_or_else(|err| panic!("observe failed: {err}"));
+        if read_pixel(&pool, info.slot, 10, 10, info.width) == common::RED {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for toplevel");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Entering the toplevel: the client attaches its bitmap cursor surface.
+    send(vec![InputEvent::PointerMoveAbs { x: 10, y: 10 }]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (width, height, display_width, display_height, hotspot_x, hotspot_y, pixels) = loop {
+        match events.try_recv() {
+            Ok(DesktopEvent::CursorImageChanged {
+                width,
+                height,
+                display_width,
+                display_height,
+                hotspot_x,
+                hotspot_y,
+                pixels,
+                ..
+            }) if width > 0 => {
+                break (
+                    width,
+                    height,
+                    display_width,
+                    display_height,
+                    hotspot_x,
+                    hotspot_y,
+                    pixels,
+                );
+            }
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "no cursor bitmap event after pointer enter"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(TryRecvError::Lagged(n)) => panic!("event subscriber lagged by {n}"),
+            Err(TryRecvError::Closed) => panic!("event channel closed"),
+        }
+    };
+
+    // At output scale 1 the buffer and display sizes match, and the hotspot is unscaled.
+    assert_eq!((width, height), (common::CURSOR_SIZE, common::CURSOR_SIZE));
+    assert_eq!(
+        (display_width, display_height),
+        (common::CURSOR_SIZE, common::CURSOR_SIZE)
+    );
+    assert_eq!(
+        (hotspot_x, hotspot_y),
+        (common::CURSOR_HOTSPOT, common::CURSOR_HOTSPOT)
+    );
+    // Solid opaque red, un-premultiplied and in BGRA order for the viewer.
+    assert_eq!(
+        pixels.len(),
+        (common::CURSOR_SIZE * common::CURSOR_SIZE * 4) as usize
+    );
+    assert!(
+        pixels.chunks_exact(4).all(|px| px == common::RED),
+        "cursor bitmap pixels are not solid red BGRA"
+    );
+
+    let frames = client.join().expect("client thread").expect("client run");
+    assert!(frames > 0, "client presented at least one frame");
+
+    env.destroy();
+}
+
+#[test]
 fn hardware_profile_renders_and_serializes_on_the_shared_device() {
     let supervisor = DesktopSupervisor::new();
     let mut config = test_config(&unique_env_id("hardware"));
