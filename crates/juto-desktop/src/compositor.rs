@@ -963,6 +963,12 @@ impl DesktopState {
         let geometry = surface.geometry();
         self.space.map_element(window.clone(), geometry.loc, true);
         self.x11_windows.insert(x11_id, window.clone());
+        if surface.is_override_redirect() {
+            // Menus and tooltips are placed by their client. They stay stacked
+            // and rendered, but must not take keyboard focus or become managed windows.
+            self.dirty = true;
+            return;
+        }
         self.focus_window(&window);
         let id = self.next_window_id;
         self.next_window_id = self.next_window_id.wrapping_add(1);
@@ -1001,13 +1007,20 @@ impl DesktopState {
             self.x11_grab = None;
         }
         self.x11_saved_geometries.remove(&x11_id);
-        if let Some(window) = self.x11_windows.remove(&x11_id)
-            && let Some(id) = self
-                .windows
-                .iter()
-                .find_map(|(id, mapped)| (mapped.window == window).then_some(*id))
+        let Some(window) = self.x11_windows.remove(&x11_id) else {
+            return;
+        };
+        match self
+            .windows
+            .iter()
+            .find_map(|(id, mapped)| (mapped.window == window).then_some(*id))
         {
-            self.unmap_window(id);
+            Some(id) => self.unmap_window(id),
+            None => {
+                // Override-redirect windows are rendered but never managed.
+                self.space.unmap_elem(&window);
+                self.dirty = true;
+            }
         }
     }
 
