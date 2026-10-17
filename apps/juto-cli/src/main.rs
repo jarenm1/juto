@@ -10,7 +10,10 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use juto_agent::{AgentEvent, RunControl};
 use juto_ai::{HttpProvider, ProviderEvent, StopReason};
-use juto_runtime::{ApprovalMode, EntryKind, Runtime, RuntimeConfig, Session, default_data_dir};
+use juto_runtime::{
+    ApprovalMode, MainEvent, MainSession, Runtime, RuntimeConfig, Session, ThreadEvent,
+    TimelineItem, default_data_dir,
+};
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
@@ -48,7 +51,8 @@ enum Command {
         #[command(subcommand)]
         command: changes::ChangesCommand,
     },
-    /// Stream a turn, using a new or existing durable session. A prompt of '-' reads stdin.
+    /// Stream a turn in a new or existing main session. The request is routed to one of
+    /// the session's internal threads. A prompt of '-' reads stdin.
     Run {
         prompt: String,
         #[arg(long)]
@@ -69,8 +73,12 @@ enum Command {
         provider: String,
     },
     Credentials,
-    /// Print messages on the active branch.
+    /// Print a main session's history: routing records and every thread's messages.
     History {
+        session: PathBuf,
+    },
+    /// List a main session's internal threads.
+    Threads {
         session: PathBuf,
     },
     /// Persist a model/role/thinking selector for the next turn.
@@ -87,7 +95,8 @@ enum Command {
         session: PathBuf,
         entry: Option<String>,
     },
-    /// Summarize with the selected provider and preserve recent complete tool groups.
+    /// Summarize a thread's journal with the selected provider and preserve recent
+    /// complete tool groups.
     Compact {
         session: PathBuf,
     },
@@ -138,18 +147,20 @@ async fn main() -> Result<()> {
                 bail!("prompt must not be empty");
             }
             let mut session = match session {
-                Some(path) => Session::open(&path)?,
-                None => runtime.new_session()?,
+                Some(path) => MainSession::open(&path)?,
+                None => runtime.new_main_session()?,
             };
             if model_override && resumed {
-                runtime.switch_model(&mut session, &runtime.config().model)?;
+                runtime.switch_main_model(&mut session, &runtime.config().model)?;
             }
             eprintln!("session: {}", session.path().display());
             let control = RunControl::new();
             let signals = install_interrupt(control.clone());
             let (events, receiver) = mpsc::unbounded_channel();
             let printer = tokio::spawn(print_events(receiver, arguments.json));
-            let result = runtime.run(&mut session, prompt, events, control).await;
+            let result = runtime
+                .send(&mut session, None, prompt, events, control)
+                .await;
             signals.abort();
             printer.await??;
             let outcome = result?;
@@ -245,12 +256,32 @@ async fn main() -> Result<()> {
             );
         }
         Command::History { session } => {
-            let session = Session::open(&session)?;
-            for entry in session.active_entries()? {
+            for item in MainSession::open(&session)?.timeline()? {
                 if arguments.json {
-                    println!("{}", serde_json::to_string(entry)?);
-                } else if let EntryKind::Message { message } = &entry.kind {
-                    println!("{}", message.text());
+                    println!("{}", serde_json::to_string(&item)?);
+                    continue;
+                }
+                match item {
+                    TimelineItem::Routed { route } => {
+                        println!("[thread {:?}: {}]", route.kind, route.label)
+                    }
+                    TimelineItem::Message { message, .. } => println!("{}", message.text()),
+                }
+            }
+        }
+        Command::Threads { session } => {
+            let main = MainSession::open(&session)?;
+            for thread in main.threads() {
+                if arguments.json {
+                    println!("{}", serde_json::to_string(thread)?);
+                } else {
+                    println!(
+                        "{}  {:?}  {}  {}",
+                        thread.id,
+                        thread.status,
+                        thread.label,
+                        thread.session_path.display()
+                    );
                 }
             }
         }
@@ -295,7 +326,7 @@ fn install_interrupt(control: RunControl) -> tokio::task::JoinHandle<()> {
     })
 }
 
-async fn print_events(mut receiver: mpsc::UnboundedReceiver<AgentEvent>, json: bool) -> Result<()> {
+async fn print_events(mut receiver: mpsc::UnboundedReceiver<MainEvent>, json: bool) -> Result<()> {
     while let Some(event) = receiver.recv().await {
         let stdout = io::stdout();
         let mut writer = stdout.lock();
@@ -304,16 +335,28 @@ async fn print_events(mut receiver: mpsc::UnboundedReceiver<AgentEvent>, json: b
             writeln!(writer)?;
         } else {
             match event {
-                AgentEvent::MessageUpdate {
+                MainEvent::Agent(AgentEvent::MessageUpdate {
                     event: ProviderEvent::TextDelta { delta, .. },
-                } => {
+                }) => {
                     write!(writer, "{delta}")?;
                     writer.flush()?;
                 }
-                AgentEvent::ToolExecutionStart { call } => {
+                MainEvent::Agent(AgentEvent::ToolExecutionStart { call }) => {
                     eprintln!("tool: {} ({})", call.name, call.id)
                 }
-                AgentEvent::Error { error } => eprintln!("error: {error}"),
+                MainEvent::Agent(AgentEvent::Error { error }) => eprintln!("error: {error}"),
+                MainEvent::Thread(ThreadEvent::ThreadRouted { route }) => {
+                    eprintln!(
+                        "thread: {} ({:?}, {})",
+                        route.label, route.kind, route.thread
+                    );
+                    if let Some(note) = route.note {
+                        eprintln!("routing note: {note}");
+                    }
+                }
+                MainEvent::Thread(ThreadEvent::ThreadLabelFailed { thread, error }) => {
+                    eprintln!("thread {thread}: label update failed: {error}")
+                }
                 _ => {}
             }
         }

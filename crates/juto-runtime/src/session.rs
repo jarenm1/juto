@@ -104,6 +104,11 @@ impl Session {
     pub fn create(directory: &Path, cwd: &Path) -> Result<Self> {
         Self::create_from(directory, cwd, None, &[])
     }
+    /// Create an empty journal whose header records `parent_session` as its
+    /// lineage, e.g. an internal thread of a main session.
+    pub(crate) fn create_child(directory: &Path, cwd: &Path, parent_session: &str) -> Result<Self> {
+        Self::create_from(directory, cwd, Some(parent_session.to_owned()), &[])
+    }
     fn create_from(
         directory: &Path,
         cwd: &Path,

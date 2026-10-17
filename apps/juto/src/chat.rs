@@ -21,7 +21,10 @@ use gpui::{
 use juto_agent::{AgentEvent, RunControl, RunOutcome, ToolTier, ViewNode, view_from_details};
 use juto_ai::{Message as AiMessage, ProviderEvent, StopReason, ToolCall};
 use juto_runtime::subagents::SubagentEvent;
-use juto_runtime::{ApprovalRequest, DesktopSessionArtifact, EntryKind, Runtime, Session};
+use juto_runtime::{
+    ApprovalRequest, DesktopSessionArtifact, MainEvent, MainSession, Route, RouteKind, Runtime,
+    ThreadEvent, TimelineItem,
+};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 
@@ -59,6 +62,8 @@ pub enum ActiveModal {
 pub enum MessageRole {
     User,
     Assistant,
+    /// Marks the internal thread the following exchange was routed to.
+    Thread,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,14 +138,92 @@ pub fn extract_desktop_artifacts(message: &AiMessage) -> Vec<DesktopSessionArtif
     artifacts
 }
 
-pub fn load_messages(session: &Session) -> Vec<Message> {
-    let Ok(entries) = session.active_entries() else {
-        return Vec::new();
+/// Transcript rows for a main session's history: each routing record becomes a
+/// thread marker, and messages convert as in [`view_messages`].
+pub fn load_messages(main: &MainSession) -> Vec<Message> {
+    let items = match main.timeline() {
+        Ok(items) => items,
+        Err(error) => {
+            return vec![Message {
+                role: MessageRole::Assistant,
+                text: format!("Error: failed to load session history: {error:#}").into(),
+                attachments: Vec::new(),
+                desktop_artifacts: Vec::new(),
+                approval: None,
+                views: Vec::new(),
+            }];
+        }
     };
-    view_messages(entries.iter().filter_map(|entry| match &entry.kind {
-        EntryKind::Message { message } => Some(message),
-        _ => None,
-    }))
+    let mut rows = Vec::new();
+    let mut pending: Vec<AiMessage> = Vec::new();
+    for item in items {
+        match item {
+            TimelineItem::Routed { route } => {
+                rows.extend(view_messages(&pending));
+                pending.clear();
+                rows.push(route_row(&route));
+            }
+            TimelineItem::Message { message, .. } => pending.push(message),
+        }
+    }
+    rows.extend(view_messages(&pending));
+    rows
+}
+
+/// Transcript marker naming the thread a request was routed to.
+pub fn route_row(route: &Route) -> Message {
+    let kind = match route.kind {
+        RouteKind::New => "New thread",
+        RouteKind::Resume => "Resumed thread",
+        RouteKind::Continue | RouteKind::Direct => "Thread",
+    };
+    let mut text = format!("{kind} · {}", route.label);
+    if let Some(note) = &route.note {
+        text.push_str(&format!(" — {note}"));
+    }
+    Message {
+        role: MessageRole::Thread,
+        text: text.into(),
+        attachments: Vec::new(),
+        desktop_artifacts: Vec::new(),
+        approval: None,
+        views: Vec::new(),
+    }
+}
+
+/// Slim transcript row naming the thread the following exchange runs in.
+fn thread_marker(index: usize, message: &Message) -> AnyElement {
+    div()
+        .id(("message", index))
+        .flex_none()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .flex_none()
+                .w(px(12.))
+                .h(px(1.))
+                .bg(rgb(theme::BORDER_STRONG)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(message.text.clone()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h(px(1.))
+                .bg(rgb(theme::BORDER_STRONG)),
+        )
+        .into_any_element()
 }
 
 /// Converts agent messages into transcript rows. Shared by the main transcript
@@ -304,7 +387,7 @@ pub struct ChatView {
     picker: Option<Task<()>>,
     scroll: ScrollHandle,
     runtime: Runtime,
-    session: Arc<Mutex<Session>>,
+    session: Arc<Mutex<MainSession>>,
     tokio_handle: tokio::runtime::Handle,
     is_running: bool,
     active_control: Option<RunControl>,
@@ -328,7 +411,7 @@ impl Drop for ChatView {
 impl ChatView {
     pub fn new(
         runtime: Runtime,
-        session: Session,
+        session: MainSession,
         tokio_handle: tokio::runtime::Handle,
         approval_requests: tokio::sync::mpsc::UnboundedReceiver<ApprovalRequest>,
         window: &mut Window,
@@ -352,8 +435,10 @@ impl ChatView {
         let subagents = runtime.subagent_manager(&subagent_control);
         let sidebar = cx.new(Sidebar::new);
         let initial_summaries = subagents.list();
+        let initial_threads = session.threads().to_vec();
         sidebar.update(cx, |s, cx| {
             s.sync_from_summaries(&initial_summaries, cx);
+            s.set_threads(initial_threads, cx);
         });
         let submitted =
             cx.subscribe_in(&input, window, |this, _, _: &SubmitMessage, window, cx| {
@@ -548,7 +633,7 @@ impl ChatView {
         let sel = selector.clone();
         tokio_handle.spawn(async move {
             let mut session_guard = session.lock().await;
-            let _ = runtime.switch_model(&mut session_guard, &sel);
+            let _ = runtime.switch_main_model(&mut session_guard, &sel);
         });
         self.close_modal(window, cx);
     }
@@ -799,17 +884,23 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Starts a run with completions waiting in the main inbox, when no run is active.
-    /// While a run is active the runtime steers arrivals into it instead.
+    /// Starts a run with reports waiting in the main inbox, when no run is active.
+    /// Reports go to the thread that spawned their sender, one thread per run;
+    /// `finish_run` wakes again for the rest. While a run is active the runtime
+    /// steers its own thread's reports into it instead.
     fn wake_if_idle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.is_running {
             return;
         }
-        let arrivals = self.subagents.main_inbox().drain();
-        if arrivals.is_empty() {
+        let Some((origin, arrivals)) = self.subagents.main_inbox().take_next_group() else {
             return;
-        }
-        self.start_run(subagent_card::completion_prompt(&arrivals), window, cx);
+        };
+        self.start_run(
+            subagent_card::completion_prompt(&arrivals),
+            origin,
+            window,
+            cx,
+        );
     }
 
     #[allow(dead_code)]
@@ -886,12 +977,21 @@ impl ChatView {
         self.artifact_notice = None;
         self.scroll.scroll_to_bottom();
         self.focus_input(window, cx);
-        self.start_run(prompt, window, cx);
+        self.start_run(prompt, None, window, cx);
     }
 
     /// Starts a run for `prompt` and streams its events into the transcript until the
-    /// run ends. Callers record any user-visible message first.
-    fn start_run(&mut self, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// run ends. Callers record any user-visible message first. `origin` is the
+    /// session that spawned a subagent whose report this is; when it names one of
+    /// the main session's threads the run goes straight there, otherwise the
+    /// runtime routes the prompt.
+    fn start_run(
+        &mut self,
+        prompt: String,
+        origin: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.is_running = true;
 
         let control = RunControl::new();
@@ -903,8 +1003,15 @@ impl ChatView {
 
         let run_future = tokio_handle.spawn(async move {
             let mut session_guard = session.lock().await;
+            let target = origin.filter(|id| session_guard.thread(id).is_some());
             runtime
-                .run(&mut session_guard, prompt, events_tx, control)
+                .send(
+                    &mut session_guard,
+                    target.as_deref(),
+                    prompt,
+                    events_tx,
+                    control,
+                )
                 .await
         });
 
@@ -916,8 +1023,9 @@ impl ChatView {
                     biased;
                     event = events_rx.recv() => {
                         let Some(event) = event else { break };
-                        let updated = this.update_in(cx, |this, _window, cx| {
-                            this.handle_agent_event(event, cx);
+                        let updated = this.update_in(cx, |this, _window, cx| match event {
+                            MainEvent::Agent(event) => this.handle_agent_event(event, cx),
+                            MainEvent::Thread(event) => this.handle_thread_event(event, cx),
                         });
                         if updated.is_err() {
                             break;
@@ -942,6 +1050,41 @@ impl ChatView {
             .ok();
         }));
 
+        cx.notify();
+    }
+
+    /// Applies routing and thread lifecycle events: a routed request gets a
+    /// thread marker ahead of its user message, and the sidebar's thread list
+    /// follows creation, relabeling, and dormancy.
+    fn handle_thread_event(&mut self, event: ThreadEvent, cx: &mut Context<Self>) {
+        match event {
+            ThreadEvent::ThreadRouted { route } => {
+                let row = route_row(&route);
+                match self.messages.last() {
+                    Some(last) if last.role == MessageRole::User => {
+                        let at = self.messages.len() - 1;
+                        self.messages.insert(at, row);
+                    }
+                    _ => self.messages.push(row),
+                }
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.set_current_thread(&route.thread, cx)
+                });
+                self.scroll.scroll_to_bottom();
+            }
+            ThreadEvent::ThreadUpdated { thread } => {
+                self.sidebar
+                    .update(cx, |sidebar, cx| sidebar.upsert_thread(thread, cx));
+            }
+            ThreadEvent::ThreadLabelFailed { error, .. } => {
+                self.sidebar.update(cx, |sidebar, cx| {
+                    sidebar.set_error(
+                        Some(format!("Thread label update failed: {error}").into()),
+                        cx,
+                    );
+                });
+            }
+        }
         cx.notify();
     }
 
@@ -1384,6 +1527,7 @@ impl ChatView {
                         let author = match message.role {
                             MessageRole::User => "You",
                             MessageRole::Assistant => "Assistant",
+                            MessageRole::Thread => return thread_marker(index, message),
                         };
                         let artifacts = message.desktop_artifacts.clone();
                         let views = message.views.clone();
@@ -1459,6 +1603,7 @@ impl ChatView {
                                     views.iter().map(|view| card_element(view, &actions, cx)),
                                 ))
                             })
+                            .into_any_element()
                     })),
             )
     }
@@ -2026,6 +2171,7 @@ impl Render for ChatView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use juto_runtime::{EntryKind, Session};
 
     #[test]
     fn bash_approval_shows_exact_command_and_cwd() {
@@ -2129,7 +2275,7 @@ mod tests {
             })
             .unwrap();
 
-        let messages = load_messages(&session);
+        let messages = load_messages(&MainSession::open(session.path()).unwrap());
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, MessageRole::User);
         assert_eq!(messages[0].text.as_ref(), "Hello from user");
@@ -2172,7 +2318,7 @@ mod tests {
             })
             .unwrap();
 
-        let messages = load_messages(&session);
+        let messages = load_messages(&MainSession::open(session.path()).unwrap());
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, MessageRole::Assistant);
         assert_eq!(messages[0].desktop_artifacts.len(), 1);
@@ -2226,7 +2372,7 @@ mod tests {
             })
             .unwrap();
 
-        let messages = load_messages(&session);
+        let messages = load_messages(&MainSession::open(session.path()).unwrap());
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].text.as_ref(), "Spawned a worker");
         assert!(messages[0].views.is_empty());
