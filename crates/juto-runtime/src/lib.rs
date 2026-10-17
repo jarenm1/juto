@@ -889,6 +889,38 @@ async fn finish_isolated_run(
     }
 }
 
+/// A child run's model: the `task` entry's `model`, else the first of its
+/// role's `model:` selectors that resolves, else `modelRoles.task`, else the
+/// configured default model.
+fn child_model_selector(
+    runtime: &Runtime,
+    explicit: Option<&str>,
+    role_models: &[String],
+    settings: &RuntimeConfig,
+) -> Result<String> {
+    if let Some(selector) = explicit {
+        return Ok(selector.to_owned());
+    }
+    let mut last_error = None;
+    for selector in role_models {
+        match runtime.resolve_model(selector) {
+            Ok(_) => return Ok(selector.clone()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if let Some(error) = last_error {
+        return Err(error.context(format!(
+            "none of the role's models resolved ({})",
+            role_models.join(", ")
+        )));
+    }
+    Ok(settings
+        .model_roles
+        .get("task")
+        .cloned()
+        .unwrap_or_else(|| settings.model.clone()))
+}
+
 /// Remove an isolated workspace directory, then reclaim the change graph. The
 /// graph is reclaimed only after the directory is gone: the workspace head is
 /// stale by then, so gc drops it and any node only it kept alive.
@@ -934,18 +966,23 @@ impl subagents::SubagentFactory for ChildFactory {
         let result: Result<SubagentResult> = async {
             let mut session = Session::create(&runtime.inner.data_dir.join("sessions/subagents"), &runtime.inner.cwd)?;
             let settings = runtime.config();
-            let selector = spec
-                .model
-                .clone()
-                .or_else(|| settings.model_roles.get("task").cloned())
-                .unwrap_or(settings.model);
+            let role = spec.agent.as_deref().unwrap_or(roles::DEFAULT_ROLE);
+            let role_models = roles::load(&runtime.inner.cwd, &runtime.inner.data_dir)?
+                .get(role)
+                .map(|role| role.models.clone())
+                .unwrap_or_default();
+            let selector = child_model_selector(
+                &runtime,
+                spec.model.as_deref(),
+                &role_models,
+                &settings,
+            )?;
             runtime.switch_model(&mut session, &selector)?;
             let mut prompt = spec.task;
             if let Some(schema) = spec.output_schema {
                 prompt.push_str("\n\nReturn a single JSON value validating against this JSON Schema, without surrounding prose:\n");
                 prompt.push_str(&serde_json::to_string(&schema)?);
             }
-            let role = spec.agent.as_deref().unwrap_or(roles::DEFAULT_ROLE);
             let manager = self.nested_manager(&runtime, &control);
             let outcome = runtime
                 .run_depth(
@@ -1638,6 +1675,55 @@ mod tests {
             "isolated child workspace must survive a completed run: {}",
             workspace_dir.display()
         );
+    }
+
+    #[test]
+    fn child_model_follows_task_then_role_then_task_role_then_default() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let mut config = mock_config();
+        let mut small = config.custom_models[0].clone();
+        small.id = "small".to_string();
+        config.custom_models.push(small);
+        config
+            .model_roles
+            .insert("smol".to_string(), "mock/small".to_string());
+        let runtime = runtime_with(
+            &repo,
+            &root.path().join("data"),
+            config,
+            Arc::new(MockProvider),
+        );
+        let settings = runtime.config();
+        let pick = |explicit: Option<&str>, role: &[&str]| {
+            let role: Vec<String> = role.iter().map(|s| s.to_string()).collect();
+            child_model_selector(&runtime, explicit, &role, &settings)
+        };
+
+        assert_eq!(pick(Some("mock/test"), &["@smol"]).unwrap(), "mock/test");
+        let smol = pick(None, &["@smol"]).unwrap();
+        assert_eq!(runtime.resolve_model(&smol).unwrap().0.id, "small");
+        assert_eq!(pick(None, &["nope/missing", "@smol"]).unwrap(), "@smol");
+        let err = pick(None, &["nope/missing"]).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("none of the role's models resolved"),
+            "{err:#}"
+        );
+        assert_eq!(pick(None, &[]).unwrap(), "mock/test");
+
+        let mut with_task_role = settings.clone();
+        with_task_role
+            .model_roles
+            .insert("task".to_string(), "mock/small".to_string());
+        assert_eq!(
+            child_model_selector(&runtime, None, &[], &with_task_role).unwrap(),
+            "mock/small"
+        );
+        // An unset `@smol` inherits the default model.
+        let mut unset = settings.clone();
+        unset.model_roles.clear();
+        assert_eq!(unset.resolve_selector("@smol").unwrap().0, "mock/test");
     }
 
     #[tokio::test]

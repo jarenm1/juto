@@ -51,8 +51,15 @@ sandbox.
 **Delegating role model.** The top-level `main` role has `read`, `glob`, `grep`, `task`, `wait`,
 `agent_send`, `agent_cancel`, `agent_inbox`, `subagent_release`, and `view`; it cannot edit files. Work runs in child agents defined as
 markdown roles in `crates/juto-runtime/src/roles/`: `builder` (all tools), `scout` and `reviewer`
-(read-only), and `task` (all tools, the default). A role's `tools` frontmatter takes `all`,
-`read-only`, or a list of tool names; a missing field means read-only. A `<role>.md` file in
+(read-only), `task` (all tools, the default), and `browser` (only the `browser` tool, on
+`@smol`). A role's `tools` frontmatter takes `all`,
+`read-only`, or a list of tool names; a missing field means read-only. An optional `model`
+field (oh-my-pi's agent `model:`) takes a selector or an ordered fallback list, such as
+`model: "@smol"` or `model: ["@smol", openai/gpt-5-mini]`. A child's model is the `task`
+entry's `model`, else the first role selector that resolves in the model registry, else
+`modelRoles.task`, else the default `model`; a role whose selectors all fail to resolve fails
+the child instead of silently using another model. `@smol` without a `modelRoles.smol` entry
+inherits the default model. A `<role>.md` file in
 `.juto/agents/` in the working directory or an ancestor, or in the runtime data directory's
 `agents/`, replaces the built-in of the same name, and the nearest file wins. Children receive
 delegation tools only below `max_recursion_depth` (default 2).
@@ -168,12 +175,18 @@ remain errors in either mode.
 
 ### Agent browser tool
 
-The runtime registers a `browser` tool (Exec tier; available to `builder` and
-`task` roles) ported from oh-my-pi's browser tool at the pinned revision. It
+The runtime registers a `browser` tool (Exec tier; available to the `builder`,
+`task`, and `browser` roles) ported from oh-my-pi's browser tool at the pinned revision. It
 drives Chromium over the DevTools protocol from Rust: `open`, `close`, `tabs`,
 `call`, and `run` keep OMP's parameter schema. Tabs are named, shared by every
 session of one runtime, and outlive individual runs; managed Chromium shuts down
 when its last tab is released, and all spawned browsers die with the runtime.
+
+The built-in `browser` role is a web researcher that `main` and builders can
+spawn for documentation, issues, or other external facts. It has only the
+`browser` tool, runs on `@smol` (set `modelRoles.smol` to a fast model), uses
+its own tab names, closes its tabs, and returns a summary with source URLs. It
+is told not to log in or submit state-changing forms unless the task says so.
 
 `call` runs one OMP tab helper or one `id(n)`/`ref("eN")` element-handle hop.
 Element work uses OMP's vendored in-page kit (selectors including `aria/`,
