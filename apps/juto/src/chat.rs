@@ -944,6 +944,7 @@ impl ChatView {
                     self.is_running,
                 );
             }
+            SubagentEvent::DesktopReported { .. } => {}
         }
         self.sync_subagents(cx);
         if matches!(event, SubagentEvent::Finished { .. }) {
