@@ -138,7 +138,7 @@ fn webrtc_streams_composed_frames_to_a_native_receiver() {
     let socket = env.socket_path().to_string_lossy().to_string();
     let client = std::thread::spawn(move || common::run(&socket, 30));
 
-    // Wait until the client has drawn something.
+    // Wait until the client's full two-tone window is composed, not just its first pixel.
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut ready = false;
     while Instant::now() < deadline {
@@ -149,8 +149,13 @@ fn webrtc_streams_composed_frames_to_a_native_receiver() {
             pool.release_slot(info.slot);
             if let Ok((header, pixels)) = read
                 && header.width > 0
-                && pixels.len() >= 4 * 4
-                && pixels[0..4] == common::RED
+                && {
+                    let at = |x: u32, y: u32| {
+                        let index = (y * header.stride + x * 4) as usize;
+                        pixels.get(index..index + 4)
+                    };
+                    at(10, 10) == Some(&common::RED[..]) && at(300, 10) == Some(&common::BLUE[..])
+                }
             {
                 ready = true;
                 break;

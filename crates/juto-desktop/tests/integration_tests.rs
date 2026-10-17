@@ -3,12 +3,14 @@
 mod common;
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use juto_desktop::DesktopError;
 use juto_desktop::WindowInfo;
 use juto_desktop::protocol::*;
-use juto_desktop::shm::{ShmFramePool, ShmReader};
+use juto_desktop::shm::{FrameWait, ShmFramePool, ShmReader};
 use juto_desktop::supervisor::{
     DesktopSupervisor, EnvironmentConfig, HostPolicy, OutputConfig, RenderProfile, SystemLimits,
 };
@@ -1007,6 +1009,149 @@ fn xwayland_maps_an_x11_client_into_the_desktop() {
         "the composed desktop never showed the X11 client's pixels"
     );
 
+    env.destroy();
+}
+
+/// Mirrors a viewer's stream: wake on each publish, reserve the newest slot,
+/// copy it, hold it while downscaling, and release it.
+fn spawn_live_reader(pool: Arc<ShmReader>, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut seen = 0;
+        let mut last = None;
+        while !stop.load(Ordering::SeqCst) {
+            let Ok(FrameWait::Published(current)) =
+                pool.wait_for_frame(seen, Duration::from_millis(100))
+            else {
+                continue;
+            };
+            seen = current;
+            let Ok(Some(frame)) = pool.latest_frame() else {
+                continue;
+            };
+            if last == Some(frame.header.frame_id) {
+                continue;
+            }
+            last = Some(frame.header.frame_id);
+            pool.acquire_slot(frame.slot);
+            let _ = pool.read_slot(frame.slot, pool.slot_size());
+            std::thread::sleep(Duration::from_millis(30));
+            pool.release_slot(frame.slot);
+        }
+    })
+}
+
+/// Regression: live viewers reserve and release slots while the desktop is
+/// idle and the control holder moves the pointer. Observation must still
+/// answer promptly.
+#[test]
+fn observe_answers_promptly_while_live_readers_hold_an_idle_desktop() {
+    let supervisor = DesktopSupervisor::new();
+    let mut config = test_config(&unique_env_id("live"));
+    config.output.width = 1280;
+    config.output.height = 720;
+    config.output.fps = 60;
+    let env = supervisor
+        .create_environment(config, &unique_env_id("req"))
+        .expect("create environment");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while env.x11_display().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    env.x11_display().expect("Xwayland must become ready");
+    env.launch(
+        "xeyes",
+        &[
+            "xeyes".to_string(),
+            "-geometry".to_string(),
+            "200x150".to_string(),
+        ],
+        None,
+        &[],
+        &unique_env_id("req"),
+    )
+    .expect("launch xeyes");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        let mapped = env
+            .get_status()
+            .mapped_windows
+            .iter()
+            .any(|w| w.app_id.contains("xeyes") || w.title.contains("xeyes"));
+        if mapped {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    // xeyes now sits idle: the desktop stops changing after its first paint.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
+    let pool = env.frame_pool();
+    let stop = Arc::new(AtomicBool::new(false));
+    // The chat canvas and the focus view may each mount a viewer.
+    let readers: Vec<_> = (0..2)
+        .map(|_| spawn_live_reader(pool.clone(), stop.clone()))
+        .collect();
+
+    let mut seq = 0;
+    for step in 0..25u32 {
+        for n in 0..10u32 {
+            seq += 1;
+            env.dispatch_input(
+                "agent:test",
+                lease.epoch,
+                env.generation(),
+                InputBatch {
+                    seq,
+                    client_timestamp_us: 0,
+                    events: vec![InputEvent::PointerMoveAbs {
+                        x: 10 + (step * 10 + n) % 500,
+                        y: 100,
+                    }],
+                },
+            )
+            .expect("pointer input accepted");
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        let started = Instant::now();
+        env.observe(Duration::from_secs(5))
+            .expect("observe must answer within 5s while live viewers hold the desktop");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+    stop.store(true, Ordering::SeqCst);
+    for reader in readers {
+        reader.join().expect("reader thread");
+    }
+    env.destroy();
+}
+
+/// Regression: the supervisor's event thread reads worker replies for the whole
+/// life of the environment. A read timeout left on the worker socket after the
+/// handshake ended that thread after 20s without events, so every later
+/// observation timed out on an idle desktop with no warning.
+#[test]
+fn observe_answers_after_an_idle_gap_longer_than_the_handshake_timeout() {
+    let supervisor = DesktopSupervisor::new();
+    let mut config = test_config(&unique_env_id("idle-gap"));
+    config.output.width = 1280;
+    config.output.height = 720;
+    config.output.fps = 60;
+    let env = supervisor
+        .create_environment(config, &unique_env_id("req"))
+        .expect("create environment");
+    env.observe(Duration::from_secs(5)).expect("first observe");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = spawn_live_reader(env.frame_pool(), stop.clone());
+    std::thread::sleep(Duration::from_secs(21));
+    let result = env.observe(Duration::from_secs(5));
+    stop.store(true, Ordering::SeqCst);
+    reader.join().expect("reader thread");
+    result.expect("observe must answer after a 21s idle gap");
     env.destroy();
 }
 
