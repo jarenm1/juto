@@ -136,7 +136,8 @@
               postFixup = ''
                 wrapProgram $out/bin/juto \
                   --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath nativeLibraries}" \
-                  --set GST_PLUGIN_SYSTEM_PATH_1_0 "${gstPluginPath}"
+                  --set GST_PLUGIN_SYSTEM_PATH_1_0 "${gstPluginPath}" \
+                  --set-default JUTO_CHROMIUM "${pkgs.chromium}/bin/chromium"
               '';
               meta = {
                 description = "Native GPUI agent runtime";
@@ -176,6 +177,9 @@
             buildInputs = nativeLibraries;
 
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+
+            # Managed Chromium for the agent `browser` tool.
+            JUTO_CHROMIUM = "${pkgs.chromium}/bin/chromium";
 
             # Keep Cargo's incremental cache usable; do not wrap rustc with sccache.
             CARGO_INCREMENTAL = "1";
