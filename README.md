@@ -222,6 +222,12 @@ maps pointer coordinates to desktop pixels, and reports connection state and err
 instead of showing a stale frame as live. `juto --desktop <command> [args...]` mounts
 the same canvas directly for development.
 
+**Live frame delivery.** Each environment has one producer. It copies and shrinks each
+newly published frame once, and every mounted canvas of that environment shares the
+result. The producer blocks on the compositor's publish signal instead of polling, so a
+live canvas shows a frame as soon as it is published. A canvas slower than the frame rate
+skips to the newest frame rather than queueing old ones.
+
 **Resize gating.** A resize publishes a new geometry generation and clears every
 viewer's acknowledgement; pointer input is rejected with `StaleGeneration` until a
 viewer reports `GeometryReady` for the new generation, so a click cannot land on a
@@ -269,6 +275,23 @@ never bursts to catch up. Frame callbacks keep idle clients on the same cadence.
 `Observe` reports the tick count, frames composed, frames dropped because every
 pool slot was held by a slow reader, and the last composition duration, so a
 caller can measure pacing and backpressure instead of inferring them.
+
+**Latency.** Measured with `target/debug/examples/frame_latency <poll|wait> <fps> <samples>`:
+200 pointer moves through the real input path per run, timed from input applied to a
+frame stamped after it, 640×480 client, Xvfb software Vulkan. `poll` sleeps 33 ms
+between reads (the viewer's previous cadence); `wait` blocks on the publish futex.
+
+| Observer | FPS | p50 ms | p95 ms | max ms | mean ms |
+|---|---|---|---|---|---|
+| poll | 30 | 33.08 | 33.12 | 33.52 | 33.09 |
+| wait | 30 | 20.27 | 21.30 | 21.64 | 20.17 |
+| poll | 60 | 33.09 | 33.14 | 34.15 | 33.10 |
+| wait | 60 | 3.60 | 3.74 | 4.83 | 3.58 |
+
+With a static client the compositor composed 0.0 frames/s while idle in every run. The
+previous change (`qvmlzyom`) was not measured with this tool. A frame that began before
+the input but finished after it can pass the stamp gate, which understates latency; this
+was not quantified.
 
 **Text input.** The compositor advertises `zwp_text_input_manager_v3` and acts as
 the input method for its own clients: focus changes send `enter`/`leave`, and
@@ -614,11 +637,20 @@ paused: one still captured at mount, `paused` status, no frame loop. A click res
 to `live 1280x720` and the client's two-tone frame appeared letterboxed in the harness
 window. A 75-second paused hold kept the environment alive (the click still reached
 `live 1280x720`); the test client exits after its 60-second argument, so that run's
-post-resume canvas was empty. Process-tree CPU over 5-second windows: 1% paused,
-187–230% live at 1280×720 (live copies every frame with no change detection). The
-viewer's read path is 854×480 (`SHOWN_MAX_WIDTH`/`SHOWN_MAX_HEIGHT`); at that size
-live CPU measured 129%, against 1% paused. Environment and agent desktops keep
-1280×720. No Wayland, hardware GPU, or provider access was exercised.
+post-resume canvas was empty. Process CPU over 5-second windows, measured for this
+change (`juto` is the viewer, `juto-desktop` the compositor worker; percent of one
+core from `/proc` stat deltas, Xvfb with software Vulkan): static test client, 1.2%
+paused and 1.4% live. `xeyes` with a 20 Hz pointer wiggle over the canvas, live, in a
+debug build, per thread over 5 s from `/proc` stat deltas: the frames thread
+(`juto-desktop-frames`: copy, downscale, upload) 52.6%, down from 102.6% before this
+pass; the `juto` main thread 27.0%; software Vulkan threads excluded. The downscale
+takes about 30 ms per 1280×720 frame in debug (about 190 ms before this pass), so the
+frames thread still misses the 30% goal in a debug build. The earlier 129–230% and
+356% figures came from different workloads and are removed. [INFERENCE] An optimised
+build should cut the frames thread well below this; not measured.
+The viewer's read
+path is 854×480 (`SHOWN_MAX_WIDTH`/`SHOWN_MAX_HEIGHT`). Environment and agent desktops
+keep 1280×720. No Wayland, hardware GPU, or provider access was exercised.
 
 Headless `juto --desktop xeyes` under Xvfb: the inline canvas rendered xeyes after
 a click resumed it, and the Pause button showed `Paused — click to resume`, status
