@@ -123,6 +123,9 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Owner lifetime: `Heartbeat` renews the owner deadline or the control lease, a
   reaper retires an environment whose heartbeat lapsed, and `Retain` transfers
   lifetime responsibility to a human session with a host-bounded deadline.
+  The runtime adopts the environments its `desktop` tool creates into a keepalive that
+  renews their owner heartbeat every 15 seconds, so they outlive the creating task
+  until they are destroyed or the process exits.
 - Artifact resolution: the runtime validates host, environment, grant, principal,
   and expiry before returning a same-host route or a one-time remote token, and
   otherwise reports `Unsupported`, `Unauthorized`, `Expired`, `Stopped`, or
@@ -303,9 +306,11 @@ Creating -> Ready -> Stopping -> Stopped
 - Owner heartbeat interval is 10 seconds for the runtime's `desktop` tool; the
   embedded canvas heartbeats every 2 seconds while it is mounted. Expiry after
   60 seconds destroys the environment unless the runtime has explicitly
-  transferred retention ownership to a human session. Task cancellation stops
-  the desktop by default. A mounted viewer keeps the desktop alive; once the
-  canvas unmounts, heartbeats stop and ordinary expiry applies.
+  transferred retention ownership to a human session. Environments adopted by the
+  runtime's `desktop` tool are the exception: the runtime renews their owner heartbeat,
+  so task cancellation does not stop them, and they end only by `Destroy` or process
+  exit. A mounted viewer keeps its desktop alive; once the canvas unmounts, its
+  heartbeats stop, and environments the runtime did not adopt expire normally.
 - `Destroy` first revokes grants/leases, releases held input, closes viewers,
   requests application termination, then stops the entire environment cgroup.
   Default grace period: 5 seconds, followed by forced termination. Destroy is
@@ -652,6 +657,10 @@ creation is **not** environment creation, grant issuance, or proof that a deskto
 exists. A `desktop_artifact` tool may register durable details and mount/replay
 the descriptor; its success must not be reported as streaming success.
 No credentials, bearer URLs, Unix paths, SDP, or media belong in the descriptor.
+
+Shipped child reporting: when a child's `desktop_artifact` call succeeds, the parent
+run emits it as `SubagentEvent::DesktopReported`, and the top-level chat shows it below
+the child's card. See README, **Child desktops in the main chat**.
 
 The runtime owns a resolver at the desktop-backend seam. Given authenticated
 principal plus descriptor, a real configured adapter validates host/environment/
