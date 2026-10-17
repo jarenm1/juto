@@ -55,7 +55,7 @@ pub enum ActiveModal {
 }
 
 /// The inline canvas for one desktop artifact, mounted once per artifact.
-enum DesktopCanvas {
+pub(crate) enum DesktopCanvas {
     /// A live viewer for an environment this process owns.
     Live(Entity<crate::desktop_viewer::DesktopViewer>),
     /// Why no canvas can be shown; rendered in the canvas's place.
@@ -597,88 +597,13 @@ impl ChatView {
     /// frame. An unavailable outcome is re-resolved on each pass, because its
     /// cause (for example, an environment that is not ready yet) can clear.
     fn mount_desktop_canvases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let pending: Vec<DesktopSessionArtifact> = self
-            .messages
-            .iter()
-            .flat_map(|message| message.desktop_artifacts.iter())
-            .filter(|artifact| {
-                !matches!(
-                    self.desktop_canvases.get(&artifact.artifact_id),
-                    Some(DesktopCanvas::Live(_))
-                )
-            })
-            .cloned()
-            .collect();
-        for artifact in pending {
-            let canvas = self.resolve_desktop_canvas(&artifact, window, cx);
-            self.desktop_canvases
-                .insert(artifact.artifact_id.clone(), canvas);
-        }
-    }
-
-    fn resolve_desktop_canvas(
-        &self,
-        artifact: &DesktopSessionArtifact,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> DesktopCanvas {
-        // Resolution is bound to this session's principal, not to whoever issued
-        // the grant: a grant issued to another principal is rejected.
-        match self
-            .runtime
-            .desktop_artifact_resolver()
-            .resolve(crate::desktop_viewer::SESSION_PRINCIPAL, artifact)
-        {
-            Ok(juto_runtime::ViewerRoute::Local {
-                env_id,
-                roles,
-                expires_at,
-            }) => {
-                let control = roles.iter().any(|role| {
-                    matches!(
-                        role,
-                        juto_runtime::protocol::GrantRole::Owner
-                            | juto_runtime::protocol::GrantRole::Control
-                    )
-                });
-                let access = if control {
-                    crate::desktop_viewer::ControlAccess::Granted { expires_at }
-                } else {
-                    crate::desktop_viewer::ControlAccess::ViewOnly
-                };
-                match self.runtime.desktop_supervisor().get_environment(&env_id) {
-                    Ok(env) => DesktopCanvas::Live(cx.new(|cx| {
-                        crate::desktop_viewer::DesktopViewer::new(env, access, window, cx)
-                    })),
-                    Err(err) => DesktopCanvas::Unavailable(
-                        format!("Desktop environment '{env_id}' is unavailable: {err}").into(),
-                    ),
-                }
-            }
-            Ok(juto_runtime::ViewerRoute::Remote { .. }) => DesktopCanvas::Unavailable(
-                "Remote desktop sessions cannot be shown inline yet.".into(),
-            ),
-            Err(err) => DesktopCanvas::Unavailable(
-                format!("Desktop '{}' cannot be opened: {err}", artifact.title).into(),
-            ),
-        }
-    }
-
-    /// The inline body of an artifact card: its live canvas, or why it has none.
-    fn desktop_canvas_body(&self, artifact: &DesktopSessionArtifact) -> AnyElement {
-        match self.desktop_canvases.get(&artifact.artifact_id) {
-            Some(DesktopCanvas::Live(viewer)) => viewer.clone().into_any_element(),
-            Some(DesktopCanvas::Unavailable(reason)) => div()
-                .text_sm()
-                .text_color(rgb(0xcbd5e1))
-                .child(reason.clone())
-                .into_any_element(),
-            None => div()
-                .text_sm()
-                .text_color(rgb(0xcbd5e1))
-                .child("Desktop canvas is not mounted.")
-                .into_any_element(),
-        }
+        mount_canvases(
+            &mut self.desktop_canvases,
+            &self.runtime,
+            &self.messages,
+            window,
+            cx,
+        );
     }
 
     /// Creates a desktop environment, launches `argv` into it, and opens the
@@ -813,7 +738,9 @@ impl ChatView {
         };
         let subagents = Arc::clone(&self.subagents);
         let tokio_handle = self.tokio_handle.clone();
-        let focus = cx.new(|cx| FocusView::new(summary, updates, subagents, tokio_handle, cx));
+        let runtime = self.runtime.clone();
+        let focus =
+            cx.new(|cx| FocusView::new(summary, updates, subagents, runtime, tokio_handle, cx));
         let subscription = cx.subscribe(&focus, |this, _, _: &FocusEvent, cx| {
             this.exit_focus(cx);
         });
@@ -1519,7 +1446,7 @@ impl ChatView {
                             .when(!artifacts.is_empty(), |row| {
                                 row.child(div().mt_3().flex().flex_col().gap_2().children(
                                     artifacts.into_iter().map(|artifact| {
-                                        let body = self.desktop_canvas_body(&artifact);
+                                        let body = canvas_body(&self.desktop_canvases, &artifact);
                                         desktop_artifact_card(&artifact, body)
                                     }),
                                 ))
@@ -1943,7 +1870,104 @@ fn menu_item(
         .child(div().text_xs().text_color(rgb(0x909090)).child(detail))
 }
 
-fn desktop_artifact_card(artifact: &DesktopSessionArtifact, body: AnyElement) -> Div {
+/// Mounts an inline canvas for each artifact in `messages` that has no live
+/// canvas yet. A live viewer is cached so rendering does not re-resolve it on
+/// every frame. An unavailable outcome is re-resolved on each pass, because its
+/// cause (for example, an environment that is not ready yet) can clear.
+pub(crate) fn mount_canvases<T: 'static>(
+    canvases: &mut HashMap<String, DesktopCanvas>,
+    runtime: &Runtime,
+    messages: &[Message],
+    window: &mut Window,
+    cx: &mut Context<T>,
+) {
+    let pending: Vec<DesktopSessionArtifact> = messages
+        .iter()
+        .flat_map(|message| message.desktop_artifacts.iter())
+        .filter(|artifact| {
+            !matches!(
+                canvases.get(&artifact.artifact_id),
+                Some(DesktopCanvas::Live(_))
+            )
+        })
+        .cloned()
+        .collect();
+    for artifact in pending {
+        let canvas = resolve_desktop_canvas(runtime, &artifact, window, cx);
+        canvases.insert(artifact.artifact_id.clone(), canvas);
+    }
+}
+
+fn resolve_desktop_canvas<T: 'static>(
+    runtime: &Runtime,
+    artifact: &DesktopSessionArtifact,
+    window: &mut Window,
+    cx: &mut Context<T>,
+) -> DesktopCanvas {
+    // Resolution is bound to this session's principal, not to whoever issued
+    // the grant: a grant issued to another principal is rejected.
+    match runtime
+        .desktop_artifact_resolver()
+        .resolve(crate::desktop_viewer::SESSION_PRINCIPAL, artifact)
+    {
+        Ok(juto_runtime::ViewerRoute::Local {
+            env_id,
+            roles,
+            expires_at,
+        }) => {
+            let control = roles.iter().any(|role| {
+                matches!(
+                    role,
+                    juto_runtime::protocol::GrantRole::Owner
+                        | juto_runtime::protocol::GrantRole::Control
+                )
+            });
+            let access = if control {
+                crate::desktop_viewer::ControlAccess::Granted { expires_at }
+            } else {
+                crate::desktop_viewer::ControlAccess::ViewOnly
+            };
+            match runtime.desktop_supervisor().get_environment(&env_id) {
+                Ok(env) => {
+                    DesktopCanvas::Live(cx.new(|cx| {
+                        crate::desktop_viewer::DesktopViewer::new(env, access, window, cx)
+                    }))
+                }
+                Err(err) => DesktopCanvas::Unavailable(
+                    format!("Desktop environment '{env_id}' is unavailable: {err}").into(),
+                ),
+            }
+        }
+        Ok(juto_runtime::ViewerRoute::Remote { .. }) => {
+            DesktopCanvas::Unavailable("Remote desktop sessions cannot be shown inline yet.".into())
+        }
+        Err(err) => DesktopCanvas::Unavailable(
+            format!("Desktop '{}' cannot be opened: {err}", artifact.title).into(),
+        ),
+    }
+}
+
+/// The inline body of an artifact card: its live canvas, or why it has none.
+pub(crate) fn canvas_body(
+    canvases: &HashMap<String, DesktopCanvas>,
+    artifact: &DesktopSessionArtifact,
+) -> AnyElement {
+    match canvases.get(&artifact.artifact_id) {
+        Some(DesktopCanvas::Live(viewer)) => viewer.clone().into_any_element(),
+        Some(DesktopCanvas::Unavailable(reason)) => div()
+            .text_sm()
+            .text_color(rgb(0xcbd5e1))
+            .child(reason.clone())
+            .into_any_element(),
+        None => div()
+            .text_sm()
+            .text_color(rgb(0xcbd5e1))
+            .child("Desktop canvas is not mounted.")
+            .into_any_element(),
+    }
+}
+
+pub(crate) fn desktop_artifact_card(artifact: &DesktopSessionArtifact, body: AnyElement) -> Div {
     div()
         .flex()
         .flex_col()
