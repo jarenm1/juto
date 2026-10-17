@@ -46,7 +46,7 @@ pub struct AutomationBarrier {
 
 /// Control protocol version. A request carrying any other version is rejected
 /// before it is dispatched (spec section 4).
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Versioned control request envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
