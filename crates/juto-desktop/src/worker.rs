@@ -231,23 +231,19 @@ pub fn run_worker(args: WorkerArgs) -> Result<(), DesktopError> {
             WorkerRequest::Snapshot => {
                 let (reply, rx) = std_mpsc::sync_channel(1);
                 let _ = cmd_tx.send(CompositorCommand::Snapshot { reply });
-                match rx.recv_timeout(Duration::from_secs(10)) {
-                    Ok(Ok(info)) => {
-                        let _ = send_response(&writer, &snapshot_response(&info), None);
-                    }
-                    Ok(Err(message)) => {
-                        let _ = send_response(&writer, &WorkerResponse::Error { message }, None);
-                    }
-                    Err(_) => {
-                        let _ = send_response(
-                            &writer,
-                            &WorkerResponse::Error {
-                                message: "snapshot timed out".to_string(),
-                            },
-                            None,
-                        );
-                    }
-                }
+                // Answer off this loop: a composition can wait on a reader to
+                // release its slot, and that release is read by this loop.
+                let writer = writer.clone();
+                std::thread::spawn(move || {
+                    let response = match rx.recv_timeout(Duration::from_secs(10)) {
+                        Ok(Ok(info)) => snapshot_response(&info),
+                        Ok(Err(message)) => WorkerResponse::Error { message },
+                        Err(_) => WorkerResponse::Error {
+                            message: "snapshot timed out".to_string(),
+                        },
+                    };
+                    let _ = send_response(&writer, &response, None);
+                });
             }
             WorkerRequest::AcquireSlot { slot } => {
                 let _ = cmd_tx.send(CompositorCommand::AcquireSlot {
@@ -725,6 +721,12 @@ fn accept_ready(
         .set_read_timeout(Some(Duration::from_secs(20)))
         .map_err(|e| DesktopError::Compositor(format!("worker socket: {e}")))?;
     let (payload, fd) = read_response_with_fd(&stream)?;
+    // The 20s bound applies to the handshake only. The socket stays open for the
+    // life of the environment and is read by the event thread, which must block
+    // rather than end after a quiet period.
+    stream
+        .set_read_timeout(None)
+        .map_err(|e| DesktopError::Compositor(format!("worker socket: {e}")))?;
     let response: WorkerResponse = serde_json::from_slice(&payload)
         .map_err(|e| DesktopError::Compositor(format!("worker handshake: {e}")))?;
     Ok((stream, response, fd))

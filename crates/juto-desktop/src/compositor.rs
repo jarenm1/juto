@@ -11,7 +11,7 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc as std_mpsc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::text_input::{TextInputManagerState, TextInputUserData};
 use smithay::backend::egl::native::EGLSurfacelessDisplay;
@@ -47,10 +47,7 @@ use smithay::reexports::calloop::channel::{
     Channel, Event as ChannelEvent, Sender as ChannelSender, channel,
 };
 use smithay::reexports::calloop::generic::Generic;
-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
-use smithay::reexports::calloop::{
-    EventLoop, Interest, LoopSignal, Mode as CalloopMode, PostAction,
-};
+use smithay::reexports::calloop::{EventLoop, Interest, Mode as CalloopMode, PostAction};
 use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::{
     zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
     zwp_text_input_v3::{self, ZwpTextInputV3},
@@ -92,6 +89,7 @@ use smithay::xwayland::xwm::{
 use smithay::xwayland::{XWayland, XWaylandClientData, XWaylandEvent};
 
 use crate::error::DesktopError;
+use crate::pacing::Pacer;
 use crate::protocol::{DesktopEvent, InputEvent, WindowInfo};
 use crate::shm::ShmFramePool;
 
@@ -794,7 +792,7 @@ struct X11Grab {
 /// The single-threaded Smithay state owned by the compositor thread.
 struct DesktopState {
     display: Option<Display<DesktopState>>,
-    signal: LoopSignal,
+    pacer: Pacer,
 
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -835,6 +833,8 @@ struct DesktopState {
     frames_dropped: u64,
     compose_micros: u64,
     dirty: bool,
+    /// Set by `Shutdown`; the run loop exits after its current pass.
+    stop_requested: bool,
     start_time: Instant,
 
     windows: HashMap<u32, MappedWindow>,
@@ -1392,12 +1392,13 @@ impl DesktopState {
         })
     }
 
-    fn flush_snapshots(&mut self) {
+    /// Answers queued snapshot requests with the frame just composed, or with
+    /// the composition error.
+    fn reply_snapshots(&mut self, result: &Result<SnapshotInfo, DesktopError>) {
         if self.pending_snapshots.is_empty() {
             return;
         }
-        let result = self.render_frame();
-        let payload = match &result {
+        let payload = match result {
             Ok(info) => Ok(*info),
             Err(err) => Err(err.to_string()),
         };
@@ -1417,16 +1418,40 @@ impl DesktopState {
         }
     }
 
-    fn tick(&mut self) {
-        self.ticks = self.ticks.wrapping_add(1);
-        if self.dirty {
-            if let Err(err) = self.render_frame() {
-                tracing::warn!(error = %err, "composition failed");
-            }
-            self.dirty = false;
+    fn wants_compose(&self) -> bool {
+        self.dirty || !self.pending_snapshots.is_empty()
+    }
+
+    /// Runs one pacing pass at `now`: composes when a frame is wanted and due,
+    /// answers snapshot requests from that frame, and sends frame callbacks on
+    /// the same cadence so idle clients keep their schedule.
+    fn pace(&mut self, now: Instant) {
+        let want = self.wants_compose();
+        let decision = self.pacer.decide(now, want);
+        if !decision.compose && !decision.callbacks {
+            return;
         }
-        self.flush_snapshots();
-        self.send_frame_callbacks();
+        self.ticks = self.ticks.wrapping_add(1);
+        if decision.compose {
+            let result = self.render_frame();
+            match &result {
+                Ok(_) => {
+                    self.dirty = false;
+                    self.reply_snapshots(&result);
+                }
+                // Readers hold every slot the producer may write: the request
+                // stays queued and the next pacing pass composes it once a slot
+                // frees. Observers bound their own wait.
+                Err(DesktopError::LimitExceeded(_)) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, "composition failed");
+                    self.reply_snapshots(&result);
+                }
+            }
+        }
+        if decision.callbacks {
+            self.send_frame_callbacks();
+        }
         self.flush();
     }
 
@@ -2307,11 +2332,10 @@ pub(crate) fn run_compositor(
 
     let mut event_loop: EventLoop<'static, DesktopState> = EventLoop::try_new()
         .map_err(|e| DesktopError::Compositor(format!("failed to create event loop: {e}")))?;
-    let signal = event_loop.get_signal();
 
     let mut state = DesktopState {
         display: None,
-        signal: signal.clone(),
+        pacer: Pacer::new(config.fps),
         compositor_state,
         xdg_shell_state,
         shm_state,
@@ -2340,6 +2364,7 @@ pub(crate) fn run_compositor(
         frames_dropped: 0,
         compose_micros: 0,
         dirty: true,
+        stop_requested: false,
         start_time: Instant::now(),
         windows: HashMap::new(),
         x11_windows: HashMap::new(),
@@ -2494,29 +2519,26 @@ pub(crate) fn run_compositor(
                     }
                     CompositorCommand::AcquireSlot { slot } => state.pool.acquire_slot(slot),
                     CompositorCommand::ReleaseSlot { slot } => state.pool.release_slot(slot),
-                    CompositorCommand::Shutdown => state.signal.stop(),
+                    CompositorCommand::Shutdown => state.stop_requested = true,
                 }
             }
         })
         .map_err(|e| DesktopError::Compositor(format!("failed to register command source: {e}")))?;
 
-    // Virtual clock.
-    let interval = Duration::from_micros(1_000_000 / state.fps.max(1) as u64);
-    let timer = Timer::from_duration(interval);
-    handle
-        .insert_source(timer, |_, _, state: &mut DesktopState| {
-            state.tick();
-            TimeoutAction::ToDuration(Duration::from_micros(1_000_000 / state.fps.max(1) as u64))
-        })
-        .map_err(|e| DesktopError::Compositor(format!("failed to register frame timer: {e}")))?;
-
     state.display = Some(display);
 
     let _ = ready_tx.try_send(Ok(()));
 
-    event_loop
-        .run(None, &mut state, |_state| {})
-        .map_err(|e| DesktopError::Compositor(format!("event loop failed: {e}")))?;
+    // Frame pacing: block on client and command events, but never past the
+    // next composition or frame callback that is due.
+    while !state.stop_requested {
+        let wants = state.wants_compose();
+        let timeout = state.pacer.next_wake(Instant::now(), wants);
+        event_loop
+            .dispatch(Some(timeout), &mut state)
+            .map_err(|e| DesktopError::Compositor(format!("event loop failed: {e}")))?;
+        state.pace(Instant::now());
+    }
 
     Ok(())
 }
@@ -2535,6 +2557,7 @@ fn reconfigure(
     state.height = height;
     state.scale = scale;
     state.fps = fps.max(1);
+    state.pacer.set_fps(state.fps);
     state.generation = generation;
 
     let mode = Mode {

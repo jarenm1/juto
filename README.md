@@ -335,11 +335,13 @@ the slice, retiring every scope inside it. A monitor samples the slice's cgroup
 and emits `LimitPressure` when memory crosses 90% of the limit or the CPU
 throttle counter advances.
 
-**Pacing and statistics.** The compositor runs a virtual clock at the effective
-FPS and never renders twice inside one interval or bursts to catch up. `Observe`
-reports the tick count, frames composed, frames dropped because every pool slot
-was held by a slow reader, and the last composition duration, so a caller can
-measure pacing and backpressure instead of inferring them.
+**Pacing and statistics.** The compositor composes only when a client commit or
+input changes the desktop, at most once per interval of the effective FPS, and
+sleeps between passes until the next composition or frame callback is due; it
+never bursts to catch up. Frame callbacks keep idle clients on the same cadence.
+`Observe` reports the tick count, frames composed, frames dropped because every
+pool slot was held by a slow reader, and the last composition duration, so a
+caller can measure pacing and backpressure instead of inferring them.
 
 **Text input.** The compositor advertises `zwp_text_input_manager_v3` and acts as
 the input method for its own clients: focus changes send `enter`/`leave`, and

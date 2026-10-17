@@ -36,7 +36,7 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   exceed it is rejected with `LimitExceeded`, and destroying an environment
   releases its share.
 - Protocol versioning: control requests carry a protocol version
-  (`PROTOCOL_VERSION = 1`); a request with any other version is rejected with a
+  (`PROTOCOL_VERSION = 2`); a request with any other version is rejected with a
   `Protocol` error before dispatch.
 - Remote transport limits: the first configured STUN server is applied to
   `webrtcbin` (the `stun-server` property is single-valued; extra STUN entries
@@ -89,7 +89,10 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   available) fed from the composed pool, a one-time-token signaling server that
   serves a browser viewer page and relays SDP/ICE over a WebSocket, pointer and
   keyboard input over a reliable ordered data channel, and a native receiver that
-  decodes the same stream.
+  decodes the same stream. The sender waits on the publish futex, sends a newly
+  published frame at most once per frame interval, and re-sends the latest frame
+  once per second while the desktop is static, so a receiver that connects after
+  the last change still gets a picture.
 - Hardening: effective scope properties are verified after launch and creation
   fails closed when they do not match; control leases and grants expire and are
   swept; orphan scopes and stale runtime directories are reconciled at startup,
@@ -100,9 +103,15 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Text input: `zwp_text_input_manager_v3` is advertised and the compositor acts
   as the input method for its own clients, delivering committed and pre-edit
   text to enabled instances for the focused surface.
-- Pacing: a virtual clock at the effective FPS with no catch-up bursts, and
-  observation statistics (ticks, frames composed, frames dropped, composition
-  duration) reported with every snapshot.
+- Pacing: the compositor composes only when a client commit or input changes the
+  desktop or a snapshot is pending, at most once per interval of the effective
+  FPS, and sleeps between passes until the next composition or frame callback is
+  due; it never bursts to catch up. Idle clients keep their callback cadence
+  without a composition. Snapshots are answered by the next allowed composition;
+  while every other pool slot is held by a reader, a snapshot waits and the next
+  pacing pass retries, so the observer's own timeout bounds the wait.
+  Observation statistics (ticks, frames composed, frames dropped, composition
+  duration) are reported with every snapshot.
 - Aggregate environment cgroup: a transient `juto-desktop-<env>.slice` carries
   the environment limits and contains the application scopes; a monitor emits
   `LimitPressure` on memory pressure and CPU throttling.
@@ -412,7 +421,7 @@ Initial host policy (configurable downward; raising ceilings requires host appro
 
 | Budget | Software profile | Hardware profile |
 |---|---|---|
-| Default output | 1280×720, scale 1, 30 FPS | 1920×1080, scale 1, 60 FPS |
+| Default output | 1280×720, scale 1, 60 FPS | 1920×1080, scale 1, 60 FPS |
 | Admitted dimensions | 320–3840 per axis, up to 8,294,400 pixels | Same |
 | Admitted FPS | 1–60; default pixel-rate ceiling 62,208,000 pixels/s | 1–120; default ceiling 497,664,000 pixels/s |
 | Per-environment CPU / RAM / swap | 400% / 8 GiB / 0 | Same |

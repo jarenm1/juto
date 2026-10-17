@@ -55,7 +55,7 @@ impl Default for OutputConfig {
             width: 1280,
             height: 720,
             scale: 1,
-            fps: 30,
+            fps: 60,
         }
     }
 }

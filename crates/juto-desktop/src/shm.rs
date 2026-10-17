@@ -3,9 +3,111 @@ use parking_lot::Mutex;
 use std::fs::File;
 use std::os::fd::{FromRawFd, RawFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 /// Number of buffers in an attachment-private triple-buffered pool.
 pub const POOL_SLOT_COUNT: usize = 3;
+/// Bytes at the start of every pool reserved for its [`ShmControl`] block.
+const CONTROL_BYTES: usize = 4096;
+/// `"JUTOSHM1"`, identifying a juto frame pool in its control block.
+const POOL_MAGIC: u64 = u64::from_le_bytes(*b"JUTOSHM1");
+/// Layout revision of the pool; readers refuse any other value.
+const POOL_LAYOUT_VERSION: u32 = 1;
+
+/// Control block at offset zero of every pool.
+///
+/// `publish_seq` is the futex word: the producer increments and wakes it once
+/// per published frame, and readers sleep on it instead of polling.
+#[repr(C)]
+struct ShmControl {
+    magic: u64,
+    layout_version: u32,
+    slot_count: u32,
+    slot_size: u64,
+    publish_seq: AtomicU32,
+}
+
+/// Outcome of [`ShmReader::wait_for_frame`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameWait {
+    /// A frame was published; carries the new publish sequence.
+    Published(u32),
+    /// No frame was published before the timeout.
+    TimedOut,
+}
+
+/// Byte offset of `slot` in a pool whose slots are `slot_size` bytes.
+fn slot_offset(slot: usize, slot_size: usize) -> Option<usize> {
+    slot.checked_mul(slot_size)?.checked_add(CONTROL_BYTES)
+}
+
+/// Checks the control block of a mapped pool and returns its slot size.
+fn validate_layout(base: *const u8, size: usize) -> Result<usize, DesktopError> {
+    if size < CONTROL_BYTES {
+        return Err(DesktopError::Shm(format!(
+            "pool of {size} bytes has no control block"
+        )));
+    }
+    // SAFETY: `size` covers the control block, so `base` is readable for it.
+    let control = unsafe { &*(base as *const ShmControl) };
+    let slot_size = usize::try_from(control.slot_size)
+        .map_err(|_| DesktopError::Shm("pool slot size out of range".to_string()))?;
+    let expected = slot_size
+        .checked_mul(POOL_SLOT_COUNT)
+        .and_then(|slots| slots.checked_add(CONTROL_BYTES));
+    let valid = control.magic == POOL_MAGIC
+        && control.layout_version == POOL_LAYOUT_VERSION
+        && control.slot_count as usize == POOL_SLOT_COUNT
+        && slot_size >= std::mem::size_of::<ShmSlotHeader>()
+        && expected == Some(size);
+    if !valid {
+        return Err(DesktopError::Shm(format!(
+            "not a juto frame pool of {size} bytes"
+        )));
+    }
+    Ok(slot_size)
+}
+
+/// Wakes every waiter on `word`. The futex is shared, not process-private:
+/// readers wait through their own mapping of the same memfd.
+fn futex_wake_all(word: &AtomicU32) {
+    futex_syscall(word, libc::FUTEX_WAKE, i32::MAX as u32, std::ptr::null());
+}
+
+/// Sleeps while `word == expected`, for at most `timeout`.
+fn futex_wait(word: &AtomicU32, expected: u32, timeout: Duration) -> std::io::Result<()> {
+    let spec = libc::timespec {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_nsec: libc::c_long::from(timeout.subsec_nanos()),
+    };
+    if futex_syscall(word, libc::FUTEX_WAIT, expected, &spec) == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn futex_syscall(
+    word: &AtomicU32,
+    op: libc::c_int,
+    val: u32,
+    timeout: *const libc::timespec,
+) -> libc::c_long {
+    // SAFETY: `word` is a live, aligned futex word. The kernel ignores the
+    // arguments an operation does not use, and they are passed as zero.
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word as *const AtomicU32 as libc::c_long,
+            libc::c_long::from(op),
+            libc::c_long::from(val),
+            timeout as libc::c_long,
+            0 as libc::c_long,
+            0 as libc::c_long,
+        )
+    }
+}
 
 /// Header metadata prepended to each shared-memory buffer slot.
 #[repr(C)]
@@ -72,7 +174,7 @@ impl ShmFramePool {
         let header_bytes = std::mem::size_of::<ShmSlotHeader>();
         // Align slot size to page boundary (4096 bytes)
         let slot_size = ((header_bytes + pixel_bytes) + 4095) & !4095;
-        let total_size = slot_size * POOL_SLOT_COUNT;
+        let total_size = CONTROL_BYTES + slot_size * POOL_SLOT_COUNT;
 
         let name = std::ffi::CString::new(format!("juto-shm-{}", pool_id))
             .map_err(|e| DesktopError::Shm(e.to_string()))?;
@@ -115,6 +217,16 @@ impl ShmFramePool {
                 "mmap failed: {}",
                 std::io::Error::last_os_error()
             )));
+        }
+        // Lay down the control block before any reader can map the pool.
+        unsafe {
+            (mmap_ptr as *mut ShmControl).write(ShmControl {
+                magic: POOL_MAGIC,
+                layout_version: POOL_LAYOUT_VERSION,
+                slot_count: POOL_SLOT_COUNT as u32,
+                slot_size: slot_size as u64,
+                publish_seq: AtomicU32::new(0),
+            });
         }
 
         let file = unsafe { Arc::new(File::from_raw_fd(fd)) };
@@ -171,6 +283,18 @@ impl ShmFramePool {
         self.slot_size
     }
 
+    fn control(&self) -> &ShmControl {
+        // SAFETY: the mapping spans the control block written by `create_unsealed`.
+        unsafe { &*(self.mmap_ptr as *const ShmControl) }
+    }
+
+    /// Bumps the publish sequence and wakes readers blocked in `wait_for_frame`.
+    fn publish(&self) {
+        let word = &self.control().publish_seq;
+        word.fetch_add(1, Ordering::Release);
+        futex_wake_all(word);
+    }
+
     /// Renders or copies new desktop content into the next available slot.
     pub fn write_frame(
         &self,
@@ -184,23 +308,20 @@ impl ShmFramePool {
         let mut active = self.active_slot.lock();
         let readers = self.in_flight_readers.lock();
 
-        // Round-robin selection of next slot not held by slow readers
-        let mut target_slot = (*active + 1) % POOL_SLOT_COUNT;
-        let mut attempts = 0;
-        while readers[target_slot] > 0 && attempts < POOL_SLOT_COUNT {
-            target_slot = (target_slot + 1) % POOL_SLOT_COUNT;
-            attempts += 1;
-        }
-
-        if readers[target_slot] > 0 {
-            // All slots held by readers: backpressure skip (drop frame export, never block seat)
+        // Next free slot. Never the slot holding the latest published frame:
+        // a reader may still be copying it.
+        let target_slot = (1..POOL_SLOT_COUNT)
+            .map(|step| (*active + step) % POOL_SLOT_COUNT)
+            .find(|&slot| readers[slot] == 0);
+        let Some(target_slot) = target_slot else {
+            // All other slots held by readers: backpressure skip (drop frame export, never block seat)
             return Err(DesktopError::LimitExceeded(
                 "all SHM pool slots held by slow readers; dropped frame".to_string(),
             ));
-        }
+        };
 
         *active = target_slot;
-        let offset = target_slot * self.slot_size;
+        let offset = CONTROL_BYTES + target_slot * self.slot_size;
         let header = ShmSlotHeader {
             frame_id,
             generation,
@@ -214,19 +335,23 @@ impl ShmFramePool {
 
         unsafe {
             let slot_ptr = self.mmap_ptr.add(offset);
-            // Write slot header
-            std::ptr::copy_nonoverlapping(
-                &header as *const ShmSlotHeader as *const u8,
-                slot_ptr,
-                std::mem::size_of::<ShmSlotHeader>(),
-            );
-            // Write pixel payload
+            // Pixels first. Readers pick the slot with the highest frame_id, so the
+            // header (which carries frame_id) must become visible only after its
+            // pixels are complete. The release fence orders the two copies.
             let pixel_ptr = slot_ptr.add(std::mem::size_of::<ShmSlotHeader>());
             let copy_len = pixels
                 .len()
                 .min(self.slot_size - std::mem::size_of::<ShmSlotHeader>());
             std::ptr::copy_nonoverlapping(pixels.as_ptr(), pixel_ptr, copy_len);
+            std::sync::atomic::fence(Ordering::Release);
+            std::ptr::copy_nonoverlapping(
+                &header as *const ShmSlotHeader as *const u8,
+                slot_ptr,
+                std::mem::size_of::<ShmSlotHeader>(),
+            );
         }
+        // Publish only after the pixels are written, so readers never see a torn frame.
+        self.publish();
 
         Ok(ShmFrame {
             slot: target_slot,
@@ -257,7 +382,7 @@ impl ShmFramePool {
     /// Describes the most recently written frame, if the pool has been written.
     pub fn latest_frame(&self) -> Option<ShmFrame> {
         let slot = *self.active_slot.lock();
-        let offset = slot * self.slot_size;
+        let offset = CONTROL_BYTES + slot * self.slot_size;
         let header = unsafe { *(self.mmap_ptr.add(offset) as *const ShmSlotHeader) };
         if header.size_bytes == 0 {
             return None;
@@ -282,7 +407,7 @@ impl ShmFramePool {
         if slot >= POOL_SLOT_COUNT {
             return Err(DesktopError::Shm(format!("slot {slot} out of range")));
         }
-        let offset = slot * self.slot_size;
+        let offset = CONTROL_BYTES + slot * self.slot_size;
         let header = unsafe { *(self.mmap_ptr.add(offset) as *const ShmSlotHeader) };
         let len = header.size_bytes as usize;
         if len > self.slot_size - std::mem::size_of::<ShmSlotHeader>() {
@@ -358,10 +483,18 @@ impl ShmReader {
             )));
         }
 
+        let slot_size = match validate_layout(mmap_ptr as *const u8, size) {
+            Ok(slot_size) => slot_size,
+            Err(err) => {
+                unsafe { libc::munmap(mmap_ptr, size) };
+                return Err(err);
+            }
+        };
+
         Ok(Self {
             fd,
             size,
-            slot_size: size / POOL_SLOT_COUNT,
+            slot_size,
             mmap_ptr: mmap_ptr as *const u8,
             pool_id,
             reservation,
@@ -402,6 +535,45 @@ impl ShmReader {
         self.slot_size
     }
 
+    /// The producer's publish sequence; it changes once per published frame.
+    pub fn publish_seq(&self) -> u32 {
+        self.control().publish_seq.load(Ordering::Acquire)
+    }
+
+    /// Blocks until the producer publishes a frame whose sequence differs from
+    /// `after`, or until `timeout` elapses. Returns at once when it already
+    /// differs, so starting from `0` also returns a frame published earlier.
+    pub fn wait_for_frame(&self, after: u32, timeout: Duration) -> Result<FrameWait, DesktopError> {
+        let deadline = Instant::now() + timeout;
+        let word = &self.control().publish_seq;
+        loop {
+            let current = word.load(Ordering::Acquire);
+            if current != after {
+                return Ok(FrameWait::Published(current));
+            }
+            let Some(remaining) = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+            else {
+                return Ok(FrameWait::TimedOut);
+            };
+            match futex_wait(word, after, remaining) {
+                Ok(()) => {}
+                Err(err)
+                    if matches!(
+                        err.raw_os_error(),
+                        Some(libc::EAGAIN | libc::EINTR | libc::ETIMEDOUT)
+                    ) => {}
+                Err(err) => return Err(DesktopError::Shm(format!("futex wait failed: {err}"))),
+            }
+        }
+    }
+
+    fn control(&self) -> &ShmControl {
+        // SAFETY: `attach_named` validated the control block at this base.
+        unsafe { &*(self.mmap_ptr as *const ShmControl) }
+    }
+
     /// The most recently written slot, chosen by the highest frame id.
     ///
     /// A reader has no producer state, so it scans the fixed slot set rather
@@ -427,6 +599,9 @@ impl ShmReader {
                 best = Some(candidate);
             }
         }
+        // Pairs with the producer's release fence: the header was observed
+        // above, so the pixels of the chosen slot are complete.
+        std::sync::atomic::fence(Ordering::Acquire);
         Ok(best)
     }
 
@@ -439,8 +614,7 @@ impl ShmReader {
         slot_size: usize,
     ) -> Result<(usize, ShmSlotHeader), DesktopError> {
         let header_size = std::mem::size_of::<ShmSlotHeader>();
-        let offset = slot
-            .checked_mul(slot_size)
+        let offset = slot_offset(slot, slot_size)
             .filter(|offset| {
                 offset
                     .checked_add(slot_size)
@@ -507,7 +681,7 @@ mod tests {
                 pool.raw_fd(),
                 claimed.as_ptr() as *const libc::c_void,
                 claimed.len(),
-                std::mem::offset_of!(ShmSlotHeader, size_bytes) as libc::off_t,
+                (CONTROL_BYTES + std::mem::offset_of!(ShmSlotHeader, size_bytes)) as libc::off_t,
             )
         };
         assert_eq!(written, claimed.len() as isize);
@@ -519,5 +693,44 @@ mod tests {
             Err(DesktopError::Shm(_))
         ));
         assert!(matches!(reader.latest_frame(), Err(DesktopError::Shm(_))));
+    }
+
+    #[test]
+    fn reader_reads_pixels_past_the_control_block() {
+        let pool = ShmFramePool::create_unsealed("pixel-offset-test", 4, 4).unwrap();
+        let pixels: Vec<u8> = (0..64).collect();
+        pool.write_frame(1, 0, 0, 4, 4, &pixels).unwrap();
+        let reader = ShmReader::attach(unsafe { libc::dup(pool.raw_fd()) }, pool.size()).unwrap();
+        let frame = reader.latest_frame().unwrap().expect("a published frame");
+        assert_eq!(frame.header.frame_id, 1);
+        let (_, slice) = reader.read_slot(frame.slot, reader.slot_size()).unwrap();
+        assert_eq!(slice, pixels.as_slice());
+    }
+
+    #[test]
+    fn reader_wakes_when_producer_publishes() {
+        let pool = ShmFramePool::create_unsealed("wake-test", 4, 4).unwrap();
+        let reader = ShmReader::attach(unsafe { libc::dup(pool.raw_fd()) }, pool.size()).unwrap();
+        let pixels = vec![7u8; 64];
+        let started = Instant::now();
+        let outcome = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                pool.write_frame(1, 0, 0, 4, 4, &pixels).unwrap();
+            });
+            reader.wait_for_frame(0, Duration::from_secs(10)).unwrap()
+        });
+        assert_eq!(outcome, FrameWait::Published(1));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn reader_wait_times_out_without_publish() {
+        let pool = ShmFramePool::create_unsealed("timeout-test", 4, 4).unwrap();
+        let reader = ShmReader::attach(unsafe { libc::dup(pool.raw_fd()) }, pool.size()).unwrap();
+        assert_eq!(
+            reader.wait_for_frame(0, Duration::from_millis(40)).unwrap(),
+            FrameWait::TimedOut
+        );
     }
 }

@@ -5,6 +5,7 @@
 
 pub mod compositor;
 pub mod error;
+mod pacing;
 pub mod png;
 pub mod protocol;
 pub mod remote;

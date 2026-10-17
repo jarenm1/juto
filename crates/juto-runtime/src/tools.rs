@@ -1584,7 +1584,7 @@ impl Tool for DesktopTool {
                     },
                     "width": { "type": "integer", "description": "create: output width in pixels (default 1280)." },
                     "height": { "type": "integer", "description": "create: output height in pixels (default 720)." },
-                    "fps": { "type": "integer", "description": "create: virtual output refresh cap (default 30)." },
+                    "fps": { "type": "integer", "description": "create: virtual output refresh cap (default 60)." },
                     "scale": { "type": "integer", "description": "create: integer output scale, 1 or 2 (default 1)." },
                     "app_id": {
                         "type": "string",
@@ -1692,7 +1692,7 @@ fn run_desktop_action(
         "create" => {
             let width = args.width.unwrap_or(1280);
             let height = args.height.unwrap_or(720);
-            let fps = args.fps.unwrap_or(30);
+            let fps = args.fps.unwrap_or(60);
             let scale = args.scale.unwrap_or(1);
             let title = args
                 .title
