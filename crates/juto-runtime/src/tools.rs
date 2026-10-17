@@ -1304,7 +1304,7 @@ impl Tool for DesktopArtifactTool {
                     },
                     "host_id": {
                         "type": "string",
-                        "description": "Opaque identifier of the host machine or cluster."
+                        "description": "Host identifier: the `Host:` value reported by `desktop` create. A different value cannot be opened here."
                     },
                     "environment_id": {
                         "type": "string",
@@ -1622,7 +1622,7 @@ fn run_desktop_action(
             let host_id = host_identifier();
             let summary = format!(
                 "Desktop environment created: {id} \"{title}\" ({width}x{height}@{fps}, scale {scale}). \
-                 Socket: {}. Owner grant: {}.",
+                 Host: {host_id}. Socket: {}. Owner grant: {}.",
                 env.socket_path().display(),
                 grant.grant_id
             );
@@ -3720,6 +3720,13 @@ mod tests {
         let env_id = created.details["envId"].as_str().unwrap().to_string();
         let grant_id = created.details["grantId"].as_str().unwrap().to_string();
         let host_id = created.details["hostId"].as_str().unwrap().to_string();
+        // A model posts the artifact from the text it was shown, not `details`.
+        let ContentBlock::Text { text } = &created.content[0] else {
+            panic!("create must report text");
+        };
+        for id in [&env_id, &grant_id, &host_id] {
+            assert!(text.contains(id.as_str()), "create text omits {id}: {text}");
+        }
 
         let resolver =
             DesktopArtifactResolver::new(supervisor.clone(), signaling.clone(), host_id.clone());
