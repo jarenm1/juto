@@ -7,6 +7,7 @@ pub mod config;
 pub mod context;
 mod contextual;
 pub mod desktop_artifact;
+pub mod desktop_keepalive;
 pub mod git_transfer;
 pub mod peers;
 pub mod replication;
@@ -122,6 +123,7 @@ struct RuntimeInner {
     subagent_manager: Mutex<Option<Arc<SubagentManager>>>,
     desktop_supervisor: Mutex<Option<Arc<DesktopSupervisor>>>,
     signaling: Mutex<Option<Arc<SignalingHandle>>>,
+    desktop_keepalive: desktop_keepalive::DesktopKeepalive,
 }
 pub fn default_data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("JUTO_DATA_DIR") {
@@ -204,6 +206,7 @@ impl Runtime {
                 subagent_manager: Mutex::new(None),
                 desktop_supervisor: Mutex::new(None),
                 signaling: Mutex::new(None),
+                desktop_keepalive: desktop_keepalive::DesktopKeepalive::new(),
             }),
         };
         if !runtime.inner.config.read().model.is_empty() {
@@ -522,6 +525,7 @@ impl Runtime {
                 &mut registry,
                 self.desktop_supervisor(),
                 self.signaling_handle(),
+                self.inner.desktop_keepalive.clone(),
                 self.inner.data_dir.clone(),
             )?;
         }

@@ -1386,6 +1386,7 @@ pub struct DesktopTool {
     supervisor: Arc<juto_desktop::DesktopSupervisor>,
     signaling: Arc<crate::SignalingHandle>,
     data_dir: PathBuf,
+    keepalive: crate::desktop_keepalive::DesktopKeepalive,
 }
 
 /// Registers the desktop environment tool against a supervisor.
@@ -1393,11 +1394,13 @@ pub fn register_desktop_tools(
     registry: &mut ToolRegistry,
     supervisor: Arc<juto_desktop::DesktopSupervisor>,
     signaling: Arc<crate::SignalingHandle>,
+    keepalive: crate::desktop_keepalive::DesktopKeepalive,
     data_dir: PathBuf,
 ) -> Result<(), AgentError> {
     registry.register(Arc::new(DesktopTool {
         supervisor,
         signaling,
+        keepalive,
         data_dir,
     }))?;
     Ok(())
@@ -1524,7 +1527,8 @@ impl Tool for DesktopTool {
         // principal would let one session drive another's desktop.
         let owner_principal = format!("agent:{}", ctx.session_id);
 
-        tokio::task::spawn_blocking(move || {
+        let creating = args.action == "create";
+        let created = tokio::task::spawn_blocking(move || {
             run_desktop_action(
                 &supervisor,
                 &signaling,
@@ -1536,7 +1540,20 @@ impl Tool for DesktopTool {
             )
         })
         .await
-        .map_err(|e| format!("desktop task failed: {e}"))?
+        .map_err(|e| format!("desktop task failed: {e}"))??;
+        if creating {
+            // The desktop must outlive this run so the main chat can open it;
+            // the keepalive renews its owner lifetime until it is destroyed.
+            let env_id = created.details["envId"]
+                .as_str()
+                .ok_or("desktop create returned no environment id")?;
+            let env = self
+                .supervisor
+                .get_environment(env_id)
+                .map_err(|e| e.to_string())?;
+            self.keepalive.adopt(env);
+        }
+        Ok(created)
     }
 }
 
@@ -3707,6 +3724,7 @@ mod tests {
             supervisor: supervisor.clone(),
             signaling: signaling.clone(),
             data_dir: data_dir.path().to_path_buf(),
+            keepalive: crate::desktop_keepalive::DesktopKeepalive::new(),
         };
         let ctx = ctx(data_dir.path());
 
@@ -3812,6 +3830,7 @@ mod tests {
             supervisor: supervisor.clone(),
             signaling: Arc::new(crate::SignalingHandle::new(supervisor.clone())),
             data_dir: data_dir.path().to_path_buf(),
+            keepalive: crate::desktop_keepalive::DesktopKeepalive::new(),
         };
         let ctx = ctx(data_dir.path());
 
