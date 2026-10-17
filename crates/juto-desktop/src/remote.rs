@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DesktopError;
 use crate::protocol::{InputBatch, InputEvent};
+use crate::shm::FrameWait;
 use crate::supervisor::DesktopEnvironment;
 
 /// Video codec negotiated for the remote stream.
@@ -526,6 +527,11 @@ impl PresentationWorker {
     }
 
     fn start_feeding(&mut self) {
+        // Waits on the producer's publish futex in slices this long, so a stop
+        // request is noticed even while no frame is being published.
+        const FEED_WAIT_SLICE: Duration = Duration::from_millis(100);
+        /// Re-send the latest frame this often while the desktop publishes nothing.
+        const IDLE_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
         let pool = self.env.frame_pool();
         let appsrc = self.appsrc.clone();
         let stop = self.stop.clone();
@@ -536,23 +542,47 @@ impl PresentationWorker {
             .spawn(move || {
                 let mut pixels: Vec<u8> = Vec::new();
                 let mut frame_index: u64 = 0;
+                let mut seen: u32 = 0;
+                let mut last_sent: Option<std::time::Instant> = None;
                 while !stop.load(Ordering::SeqCst) {
-                    let started = std::time::Instant::now();
+                    // Sleep until the producer publishes instead of polling.
+                    let published = match pool.wait_for_frame(seen, FEED_WAIT_SLICE) {
+                        Ok(FrameWait::Published(sequence)) => {
+                            seen = sequence;
+                            true
+                        }
+                        Ok(FrameWait::TimedOut) => false,
+                        Err(_) => {
+                            std::thread::sleep(FEED_WAIT_SLICE);
+                            continue;
+                        }
+                    };
+                    // A new frame goes out at most once per interval; a burst of
+                    // publishes collapses into the newest frame. With no new frame,
+                    // the latest one is re-sent every IDLE_REFRESH_INTERVAL so a
+                    // static desktop keeps the transport and late decoders fed.
+                    if let Some(last) = last_sent {
+                        let elapsed = last.elapsed();
+                        if published {
+                            if elapsed < interval {
+                                std::thread::sleep(interval - elapsed);
+                            }
+                        } else if elapsed < IDLE_REFRESH_INTERVAL {
+                            continue;
+                        }
+                    }
                     let Ok(Some(frame)) = pool.latest_frame() else {
-                        std::thread::sleep(interval);
                         continue;
                     };
                     pool.acquire_slot(frame.slot);
                     let read = pool.read_slot(frame.slot, pool.slot_size());
                     pool.release_slot(frame.slot);
                     let Ok((header, slice)) = read else {
-                        std::thread::sleep(interval);
                         continue;
                     };
                     pixels.clear();
                     pixels.extend_from_slice(slice);
                     if header.size_bytes == 0 {
-                        std::thread::sleep(interval);
                         continue;
                     }
                     let mut buffer = match gst::Buffer::with_size(pixels.len()) {
@@ -574,10 +604,7 @@ impl PresentationWorker {
                     if appsrc.push_buffer(buffer).is_err() {
                         break;
                     }
-                    let elapsed = started.elapsed();
-                    if elapsed < interval {
-                        std::thread::sleep(interval - elapsed);
-                    }
+                    last_sent = Some(std::time::Instant::now());
                 }
             })
             .ok();
