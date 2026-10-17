@@ -17,13 +17,12 @@ use gpui::{
     Pixels, Point, Render, RenderImage, ScrollWheelEvent, Subscription, Task, Window, canvas, div,
     img, prelude::*, px, rgb, rgba,
 };
-use image::{Frame, ImageBuffer, Rgba};
 use juto_runtime::DesktopEnvironment;
 use juto_runtime::protocol::{DesktopEvent, GrantRole, InputBatch, InputEvent};
 use tokio::sync::broadcast::error::RecvError;
 
-/// Frame polling interval (~30 fps).
-const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+use crate::desktop_stream;
+
 /// Control lease renewal interval (spec section 8: heartbeat 2s, expiry 6s).
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(2);
 /// Evdev codes for the modifier keys forwarded to the seat.
@@ -144,7 +143,7 @@ pub struct DesktopViewer {
     grant_expires_at: Option<u64>,
     paused: bool,
     input_seq: u64,
-    poll_task: Option<Task<()>>,
+    frame_task: Option<Task<()>>,
     heartbeat_task: Option<Task<()>>,
     snapshot_task: Option<Task<()>>,
     /// Set when a left press starts while paused; its release resumes the canvas.
@@ -197,7 +196,7 @@ impl DesktopViewer {
             grant_expires_at,
             paused: true,
             input_seq: 0,
-            poll_task: None,
+            frame_task: None,
             snapshot_task: None,
             press_started_paused: false,
             modifiers: Modifiers::default(),
@@ -225,31 +224,20 @@ impl DesktopViewer {
         viewer
     }
 
-    /// Starts the ~30 fps frame loop. Only a live viewer runs it.
-    fn start_polling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let env = self.env.clone();
-        self.poll_task = Some(cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor().timer(FRAME_INTERVAL).await;
-                if !env.is_alive() {
-                    let _ = this.update_in(cx, |this, _window, cx| this.mark_stopped(cx));
-                    break;
-                }
-                let read_env = env.clone();
-                let read = cx
-                    .background_executor()
-                    .spawn(async move { read_latest_frame(read_env) })
-                    .await;
-                let Some(frame) = read else {
-                    continue;
-                };
+    /// Follows the environment's shared frame feed. Only a live viewer does this.
+    fn start_frames(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut feed = desktop_stream::subscribe(&self.env);
+        self.frame_task = Some(cx.spawn_in(window, async move |this, cx| {
+            while let Some(frame) = feed.next().await {
                 let updated = this.update_in(cx, |this, window, cx| {
                     this.set_frame(frame, window, cx);
                 });
                 if updated.is_err() {
-                    break;
+                    return;
                 }
             }
+            // The feed ends only when the environment does.
+            let _ = this.update_in(cx, |this, _window, cx| this.mark_stopped(cx));
         }));
     }
 
@@ -344,35 +332,27 @@ impl DesktopViewer {
         )
     }
 
-    /// Captures one still of the newest frame without starting the frame loop.
+    /// Captures one still of the newest frame without starting the live feed.
     pub fn capture_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let env = self.env.clone();
+        let mut feed = desktop_stream::subscribe(&self.env);
         self.snapshot_task = Some(cx.spawn_in(window, async move |this, cx| {
-            // The worker may not have produced its first frame yet: keep trying
-            // until one exists or the environment ends.
-            loop {
-                let read_env = env.clone();
-                let read = cx
-                    .background_executor()
-                    .spawn(async move { read_latest_frame(read_env) })
-                    .await;
-                if let Some(frame) = read {
-                    let _ = this.update_in(cx, |this, window, cx| {
-                        this.set_frame(frame, window, cx);
-                    });
-                    break;
-                }
-                if !env.is_alive() {
-                    break;
-                }
-                cx.background_executor().timer(FRAME_INTERVAL).await;
+            // The worker may not have composed its first frame yet; the feed waits
+            // for one and ends only when the environment does.
+            if let Some(frame) = feed.next().await {
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.set_frame(frame, window, cx);
+                });
             }
         }));
     }
 
-    fn set_frame(&mut self, frame: LatestFrame, window: &mut Window, cx: &mut Context<Self>) {
-        let image = render_image_from_bgra(frame.pixels, frame.width, frame.height);
-        let previous = self.frame.replace(image);
+    fn set_frame(
+        &mut self,
+        frame: Arc<desktop_stream::StreamFrame>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous = self.frame.replace(frame.image.clone());
         if let Some(previous) = previous {
             cx.drop_image(previous, Some(window));
         }
@@ -397,7 +377,7 @@ impl DesktopViewer {
         }
         self.release_held_input(cx);
         self.paused = true;
-        self.poll_task = None;
+        self.frame_task = None;
         if self.has_control {
             self.release_control(cx);
         }
@@ -419,7 +399,7 @@ impl DesktopViewer {
         self.status = "connecting".to_string();
         // A pending still must not overwrite live frames.
         self.snapshot_task = None;
-        self.start_polling(window, cx);
+        self.start_frames(window, cx);
         cx.notify();
     }
 
@@ -466,7 +446,7 @@ impl DesktopViewer {
     /// Ends the session after the environment was destroyed underneath the
     /// viewer. The last frame stays on screen; input is no longer forwarded.
     fn mark_stopped(&mut self, cx: &mut Context<Self>) {
-        self.poll_task = None;
+        self.frame_task = None;
         self.has_control = false;
         self.status = "stopped".to_string();
         self.error = Some("desktop stopped".to_string());
@@ -970,95 +950,6 @@ impl Render for DesktopViewer {
     }
 }
 
-/// Longest shown edges are 854x480 (480p, 16:9). Larger frames are shrunk
-/// before upload; the environment keeps its resolution and input is still
-/// mapped to environment pixels.
-const SHOWN_MAX_WIDTH: u32 = 854;
-const SHOWN_MAX_HEIGHT: u32 = 480;
-
-/// A composed frame ready for display.
-struct LatestFrame {
-    /// Environment resolution; input coordinates are mapped to this.
-    source: (u32, u32),
-    /// Displayed resolution after fitting within the shown bounds.
-    width: u32,
-    height: u32,
-    pixels: Vec<u8>,
-}
-
-/// Reads the newest composed frame, copying its pixels out of the shared slot
-/// and shrinking them for display. Called from a background task, never from
-/// the foreground thread.
-fn read_latest_frame(env: DesktopEnvironment) -> Option<LatestFrame> {
-    let pool = env.frame_pool();
-    let frame = pool.latest_frame().ok()??;
-    pool.acquire_slot(frame.slot);
-    let read = pool.read_slot(frame.slot, pool.slot_size());
-    pool.release_slot(frame.slot);
-    let (header, pixels) = read.ok()?;
-    let (width, height, pixels) = fit_shown(pixels, header.width, header.height)?;
-    Some(LatestFrame {
-        source: (header.width, header.height),
-        width,
-        height,
-        pixels,
-    })
-}
-
-/// Fits packed BGRA8 rows (stride `width * 4`) inside the shown bounds by
-/// averaging each destination pixel's source footprint (a box filter), so fine
-/// detail shrinks smoothly instead of aliasing. Frames already small enough are
-/// copied as-is.
-fn fit_shown(bgra: &[u8], width: u32, height: u32) -> Option<(u32, u32, Vec<u8>)> {
-    if width == 0 || height == 0 {
-        return None;
-    }
-    let src_row = width as usize * 4;
-    let src = bgra.get(..src_row * height as usize)?;
-    if width <= SHOWN_MAX_WIDTH && height <= SHOWN_MAX_HEIGHT {
-        return Some((width, height, src.to_vec()));
-    }
-    let scale =
-        (SHOWN_MAX_WIDTH as f32 / width as f32).min(SHOWN_MAX_HEIGHT as f32 / height as f32);
-    let out_w = ((width as f32 * scale).round() as u32).max(1);
-    let out_h = ((height as f32 * scale).round() as u32).max(1);
-    let mut out = Vec::with_capacity(out_w as usize * out_h as usize * 4);
-    for dy in 0..out_h as u64 {
-        let (y0, y1) = source_span(dy, height as u64, out_h as u64);
-        for dx in 0..out_w as u64 {
-            let (x0, x1) = source_span(dx, width as u64, out_w as u64);
-            let mut sum = [0u32; 4];
-            for row in src[y0 * src_row..y1 * src_row].chunks_exact(src_row) {
-                for px in row[x0 * 4..x1 * 4].chunks_exact(4) {
-                    for (acc, &channel) in sum.iter_mut().zip(px) {
-                        *acc += u32::from(channel);
-                    }
-                }
-            }
-            let count = ((y1 - y0) * (x1 - x0)) as u32;
-            out.extend(sum.iter().map(|&total| ((total + count / 2) / count) as u8));
-        }
-    }
-    Some((out_w, out_h, out))
-}
-
-/// Source pixel span `[start, end)` covered by destination pixel `d` when `src`
-/// pixels are mapped onto `dst`. Always covers at least one pixel.
-fn source_span(d: u64, src: u64, dst: u64) -> (usize, usize) {
-    let start = d * src / dst;
-    let end = ((d + 1) * src / dst).max(start + 1);
-    (start as usize, end as usize)
-}
-
-/// Builds a gpui `RenderImage` from packed BGRA8 pixels with straight alpha.
-///
-/// gpui's texture atlas is `Bgra8Unorm`, so the bytes are handed over unchanged.
-fn render_image_from_bgra(bgra: Vec<u8>, width: u32, height: u32) -> Arc<RenderImage> {
-    let buffer: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_raw(width, height, bgra).expect("pixel buffer size mismatch");
-    Arc::new(RenderImage::new(vec![Frame::new(buffer)]))
-}
-
 /// Builds the cursor overlay from a `CursorImageChanged` payload. Empty or
 /// inconsistent payloads yield `None`, so the viewer shows the named cursor.
 fn cursor_overlay_from_event(
@@ -1080,7 +971,7 @@ fn cursor_overlay_from_event(
         return None;
     }
     Some(CursorOverlay {
-        image: render_image_from_bgra(pixels, width, height),
+        image: desktop_stream::render_image_from_bgra(pixels, width, height),
         display_size: (display_width, display_height),
         hotspot: (hotspot_x, hotspot_y),
     })
@@ -1174,39 +1065,4 @@ fn evdev_keycode(key: &str) -> Option<u32> {
         _ => return None,
     };
     Some(code)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Alternating black and white pixels, one pixel per cell.
-    fn checkerboard_bgra(width: u32, height: u32) -> Vec<u8> {
-        let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
-        for y in 0..height {
-            for x in 0..width {
-                let value = if (x + y) % 2 == 0 { 0 } else { 255 };
-                pixels.extend_from_slice(&[value, value, value, 255]);
-            }
-        }
-        pixels
-    }
-
-    #[test]
-    fn downscale_averages_fine_detail_instead_of_sampling_it() {
-        // 1708x960 maps onto 854x480 at exactly 1/2, so each destination pixel
-        // covers a 2x2 block holding two black and two white pixels.
-        let pixels = checkerboard_bgra(1708, 960);
-        let (width, height, out) = fit_shown(&pixels, 1708, 960).unwrap();
-        assert_eq!((width, height), (854, 480));
-        assert!(out.chunks_exact(4).all(|px| px == [128, 128, 128, 255]));
-    }
-
-    #[test]
-    fn frames_within_bounds_pass_through_unchanged() {
-        let pixels = checkerboard_bgra(640, 360);
-        let (width, height, out) = fit_shown(&pixels, 640, 360).unwrap();
-        assert_eq!((width, height), (640, 360));
-        assert_eq!(out, pixels);
-    }
 }
