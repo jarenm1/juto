@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::session::Session;
+use crate::tools::DesktopSessionArtifact;
 use async_trait::async_trait;
 use futures::FutureExt;
 use juto_agent::{AgentEvent, RunControl};
@@ -339,6 +340,12 @@ pub enum SubagentEvent {
         result: Option<SubagentResult>,
         error: Option<String>,
     },
+    /// A child's turn posted a desktop artifact that opened successfully.
+    /// Observers mount it live; main also gets a `Desktop` inbox notice.
+    DesktopReported {
+        id: String,
+        artifact: DesktopSessionArtifact,
+    },
 }
 
 /// Events buffered per manager before a slow receiver lags.
@@ -356,6 +363,8 @@ pub enum MainMessageKind {
     Failed,
     /// A child reached the `Cancelled` terminal state.
     Cancelled,
+    /// A child opened a desktop artifact that main can observe.
+    Desktop,
 }
 
 impl MainMessageKind {
@@ -1268,14 +1277,19 @@ async fn run_turn<F, Fut>(
     });
 
     let (events_tx, events_rx) = mpsc::unbounded_channel();
-    // The manager owns no consumer for child events; keep the receiver alive
-    // so `UnboundedSender::send` does not fail during the run.
-    let _events_rx = events_rx;
+    let reporter = tokio::spawn(report_desktops(
+        child.id.clone(),
+        events_rx,
+        inner.events.clone(),
+        inner.main_inbox.clone(),
+    ));
 
     let run = turn(events_tx);
     // A panicking factory must still publish a terminal state or every waiter
     // would hang.
     let outcome = AssertUnwindSafe(run).catch_unwind().await;
+    // Every report is delivered before the terminal state is published.
+    let _ = reporter.await;
 
     propagation_done.cancel();
 
@@ -1370,6 +1384,57 @@ fn finish(
         result,
         error,
     });
+}
+
+/// Watches one child turn's events for successful desktop artifact posts. Each
+/// one becomes a `Desktop` main inbox notice and a `DesktopReported` event. The
+/// notice is pushed first, so an observer woken by it already sees the notice.
+/// Ends when the turn drops its event sender.
+async fn report_desktops(
+    child_id: String,
+    mut events: mpsc::UnboundedReceiver<AgentEvent>,
+    observers: broadcast::Sender<SubagentEvent>,
+    main_inbox: MainInbox,
+) {
+    while let Some(event) = events.recv().await {
+        let AgentEvent::ToolExecutionEnd { result, .. } = event else {
+            continue;
+        };
+        let Some(artifact) = reported_desktop(&result) else {
+            continue;
+        };
+        main_inbox.push(MainMessage {
+            from: child_id.clone(),
+            kind: MainMessageKind::Desktop,
+            body: format!(
+                "Desktop '{}' is open: environment {}, artifact {}.",
+                artifact.title, artifact.environment_id, artifact.artifact_id
+            ),
+        });
+        let _ = observers.send(SubagentEvent::DesktopReported {
+            id: child_id.clone(),
+            artifact,
+        });
+    }
+}
+
+/// The artifact a successful `desktop_artifact` tool result carries, if any.
+fn reported_desktop(message: &Message) -> Option<DesktopSessionArtifact> {
+    let Message::ToolResult {
+        tool_name,
+        is_error: false,
+        details,
+        ..
+    } = message
+    else {
+        return None;
+    };
+    if tool_name != "desktop_artifact"
+        || details.get("type")?.as_str()? != "desktop_session_artifact"
+    {
+        return None;
+    }
+    serde_json::from_value(details.get("artifact")?.clone()).ok()
 }
 
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
@@ -2811,6 +2876,83 @@ mod tests {
         inbox.requeue_front(vec![note("first"), note("second")]);
         let bodies: Vec<String> = inbox.drain().into_iter().map(|m| m.body).collect();
         assert_eq!(bodies, ["first", "second", "third"]);
+    }
+
+    /// Factory whose one run posts a failed and then a successful desktop artifact.
+    struct DesktopFactory;
+
+    #[async_trait]
+    impl SubagentFactory for DesktopFactory {
+        async fn run(
+            &self,
+            id: &str,
+            _spec: TaskSpec,
+            _control: RunControl,
+            events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<SubagentResult, String> {
+            let post = |is_error: bool, artifact_id: &str| AgentEvent::ToolExecutionEnd {
+                call_id: artifact_id.to_string(),
+                result: Message::ToolResult {
+                    tool_call_id: artifact_id.to_string(),
+                    tool_name: "desktop_artifact".into(),
+                    content: Vec::new(),
+                    is_error,
+                    details: serde_json::json!({
+                        "type": "desktop_session_artifact",
+                        "artifact": {
+                            "version": 1,
+                            "artifactId": artifact_id,
+                            "title": "Game",
+                            "hostId": "local",
+                            "environmentId": "env-1",
+                            "grantId": "grant-1",
+                        },
+                    }),
+                    timestamp: 0,
+                },
+            };
+            let _ = events.send(post(true, "failed"));
+            let _ = events.send(post(false, "live"));
+            Ok(SubagentResult {
+                id: id.to_string(),
+                output: "done".into(),
+                data: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                session_path: PathBuf::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_desktop_posts_reach_observers_and_main_before_finish() {
+        let manager = manager(Arc::new(DesktopFactory), 1, CancellationToken::new());
+        let mut events = manager.subscribe_events();
+        let id = manager.spawn(spec("build")).unwrap();
+        manager.wait(&id).await.expect("run");
+
+        let mut reported = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let SubagentEvent::DesktopReported { id: from, artifact } = event {
+                reported.push((from, artifact.artifact_id));
+            }
+        }
+        assert_eq!(reported, vec![(id.clone(), "live".to_string())]);
+        assert_eq!(
+            manager.main_inbox().drain(),
+            vec![
+                MainMessage {
+                    from: id.clone(),
+                    kind: MainMessageKind::Desktop,
+                    body: "Desktop 'Game' is open: environment env-1, artifact live.".into(),
+                },
+                MainMessage {
+                    from: id,
+                    kind: MainMessageKind::Completed,
+                    body: "done".into(),
+                },
+            ]
+        );
     }
 
     #[tokio::test]
