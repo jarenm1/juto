@@ -303,6 +303,18 @@ pub fn view_row(view: ViewNode) -> Message {
     }
 }
 
+/// Transcript row that shows one desktop artifact's live canvas.
+pub fn desktop_row(artifact: DesktopSessionArtifact) -> Message {
+    Message {
+        role: MessageRole::Assistant,
+        text: SharedString::default(),
+        attachments: Vec::new(),
+        desktop_artifacts: vec![artifact],
+        approval: None,
+        views: Vec::new(),
+    }
+}
+
 /// Renders a view. A subagent card is clickable and opens its focus thread.
 fn card_element(view: &ViewNode, actions: &ViewActions, cx: &Context<ChatView>) -> AnyElement {
     let Some(id) = subagent_card::card_id(view) else {
@@ -944,7 +956,10 @@ impl ChatView {
                     self.is_running,
                 );
             }
-            SubagentEvent::DesktopReported { .. } => {}
+            SubagentEvent::DesktopReported { id, artifact } => {
+                subagent_card::attach_desktop_artifact(&mut self.messages, id, artifact.clone());
+                self.scroll.scroll_to_bottom();
+            }
         }
         self.sync_subagents(cx);
         if matches!(event, SubagentEvent::Finished { .. }) {
