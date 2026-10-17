@@ -671,6 +671,10 @@ exists. A `desktop_artifact` tool may register durable details and mount/replay
 the descriptor; its success must not be reported as streaming success.
 No credentials, bearer URLs, Unix paths, SDP, or media belong in the descriptor.
 
+Shipped child reporting: when a child's `desktop_artifact` call succeeds, the parent
+run emits it as `SubagentEvent::DesktopReported`, and the top-level chat shows it below
+the child's card. See README, **Child desktops in the main chat**.
+
 The runtime owns a resolver at the desktop-backend seam. Given authenticated
 principal plus descriptor, a real configured adapter validates host/environment/
 grant and returns an authenticated browser viewer route with expiry and roles,

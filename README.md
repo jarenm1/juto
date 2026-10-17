@@ -434,6 +434,20 @@ The chat view mounts each same-host artifact as an inline canvas (see **Embedded
 that starts paused. A remote-host artifact shows an explicit notice instead of a canvas,
 and a resolver failure shows `Desktop '<title>' cannot be opened: <reason>` in its place.
 
+**Child desktops in the main chat.** When a child agent posts a desktop with
+`desktop_artifact`, the top-level run reports it: the main chat shows the desktop as an
+inline canvas directly below the child's card, live and after the child finishes. Only
+children started by the top-level session reach the main chat; a desktop posted by a
+deeper child stays with its manager. A report missed while the chat's event stream lags
+is not replayed, though the desktop keeps running. The main agent can look at a child's
+desktop with `desktop_observe`, which returns the current frame as an image; it cannot
+send input or change the environment.
+
+Environments created by the `desktop` tool set no owner timeout, so they outlive the child
+that created them; they end when destroyed, reclaimed as idle, or when the process exits
+(see **Idle suspension**). The runtime renews the session viewer's grant before it lapses,
+so a canvas mounted hours later still resolves.
+
 **Element trees in tool results.** A tool result may attach a declarative tree under
 `ToolOutput.details` as `{"type":"view","view":{tag, props, children}}`. The model-facing
 `content` is unchanged. The chat and focus views render the tree in its own row after the
