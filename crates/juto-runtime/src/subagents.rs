@@ -60,6 +60,10 @@ pub struct TaskSpec {
     /// isolated and may only be spawned by the main thread.
     #[serde(default, skip_serializing_if = "is_false")]
     pub focus: bool,
+    /// Session id of the top-level run whose tree spawned this child. Child
+    /// reports to `agent://main` return to that session; never model-supplied.
+    #[serde(skip)]
+    pub origin: Option<String>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -90,6 +94,7 @@ impl TaskSpec {
             isolated_workspace: false,
             solution_space: None,
             focus: false,
+            origin: None,
         }
     }
 }
@@ -381,18 +386,33 @@ pub struct MainMessage {
 /// In-memory mailbox the main agent drains with `agent_inbox`. One inbox is
 /// shared by every manager in a run tree, so nested children write into the
 /// same main thread. Not persisted: messages are lost when the process exits.
+///
+/// Each message remembers the session id of the top-level run that spawned
+/// its sender (`origin`), so a main session with several internal threads
+/// delivers a report to the thread that asked for it.
 #[derive(Clone, Default)]
 pub struct MainInbox {
-    messages: Arc<Mutex<Vec<MainMessage>>>,
+    messages: Arc<Mutex<Vec<Queued>>>,
     arrived: Arc<Notify>,
 }
 
+struct Queued {
+    origin: Option<String>,
+    message: MainMessage,
+}
+
 impl MainInbox {
+    /// Queue a message with no known origin; any top-level run may take it.
     pub fn push(&self, message: MainMessage) {
+        self.push_from(None, message);
+    }
+
+    /// Queue a message addressed to the top-level session `origin`.
+    pub fn push_from(&self, origin: Option<String>, message: MainMessage) {
         self.messages
             .lock()
             .expect("main inbox poisoned")
-            .push(message);
+            .push(Queued { origin, message });
         // Stores a permit when no waiter is parked, so a push racing a drain
         // is not missed by the next `arrived` wait.
         self.arrived.notify_one();
@@ -403,21 +423,56 @@ impl MainInbox {
         self.arrived.notified().await;
     }
 
-    /// Put undelivered messages back at the front, preserving arrival order.
-    pub fn requeue_front(&self, messages: Vec<MainMessage>) {
+    /// Put undelivered messages for `origin` back at the front, preserving
+    /// arrival order.
+    pub fn requeue_front(&self, origin: Option<&str>, messages: Vec<MainMessage>) {
         if messages.is_empty() {
             return;
         }
+        let queued = messages.into_iter().map(|message| Queued {
+            origin: origin.map(str::to_owned),
+            message,
+        });
         self.messages
             .lock()
             .expect("main inbox poisoned")
-            .splice(0..0, messages);
+            .splice(0..0, queued);
         self.arrived.notify_one();
     }
 
     /// Remove and return every pending message in arrival order.
     pub fn drain(&self) -> Vec<MainMessage> {
         std::mem::take(&mut *self.messages.lock().expect("main inbox poisoned"))
+            .into_iter()
+            .map(|queued| queued.message)
+            .collect()
+    }
+
+    /// Remove and return the messages a run of session `session_id` should
+    /// receive: those addressed to it and those with no origin. Messages for
+    /// other sessions stay queued in order.
+    pub fn drain_for(&self, session_id: &str) -> Vec<MainMessage> {
+        let mut guard = self.messages.lock().expect("main inbox poisoned");
+        let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *guard)
+            .into_iter()
+            .partition(|queued| queued.origin.as_deref().is_none_or(|o| o == session_id));
+        *guard = kept;
+        taken.into_iter().map(|queued| queued.message).collect()
+    }
+
+    /// Remove the oldest message's origin group: every pending message that
+    /// shares its origin, in arrival order. Other origins stay queued.
+    pub fn take_next_group(&self) -> Option<(Option<String>, Vec<MainMessage>)> {
+        let mut guard = self.messages.lock().expect("main inbox poisoned");
+        let origin = guard.first()?.origin.clone();
+        let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *guard)
+            .into_iter()
+            .partition(|queued| queued.origin == origin);
+        *guard = kept;
+        Some((
+            origin,
+            taken.into_iter().map(|queued| queued.message).collect(),
+        ))
     }
 }
 
@@ -489,6 +544,9 @@ struct Inner {
     semaphore: Arc<Semaphore>,
     parent_cancel: CancellationToken,
     main_inbox: MainInbox,
+    /// Top-level session every child of this manager reports to. `None` for
+    /// the root manager, whose callers stamp each spec with its own session.
+    origin: Option<String>,
     events: broadcast::Sender<SubagentEvent>,
     children: Mutex<HashMap<String, Arc<Child>>>,
 }
@@ -508,16 +566,35 @@ impl SubagentManager {
         parent_cancel: CancellationToken,
         main_inbox: MainInbox,
     ) -> Self {
+        Self::with_origin(factory, max_concurrency, parent_cancel, main_inbox, None)
+    }
+
+    /// A manager whose children all report to the top-level session `origin`,
+    /// whatever the spawning tool records. Nested managers use this so a
+    /// grandchild's report returns to the thread that started the tree.
+    pub fn with_origin(
+        factory: Arc<dyn SubagentFactory>,
+        max_concurrency: usize,
+        parent_cancel: CancellationToken,
+        main_inbox: MainInbox,
+        origin: Option<String>,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 factory,
                 semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
                 parent_cancel,
                 main_inbox,
+                origin,
                 children: Mutex::new(HashMap::new()),
                 events: broadcast::channel(EVENT_CAPACITY).0,
             }),
         }
+    }
+
+    /// Top-level session this manager's children report to, when fixed.
+    pub fn origin(&self) -> Option<&str> {
+        self.inner.origin.as_deref()
     }
 
     /// The inbox every child of this manager pushes into. Shared with nested
@@ -540,6 +617,9 @@ impl SubagentManager {
             // always needs a dedicated workspace regardless of what the
             // caller requested.
             spec.isolated_workspace = true;
+        }
+        if let Some(origin) = &self.inner.origin {
+            spec.origin = Some(origin.clone());
         }
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(SubagentError::NoRuntime);
@@ -1349,11 +1429,14 @@ fn finish(
             Ok(result) => result.output.clone(),
             Err(err) => err.clone(),
         };
-        inner.main_inbox.push(MainMessage {
-            from: child.id.clone(),
-            kind,
-            body,
-        });
+        inner.main_inbox.push_from(
+            child.spec.origin.clone(),
+            MainMessage {
+                from: child.id.clone(),
+                kind,
+                body,
+            },
+        );
     }
     let (result, error) = match &outcome {
         Ok(result) => (Some(result.clone()), None),
@@ -1446,6 +1529,7 @@ mod tests {
             isolated_workspace: false,
             solution_space: None,
             focus: false,
+            origin: None,
         }
     }
 
@@ -2808,9 +2892,39 @@ mod tests {
             body: body.into(),
         };
         inbox.push(note("third"));
-        inbox.requeue_front(vec![note("first"), note("second")]);
+        inbox.requeue_front(None, vec![note("first"), note("second")]);
         let bodies: Vec<String> = inbox.drain().into_iter().map(|m| m.body).collect();
         assert_eq!(bodies, ["first", "second", "third"]);
+    }
+
+    #[test]
+    fn inbox_delivers_reports_to_the_session_that_spawned_them() {
+        let inbox = MainInbox::default();
+        let note = |body: &str| MainMessage {
+            from: "child".into(),
+            kind: MainMessageKind::Completed,
+            body: body.into(),
+        };
+        inbox.push_from(Some("thread-a".into()), note("a1"));
+        inbox.push_from(Some("thread-b".into()), note("b1"));
+        inbox.push(note("anyone"));
+        inbox.push_from(Some("thread-a".into()), note("a2"));
+
+        // A run of thread b takes its own report and the unaddressed one,
+        // never thread a's.
+        let bodies: Vec<String> = inbox
+            .drain_for("thread-b")
+            .into_iter()
+            .map(|m| m.body)
+            .collect();
+        assert_eq!(bodies, ["b1", "anyone"]);
+
+        // Waking idle threads takes one origin group at a time, oldest first.
+        let (origin, group) = inbox.take_next_group().expect("thread a group");
+        assert_eq!(origin.as_deref(), Some("thread-a"));
+        let bodies: Vec<String> = group.into_iter().map(|m| m.body).collect();
+        assert_eq!(bodies, ["a1", "a2"]);
+        assert!(inbox.take_next_group().is_none());
     }
 
     #[tokio::test]

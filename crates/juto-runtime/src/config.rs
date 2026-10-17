@@ -91,6 +91,9 @@ fn default_compaction_threshold() -> f64 {
 fn default_keep_recent() -> usize {
     8
 }
+fn default_max_active_threads() -> usize {
+    6
+}
 
 /// Runtime settings. All fields carry serde defaults so partial files layer
 /// cleanly; `load` merges raw YAML values before deserialization so deep maps
@@ -125,6 +128,10 @@ pub struct RuntimeConfig {
     /// user scope with the CPU and memory caps from `AGENT_*`. Off by default,
     /// because it changes how a command is supervised and needs `systemd-run`.
     pub bash_scoped: bool,
+    /// Internal threads of a main session the router may choose among. Past
+    /// this many, the least recently routed thread goes dormant; dormant
+    /// threads are reached by history lookup.
+    pub max_active_threads: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -146,6 +153,7 @@ impl Default for RuntimeConfig {
             tools: Vec::new(),
             custom_models: Vec::new(),
             bash_scoped: false,
+            max_active_threads: default_max_active_threads(),
         }
     }
 }
@@ -199,6 +207,11 @@ impl RuntimeConfig {
         if self.max_concurrency == 0 {
             return Err(ConfigError::Validation(
                 "maxConcurrency must be positive".into(),
+            ));
+        }
+        if self.max_active_threads == 0 {
+            return Err(ConfigError::Validation(
+                "maxActiveThreads must be positive".into(),
             ));
         }
         if !(self.compaction_threshold > 0.0 && self.compaction_threshold <= 1.0) {

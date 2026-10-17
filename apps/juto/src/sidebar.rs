@@ -1,5 +1,8 @@
-//! Left sidebar listing focus threads (subagents that own an orchestrated task).
+//! Left sidebar listing the main session's internal threads and its focus
+//! threads (subagents that own an orchestrated task).
 //!
+//! - Internal threads: one row per thread with its label and whether it is the
+//!   current, an active, or a dormant thread.
 //! - One row per focus thread: title, status, and lifecycle stage bar (see
 //!   `task_card`). Clicking a row selects it and opens focus mode.
 //! - Direct integration with `juto_runtime::subagents::{BlockerReason, SubagentStatus, SubagentSummary}`.
@@ -13,9 +16,10 @@ use std::collections::HashMap;
 
 use gpui::{
     App, ClickEvent, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Render,
-    ScrollHandle, SharedString, Subscription, Window, actions, div, prelude::*, rgb,
+    ScrollHandle, SharedString, Subscription, Window, actions, div, prelude::*, px, rgb,
 };
 use juto_runtime::subagents::{BlockerReason, SubagentStatus, SubagentSummary};
+use juto_runtime::{ThreadInfo, ThreadStatus};
 
 use crate::task_card::{
     DiffFileModel, DiffHunkModel, DiffLineKind, DiffLineModel, TaskCard, TaskCardEvent,
@@ -81,6 +85,15 @@ pub struct Sidebar {
     error_message: Option<SharedString>,
     /// Live row views by task id, with the subscription forwarding their events.
     cards: HashMap<String, (Entity<TaskCard>, Subscription)>,
+    threads: ThreadList,
+}
+
+/// The main session's internal threads, in creation order.
+#[derive(Default)]
+struct ThreadList {
+    items: Vec<ThreadInfo>,
+    /// Thread the latest request was routed to.
+    current: Option<String>,
 }
 
 impl gpui::EventEmitter<SidebarEvent> for Sidebar {}
@@ -97,6 +110,7 @@ impl Sidebar {
             search_query: String::new(),
             error_message: None,
             cards: HashMap::new(),
+            threads: ThreadList::default(),
         }
     }
 
@@ -207,6 +221,31 @@ impl Sidebar {
 
     pub fn tasks(&self) -> &[TaskCardModel] {
         &self.tasks
+    }
+
+    /// Replace the thread list; the most recently routed thread is current.
+    pub fn set_threads(&mut self, threads: Vec<ThreadInfo>, cx: &mut Context<Self>) {
+        self.threads.current = threads
+            .iter()
+            .max_by_key(|thread| thread.last_routed)
+            .map(|thread| thread.id.clone());
+        self.threads.items = threads;
+        cx.notify();
+    }
+
+    /// Add a new thread or replace an existing one's label and status.
+    pub fn upsert_thread(&mut self, thread: ThreadInfo, cx: &mut Context<Self>) {
+        match self.threads.items.iter_mut().find(|t| t.id == thread.id) {
+            Some(existing) => *existing = thread,
+            None => self.threads.items.push(thread),
+        }
+        cx.notify();
+    }
+
+    /// Mark the thread the latest request was routed to.
+    pub fn set_current_thread(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.threads.current = Some(id.to_owned());
+        cx.notify();
     }
 
     pub fn set_error(&mut self, error: Option<SharedString>, cx: &mut Context<Self>) {
@@ -415,6 +454,62 @@ impl Sidebar {
             || task.id.to_lowercase().contains(&q)
     }
 
+    fn render_threads(&self) -> impl IntoElement {
+        let current = self.threads.current.as_deref();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_5()
+            .pt_5()
+            .pb_2()
+            .border_b_1()
+            .border_color(rgb(theme::BORDER))
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .child("THREADS"),
+            )
+            .children(self.threads.items.iter().map(|thread| {
+                let is_current = current == Some(thread.id.as_str());
+                let dormant = thread.status == ThreadStatus::Dormant;
+                let (dot, state) = if is_current {
+                    (theme::ACCENT, "current")
+                } else if dormant {
+                    (theme::BORDER_STRONG, "dormant")
+                } else {
+                    (theme::TEXT_MUTED, "active")
+                };
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_0p5()
+                    .child(div().flex_none().size(px(6.)).rounded_full().bg(rgb(dot)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(rgb(if dormant {
+                                theme::TEXT_FAINT
+                            } else {
+                                theme::TEXT
+                            }))
+                            .child(thread.label.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_FAINT))
+                            .child(state),
+                    )
+            }))
+    }
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (total, active, blocked, done) = self.filter_counts();
 
@@ -646,6 +741,9 @@ impl Render for Sidebar {
             .flex()
             .flex_col()
             .size_full()
+            .when(!self.threads.items.is_empty(), |sidebar| {
+                sidebar.child(self.render_threads())
+            })
             .child(self.render_header(cx))
             .child(
                 div()
@@ -689,6 +787,7 @@ mod tests {
             search_query: String::new(),
             error_message: None,
             cards: HashMap::new(),
+            threads: ThreadList::default(),
         };
 
         let (total, active, blocked, done) = sidebar.filter_counts();
@@ -723,6 +822,7 @@ mod tests {
             search_query: String::new(),
             error_message: None,
             cards: HashMap::new(),
+            threads: ThreadList::default(),
         };
 
         // Truthful initial empty state
@@ -844,6 +944,7 @@ mod tests {
             search_query: String::new(),
             error_message: None,
             cards: HashMap::new(),
+            threads: ThreadList::default(),
         };
 
         assert!(sidebar.error_message.is_none());
@@ -868,6 +969,7 @@ mod tests {
             search_query: String::new(),
             error_message: None,
             cards: HashMap::new(),
+            threads: ThreadList::default(),
         };
         let summary = |id: &str, focus: bool| SubagentSummary {
             id: id.into(),
@@ -901,6 +1003,7 @@ mod tests {
             search_query: String::new(),
             error_message: None,
             cards: HashMap::new(),
+            threads: ThreadList::default(),
         };
         let summary = SubagentSummary {
             id: "focus-1".into(),
