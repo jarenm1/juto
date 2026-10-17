@@ -1525,7 +1525,7 @@ pub fn register_desktop_tools(
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct DesktopArgs {
     action: String,
     #[serde(default)]
@@ -1661,6 +1661,114 @@ impl Tool for DesktopTool {
                 args,
                 &cancel,
             )
+        })
+        .await
+        .map_err(|e| format!("desktop task failed: {e}"))?
+    }
+}
+
+/// Read-only desktop access for the main thread: shows an environment's current
+/// frame to the model. It cannot send input or change the environment.
+pub struct DesktopObserveTool {
+    supervisor: Arc<juto_desktop::DesktopSupervisor>,
+    signaling: Arc<crate::SignalingHandle>,
+    data_dir: PathBuf,
+}
+
+/// Registers the read-only desktop observe tool against a supervisor.
+pub fn register_desktop_observe_tool(
+    registry: &mut ToolRegistry,
+    supervisor: Arc<juto_desktop::DesktopSupervisor>,
+    signaling: Arc<crate::SignalingHandle>,
+    data_dir: PathBuf,
+) -> Result<(), AgentError> {
+    registry.register(Arc::new(DesktopObserveTool {
+        supervisor,
+        signaling,
+        data_dir,
+    }))?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct DesktopObserveArgs {
+    env_id: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[async_trait]
+impl Tool for DesktopObserveTool {
+    fn definition(&self) -> juto_ai::ToolDefinition {
+        juto_ai::ToolDefinition {
+            name: "desktop_observe".to_string(),
+            description: "Shows the current frame of a desktop environment as an image. \
+                          Read-only: it cannot send input or change the environment. Use the \
+                          env_id from a child's desktop report."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "env_id": {
+                        "type": "string",
+                        "description": "Environment id of the desktop to observe."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How long to wait for a frame, in milliseconds (default 5000)."
+                    }
+                },
+                "required": ["env_id"]
+            }),
+        }
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Shared
+    }
+
+    async fn execute(&self, arguments: Value, ctx: ToolContext) -> Result<ToolOutput, String> {
+        let args: DesktopObserveArgs = serde_json::from_value(arguments)
+            .map_err(|e| format!("invalid desktop_observe arguments: {e}"))?;
+        check_cancel(&ctx.cancel)?;
+
+        let supervisor = self.supervisor.clone();
+        let signaling = self.signaling.clone();
+        let data_dir = self.data_dir.clone();
+        let workspace = effective_cwd(Path::new(""), &ctx).to_path_buf();
+        let cancel = ctx.cancel.clone();
+        let owner_principal = format!("agent:{}", ctx.session_id);
+        let observe = DesktopArgs {
+            action: "observe".to_string(),
+            env_id: Some(args.env_id),
+            timeout_ms: args.timeout_ms,
+            ..DesktopArgs::default()
+        };
+
+        tokio::task::spawn_blocking(move || {
+            use base64::Engine as _;
+
+            let mut out = run_desktop_action(
+                &supervisor,
+                &signaling,
+                &data_dir,
+                &workspace,
+                &owner_principal,
+                observe,
+                &cancel,
+            )?;
+            // Attach the frame itself so the model can see it, not only its path.
+            let path = out.details["snapshotPath"]
+                .as_str()
+                .ok_or("observe returned no snapshot path")?
+                .to_string();
+            let png = std::fs::read(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
+            out.content.push(ContentBlock::Image {
+                data: base64::engine::general_purpose::STANDARD.encode(png),
+                mime_type: "image/png".to_string(),
+            });
+            Ok(out)
         })
         .await
         .map_err(|e| format!("desktop task failed: {e}"))?
@@ -4204,5 +4312,52 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn desktop_observe_attaches_the_frame_as_png() {
+        use base64::Engine as _;
+
+        let supervisor = Arc::new(juto_desktop::DesktopSupervisor::new());
+        let data_dir = tempfile::tempdir().unwrap();
+        let signaling = Arc::new(crate::SignalingHandle::new(supervisor.clone()));
+        let create = DesktopTool {
+            supervisor: supervisor.clone(),
+            signaling: signaling.clone(),
+            data_dir: data_dir.path().to_path_buf(),
+        };
+        let ctx = ctx(data_dir.path());
+        let created = create
+            .execute(
+                json!({"action": "create", "title": "observe", "width": 640, "height": 480}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        let env_id = created.details["envId"].as_str().unwrap().to_string();
+
+        let observe = DesktopObserveTool {
+            supervisor,
+            signaling,
+            data_dir: data_dir.path().to_path_buf(),
+        };
+        let observed = observe
+            .execute(json!({"env_id": env_id, "timeout_ms": 5000}), ctx)
+            .await
+            .unwrap();
+
+        let (data, mime_type) = observed
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Image { data, mime_type } => Some((data, mime_type)),
+                _ => None,
+            })
+            .expect("observe attaches the frame as an image block");
+        assert_eq!(mime_type, "image/png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 }
