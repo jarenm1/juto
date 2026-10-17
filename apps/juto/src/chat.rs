@@ -771,7 +771,7 @@ impl ChatView {
                 width: 1280,
                 height: 720,
                 scale: 1,
-                fps: 30,
+                fps: 60,
             },
             render_profile: juto_runtime::RenderProfile::Software,
             limits: juto_runtime::SystemLimits::default(),
