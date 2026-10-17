@@ -638,9 +638,19 @@ impl DesktopEnvironment {
         action: &str,
         is_human: bool,
     ) -> Result<Option<ControlLease>, DesktopError> {
+        // Lock order matches `revoke_grant`: grants, then lease.
+        let grants = self.inner.grants.lock();
         let mut lease = self.inner.lease.lock();
         match action {
             "acquire" => {
+                // Human control needs a live grant; agent control is unchanged.
+                if is_human && !grants_permit_control(&grants, caller) {
+                    return Err(DesktopError::Unauthorized {
+                        caller: caller.to_string(),
+                        role: "Control".to_string(),
+                        environment: self.env_id().to_string(),
+                    });
+                }
                 if let Some(current) = lease.as_ref() {
                     if current.holder == caller && current.is_human == is_human {
                         // Renewal: same holder keeps its epoch and extends the
@@ -760,6 +770,16 @@ impl DesktopEnvironment {
         // benign host variables plus environment-private paths and explicit
         // overrides. No host display, session bus, SSH agent, or provider
         // secrets are inherited.
+        // Launching before Xwayland reports ready would start X11 clients
+        // without `DISPLAY`; wait briefly for the environment's X server.
+        let x11_display = self.wait_for_x11(Duration::from_secs(10));
+        if x11_display.is_none() {
+            tracing::warn!(
+                env_id = %self.env_id(),
+                app_id,
+                "launching application before Xwayland is ready; no DISPLAY"
+            );
+        }
         let home = self.inner.runtime_dir.join("home");
         let mut app_env: Vec<(String, String)> = Vec::new();
         for key in ENV_ALLOWLIST {
@@ -812,7 +832,7 @@ impl DesktopEnvironment {
         ));
         // X11 applications reach the environment's private Xwayland instance
         // with the environment's own authorization cookie.
-        if let Some(display_number) = *self.inner.x11_display.lock() {
+        if let Some(display_number) = x11_display {
             app_env.push(("DISPLAY".to_string(), format!(":{display_number}")));
             app_env.push((
                 "XAUTHORITY".to_string(),
@@ -938,6 +958,8 @@ impl DesktopEnvironment {
         generation: GeometryGeneration,
         batch: InputBatch,
     ) -> Result<u64, DesktopError> {
+        // Lock order matches `revoke_grant`: grants, then lease.
+        let grants = self.inner.grants.lock();
         let lease = self.inner.lease.lock();
         let current_lease = lease.as_ref().ok_or_else(|| DesktopError::Unauthorized {
             caller: caller.to_string(),
@@ -954,6 +976,13 @@ impl DesktopEnvironment {
             return Err(DesktopError::StaleLease {
                 expected: current_lease.epoch,
                 received: epoch,
+            });
+        }
+        if current_lease.is_human && !grants_permit_control(&grants, caller) {
+            return Err(DesktopError::Unauthorized {
+                caller: caller.to_string(),
+                role: "Control".to_string(),
+                environment: self.env_id().to_string(),
             });
         }
         let current_gen = self.generation();
@@ -983,6 +1012,7 @@ impl DesktopEnvironment {
             }
         }
         drop(lease);
+        drop(grants);
 
         let compositor = self.compositor()?;
         for event in batch.events {
@@ -1137,6 +1167,20 @@ impl DesktopEnvironment {
         *self.inner.x11_display.lock()
     }
 
+    /// Waits up to `timeout` for the environment's Xwayland to report ready.
+    pub fn wait_for_x11(&self, timeout: Duration) -> Option<u32> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(display_number) = self.x11_display() {
+                return Some(display_number);
+            }
+            if self.inner.destroyed.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Number of viewers currently admitted to the environment.
     pub fn active_viewers(&self) -> usize {
         self.inner.viewers.lock().len()
@@ -1194,6 +1238,11 @@ impl DesktopEnvironment {
         // Every viewer must present a new-generation frame before input resumes.
         self.inner.geometry_ready.lock().clear();
         Ok(new_gen)
+    }
+
+    /// False once the environment has been destroyed.
+    pub fn is_alive(&self) -> bool {
+        !self.inner.destroyed.load(Ordering::SeqCst)
     }
 
     pub fn get_status(&self) -> EnvironmentStatus {
@@ -1984,6 +2033,20 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Whether `caller` holds an unexpired grant that permits interactive control.
+/// Expired grants stay in the table for lookup, so the deadline is checked here.
+fn grants_permit_control(grants: &HashMap<String, Grant>, caller: &str) -> bool {
+    let now = now_secs();
+    grants.values().any(|grant| {
+        grant.principal == caller
+            && grant.expires_at > now
+            && grant
+                .roles
+                .iter()
+                .any(|role| matches!(role, GrantRole::Owner | GrantRole::Control))
+    })
 }
 
 /// Whether per-environment systemd scopes are enforced.

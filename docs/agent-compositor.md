@@ -82,7 +82,9 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Same-host embedded viewer in the harness: composes from the sealed pool with no
   codec, letterboxes, maps pointer coordinates to desktop pixels, forwards
   pointer/scroll/keyboard input, and holds a human control lease with a
-  heartbeat.
+  heartbeat. The harness mounts it inline in chat as a canvas that starts paused
+  (one still, no input) and resumes on click; the owner heartbeat runs for the
+  viewer's lifetime, and the control lease renews only while held.
 - Remote presentation: a GStreamer `webrtcbin` sender (VP8 default, H.264
   available) fed from the composed pool, a one-time-token signaling server that
   serves a browser viewer page and relays SDP/ICE over a WebSocket, pointer and
@@ -287,10 +289,12 @@ Creating -> Ready -> Stopping -> Stopped
   spawn errors separate from exit status. `WindowMapped` and `FrameAvailable`
   are observations, not inferred from successful process launch. Launchers may
   spawn several processes/windows; an application handle tracks its subtree.
-- Owner heartbeat interval is 10 seconds; expiry after 60 seconds destroys the
-  environment unless the runtime has explicitly transferred retention ownership
-  to a human session. Task cancellation stops the desktop by default. A viewer
-  alone never keeps an abandoned desktop alive.
+- Owner heartbeat interval is 10 seconds for the runtime's `desktop` tool; the
+  embedded canvas heartbeats every 2 seconds while it is mounted. Expiry after
+  60 seconds destroys the environment unless the runtime has explicitly
+  transferred retention ownership to a human session. Task cancellation stops
+  the desktop by default. A mounted viewer keeps the desktop alive; once the
+  canvas unmounts, heartbeats stop and ordinary expiry applies.
 - `Destroy` first revokes grants/leases, releases held input, closes viewers,
   requests application termination, then stops the entire environment cgroup.
   Default grace period: 5 seconds, followed by forced termination. Destroy is
@@ -342,7 +346,8 @@ Retention requires authenticated human acceptance and a host-approved deadline
 
 Events carry monotonic sequence numbers and include `Ready`, `ApplicationExited`,
 `WindowMapped/Unmapped`, `OutputChanged`, `ControlChanged`, `ViewerStateChanged`,
-`TextFocusChanged`, `LimitPressure`, `Failed`, and `Stopped`.
+`TextFocusChanged`, `CursorShapeChanged` (CSS cursor name, `none` when hidden),
+`LimitPressure`, `Failed`, and `Stopped`.
 Use a bounded 256-event replay ring;
 a lagging consumer gets `ResyncRequired` and must call `Describe`, not silently
 lose exits. Images/media are not JSON events. Terminal state remains queryable

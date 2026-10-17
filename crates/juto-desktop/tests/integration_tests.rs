@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use juto_desktop::DesktopError;
+use juto_desktop::WindowInfo;
 use juto_desktop::protocol::*;
 use juto_desktop::shm::{ShmFramePool, ShmReader};
 use juto_desktop::supervisor::{
@@ -133,7 +134,13 @@ fn control_lease_and_human_preemption() {
     // A second agent cannot steal control.
     assert!(env.set_control("agent:other", "acquire", false).is_err());
 
-    // A human preempts the agent and increments the epoch.
+    // A human with an Owner grant preempts the agent and increments the epoch.
+    env.issue_grant(
+        "human:test".to_string(),
+        vec![juto_desktop::protocol::GrantRole::Owner],
+        "session".to_string(),
+        60,
+    );
     let human = env
         .set_control("human:test", "acquire", true)
         .expect("human preempts")
@@ -148,6 +155,74 @@ fn control_lease_and_human_preemption() {
             .is_none()
     );
     assert!(env.get_status().active_control_lease.is_none());
+
+    env.destroy();
+}
+
+#[test]
+fn human_control_requires_live_grant() {
+    use juto_desktop::protocol::GrantRole;
+
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("grant")), &unique_env_id("req"))
+        .expect("create environment");
+
+    // No grant: a human cannot take control.
+    assert!(matches!(
+        env.set_control("human:none", "acquire", true),
+        Err(DesktopError::Unauthorized { .. })
+    ));
+
+    // A View-only grant does not confer control.
+    env.issue_grant(
+        "human:viewer-only".to_string(),
+        vec![GrantRole::View],
+        "session".to_string(),
+        60,
+    );
+    assert!(matches!(
+        env.set_control("human:viewer-only", "acquire", true),
+        Err(DesktopError::Unauthorized { .. })
+    ));
+
+    // A lapsed grant is refused although it stays in the grant table.
+    env.issue_grant(
+        "human:lapsed".to_string(),
+        vec![GrantRole::Owner],
+        "session".to_string(),
+        0,
+    );
+    assert!(matches!(
+        env.set_control("human:lapsed", "acquire", true),
+        Err(DesktopError::Unauthorized { .. })
+    ));
+
+    // A live Owner grant acquires control.
+    let owner_grant = env.issue_grant(
+        "human:owner".to_string(),
+        vec![GrantRole::Owner],
+        "session".to_string(),
+        60,
+    );
+    let lease = env
+        .set_control("human:owner", "acquire", true)
+        .expect("owner acquires")
+        .expect("lease present");
+    assert!(lease.is_human);
+
+    // Revoking the grant releases the lease, so the holder's input is refused.
+    assert!(env.revoke_grant(&owner_grant.grant_id));
+    assert!(env.get_status().active_control_lease.is_none());
+    let batch = InputBatch {
+        seq: 1,
+        client_timestamp_us: 0,
+        events: Vec::new(),
+    };
+    assert!(matches!(
+        env.dispatch_input("human:owner", lease.epoch, env.generation(), batch),
+        Err(DesktopError::Unauthorized { .. })
+    ));
 
     env.destroy();
 }
@@ -241,6 +316,435 @@ fn compositor_renders_real_client_frame() {
     assert_eq!(info.width, 640);
     assert_eq!(info.height, 480);
     assert_eq!(info.generation, 1);
+
+    let frames = client.join().expect("client thread").expect("client run");
+    assert!(frames > 0, "client presented at least one frame");
+
+    env.destroy();
+}
+
+#[test]
+fn compositor_renders_xdg_popup_above_its_parent() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("popup")), &unique_env_id("req"))
+        .expect("create environment");
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    let client = std::thread::spawn(move || common::run_with_popup(&socket, 10));
+
+    let pool = env.frame_pool();
+    let popup_px = common::POPUP_OFFSET as u32 + 20;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut verified = None;
+    while Instant::now() < deadline {
+        let info = match env.observe(Duration::from_secs(2)) {
+            Ok(info) => info,
+            Err(err) => panic!("observe failed: {err}"),
+        };
+        let parent = read_pixel(&pool, info.slot, 10, 10, info.width);
+        let popup = read_pixel(&pool, info.slot, popup_px, popup_px, info.width);
+        if parent == common::RED && popup == common::GREEN {
+            verified = Some(info);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    verified.expect("compositor never drew the child popup over its parent");
+
+    let frames = client.join().expect("client thread").expect("client run");
+    assert!(frames > 0, "client presented at least one frame");
+
+    env.destroy();
+}
+
+#[test]
+fn xdg_toplevel_restores_its_layout_after_unmaximize() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(
+            test_config(&unique_env_id("maximize")),
+            &unique_env_id("req"),
+        )
+        .expect("create environment");
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    // The first client takes the origin cascade slot, so the second starts away
+    // from (0, 0). A restore must return it to that start, not to the origin.
+    let first_socket = socket.clone();
+    let first = std::thread::spawn(move || common::run(&first_socket, 10));
+    let wait_for = |accept: &dyn Fn(&WindowInfo) -> bool| -> WindowInfo {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let found = env
+                .get_status()
+                .mapped_windows
+                .into_iter()
+                .find(|window| accept(window));
+            if let Some(window) = found {
+                return window;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected window layout never appeared"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    let first_window = wait_for(&|_: &WindowInfo| true);
+    let second = std::thread::spawn(move || common::run_with_maximize_cycle(&socket, 10));
+    let start = wait_for(&|window: &WindowInfo| {
+        window.window_id != first_window.window_id && window.width > 0
+    });
+    assert_ne!(
+        (start.x, start.y),
+        (0, 0),
+        "second window must start away from the origin"
+    );
+    let id = start.window_id;
+
+    // Maximize moves the window to the output origin.
+    wait_for(&|window: &WindowInfo| window.window_id == id && (window.x, window.y) == (0, 0));
+    // Unmaximize must return it to where it was before maximize, at its old size.
+    let restored = wait_for(&|window: &WindowInfo| {
+        window.window_id == id && (window.x, window.y) == (start.x, start.y)
+    });
+    assert_eq!(
+        (restored.width, restored.height),
+        (start.width, start.height)
+    );
+
+    first
+        .join()
+        .expect("first client thread")
+        .expect("first client run");
+    second
+        .join()
+        .expect("second client thread")
+        .expect("second client run");
+    env.destroy();
+}
+
+#[test]
+fn popup_receives_pointer_and_dismisses_on_outside_click() {
+    const BTN_LEFT: u32 = 0x110;
+
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(
+            test_config(&unique_env_id("popup-input")),
+            &unique_env_id("req"),
+        )
+        .expect("create environment");
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    let client = std::thread::spawn(move || common::run_with_menu(&socket, 20));
+
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
+    let pool = env.frame_pool();
+
+    let mut seq = 0;
+    let mut send = |events: Vec<InputEvent>| {
+        seq += 1;
+        env.dispatch_input(
+            "agent:test",
+            lease.epoch,
+            env.generation(),
+            InputBatch {
+                seq,
+                client_timestamp_us: 0,
+                events,
+            },
+        )
+        .expect("input accepted");
+    };
+
+    // Waits until every `(x, y, color)` in `want` matches the latest frame.
+    let await_frame = |want: &[(u32, u32, [u8; 4])], what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let info = env
+                .observe(Duration::from_secs(2))
+                .unwrap_or_else(|err| panic!("observe failed: {err}"));
+            if want
+                .iter()
+                .all(|&(x, y, color)| read_pixel(&pool, info.slot, x, y, info.width) == color)
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    // Input before the toplevel maps would hit no surface and produce no enter.
+    await_frame(&[(10, 10, common::RED)], "toplevel mapped");
+
+    // A press on the toplevel opens the menu: the client creates the popup and
+    // grabs with that press's serial, so the popup must appear before any hover.
+    send(vec![InputEvent::PointerMoveAbs { x: 10, y: 10 }]);
+    send(vec![InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: true,
+    }]);
+    send(vec![InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: false,
+    }]);
+    await_frame(
+        &[(10, 10, common::RED), (120, 120, common::GREEN)],
+        "menu opened by press",
+    );
+
+    // Hover over the popup: pointer input is routed to the popup, not the parent.
+    send(vec![InputEvent::PointerMoveAbs { x: 120, y: 120 }]);
+    await_frame(&[(120, 120, common::BLUE)], "menu hovered");
+
+    // A click inside the grabbed popup must not dismiss it. Settle first, so a
+    // wrongful popup_done would have arrived before the check.
+    send(vec![InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: true,
+    }]);
+    send(vec![InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: false,
+    }]);
+    std::thread::sleep(Duration::from_millis(200));
+    await_frame(&[(120, 120, common::BLUE)], "menu open after inside click");
+
+    // Click on empty desktop, outside the popup's client. Smithay dismisses a
+    // grabbed popup on a press whose focus is not the grab's client; a press on the
+    // parent (same client) keeps the grab. The client sees popup_done and unmaps.
+    send(vec![InputEvent::PointerMoveAbs { x: 500, y: 400 }]);
+    send(vec![InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: true,
+    }]);
+    send(vec![InputEvent::PointerButton {
+        button: BTN_LEFT,
+        pressed: false,
+    }]);
+    await_frame(
+        &[(120, 120, common::RED)],
+        "menu dismissed by outside click",
+    );
+
+    let frames = client.join().expect("client thread").expect("client run");
+    assert!(frames > 0, "client presented at least one frame");
+
+    env.destroy();
+}
+
+#[test]
+fn application_cursor_shape_is_forwarded_once_per_change() {
+    use tokio::sync::broadcast::error::TryRecvError;
+    use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
+
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("cursor")), &unique_env_id("req"))
+        .expect("create environment");
+    let mut events = env.subscribe();
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    let client = std::thread::spawn(move || common::run_with_cursor(&socket, 20, Shape::Pointer));
+
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
+    let pool = env.frame_pool();
+
+    let mut seq = 0;
+    let mut send = |batch: Vec<InputEvent>| {
+        seq += 1;
+        env.dispatch_input(
+            "agent:test",
+            lease.epoch,
+            env.generation(),
+            InputBatch {
+                seq,
+                client_timestamp_us: 0,
+                events: batch,
+            },
+        )
+        .expect("input accepted");
+    };
+
+    // Wait for the toplevel to map; input before that hits no surface and no enter.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let info = env
+            .observe(Duration::from_secs(2))
+            .unwrap_or_else(|err| panic!("observe failed: {err}"));
+        if read_pixel(&pool, info.slot, 10, 10, info.width) == common::RED {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for toplevel");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Entering the toplevel: the client answers the enter with its shape request.
+    send(vec![InputEvent::PointerMoveAbs { x: 10, y: 10 }]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let first = loop {
+        match events.try_recv() {
+            Ok(DesktopEvent::CursorShapeChanged { shape, .. }) => break shape,
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "no cursor shape event after pointer enter"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(TryRecvError::Lagged(n)) => panic!("event subscriber lagged by {n}"),
+            Err(TryRecvError::Closed) => panic!("event channel closed"),
+        }
+    };
+    assert_eq!(first, "pointer");
+
+    // Motion over the same shape must not re-emit it.
+    for (x, y) in [(11, 11), (12, 12), (13, 13), (14, 14), (15, 15)] {
+        send(vec![InputEvent::PointerMoveAbs { x, y }]);
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let mut repeats = Vec::new();
+    loop {
+        match events.try_recv() {
+            Ok(DesktopEvent::CursorShapeChanged { shape, .. }) => repeats.push(shape),
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Lagged(n)) => panic!("event subscriber lagged by {n}"),
+            Err(TryRecvError::Closed) => panic!("event channel closed"),
+        }
+    }
+    assert_eq!(
+        repeats,
+        Vec::<String>::new(),
+        "identical cursor shape re-emitted after motion"
+    );
+
+    let frames = client.join().expect("client thread").expect("client run");
+    assert!(frames > 0, "client presented at least one frame");
+
+    env.destroy();
+}
+
+#[test]
+fn application_cursor_bitmap_is_forwarded_with_hotspot() {
+    use tokio::sync::broadcast::error::TryRecvError;
+
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(
+            test_config(&unique_env_id("cursor-bitmap")),
+            &unique_env_id("req"),
+        )
+        .expect("create environment");
+    let mut events = env.subscribe();
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    let client = std::thread::spawn(move || common::run_with_cursor_bitmap(&socket, 20));
+
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .unwrap()
+        .unwrap();
+    let pool = env.frame_pool();
+
+    let mut seq = 0;
+    let mut send = |batch: Vec<InputEvent>| {
+        seq += 1;
+        env.dispatch_input(
+            "agent:test",
+            lease.epoch,
+            env.generation(),
+            InputBatch {
+                seq,
+                client_timestamp_us: 0,
+                events: batch,
+            },
+        )
+        .expect("input accepted");
+    };
+
+    // Wait for the toplevel to map; input before that hits no surface and no enter.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let info = env
+            .observe(Duration::from_secs(2))
+            .unwrap_or_else(|err| panic!("observe failed: {err}"));
+        if read_pixel(&pool, info.slot, 10, 10, info.width) == common::RED {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for toplevel");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Entering the toplevel: the client attaches its bitmap cursor surface.
+    send(vec![InputEvent::PointerMoveAbs { x: 10, y: 10 }]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (width, height, display_width, display_height, hotspot_x, hotspot_y, pixels) = loop {
+        match events.try_recv() {
+            Ok(DesktopEvent::CursorImageChanged {
+                width,
+                height,
+                display_width,
+                display_height,
+                hotspot_x,
+                hotspot_y,
+                pixels,
+                ..
+            }) if width > 0 => {
+                break (
+                    width,
+                    height,
+                    display_width,
+                    display_height,
+                    hotspot_x,
+                    hotspot_y,
+                    pixels,
+                );
+            }
+            Ok(_) => {}
+            Err(TryRecvError::Empty) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "no cursor bitmap event after pointer enter"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(TryRecvError::Lagged(n)) => panic!("event subscriber lagged by {n}"),
+            Err(TryRecvError::Closed) => panic!("event channel closed"),
+        }
+    };
+
+    // At output scale 1 the buffer and display sizes match, and the hotspot is unscaled.
+    assert_eq!((width, height), (common::CURSOR_SIZE, common::CURSOR_SIZE));
+    assert_eq!(
+        (display_width, display_height),
+        (common::CURSOR_SIZE, common::CURSOR_SIZE)
+    );
+    assert_eq!(
+        (hotspot_x, hotspot_y),
+        (common::CURSOR_HOTSPOT, common::CURSOR_HOTSPOT)
+    );
+    // Solid opaque red, un-premultiplied and in BGRA order for the viewer.
+    assert_eq!(
+        pixels.len(),
+        (common::CURSOR_SIZE * common::CURSOR_SIZE * 4) as usize
+    );
+    assert!(
+        pixels.chunks_exact(4).all(|px| px == common::RED),
+        "cursor bitmap pixels are not solid red BGRA"
+    );
 
     let frames = client.join().expect("client thread").expect("client run");
     assert!(frames > 0, "client presented at least one frame");

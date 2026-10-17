@@ -17,14 +17,30 @@ use crate::text_input::{TextInputManagerState, TextInputUserData};
 use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::input::{Axis, ButtonState, KeyState};
+use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::surface::{
+    WaylandSurfaceRenderElement, render_elements_from_surface_tree,
+};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::pixman::PixmanRenderer;
-use smithay::backend::renderer::utils::{draw_render_elements, on_commit_buffer_handler};
-use smithay::backend::renderer::{Bind, Color32F, ExportMem, Frame, Offscreen, Renderer};
-use smithay::desktop::Window;
+use smithay::backend::renderer::utils::{
+    draw_render_elements, on_commit_buffer_handler, with_renderer_surface_state,
+};
+use smithay::backend::renderer::{
+    Bind, Color32F, ExportMem, Frame, ImportAll, Offscreen, Renderer,
+};
 use smithay::desktop::space::Space;
-use smithay::input::keyboard::{FilterResult, KeyboardHandle, Keycode, XkbConfig};
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, PointerHandle};
+use smithay::desktop::{
+    PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy, Window,
+    WindowSurfaceType, find_popup_root_surface, utils::under_from_surface_tree,
+};
+use smithay::input::keyboard::{
+    FilterResult, KeyboardHandle, KeyboardTarget, Keycode, KeysymHandle, ModifiersState, XkbConfig,
+};
+use smithay::input::pointer::{
+    AxisFrame, ButtonEvent, CursorImageStatus, CursorImageSurfaceData, Focus, MotionEvent,
+    PointerHandle,
+};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::channel::{
@@ -42,18 +58,20 @@ use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::{
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::protocol::wl_buffer;
+use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{
     Client, DataInit, Dispatch, Display, GlobalDispatch, ListeningSocket, New, Resource,
 };
 use smithay::utils::{
-    Buffer, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform,
+    Buffer, IsAlive, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial, Size, Transform,
 };
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes, TraversalAction,
     with_states, with_surface_tree_downward,
 };
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::output::{OutputHandler, OutputManagerState};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::selection::SelectionHandler;
@@ -65,7 +83,8 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
 };
-use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::wayland::shm::{BufferData, ShmHandler, ShmState, with_buffer_contents};
+use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{
     Reorder, ResizeEdge, WmWindowProperty, X11Surface, X11Wm, XwmHandler, XwmId,
@@ -467,6 +486,7 @@ impl FrameRenderer {
     fn compose(
         &mut self,
         space: &Space<Window>,
+        popups: &[(WlSurface, Point<i32, Logical>)],
         logical: &Rectangle<i32, Logical>,
         physical: Size<i32, Physical>,
         scale: u32,
@@ -477,6 +497,7 @@ impl FrameRenderer {
             Self::Pixman { renderer, image } => {
                 let elements =
                     space.render_elements_for_region(renderer, logical, scale as f64, 1.0);
+                let popup_elements = popup_render_elements(renderer, popups, scale);
                 let mut target = renderer
                     .bind(image)
                     .map_err(|e| DesktopError::Compositor(format!("bind target: {e}")))?;
@@ -488,6 +509,8 @@ impl FrameRenderer {
                     .map_err(|e| DesktopError::Compositor(format!("clear: {e}")))?;
                 draw_render_elements(&mut frame, 1.0, &elements, &damage)
                     .map_err(|e| DesktopError::Compositor(format!("draw: {e}")))?;
+                draw_render_elements(&mut frame, 1.0, &popup_elements, &damage)
+                    .map_err(|e| DesktopError::Compositor(format!("draw popups: {e}")))?;
                 let _ = frame
                     .finish()
                     .map_err(|e| DesktopError::Compositor(format!("finish: {e}")))?;
@@ -520,6 +543,7 @@ impl FrameRenderer {
             } => {
                 let elements =
                     space.render_elements_for_region(renderer, logical, scale as f64, 1.0);
+                let popup_elements = popup_render_elements(renderer, popups, scale);
                 {
                     let mut target = renderer
                         .bind(texture)
@@ -532,6 +556,8 @@ impl FrameRenderer {
                         .map_err(|e| DesktopError::Compositor(format!("clear: {e}")))?;
                     draw_render_elements(&mut frame, 1.0, &elements, &damage)
                         .map_err(|e| DesktopError::Compositor(format!("draw: {e}")))?;
+                    draw_render_elements(&mut frame, 1.0, &popup_elements, &damage)
+                        .map_err(|e| DesktopError::Compositor(format!("draw popups: {e}")))?;
                     let _ = frame
                         .finish()
                         .map_err(|e| DesktopError::Compositor(format!("finish: {e}")))?;
@@ -555,11 +581,46 @@ impl FrameRenderer {
     }
 }
 
+/// Render elements for popup surface trees at region-relative logical positions.
+fn popup_render_elements<R>(
+    renderer: &mut R,
+    popups: &[(WlSurface, Point<i32, Logical>)],
+    scale: u32,
+) -> Vec<WaylandSurfaceRenderElement<R>>
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Clone + 'static,
+{
+    let mut elements = Vec::new();
+    for (surface, loc) in popups {
+        let location = Point::<i32, Physical>::from((loc.x * scale as i32, loc.y * scale as i32));
+        elements.extend(render_elements_from_surface_tree::<
+            R,
+            WaylandSurfaceRenderElement<R>,
+        >(
+            renderer,
+            surface,
+            location,
+            scale as f64,
+            1.0,
+            Kind::Unspecified,
+        ));
+    }
+    elements
+}
+
 smithay::delegate_xwayland_shell!(DesktopState);
 
 impl XWaylandShellHandler for DesktopState {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.xwayland_shell_state
+    }
+
+    fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, surface: X11Surface) {
+        // XWayland binds the wl_surface after mapping, so map-time focus can be a no-op.
+        if let Some(window) = self.x11_windows.get(&surface.window_id()).cloned() {
+            self.focus_window(&window);
+        }
     }
 }
 
@@ -745,11 +806,18 @@ struct DesktopState {
     text_input_manager_state: TextInputManagerState,
 
     space: Space<Window>,
+    popups: PopupManager,
     output: Output,
     /// Kept alive so the virtual seat stays registered for the environment.
     _seat: Seat<Self>,
     keyboard: KeyboardHandle<Self>,
     pointer: PointerHandle<Self>,
+    /// Last pointer shape sent to the viewer; `cursor_image` fires on every change.
+    last_cursor_shape: &'static str,
+    /// Client cursor surface the viewer should draw, if the client set one.
+    cursor_surface: Option<WlSurface>,
+    /// Last cursor bitmap sent to the viewer; `None` means the viewer has no bitmap.
+    last_cursor_bitmap: Option<CursorBitmap>,
 
     renderer: FrameRenderer,
     pool: Arc<ShmFramePool>,
@@ -777,6 +845,8 @@ struct DesktopState {
     /// X11 surface geometries saved when a window is maximized or fullscreened,
     /// so unmaximize/unfullscreen restore the previous layout.
     x11_saved_geometries: HashMap<u32, Rectangle<i32, Logical>>,
+    /// Xdg toplevel layouts saved when maximized or fullscreened, restored on exit.
+    xdg_saved_geometries: HashMap<u32, Rectangle<i32, Logical>>,
     /// In-progress X11 interactive move/resize grab, if any.
     x11_grab: Option<X11Grab>,
     next_window_id: u32,
@@ -821,17 +891,15 @@ impl DesktopState {
                 .map(toplevel_identity)
                 .unwrap_or((None, None)),
         };
-        let is_focused = self
-            .keyboard
-            .current_focus()
-            .map(|focus| {
-                mapped
-                    .window
-                    .wl_surface()
-                    .map(|s| s.as_ref() == &focus)
-                    .unwrap_or(false)
-            })
-            .unwrap_or(false);
+        let is_focused = match (
+            self.keyboard
+                .current_focus()
+                .map(|focus| self.owning_target(focus)),
+            keyboard_target(&mapped.window),
+        ) {
+            (Some(focus), Some(target)) => focus == target,
+            _ => false,
+        };
         WindowInfo {
             window_id: mapped.id,
             title: title.unwrap_or_default(),
@@ -845,13 +913,9 @@ impl DesktopState {
     }
 
     fn focus_window(&mut self, window: &Window) {
-        if let Some(surface) = window.wl_surface() {
+        if let Some(target) = keyboard_target(window) {
             let keyboard = self.keyboard.clone();
-            keyboard.set_focus(
-                self,
-                Some(surface.as_ref().clone()),
-                SERIAL_COUNTER.next_serial(),
-            );
+            keyboard.set_focus(self, Some(target), SERIAL_COUNTER.next_serial());
         }
     }
 
@@ -899,6 +963,13 @@ impl DesktopState {
         let geometry = surface.geometry();
         self.space.map_element(window.clone(), geometry.loc, true);
         self.x11_windows.insert(x11_id, window.clone());
+        if surface.is_override_redirect() {
+            // Menus and tooltips are placed by their client. They stay stacked
+            // and rendered, but must not take keyboard focus or become managed windows.
+            self.dirty = true;
+            return;
+        }
+        self.focus_window(&window);
         let id = self.next_window_id;
         self.next_window_id = self.next_window_id.wrapping_add(1);
         let mut mapped = MappedWindow {
@@ -936,13 +1007,20 @@ impl DesktopState {
             self.x11_grab = None;
         }
         self.x11_saved_geometries.remove(&x11_id);
-        if let Some(window) = self.x11_windows.remove(&x11_id)
-            && let Some(id) = self
-                .windows
-                .iter()
-                .find_map(|(id, mapped)| (mapped.window == window).then_some(*id))
+        let Some(window) = self.x11_windows.remove(&x11_id) else {
+            return;
+        };
+        match self
+            .windows
+            .iter()
+            .find_map(|(id, mapped)| (mapped.window == window).then_some(*id))
         {
-            self.unmap_window(id);
+            Some(id) => self.unmap_window(id),
+            None => {
+                // Override-redirect windows are rendered but never managed.
+                self.space.unmap_elem(&window);
+                self.dirty = true;
+            }
         }
     }
 
@@ -1070,14 +1148,99 @@ impl DesktopState {
         self.dirty = true;
     }
 
+    /// Remembers an xdg toplevel's layout before maximize or fullscreen moves it to
+    /// the output origin. Only the first save is kept until the matching restore.
+    fn save_xdg_placement(&mut self, surface: &ToplevelSurface) {
+        let Some(id) = self.window_id_for_surface(surface.wl_surface()) else {
+            return;
+        };
+        let Some(mapped) = self.windows.get(&id) else {
+            return;
+        };
+        let Some(location) = self.space.element_location(&mapped.window) else {
+            return;
+        };
+        let size = mapped.window.geometry().size;
+        self.xdg_saved_geometries
+            .entry(id)
+            .or_insert_with(|| Rectangle::new(location, size));
+    }
+
+    /// Takes the layout saved by `save_xdg_placement`, with the window to map back.
+    fn take_xdg_placement(
+        &mut self,
+        surface: &ToplevelSurface,
+    ) -> Option<(Window, Rectangle<i32, Logical>)> {
+        let id = self.window_id_for_surface(surface.wl_surface())?;
+        let geometry = self.xdg_saved_geometries.remove(&id)?;
+        let window = self.windows.get(&id)?.window.clone();
+        Some((window, geometry))
+    }
+
+    /// Clears one layout state (maximized or fullscreen). The saved layout returns
+    /// only once no other layout state still holds the window.
+    fn leave_layout_state(&mut self, surface: &ToplevelSurface, exited: xdg_toplevel::State) {
+        let size = self.logical_size();
+        let still_constrained = surface.with_pending_state(|state| {
+            state.states.unset(exited);
+            state.states.contains(xdg_toplevel::State::Maximized)
+                || state.states.contains(xdg_toplevel::State::Fullscreen)
+        });
+        if still_constrained {
+            surface.with_pending_state(|state| state.size = Some(size));
+            surface.send_configure();
+        } else {
+            let saved = self.take_xdg_placement(surface);
+            surface.with_pending_state(|state| {
+                state.size = saved.as_ref().map(|(_, geometry)| geometry.size);
+            });
+            surface.send_configure();
+            if let Some((window, geometry)) = saved {
+                self.space.map_element(window, geometry.loc, true);
+            }
+        }
+        self.dirty = true;
+    }
+
     fn unmap_window(&mut self, id: u32) {
+        self.xdg_saved_geometries.remove(&id);
         if let Some(mapped) = self.windows.remove(&id) {
+            let was_focused = match (
+                self.keyboard.current_focus(),
+                keyboard_target(&mapped.window),
+            ) {
+                (Some(focus), Some(target)) => focus == target,
+                _ => false,
+            };
             self.space.unmap_elem(&mapped.window);
+            if was_focused {
+                self.focus_topmost_window();
+            }
             self.dirty = true;
             let _ = self.events.send(DesktopEvent::WindowUnmapped {
                 env_id: self.env_id.clone(),
                 window_id: id,
             });
+        }
+    }
+
+    /// Moves keyboard focus to the topmost remaining window, or clears it.
+    ///
+    /// Smithay keeps keyboard focus on a destroyed surface and drops input
+    /// sent to it, so a closed window must hand focus off explicitly.
+    fn focus_topmost_window(&mut self) {
+        let next = self
+            .space
+            .elements()
+            .rev()
+            .find(|window| keyboard_target(window).is_some())
+            .cloned();
+        match next {
+            Some(window) => self.focus_window(&window),
+            None => {
+                let keyboard = self.keyboard.clone();
+                keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+            }
         }
     }
 
@@ -1117,15 +1280,80 @@ impl DesktopState {
         })
     }
 
+    /// The popup surface under `point` in global logical coordinates, with its global
+    /// surface origin. Popups sit above their parent windows, so they are checked first.
+    fn popup_under(&self, point: Point<f64, Logical>) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.popup_placements(Point::from((0, 0)))
+            .into_iter()
+            .rev()
+            .find_map(|(surface, origin)| {
+                under_from_surface_tree(&surface, point, origin, WindowSurfaceType::ALL)
+                    .map(|(hit, loc)| (hit, loc.to_f64()))
+            })
+    }
+
+    /// Pointer target at `point`: a popup surface above its parent, else the topmost window.
+    fn pointer_focus_at(
+        &self,
+        point: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        self.popup_under(point).or_else(|| {
+            self.space.element_under(point).and_then(|(window, loc)| {
+                window
+                    .wl_surface()
+                    .map(|s| (s.as_ref().clone(), loc.to_f64()))
+            })
+        })
+    }
+
+    /// Maps a keyboard focus to the window-level target that owns it: a popup's focus
+    /// belongs to its root toplevel surface.
+    fn owning_target(&self, focus: KeyboardFocusTarget) -> KeyboardFocusTarget {
+        let root = match &focus {
+            KeyboardFocusTarget::Wayland(surface) => self
+                .popups
+                .find_popup(surface)
+                .and_then(|popup| find_popup_root_surface(&popup).ok()),
+            KeyboardFocusTarget::X11(_) => None,
+        };
+        root.map_or(focus, KeyboardFocusTarget::Wayland)
+    }
+
+    /// Surface origins of every popup under the window tree, relative to `region_origin`
+    /// (pass `(0, 0)` for global coordinates), in the same space as
+    /// `Space::render_elements_for_region`.
+    fn popup_placements(
+        &self,
+        region_origin: Point<i32, Logical>,
+    ) -> Vec<(WlSurface, Point<i32, Logical>)> {
+        let mut placements = Vec::new();
+        for window in self.space.elements() {
+            let Some(root) = window.wl_surface() else {
+                continue;
+            };
+            let Some(location) = self.space.element_location(window) else {
+                continue;
+            };
+            let origin = location - window.geometry().loc;
+            for (popup, offset) in PopupManager::popups_for_surface(&root) {
+                let loc = origin + offset - popup.geometry().loc - region_origin;
+                placements.push((popup.wl_surface().clone(), loc));
+            }
+        }
+        placements
+    }
+
     /// Compose the desktop into the memory image and copy it into the pool.
     fn render_frame(&mut self) -> Result<SnapshotInfo, DesktopError> {
         let started = Instant::now();
         let physical = Size::<i32, Physical>::from((self.width as i32, self.height as i32));
         let logical = Rectangle::from_size(self.logical_size());
 
+        self.popups.cleanup();
+        let popups = self.popup_placements(logical.loc);
         let pixels = self
             .renderer
-            .compose(&self.space, &logical, physical, self.scale)?;
+            .compose(&self.space, &popups, &logical, physical, self.scale)?;
         let composed_micros = started.elapsed().as_micros() as u64;
 
         self.frame_counter = self.frame_counter.wrapping_add(1);
@@ -1181,8 +1409,10 @@ impl DesktopState {
     fn send_frame_callbacks(&self) {
         let time = self.start_time.elapsed().as_millis() as u32;
         for mapped in self.windows.values() {
-            if let Some(toplevel) = mapped.window.toplevel() {
-                send_frames_surface_tree(toplevel.wl_surface(), time);
+            // X11 windows have no xdg toplevel, but Xwayland paces its commits
+            // on wl_surface frame callbacks, so they need them too.
+            if let Some(surface) = mapped.window.wl_surface() {
+                send_frames_surface_tree(surface.as_ref(), time);
             }
         }
     }
@@ -1224,17 +1454,14 @@ impl DesktopState {
         let serial = SERIAL_COUNTER.next_serial();
         let pointer = self.pointer.clone();
         let keyboard = self.keyboard.clone();
+        tracing::debug!(?event, "input dispatched to virtual seat");
         match event {
             InputEvent::PointerMoveAbs { x, y } => {
                 let point = Point::<f64, Logical>::from((
                     x as f64 / self.scale.max(1) as f64,
                     y as f64 / self.scale.max(1) as f64,
                 ));
-                let focus = self.space.element_under(point).and_then(|(window, loc)| {
-                    window
-                        .wl_surface()
-                        .map(|s| (s.as_ref().clone(), loc.to_f64()))
-                });
+                let focus = self.pointer_focus_at(point);
                 pointer.motion(
                     self,
                     focus,
@@ -1251,11 +1478,7 @@ impl DesktopState {
                 let current = self.pointer.current_location();
                 let point =
                     Point::<f64, Logical>::from((current.x + dx as f64, current.y + dy as f64));
-                let focus = self.space.element_under(point).and_then(|(window, loc)| {
-                    window
-                        .wl_surface()
-                        .map(|s| (s.as_ref().clone(), loc.to_f64()))
-                });
+                let focus = self.pointer_focus_at(point);
                 pointer.motion(
                     self,
                     focus,
@@ -1305,7 +1528,8 @@ impl DesktopState {
                 };
                 keyboard.input::<(), _>(
                     self,
-                    Keycode::new(keycode),
+                    // Wire keycodes are evdev; the seat expects XKB codes (evdev + 8).
+                    Keycode::new(keycode.saturating_add(8)),
                     state,
                     serial,
                     time,
@@ -1328,6 +1552,42 @@ impl DesktopState {
                 self.dirty = true;
             }
         }
+    }
+
+    /// Sends the client cursor bitmap to the viewer when it changed. A missing
+    /// cursor surface, or one without drawable pixels, clears the viewer's bitmap.
+    fn sync_cursor_bitmap(&mut self) {
+        let bitmap = self
+            .cursor_surface
+            .as_ref()
+            .and_then(|surface| read_cursor_bitmap(surface, self.scale));
+        if bitmap == self.last_cursor_bitmap {
+            return;
+        }
+        self.last_cursor_bitmap = bitmap.clone();
+        let event = match bitmap {
+            Some(bitmap) => DesktopEvent::CursorImageChanged {
+                env_id: self.env_id.clone(),
+                width: bitmap.width,
+                height: bitmap.height,
+                display_width: bitmap.display_width,
+                display_height: bitmap.display_height,
+                hotspot_x: bitmap.hotspot_x,
+                hotspot_y: bitmap.hotspot_y,
+                pixels: bitmap.pixels,
+            },
+            None => DesktopEvent::CursorImageChanged {
+                env_id: self.env_id.clone(),
+                width: 0,
+                height: 0,
+                display_width: 0,
+                display_height: 0,
+                hotspot_x: 0,
+                hotspot_y: 0,
+                pixels: Vec::new(),
+            },
+        };
+        let _ = self.events.send(event);
     }
 }
 
@@ -1387,6 +1647,13 @@ impl CompositorHandler for DesktopState {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+        self.popups.commit(surface);
+        if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
+            && !popup.is_initial_configure_sent()
+            && let Err(err) = popup.send_configure()
+        {
+            tracing::warn!(error = %err, "initial popup configure failed");
+        }
         let mut updated: Vec<u32> = Vec::new();
         for (id, mapped) in self.windows.iter() {
             let mut belongs = false;
@@ -1403,6 +1670,9 @@ impl CompositorHandler for DesktopState {
         for id in updated {
             self.refresh_window_info(id);
         }
+        if self.cursor_surface.as_ref() == Some(surface) {
+            self.sync_cursor_bitmap();
+        }
         self.dirty = true;
     }
 }
@@ -1413,8 +1683,254 @@ impl ShmHandler for DesktopState {
     }
 }
 
+/// Keyboard focus target. X11 windows focus through `X11Surface`, so its
+/// `KeyboardTarget` impl sets X input focus with the seat. A bare `WlSurface`
+/// leaves X input focus on PointerRoot, so keys follow the pointer instead.
+#[derive(Debug, Clone, PartialEq)]
+pub enum KeyboardFocusTarget {
+    Wayland(WlSurface),
+    X11(X11Surface),
+}
+
+impl WaylandFocus for KeyboardFocusTarget {
+    fn wl_surface(&self) -> Option<std::borrow::Cow<'_, WlSurface>> {
+        match self {
+            Self::Wayland(surface) => Some(std::borrow::Cow::Borrowed(surface)),
+            Self::X11(surface) => surface.wl_surface().map(std::borrow::Cow::Owned),
+        }
+    }
+}
+
+impl From<PopupKind> for KeyboardFocusTarget {
+    fn from(popup: PopupKind) -> Self {
+        Self::Wayland(popup.wl_surface().clone())
+    }
+}
+
+impl From<KeyboardFocusTarget> for WlSurface {
+    fn from(target: KeyboardFocusTarget) -> Self {
+        match target {
+            KeyboardFocusTarget::Wayland(surface) => surface,
+            // Popup grabs are rooted at xdg toplevels, so X11 never reaches this conversion.
+            KeyboardFocusTarget::X11(surface) => surface
+                .wl_surface()
+                .expect("popup grab focus is always a Wayland surface"),
+        }
+    }
+}
+
+impl IsAlive for KeyboardFocusTarget {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Wayland(surface) => surface.alive(),
+            Self::X11(surface) => surface.alive(),
+        }
+    }
+}
+
+impl KeyboardTarget<DesktopState> for KeyboardFocusTarget {
+    fn enter(
+        &self,
+        seat: &Seat<DesktopState>,
+        data: &mut DesktopState,
+        keys: Vec<KeysymHandle<'_>>,
+        serial: Serial,
+    ) {
+        match self {
+            Self::Wayland(surface) => KeyboardTarget::enter(surface, seat, data, keys, serial),
+            Self::X11(surface) => KeyboardTarget::enter(surface, seat, data, keys, serial),
+        }
+    }
+
+    fn leave(&self, seat: &Seat<DesktopState>, data: &mut DesktopState, serial: Serial) {
+        match self {
+            Self::Wayland(surface) => KeyboardTarget::leave(surface, seat, data, serial),
+            Self::X11(surface) => KeyboardTarget::leave(surface, seat, data, serial),
+        }
+    }
+
+    fn key(
+        &self,
+        seat: &Seat<DesktopState>,
+        data: &mut DesktopState,
+        key: KeysymHandle<'_>,
+        state: KeyState,
+        serial: Serial,
+        time: u32,
+    ) {
+        match self {
+            Self::Wayland(surface) => {
+                KeyboardTarget::key(surface, seat, data, key, state, serial, time)
+            }
+            Self::X11(surface) => {
+                KeyboardTarget::key(surface, seat, data, key, state, serial, time)
+            }
+        }
+    }
+
+    fn modifiers(
+        &self,
+        seat: &Seat<DesktopState>,
+        data: &mut DesktopState,
+        modifiers: ModifiersState,
+        serial: Serial,
+    ) {
+        match self {
+            Self::Wayland(surface) => {
+                KeyboardTarget::modifiers(surface, seat, data, modifiers, serial)
+            }
+            Self::X11(surface) => KeyboardTarget::modifiers(surface, seat, data, modifiers, serial),
+        }
+    }
+}
+
+/// The keyboard target for a window: its X11 surface when it is one.
+fn keyboard_target(window: &Window) -> Option<KeyboardFocusTarget> {
+    match window.x11_surface() {
+        Some(surface) => Some(KeyboardFocusTarget::X11(surface.clone())),
+        None => window
+            .wl_surface()
+            .map(|surface| KeyboardFocusTarget::Wayland(surface.into_owned())),
+    }
+}
+
+/// CSS cursor name for the viewer, or `none` when the client hid the cursor.
+///
+/// A client-drawn cursor surface has no name, so it reports `default`; the viewer
+/// draws its own arrow for that case.
+fn cursor_shape_name(image: &CursorImageStatus) -> &'static str {
+    match image {
+        CursorImageStatus::Hidden => "none",
+        CursorImageStatus::Named(icon) => icon.name(),
+        CursorImageStatus::Surface(_) => "default",
+    }
+}
+
+/// Largest client cursor bitmap forwarded to the viewer, per side in buffer pixels.
+const MAX_CURSOR_BITMAP_SIDE: u32 = 256;
+
+/// A client cursor surface's pixels and placement, as the viewer draws them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CursorBitmap {
+    /// Buffer size in pixels; the viewer draws the bitmap at `display_*` instead.
+    width: u32,
+    height: u32,
+    /// Size on the environment output, in environment pixels.
+    display_width: u32,
+    display_height: u32,
+    /// Hotspot in environment pixels.
+    hotspot_x: i32,
+    hotspot_y: i32,
+    /// Straight-alpha BGRA rows, `width * 4` bytes each, tightly packed.
+    pixels: Vec<u8>,
+}
+
+/// Reads the cursor surface's current SHM buffer and hotspot, placed at the
+/// environment's output scale. `None` when the surface has no drawable buffer;
+/// the viewer then falls back to the named arrow.
+fn read_cursor_bitmap(surface: &WlSurface, output_scale: u32) -> Option<CursorBitmap> {
+    if !surface.alive() {
+        return None;
+    }
+    // Smithay's commit handler moves the attached buffer out of `SurfaceAttributes`
+    // into `RendererSurfaceState`, so the buffer must be read from there.
+    let buffer = with_renderer_surface_state(surface, |state| state.buffer().cloned()).flatten()?;
+    let (buffer_scale, hotspot) = with_states(surface, |states| {
+        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+        let buffer_scale = attributes.current().buffer_scale.max(1) as u32;
+        let hotspot = states
+            .data_map
+            .get::<CursorImageSurfaceData>()?
+            .lock()
+            .ok()?
+            .hotspot;
+        Some((buffer_scale, hotspot))
+    })?;
+    let (width, height, pixels) = match with_buffer_contents(&buffer, copy_cursor_pixels) {
+        Ok(Some(bitmap)) => bitmap,
+        Ok(None) => return None,
+        Err(err) => {
+            tracing::debug!(error = %err, "cursor buffer is not readable shared memory");
+            return None;
+        }
+    };
+    // Buffer pixels are `buffer_scale` per logical unit; the hotspot is already logical.
+    Some(CursorBitmap {
+        width,
+        height,
+        display_width: width * output_scale / buffer_scale,
+        display_height: height * output_scale / buffer_scale,
+        hotspot_x: hotspot.x.saturating_mul(output_scale as i32),
+        hotspot_y: hotspot.y.saturating_mul(output_scale as i32),
+        pixels,
+    })
+}
+
+/// Copies an SHM cursor buffer into a tight straight-alpha BGRA buffer. Every
+/// row is bounds-checked against the pool before it is read.
+fn copy_cursor_pixels(ptr: *const u8, len: usize, data: BufferData) -> Option<(u32, u32, Vec<u8>)> {
+    let premultiplied = match data.format {
+        wl_shm::Format::Argb8888 => true,
+        wl_shm::Format::Xrgb8888 => false,
+        _ => return None,
+    };
+    let side = 1..=MAX_CURSOR_BITMAP_SIDE;
+    let width = u32::try_from(data.width)
+        .ok()
+        .filter(|w| side.contains(w))?;
+    let height = u32::try_from(data.height)
+        .ok()
+        .filter(|h| side.contains(h))?;
+    let offset = usize::try_from(data.offset).ok()?;
+    let stride = usize::try_from(data.stride).ok()?;
+    let row_bytes = width as usize * 4;
+    if stride < row_bytes {
+        return None;
+    }
+    let last_row_end = offset
+        .checked_add((height as usize - 1).checked_mul(stride)?)?
+        .checked_add(row_bytes)?;
+    if last_row_end > len {
+        return None;
+    }
+    let mut pixels = vec![0u8; row_bytes * height as usize];
+    for (row, dst) in pixels.chunks_exact_mut(row_bytes).enumerate() {
+        // SAFETY: `last_row_end <= len` keeps this row inside the pool mapping that
+        // `with_buffer_contents` keeps alive for the callback; `dst` is a separate
+        // allocation of exactly `row_bytes` bytes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                ptr.add(offset + row * stride),
+                dst.as_mut_ptr(),
+                row_bytes,
+            );
+        }
+    }
+    for px in pixels.chunks_exact_mut(4) {
+        straighten_bgra(px, premultiplied);
+    }
+    Some((width, height, pixels))
+}
+
+/// Converts one BGRA pixel to straight alpha in place. Xrgb8888 has no alpha,
+/// so its pixels become opaque.
+fn straighten_bgra(px: &mut [u8], premultiplied: bool) {
+    if !premultiplied {
+        px[3] = u8::MAX;
+        return;
+    }
+    let alpha = u32::from(px[3]);
+    if alpha == 0 {
+        px[..3].fill(0);
+    } else if alpha < 255 {
+        for channel in &mut px[..3] {
+            *channel = ((u32::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+        }
+    }
+}
+
 impl SeatHandler for DesktopState {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = KeyboardFocusTarget;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -1422,16 +1938,32 @@ impl SeatHandler for DesktopState {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        self.text_input_manager_state.set_focus(focused.cloned());
+    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&KeyboardFocusTarget>) {
+        self.text_input_manager_state.set_focus(
+            focused
+                .and_then(WaylandFocus::wl_surface)
+                .map(|surface| surface.into_owned()),
+        );
     }
-    fn cursor_image(
-        &mut self,
-        _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
-    ) {
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        self.cursor_surface = match &image {
+            CursorImageStatus::Surface(surface) => Some(surface.clone()),
+            _ => None,
+        };
+        self.sync_cursor_bitmap();
+        let shape = cursor_shape_name(&image);
+        if shape == self.last_cursor_shape {
+            return;
+        }
+        self.last_cursor_shape = shape;
+        let _ = self.events.send(DesktopEvent::CursorShapeChanged {
+            env_id: self.env_id.clone(),
+            shape: shape.to_string(),
+        });
     }
 }
+
+impl TabletSeatHandler for DesktopState {}
 
 impl OutputHandler for DesktopState {
     fn output_bound(
@@ -1472,22 +2004,85 @@ impl XdgShellHandler for DesktopState {
         self.map_toplevel(surface);
     }
 
-    fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        if let Err(err) = self.popups.track_popup(PopupKind::from(surface)) {
+            tracing::warn!(error = %err, "failed to track popup");
+        }
+        self.dirty = true;
+    }
 
     fn grab(
         &mut self,
-        _surface: PopupSurface,
-        _seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
-        _serial: Serial,
+        surface: PopupSurface,
+        seat: smithay::reexports::wayland_server::protocol::wl_seat::WlSeat,
+        serial: Serial,
     ) {
+        let Some(seat) = Seat::<Self>::from_resource(&seat) else {
+            tracing::warn!("popup grab requested for an unknown seat");
+            return;
+        };
+        let kind = PopupKind::from(surface);
+        let root = match find_popup_root_surface(&kind) {
+            Ok(root) => root,
+            Err(err) => {
+                tracing::warn!(error = ?err, "popup grab without a live root surface");
+                return;
+            }
+        };
+        let mut grab = match self.popups.grab_popup::<Self>(
+            KeyboardFocusTarget::Wayland(root),
+            kind,
+            &seat,
+            serial,
+        ) {
+            Ok(grab) => grab,
+            Err(err) => {
+                tracing::warn!(error = ?err, "popup grab rejected");
+                return;
+            }
+        };
+        if let Some(keyboard) = seat.get_keyboard() {
+            if keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial)
+                    || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
     }
 
     fn reposition_request(
         &mut self,
-        _surface: PopupSurface,
-        _positioner: PositionerState,
-        _token: u32,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
     ) {
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_geometry();
+            state.positioner = positioner;
+        });
+        surface.send_repositioned(token);
+        if let Err(err) = surface.send_configure() {
+            tracing::warn!(error = %err, "failed to configure repositioned popup");
+        }
+        self.dirty = true;
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -1497,6 +2092,7 @@ impl XdgShellHandler for DesktopState {
     }
 
     fn maximize_request(&mut self, surface: ToplevelSurface) {
+        self.save_xdg_placement(&surface);
         let size = self.logical_size();
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Maximized);
@@ -1513,11 +2109,7 @@ impl XdgShellHandler for DesktopState {
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        surface.with_pending_state(|state| {
-            state.states.unset(xdg_toplevel::State::Maximized);
-        });
-        surface.send_configure();
-        self.dirty = true;
+        self.leave_layout_state(&surface, xdg_toplevel::State::Maximized);
     }
 
     fn fullscreen_request(
@@ -1525,6 +2117,7 @@ impl XdgShellHandler for DesktopState {
         surface: ToplevelSurface,
         _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
     ) {
+        self.save_xdg_placement(&surface);
         let size = self.logical_size();
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Fullscreen);
@@ -1541,11 +2134,7 @@ impl XdgShellHandler for DesktopState {
     }
 
     fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
-        surface.with_pending_state(|state| {
-            state.states.unset(xdg_toplevel::State::Fullscreen);
-        });
-        surface.send_configure();
-        self.dirty = true;
+        self.leave_layout_state(&surface, xdg_toplevel::State::Fullscreen);
     }
 
     fn title_changed(&mut self, surface: ToplevelSurface) {
@@ -1561,6 +2150,7 @@ smithay::delegate_seat!(DesktopState);
 smithay::delegate_xdg_shell!(DesktopState);
 smithay::delegate_data_device!(DesktopState);
 smithay::delegate_output!(DesktopState);
+smithay::delegate_cursor_shape!(DesktopState);
 impl GlobalDispatch<ZwpTextInputManagerV3, (), DesktopState> for DesktopState {
     fn bind(
         _state: &mut DesktopState,
@@ -1676,6 +2266,7 @@ pub(crate) fn run_compositor(
     let output_manager_state = OutputManagerState::new_with_xdg_output::<DesktopState>(&dh);
     let text_input_manager_state = TextInputManagerState::default();
     dh.create_global::<DesktopState, ZwpTextInputManagerV3, _>(1, ());
+    CursorShapeManagerState::new::<DesktopState>(&dh);
 
     let mut seat_state = SeatState::new();
     let mut seat = seat_state.new_wl_seat(&dh, "juto-seat");
@@ -1729,6 +2320,7 @@ pub(crate) fn run_compositor(
         output_manager_state,
         text_input_manager_state,
         space,
+        popups: PopupManager::default(),
         output,
         _seat: seat,
         keyboard,
@@ -1753,6 +2345,10 @@ pub(crate) fn run_compositor(
         x11_windows: HashMap::new(),
         xwm: None,
         x11_saved_geometries: HashMap::new(),
+        xdg_saved_geometries: HashMap::new(),
+        last_cursor_shape: "default",
+        cursor_surface: None,
+        last_cursor_bitmap: None,
         x11_grab: None,
         xwayland_shell_state,
         next_window_id: 1,

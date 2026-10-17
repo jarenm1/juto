@@ -145,6 +145,7 @@ fn run_worker_command(args: &[String]) -> Result<(), juto_desktop::DesktopError>
 fn tracing_subscriber_init() {
     // Keep the daemon quiet by default; RUST_LOG enables tracing output.
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
