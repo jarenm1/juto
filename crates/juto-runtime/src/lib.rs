@@ -2,6 +2,7 @@
 //! Behavioral reference: oh-my-pi 579da1d6; upstream attribution is in licenses/OMP-MIT.txt.
 
 pub mod approval;
+pub mod browser;
 pub mod change_graph;
 pub mod config;
 pub mod context;
@@ -122,6 +123,8 @@ struct RuntimeInner {
     subagent_manager: Mutex<Option<Arc<SubagentManager>>>,
     desktop_supervisor: Mutex<Option<Arc<DesktopSupervisor>>>,
     signaling: Mutex<Option<Arc<SignalingHandle>>>,
+    /// Browser processes and named tabs shared across runs.
+    browser: Arc<browser::BrowserManager>,
 }
 pub fn default_data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("JUTO_DATA_DIR") {
@@ -195,6 +198,7 @@ impl Runtime {
         let runtime = Self {
             inner: Arc::new(RuntimeInner {
                 cwd,
+                browser: Arc::new(browser::BrowserManager::new(data_dir.clone())),
                 data_dir,
                 config: RwLock::new(config),
                 registry,
@@ -521,6 +525,7 @@ impl Runtime {
             };
             register_agent_tools(&mut registry, manager, peers, catalog.clone(), depth == 0)?;
         }
+        browser::register_browser_tool(&mut registry, self.inner.browser.clone(), &self.inner.cwd)?;
         if scope.allows("desktop") {
             tools::register_desktop_tools(
                 &mut registry,

@@ -10,6 +10,9 @@ juto-agent.workspace = true
 juto-catalog.workspace = true
 juto-desktop.workspace = true
 anyhow.workspace = true
+base64.workspace = true
+dom_smoothie = "0.18"
+htmd = "0.5"
 async-trait.workspace = true
 fs2.workspace = true
 futures.workspace = true
@@ -19,10 +22,13 @@ jsonschema.workspace = true
 libc.workspace = true
 parking_lot = "0.12"
 regex.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
+tokio-tungstenite = { version = "0.27", default-features = false, features = ["connect", "handshake"] }
 tokio-util.workspace = true
 thiserror.workspace = true
 tree-sitter = "0.27"
@@ -32,5 +38,3 @@ tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 uuid.workspace = true
 
-[dev-dependencies]
-tempfile.workspace = true
