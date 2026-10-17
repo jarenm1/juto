@@ -51,8 +51,15 @@ sandbox.
 **Delegating role model.** The top-level `main` role has `read`, `glob`, `grep`, `task`, `wait`,
 `agent_send`, `agent_cancel`, `agent_inbox`, `subagent_release`, and `view`; it cannot edit files. Work runs in child agents defined as
 markdown roles in `crates/juto-runtime/src/roles/`: `builder` (all tools), `scout` and `reviewer`
-(read-only), and `task` (all tools, the default). A role's `tools` frontmatter takes `all`,
-`read-only`, or a list of tool names; a missing field means read-only. A `<role>.md` file in
+(read-only), `task` (all tools, the default), and `browser` (only the `browser` tool, on
+`@smol`). A role's `tools` frontmatter takes `all`,
+`read-only`, or a list of tool names; a missing field means read-only. An optional `model`
+field (oh-my-pi's agent `model:`) takes a selector or an ordered fallback list, such as
+`model: "@smol"` or `model: ["@smol", openai/gpt-5-mini]`. A child's model is the `task`
+entry's `model`, else the first role selector that resolves in the model registry, else
+`modelRoles.task`, else the default `model`; a role whose selectors all fail to resolve fails
+the child instead of silently using another model. `@smol` without a `modelRoles.smol` entry
+inherits the default model. A `<role>.md` file in
 `.juto/agents/` in the working directory or an ancestor, or in the runtime data directory's
 `agents/`, replaces the built-in of the same name, and the nearest file wins. Children receive
 delegation tools only below `max_recursion_depth` (default 2).
@@ -165,6 +172,45 @@ Subagent `output_schema` validation is strict by default. Task requests may set
 `schema_mode: "permissive"` to retain a completed result even when its structured
 data is absent or does not match the declared schema; malformed schema definitions
 remain errors in either mode.
+
+### Agent browser tool
+
+The runtime registers a `browser` tool (Exec tier; available to the `builder`,
+`task`, and `browser` roles) ported from oh-my-pi's browser tool at the pinned revision. It
+drives Chromium over the DevTools protocol from Rust: `open`, `close`, `tabs`,
+`call`, and `run` keep OMP's parameter schema. Tabs are named, shared by every
+session of one runtime, and outlive individual runs; managed Chromium shuts down
+when its last tab is released, and all spawned browsers die with the runtime.
+
+The built-in `browser` role is a web researcher that `main` and builders can
+spawn for documentation, issues, or other external facts. It has only the
+`browser` tool, runs on `@smol` (set `modelRoles.smol` to a fast model), uses
+its own tab names, closes its tabs, and returns a summary with source URLs. It
+is told not to log in or submit state-changing forms unless the task says so.
+
+`call` runs one OMP tab helper or one `id(n)`/`ref("eN")` element-handle hop.
+Element work uses OMP's vendored in-page kit (selectors including `aria/`,
+`text/`, `xpath/`, `pierce/`, `label/`, `role/…`, and snapshot refs;
+actionability checks; `observe`; Playwright ARIA snapshots) in an isolated
+world, while clicks, typing, and keys are trusted CDP input events. Implemented
+helpers: navigation and `waitForUrl`, `observe`, `ariaSnapshot` (interactive,
+compact, URL, and diff modes), screenshots (model image capped at 1024 px /
+150 KB, file saved), `pdf` (headless only), `extract` (Readability via
+`dom_smoothie`, Markdown via `htmd`, with outline/filter), element reads,
+pointer/keyboard interaction, uploads, waits, dialogs, emulation, cookies and
+Web Storage, init scripts, downloads, console/errors, metrics, the request log,
+and `allowed_domains` request blocking.
+
+Differences from OMP: `run` evaluates code in the page's main world — OMP runs
+it in a Bun worker with Puppeteer `page`/`tab` objects, which Juto has no host
+for. Backends are managed Chromium (headless by default, `headed: true`),
+`app.path` spawns, and `app.cdp_url` attach; the relay, Tern, and cmux backends,
+idle tab freezing (`persist`), and these helpers are not ported: `a11y`,
+`diffScreenshot`, `webmcp*`, `devices`, clipboard, `saveState`/`loadState`,
+tracing/profiling, `route`/HAR/`request`, `vitals`, `react*`, `record*`, frame
+handles, and screenshot change detection. Chromium is not downloaded on demand:
+the dev shell and Nix package set `JUTO_CHROMIUM`; otherwise a `chromium` or
+`google-chrome` on `PATH` is used.
 
 ### Agent desktop compositor
 
@@ -562,6 +608,21 @@ Build or run the packaged application with `nix build .#default` or
 `nix run .#default`. For a headless native-window smoke, see the
 `devShells.smoke` instructions below; that exercises the development binary,
 not the packaged artifact.
+
+### Agent browser tool verification
+
+```sh
+scripts/agent-scope.sh -- nix develop . -c cargo test -p juto-runtime --lib browser
+```
+
+`browser::live_tests` launches the dev shell's Chromium against a loopback
+HTTP fixture and drives the tool end to end: semantic-selector fill and click,
+observe ids and ARIA refs as element handles, a pending `confirm` handled with
+`handleDialog`, console capture, a saved screenshot returned as an image,
+navigation invalidating ids, Readability extraction, back navigation through
+the back/forward cache, page-world `run` values and exceptions,
+`allowed_domains` blocking another host, cancellation, and `close all`. It
+skips (prints a notice) when no Chromium is available.
 
 ### Agent desktop compositor verification
 
