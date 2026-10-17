@@ -441,7 +441,8 @@ children started by the top-level session reach the main chat; a desktop posted 
 deeper child stays with its manager. A report missed while the chat's event stream lags
 is not replayed, though the desktop keeps running. The main agent can look at a child's
 desktop with `desktop_observe`, which returns the current frame as an image; it cannot
-send input or change the environment.
+send input or change the environment. The focus view of a finished child shows the same
+canvases from its transcript; a running child's desktops appear only in the main chat.
 
 Environments created by the `desktop` tool set no owner timeout, so they outlive the child
 that created them; they end when destroyed, reclaimed as idle, or when the process exits
