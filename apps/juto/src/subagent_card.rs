@@ -2,10 +2,11 @@
 //! created when a child is first seen, then updated in place as its status changes.
 
 use juto_agent::ViewNode;
+use juto_runtime::DesktopSessionArtifact;
 use juto_runtime::subagents::{MainMessage, SubagentStatus};
 use serde_json::{Map, json};
 
-use crate::chat::{Message, MessageRole, view_row};
+use crate::chat::{Message, MessageRole, desktop_row, view_row};
 use crate::task_card::status_label;
 
 /// Element tag that `view_element` renders as a subagent card. Host-built, so it
@@ -81,6 +82,32 @@ pub fn upsert_subagent_card(
         messages.insert(at, view_row(card));
     } else {
         messages.push(view_row(card));
+    }
+}
+
+/// Places a desktop that child `id` reported in its own row directly below the
+/// child's card, so the canvas stays with the child it came from. An artifact
+/// already in the transcript is not added again. With no card yet, it goes last.
+pub fn attach_desktop_artifact(
+    messages: &mut Vec<Message>,
+    id: &str,
+    artifact: DesktopSessionArtifact,
+) {
+    let already_shown = messages.iter().any(|message| {
+        message
+            .desktop_artifacts
+            .iter()
+            .any(|shown| shown.artifact_id == artifact.artifact_id)
+    });
+    if already_shown {
+        return;
+    }
+    let card_row = messages
+        .iter()
+        .position(|message| message.views.iter().any(|view| card_id(view) == Some(id)));
+    match card_row {
+        Some(index) => messages.insert(index + 1, desktop_row(artifact)),
+        None => messages.push(desktop_row(artifact)),
     }
 }
 
@@ -175,6 +202,36 @@ mod tests {
 
         assert_eq!(card_count(&messages), 1);
         assert_eq!(messages[0].views[0].props.get("name"), Some(&json!("w2")));
+    }
+
+    fn desktop(artifact_id: &str) -> DesktopSessionArtifact {
+        DesktopSessionArtifact {
+            version: 1,
+            artifact_id: artifact_id.to_owned(),
+            title: "Build desktop".to_owned(),
+            host_id: "host-local".to_owned(),
+            environment_id: "desk-1".to_owned(),
+            grant_id: "grant-1".to_owned(),
+        }
+    }
+
+    #[test]
+    fn reported_desktop_sits_below_its_card_and_shows_once() {
+        let mut messages = Vec::new();
+        upsert_subagent_card(&mut messages, "w1", None, &SubagentStatus::Running, false);
+        upsert_subagent_card(&mut messages, "w2", None, &SubagentStatus::Running, false);
+        attach_desktop_artifact(&mut messages, "w1", desktop("desk-1-artifact"));
+        attach_desktop_artifact(&mut messages, "w1", desktop("desk-1-artifact"));
+
+        assert_eq!(messages.len(), 3);
+        assert_eq!(card_count(&messages), 2);
+        assert!(messages[0].desktop_artifacts.is_empty());
+        assert!(messages[1].views.is_empty());
+        assert_eq!(
+            messages[1].desktop_artifacts,
+            vec![desktop("desk-1-artifact")]
+        );
+        assert!(messages[2].desktop_artifacts.is_empty());
     }
 
     #[test]
