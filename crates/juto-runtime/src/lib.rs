@@ -7,6 +7,7 @@ pub mod config;
 pub mod context;
 mod contextual;
 pub mod desktop_artifact;
+pub mod desktop_keepalive;
 pub mod git_transfer;
 pub mod peers;
 pub mod replication;
@@ -122,6 +123,7 @@ struct RuntimeInner {
     subagent_manager: Mutex<Option<Arc<SubagentManager>>>,
     desktop_supervisor: Mutex<Option<Arc<DesktopSupervisor>>>,
     signaling: Mutex<Option<Arc<SignalingHandle>>>,
+    desktop_keepalive: desktop_keepalive::DesktopKeepalive,
 }
 pub fn default_data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("JUTO_DATA_DIR") {
@@ -204,6 +206,7 @@ impl Runtime {
                 subagent_manager: Mutex::new(None),
                 desktop_supervisor: Mutex::new(None),
                 signaling: Mutex::new(None),
+                desktop_keepalive: desktop_keepalive::DesktopKeepalive::new(),
             }),
         };
         if !runtime.inner.config.read().model.is_empty() {
@@ -519,6 +522,15 @@ impl Runtime {
         }
         if scope.allows("desktop") {
             tools::register_desktop_tools(
+                &mut registry,
+                self.desktop_supervisor(),
+                self.signaling_handle(),
+                self.inner.desktop_keepalive.clone(),
+                self.inner.data_dir.clone(),
+            )?;
+        }
+        if scope.allows("desktop_observe") {
+            tools::register_desktop_observe_tool(
                 &mut registry,
                 self.desktop_supervisor(),
                 self.signaling_handle(),
@@ -1320,10 +1332,11 @@ fn queued_output(children: Vec<(String, Option<String>, bool)>) -> ToolOutput {
             |(id, name, focus)| json!({"id": id, "name": name, "status": "queued", "focus": focus}),
         )
         .collect();
+    let listing = serde_json::to_string(&entries).unwrap_or_default();
     ToolOutput {
         content: vec![ContentBlock::Text {
             text: format!(
-                "Queued {count} child agent(s). Their results arrive in the main thread as they finish; call `wait` with an id to read one now."
+                "Queued {count} child agent(s): {listing}. Their results arrive in the main thread as they finish; call `wait` with these ids to read them now. Children still running when your turn ends are cancelled."
             ),
         }],
         details: Value::Array(entries),
@@ -1478,6 +1491,22 @@ mod tests {
     use std::collections::BTreeSet;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn queued_task_result_shows_the_model_every_child_id() {
+        let output = queued_output(vec![
+            ("agent-a".into(), Some("builder".into()), false),
+            ("agent-b".into(), None, true),
+        ]);
+        let ContentBlock::Text { text } = &output.content[0] else {
+            panic!("queued output must be text");
+        };
+        // The model only sees `content`; without the ids it cannot `wait`.
+        assert!(
+            text.contains("agent-a") && text.contains("agent-b"),
+            "{text}"
+        );
+    }
 
     /// Streams one text response and stops, so an isolated child run completes
     /// without touching a real provider.
@@ -1974,7 +2003,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn main_thread_advertises_read_and_delegation_tools_only() {
+    async fn main_thread_advertises_read_delegation_and_observe_tools_only() {
         let root = tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         native_repo(&repo);
@@ -2001,6 +2030,7 @@ mod tests {
                 "agent_send",
                 "agent_cancel",
                 "agent_inbox",
+                "desktop_observe",
                 "subagent_release",
             ])]
         );

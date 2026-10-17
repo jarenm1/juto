@@ -11,6 +11,7 @@ juto-catalog.workspace = true
 juto-desktop.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 fs2.workspace = true
 futures.workspace = true
 globset.workspace = true

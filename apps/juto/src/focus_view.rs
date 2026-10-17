@@ -1,16 +1,21 @@
 //! Focus mode for a focus thread: its transcript, a follow-up composer, and the
 //! VCS panel rooted at its workspace.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{
     ClickEvent, Context, Entity, EventEmitter, IntoElement, Render, ScrollHandle, SharedString,
     Subscription, Task, Window, div, prelude::*, px, rgb,
 };
+use juto_runtime::Runtime;
 use juto_runtime::subagents::{ChildState, SubagentManager, SubagentStatus, SubagentSummary};
 use tokio::sync::watch;
 
-use crate::chat::{Message, MessageRole, view_messages};
+use crate::chat::{
+    DesktopCanvas, Message, MessageRole, canvas_body, desktop_artifact_card, mount_canvases,
+    view_messages,
+};
 use crate::chat_input::{ChatInput, SubmitMessage};
 use crate::vcs_sidebar::VcsSidebar;
 use crate::view_element::{ViewActions, render_view};
@@ -160,6 +165,8 @@ pub struct FocusView {
     state: FocusState<Entity<VcsSidebar>>,
     title: SharedString,
     subagents: Arc<SubagentManager>,
+    runtime: Runtime,
+    desktop_canvases: HashMap<String, DesktopCanvas>,
     input: Entity<ChatInput>,
     transcript_scroll: ScrollHandle,
     error: Option<SharedString>,
@@ -176,6 +183,7 @@ impl FocusView {
         summary: SubagentSummary,
         mut updates: watch::Receiver<ChildState>,
         subagents: Arc<SubagentManager>,
+        runtime: Runtime,
         tokio_handle: tokio::runtime::Handle,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -205,6 +213,8 @@ impl FocusView {
             state: FocusState::enter(summary.id, status, vcs, summary.released, summary.focus),
             title: summary.name.unwrap_or(summary.task).into(),
             subagents,
+            runtime,
+            desktop_canvases: HashMap::new(),
             input,
             transcript_scroll: ScrollHandle::new(),
             error: None,
@@ -306,17 +316,33 @@ impl FocusView {
             )
     }
 
+    /// Mounts a canvas for each desktop artifact in the loaded transcript, so a
+    /// finished child's desktop shows in its focus view.
+    fn mount_desktop_canvases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let messages: &[Message] = match self.state.transcript() {
+            Ok(messages) => messages,
+            Err(_) => &[],
+        };
+        mount_canvases(
+            &mut self.desktop_canvases,
+            &self.runtime,
+            messages,
+            window,
+            cx,
+        );
+    }
+
     fn transcript_panel(&self) -> impl IntoElement {
         let body = match self.state.transcript() {
             Ok(messages) if messages.is_empty() => div()
                 .text_sm()
                 .text_color(rgb(0x9ca3af))
                 .child(empty_transcript_hint(self.state.status())),
-            Ok(messages) => div()
-                .flex()
-                .flex_col()
-                .gap_4()
-                .children(messages.iter().map(render_message)),
+            Ok(messages) => div().flex().flex_col().gap_4().children(
+                messages
+                    .iter()
+                    .map(|message| render_message(message, &self.desktop_canvases)),
+            ),
             Err(err) => div().text_sm().text_color(rgb(0xf87171)).child(err.clone()),
         };
         div()
@@ -398,7 +424,8 @@ impl FocusView {
 }
 
 impl Render for FocusView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.mount_desktop_canvases(window, cx);
         div()
             .flex()
             .flex_1()
@@ -440,7 +467,10 @@ fn empty_transcript_hint(status: &SubagentStatus) -> &'static str {
     }
 }
 
-fn render_message(message: &Message) -> impl IntoElement {
+fn render_message(
+    message: &Message,
+    canvases: &HashMap<String, DesktopCanvas>,
+) -> impl IntoElement {
     let author = match message.role {
         MessageRole::User => "You",
         MessageRole::Assistant => "Assistant",
@@ -451,6 +481,12 @@ fn render_message(message: &Message) -> impl IntoElement {
         .gap_1()
         .child(div().text_xs().text_color(rgb(0x9ca3af)).child(author))
         .child(div().text_sm().child(message.text.clone()))
+        .children(
+            message
+                .desktop_artifacts
+                .iter()
+                .map(|artifact| desktop_artifact_card(artifact, canvas_body(canvases, artifact))),
+        )
         .children(
             message
                 .views

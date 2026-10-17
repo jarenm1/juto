@@ -1304,7 +1304,7 @@ impl Tool for DesktopArtifactTool {
                     },
                     "host_id": {
                         "type": "string",
-                        "description": "Opaque identifier of the host machine or cluster."
+                        "description": "Host identifier: the `Host:` value reported by `desktop` create. A different value cannot be opened here."
                     },
                     "environment_id": {
                         "type": "string",
@@ -1386,6 +1386,7 @@ pub struct DesktopTool {
     supervisor: Arc<juto_desktop::DesktopSupervisor>,
     signaling: Arc<crate::SignalingHandle>,
     data_dir: PathBuf,
+    keepalive: crate::desktop_keepalive::DesktopKeepalive,
 }
 
 /// Registers the desktop environment tool against a supervisor.
@@ -1393,17 +1394,19 @@ pub fn register_desktop_tools(
     registry: &mut ToolRegistry,
     supervisor: Arc<juto_desktop::DesktopSupervisor>,
     signaling: Arc<crate::SignalingHandle>,
+    keepalive: crate::desktop_keepalive::DesktopKeepalive,
     data_dir: PathBuf,
 ) -> Result<(), AgentError> {
     registry.register(Arc::new(DesktopTool {
         supervisor,
         signaling,
+        keepalive,
         data_dir,
     }))?;
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct DesktopArgs {
     action: String,
     #[serde(default)]
@@ -1524,7 +1527,8 @@ impl Tool for DesktopTool {
         // principal would let one session drive another's desktop.
         let owner_principal = format!("agent:{}", ctx.session_id);
 
-        tokio::task::spawn_blocking(move || {
+        let creating = args.action == "create";
+        let created = tokio::task::spawn_blocking(move || {
             run_desktop_action(
                 &supervisor,
                 &signaling,
@@ -1534,6 +1538,127 @@ impl Tool for DesktopTool {
                 args,
                 &cancel,
             )
+        })
+        .await
+        .map_err(|e| format!("desktop task failed: {e}"))??;
+        if creating {
+            // The desktop must outlive this run so the main chat can open it;
+            // the keepalive renews its owner lifetime until it is destroyed.
+            let env_id = created.details["envId"]
+                .as_str()
+                .ok_or("desktop create returned no environment id")?;
+            let env = self
+                .supervisor
+                .get_environment(env_id)
+                .map_err(|e| e.to_string())?;
+            self.keepalive.adopt(env);
+        }
+        Ok(created)
+    }
+}
+
+/// Read-only desktop access for the main thread: shows an environment's current
+/// frame to the model. It cannot send input or change the environment.
+pub struct DesktopObserveTool {
+    supervisor: Arc<juto_desktop::DesktopSupervisor>,
+    signaling: Arc<crate::SignalingHandle>,
+    data_dir: PathBuf,
+}
+
+/// Registers the read-only desktop observe tool against a supervisor.
+pub fn register_desktop_observe_tool(
+    registry: &mut ToolRegistry,
+    supervisor: Arc<juto_desktop::DesktopSupervisor>,
+    signaling: Arc<crate::SignalingHandle>,
+    data_dir: PathBuf,
+) -> Result<(), AgentError> {
+    registry.register(Arc::new(DesktopObserveTool {
+        supervisor,
+        signaling,
+        data_dir,
+    }))?;
+    Ok(())
+}
+
+#[derive(Deserialize)]
+struct DesktopObserveArgs {
+    env_id: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[async_trait]
+impl Tool for DesktopObserveTool {
+    fn definition(&self) -> juto_ai::ToolDefinition {
+        juto_ai::ToolDefinition {
+            name: "desktop_observe".to_string(),
+            description: "Shows the current frame of a desktop environment as an image. \
+                          Read-only: it cannot send input or change the environment. Use the \
+                          env_id from a child's desktop report."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "env_id": {
+                        "type": "string",
+                        "description": "Environment id of the desktop to observe."
+                    },
+                    "timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How long to wait for a frame, in milliseconds (default 5000)."
+                    }
+                },
+                "required": ["env_id"]
+            }),
+        }
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Shared
+    }
+
+    async fn execute(&self, arguments: Value, ctx: ToolContext) -> Result<ToolOutput, String> {
+        let args: DesktopObserveArgs = serde_json::from_value(arguments)
+            .map_err(|e| format!("invalid desktop_observe arguments: {e}"))?;
+        check_cancel(&ctx.cancel)?;
+
+        let supervisor = self.supervisor.clone();
+        let signaling = self.signaling.clone();
+        let data_dir = self.data_dir.clone();
+        let workspace = effective_cwd(Path::new(""), &ctx).to_path_buf();
+        let cancel = ctx.cancel.clone();
+        let owner_principal = format!("agent:{}", ctx.session_id);
+        let observe = DesktopArgs {
+            action: "observe".to_string(),
+            env_id: Some(args.env_id),
+            timeout_ms: args.timeout_ms,
+            ..DesktopArgs::default()
+        };
+
+        tokio::task::spawn_blocking(move || {
+            use base64::Engine as _;
+
+            let mut out = run_desktop_action(
+                &supervisor,
+                &signaling,
+                &data_dir,
+                &workspace,
+                &owner_principal,
+                observe,
+                &cancel,
+            )?;
+            // Attach the frame itself so the model can see it, not only its path.
+            let path = out.details["snapshotPath"]
+                .as_str()
+                .ok_or("observe returned no snapshot path")?
+                .to_string();
+            let png = std::fs::read(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
+            out.content.push(ContentBlock::Image {
+                data: base64::engine::general_purpose::STANDARD.encode(png),
+                mime_type: "image/png".to_string(),
+            });
+            Ok(out)
         })
         .await
         .map_err(|e| format!("desktop task failed: {e}"))?
@@ -1622,7 +1747,7 @@ fn run_desktop_action(
             let host_id = host_identifier();
             let summary = format!(
                 "Desktop environment created: {id} \"{title}\" ({width}x{height}@{fps}, scale {scale}). \
-                 Socket: {}. Owner grant: {}.",
+                 Host: {host_id}. Socket: {}. Owner grant: {}.",
                 env.socket_path().display(),
                 grant.grant_id
             );
@@ -3707,6 +3832,7 @@ mod tests {
             supervisor: supervisor.clone(),
             signaling: signaling.clone(),
             data_dir: data_dir.path().to_path_buf(),
+            keepalive: crate::desktop_keepalive::DesktopKeepalive::new(),
         };
         let ctx = ctx(data_dir.path());
 
@@ -3720,6 +3846,13 @@ mod tests {
         let env_id = created.details["envId"].as_str().unwrap().to_string();
         let grant_id = created.details["grantId"].as_str().unwrap().to_string();
         let host_id = created.details["hostId"].as_str().unwrap().to_string();
+        // A model posts the artifact from the text it was shown, not `details`.
+        let ContentBlock::Text { text } = &created.content[0] else {
+            panic!("create must report text");
+        };
+        for id in [&env_id, &grant_id, &host_id] {
+            assert!(text.contains(id.as_str()), "create text omits {id}: {text}");
+        }
 
         let resolver =
             DesktopArtifactResolver::new(supervisor.clone(), signaling.clone(), host_id.clone());
@@ -3805,6 +3938,7 @@ mod tests {
             supervisor: supervisor.clone(),
             signaling: Arc::new(crate::SignalingHandle::new(supervisor.clone())),
             data_dir: data_dir.path().to_path_buf(),
+            keepalive: crate::desktop_keepalive::DesktopKeepalive::new(),
         };
         let ctx = ctx(data_dir.path());
 
@@ -3894,5 +4028,53 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn desktop_observe_attaches_the_frame_as_png() {
+        use base64::Engine as _;
+
+        let supervisor = Arc::new(juto_desktop::DesktopSupervisor::new());
+        let data_dir = tempfile::tempdir().unwrap();
+        let signaling = Arc::new(crate::SignalingHandle::new(supervisor.clone()));
+        let create = DesktopTool {
+            supervisor: supervisor.clone(),
+            signaling: signaling.clone(),
+            data_dir: data_dir.path().to_path_buf(),
+            keepalive: crate::desktop_keepalive::DesktopKeepalive::new(),
+        };
+        let ctx = ctx(data_dir.path());
+        let created = create
+            .execute(
+                json!({"action": "create", "title": "observe", "width": 640, "height": 480}),
+                ctx.clone(),
+            )
+            .await
+            .unwrap();
+        let env_id = created.details["envId"].as_str().unwrap().to_string();
+
+        let observe = DesktopObserveTool {
+            supervisor,
+            signaling,
+            data_dir: data_dir.path().to_path_buf(),
+        };
+        let observed = observe
+            .execute(json!({"env_id": env_id, "timeout_ms": 5000}), ctx)
+            .await
+            .unwrap();
+
+        let (data, mime_type) = observed
+            .content
+            .iter()
+            .find_map(|block| match block {
+                ContentBlock::Image { data, mime_type } => Some((data, mime_type)),
+                _ => None,
+            })
+            .expect("observe attaches the frame as an image block");
+        assert_eq!(mime_type, "image/png");
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
     }
 }
