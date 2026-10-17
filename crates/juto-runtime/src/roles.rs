@@ -1,11 +1,13 @@
-//! Agent roles: named profiles that set which tools a run may use and what
-//! instructions it starts with.
+//! Agent roles: named profiles that set which tools a run may use, which
+//! model a child run defaults to, and what instructions it starts with.
 //!
-//! A role is a markdown file. Its frontmatter names the tools it may use, and
-//! its body is appended to the run's system prompt. Built-in roles ship with
-//! the crate. A `<role>.md` file under `.juto/agents/` in the working directory
-//! or one of its ancestors, or under the runtime data directory's `agents/`,
-//! replaces the built-in role of the same name. Nearer files win.
+//! A role is a markdown file. Its frontmatter names the tools it may use and,
+//! optionally, a model selector (`provider/model` or an `@role` alias such as
+//! `@smol`), and its body is appended to the run's system prompt. Built-in
+//! roles ship with the crate. A `<role>.md` file under `.juto/agents/` in the
+//! working directory or one of its ancestors, or under the runtime data
+//! directory's `agents/`, replaces the built-in role of the same name. Nearer
+//! files win.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -31,6 +33,7 @@ const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("scout", include_str!("roles/scout.md")),
     ("reviewer", include_str!("roles/reviewer.md")),
     ("task", include_str!("roles/task.md")),
+    ("browser", include_str!("roles/browser.md")),
 ];
 
 /// Registry tool names a run may advertise. `None` allows every tool the run
@@ -85,6 +88,9 @@ pub(crate) struct AgentRole {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) tools: ToolScope,
+    /// Model selectors a child run of this role tries in order when its
+    /// `task` entry names no model (oh-my-pi agent `model:` frontmatter).
+    pub(crate) models: Vec<String>,
     /// Markdown body, appended to the run's system prompt.
     pub(crate) instructions: String,
 }
@@ -95,6 +101,8 @@ struct RoleFrontmatter {
     description: String,
     /// Omitted means read-only, so a role must grant write access explicitly.
     tools: Option<ToolsField>,
+    /// A selector or an ordered fallback list.
+    model: Option<ModelField>,
 }
 
 #[derive(Deserialize)]
@@ -104,6 +112,13 @@ enum ToolsField {
     Keyword(String),
     /// Explicit registry tool names.
     Named(Vec<String>),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ModelField {
+    One(String),
+    Fallbacks(Vec<String>),
 }
 
 fn parse_role(path: &Path, name: &str, text: &str) -> Result<AgentRole> {
@@ -131,10 +146,19 @@ fn parse_role(path: &Path, name: &str, text: &str) -> Result<AgentRole> {
         },
         Some(ToolsField::Named(names)) => ToolScope::named(names),
     };
+    let models = match fm.model {
+        None => Vec::new(),
+        Some(ModelField::One(model)) => vec![model],
+        Some(ModelField::Fallbacks(models)) => models,
+    };
+    if models.iter().any(|m| m.trim().is_empty()) {
+        bail!("{}: model selectors must not be empty", path.display());
+    }
     Ok(AgentRole {
         name: name.to_owned(),
         description: fm.description,
         tools,
+        models,
         instructions: body.trim().to_owned(),
     })
 }
@@ -206,6 +230,12 @@ mod tests {
         assert!(!roles["scout"].tools.allows("write"));
         assert!(!roles["scout"].tools.allows("task"));
         assert!(!roles["reviewer"].tools.allows("bash"));
+        let browser = &roles["browser"];
+        assert!(browser.tools.allows("browser"));
+        assert!(!browser.tools.allows("bash") && !browser.tools.allows("write"));
+        assert!(!browser.tools.allows("task"));
+        assert_eq!(browser.models, ["@smol"]);
+        assert!(roles["task"].models.is_empty());
     }
 
     #[test]
@@ -258,5 +288,28 @@ mod tests {
 
         let err = load(root.path(), &root.path().join("data")).expect_err("unknown keyword");
         assert!(format!("{err:#}").contains("everything"), "{err:#}");
+    }
+
+    #[test]
+    fn role_model_accepts_a_selector_or_fallback_list() {
+        let root = tempdir().expect("tempdir");
+        let agents = root.path().join(".juto/agents");
+        write_role(
+            &agents,
+            "one",
+            "---\ndescription: d\nmodel: openai/gpt-5\n---\n",
+        );
+        write_role(
+            &agents,
+            "many",
+            "---\ndescription: d\nmodel: [\"@smol\", openai/gpt-5-mini]\n---\n",
+        );
+        let roles = load(root.path(), &root.path().join("data")).expect("load roles");
+        assert_eq!(roles["one"].models, ["openai/gpt-5"]);
+        assert_eq!(roles["many"].models, ["@smol", "openai/gpt-5-mini"]);
+
+        write_role(&agents, "blank", "---\ndescription: d\nmodel: \"\"\n---\n");
+        let err = load(root.path(), &root.path().join("data")).expect_err("empty model");
+        assert!(format!("{err:#}").contains("must not be empty"), "{err:#}");
     }
 }
