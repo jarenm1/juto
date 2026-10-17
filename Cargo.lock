@@ -3685,6 +3685,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "dom_smoothie",
+ "base64 0.22.1",
  "fs2",
  "futures",
  "globset",
