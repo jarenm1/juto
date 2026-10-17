@@ -116,14 +116,17 @@ impl PeerBus {
         let message = message.into();
         let ids = match target {
             PeerTarget::Main => {
-                self.subagents.main_inbox().push(MainMessage {
-                    from: self
-                        .sender
-                        .clone()
-                        .unwrap_or_else(|| UNKNOWN_SENDER.to_string()),
-                    kind: MainMessageKind::Message,
-                    body: message,
-                });
+                self.subagents.main_inbox().push_from(
+                    self.subagents.origin().map(str::to_owned),
+                    MainMessage {
+                        from: self
+                            .sender
+                            .clone()
+                            .unwrap_or_else(|| UNKNOWN_SENDER.to_string()),
+                        kind: MainMessageKind::Message,
+                        body: message,
+                    },
+                );
                 return Ok(PeerSendReport {
                     sent: vec![MAIN_RECIPIENT.to_string()],
                     failed: Vec::new(),

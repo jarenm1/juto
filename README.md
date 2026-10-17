@@ -66,11 +66,43 @@ result and session transcript are kept. Nothing folds subagent work back automat
 
 On the top-level thread, `task` does not block. It returns `queued` ids immediately, and each
 child's terminal result (completed, failed, or cancelled) reaches the running main turn as a
-steered user message headed `[subagent <id> <kind>]`. A completion that lands while no main run
-is active is delivered at the start of the next run. Waking an idle session when a child finishes
-is the host's job; the runtime does not start a run on its own. Lifecycle events (`spawned`,
+steered user message headed `[subagent <id> <kind>]`. Each report is addressed to the session
+whose run spawned the child tree, so a main session's internal thread receives only its own
+children's reports; a report that lands while that thread has no active run is delivered at the
+start of its next run. Waking an idle session when a child finishes is the host's job; the GUI
+runs the report in the thread that spawned the child. Lifecycle events (`spawned`,
 `status_changed`, `finished`) are available from `SubagentManager::subscribe_events`. Child agents
 that call `task` still wait for their own children.
+
+**Internal main threads.** The GUI and `juto-cli run` talk to a *main session* that holds no
+conversation of its own. `Runtime::send` routes each request to one of the session's internal
+threads, each an append-only session journal under `<main-session>/threads/`, so a request runs
+with only its topic's history and each thread's prompt prefix stays stable for provider caching.
+Routing works like this:
+
+- The first request starts a thread without consulting a judge.
+- Later requests go to the judge (`Runtime::judge`): it chooses one of the *active* threads by
+  label, a new thread, or, when dormant threads exist, a history lookup. Without a `judge` role
+  or TypeSafe/OpenRouter credentials, the judge is a `TextJudge` on the `@tiny` model chain
+  (`tiny → smol → default`). A choice below 0.5 confidence is also checked against history.
+- A lookup asks `@tiny` for keywords and scores every thread's label and messages against them
+  (a label hit counts fully, a message hit half). A thread matching at least half the keywords
+  is resumed; otherwise a new thread starts.
+- After a completed turn, `@tiny` relabels the thread from its latest exchange. Past
+  `maxActiveThreads` (default 6), the least recently routed thread goes dormant; the judge never
+  sees dormant threads, which keeps its option list bounded.
+- If the judge is unavailable or fails, the request continues the most recent active thread and
+  the route carries a `note` saying why. Cancelling during routing records nothing.
+
+The main journal records `thread_created`, `thread_routed`, `thread_labeled`, and
+`thread_status` entries; reopening it restores threads, labels, and dormancy. A session from
+before threads (messages in its own journal) is copied into a thread on its next request, and
+its history shows those messages once. `Runtime::send` streams `MainEvent`s: the routing
+decision (`thread_routed`), then the thread's agent events, then any `thread_updated` or
+`thread_label_failed` events. The GUI marks each exchange with its thread and lists threads in
+the sidebar as current, active, or dormant. `juto-cli history <session>` prints the merged
+history, and `juto-cli threads <session>` lists threads. `juto-cli compact` takes a thread's
+journal path. Threads do not yet share memory or see one another's labels.
 
 **Native live-change DAG and Git transfer.** Juto tracks live agent edits in its own
 version control DAG rather than synthesizing premature Git commits or depending on

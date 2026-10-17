@@ -21,7 +21,7 @@ use gpui::{
     App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
     prelude::*, px, size,
 };
-use juto_runtime::{ChannelApprovalHandler, Runtime, RuntimeConfig, Session, default_data_dir};
+use juto_runtime::{ChannelApprovalHandler, MainSession, Runtime, RuntimeConfig, default_data_dir};
 
 actions!(juto, [Quit]);
 
@@ -137,7 +137,7 @@ fn run() -> ExitCode {
             }
         };
     let session = match session_path {
-        Some(path) => match Session::open(&path) {
+        Some(path) => match MainSession::open(&path) {
             Ok(session) => session,
             Err(err) => {
                 eprintln!(
@@ -147,7 +147,7 @@ fn run() -> ExitCode {
                 return ExitCode::from(1);
             }
         },
-        None => match runtime.new_session() {
+        None => match runtime.new_main_session() {
             Ok(session) => session,
             Err(err) => {
                 eprintln!("error: failed to create new session: {err}");
