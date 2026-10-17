@@ -1320,10 +1320,11 @@ fn queued_output(children: Vec<(String, Option<String>, bool)>) -> ToolOutput {
             |(id, name, focus)| json!({"id": id, "name": name, "status": "queued", "focus": focus}),
         )
         .collect();
+    let listing = serde_json::to_string(&entries).unwrap_or_default();
     ToolOutput {
         content: vec![ContentBlock::Text {
             text: format!(
-                "Queued {count} child agent(s). Their results arrive in the main thread as they finish; call `wait` with an id to read one now."
+                "Queued {count} child agent(s): {listing}. Their results arrive in the main thread as they finish; call `wait` with these ids to read them now. Children still running when your turn ends are cancelled."
             ),
         }],
         details: Value::Array(entries),
@@ -1478,6 +1479,22 @@ mod tests {
     use std::collections::BTreeSet;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn queued_task_result_shows_the_model_every_child_id() {
+        let output = queued_output(vec![
+            ("agent-a".into(), Some("builder".into()), false),
+            ("agent-b".into(), None, true),
+        ]);
+        let ContentBlock::Text { text } = &output.content[0] else {
+            panic!("queued output must be text");
+        };
+        // The model only sees `content`; without the ids it cannot `wait`.
+        assert!(
+            text.contains("agent-a") && text.contains("agent-b"),
+            "{text}"
+        );
+    }
 
     /// Streams one text response and stops, so an isolated child run completes
     /// without touching a real provider.
