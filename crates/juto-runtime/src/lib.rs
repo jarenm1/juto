@@ -529,6 +529,14 @@ impl Runtime {
                 self.inner.data_dir.clone(),
             )?;
         }
+        if scope.allows("desktop_observe") {
+            tools::register_desktop_observe_tool(
+                &mut registry,
+                self.desktop_supervisor(),
+                self.signaling_handle(),
+                self.inner.data_dir.clone(),
+            )?;
+        }
         scope.apply(&mut registry);
         if !settings.tools.is_empty() {
             registry.retain_names(&settings.tools);
@@ -1995,7 +2003,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn main_thread_advertises_read_and_delegation_tools_only() {
+    async fn main_thread_advertises_read_delegation_and_observe_tools_only() {
         let root = tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         native_repo(&repo);
@@ -2022,6 +2030,7 @@ mod tests {
                 "agent_send",
                 "agent_cancel",
                 "agent_inbox",
+                "desktop_observe",
                 "subagent_release",
             ])]
         );
