@@ -444,6 +444,7 @@ fn render_message(message: &Message) -> impl IntoElement {
     let author = match message.role {
         MessageRole::User => "You",
         MessageRole::Assistant => "Assistant",
+        MessageRole::Thread => "Thread",
     };
     div()
         .flex()
