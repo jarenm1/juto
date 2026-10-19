@@ -2,8 +2,8 @@
 
 Juto records what each governed command actually used, and derives the limits
 each command runs under from the host's measured capacity. This document covers
-recording, inspection, capacity, and grants. Admission, queueing, and the
-desk/provider pools are described where they are implemented.
+recording, inspection, capacity, grants, and admission queueing (see Admission and
+queueing).
 
 ## Where records live
 
@@ -60,8 +60,9 @@ assignments are skipped. For example, `sh -c 'i=0; while …'` is classified as
 
 ## Which commands are recorded
 
-- `juto-cli resources run -- <argv>`: always, under default limits. Scope
-  enforcement stays on, so it fails closed when systemd is unavailable.
+- `juto-cli resources run [--priority CLASS] -- <argv>`: always, under default limits
+  and through the admission queue. Scope enforcement stays on, so it fails closed
+  when systemd is unavailable.
 - Scoped bash commands: when `bash_scoped` is enabled in the runtime
   configuration (off by default).
 - Any other `run_scoped`, `spawn_scoped`, or `run_scoped_blocking` call on a
@@ -136,6 +137,41 @@ it first with `cargo build -p juto-cli` when it is not on `PATH`.
 Without systemd, no limits are applied and `CARGO_BUILD_JOBS` is left to cargo.
 Callers that need enforcement fail closed before running.
 
+## Admission and queueing
+
+A governed command reserves its memory ceiling in a shared ledger before it
+starts. The ledger is `broker/broker.json` under the resources directory, guarded
+by `broker/broker.lock`. The runtime, `juto-cli`, and detached jobs share it, so
+the budget holds across processes.
+
+- A command starts when its reservation fits the agent memory budget
+  (`juto-capacity`), no other GPU command holds the exclusive GPU slot (for GPU
+  commands), and memory stall is not rising (`full avg10` above `full avg60` in
+  `/proc/pressure/memory`). A steady stall from other work on the host does not block
+  admission, and without PSI the ledger alone gates admission.
+- A request larger than the budget fails at once; it never queues.
+- The queue is ordered by class: `attended`, then `verification`, `background`,
+  and `scheduled`. Each 60 seconds of waiting raises a request one class, capped
+  at `attended`, so an old scheduled command eventually runs ahead of fresh
+  attended ones. Equal requests run in arrival order.
+- A queued request that is cancelled or dropped leaves the queue at once and
+  never blocks the requests behind it.
+- Ledger entries of dead processes are pruned on every update. Liveness is the
+  pid together with its start time, so a reused pid does not keep a reservation.
+- The reservation is the command's resolved memory ceiling. Recorded usage does
+  not yet change it.
+
+Runtime: when `bash_scoped` is enabled (off by default), a bash command in the main
+session is `attended`; a delegated one is `background`. A bash command that must wait returns at once with a job id
+(`status: "queued"`, its queue position, and the reserved MiB). Its result is
+steered into the run when it finishes, and the run does not stop while such a job
+is outstanding. `bash_job` reports a job's status; with `wait: true` it blocks
+until the job has a result.
+
+CLI: `juto-cli resources run` waits in the same queue and prints its position on
+stderr while it waits. Its class defaults to `attended` and is set with
+`--priority`.
+
 ## Limitations
 
 - A command whose handle is dropped without `wait()` records nothing.
@@ -145,3 +181,8 @@ Callers that need enforcement fail closed before running.
   unit. On the reference host the user manager delegates only `memory` and
   `pids`, so IO is `null` there.
 - The bare fallback (no systemd) runs unwrapped and is not recorded.
+- A run that ends by error or by the turn limit does not wait for outstanding
+  background bash jobs. Their results are dropped, because steering no longer
+  reaches a run that has stopped.
+- Reservations use the memory ceiling, not learned usage, so a command that uses
+  less than its ceiling holds memory it does not use.

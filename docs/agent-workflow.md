@@ -47,6 +47,10 @@ scripts/agent-scope.sh -- nix develop "$JUTO_FLAKE#smoke" -c <visual-smoke-comma
   scope.
 - Runs through `juto-cli resources run` are recorded (see `docs/resources.md`);
   `scripts/agent-scope.sh` runs are not, because they bypass the runtime.
+- A `juto-cli resources run` waits in the shared admission queue when its reserved
+  memory does not fit the budget, printing its queue position; `--priority` sets its
+  class (default `attended`). Scoped bash in a runtime session may return a queued job
+  id instead (see `docs/resources.md`, Admission and queueing).
 
 ## Build profile
 
