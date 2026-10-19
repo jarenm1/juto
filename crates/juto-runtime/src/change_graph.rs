@@ -592,6 +592,49 @@ impl ChangeGraph {
         Ok(result)
     }
 
+    /// Capture the workspace's live state on its own thread, then report the
+    /// node only when that thread's tree differs from the point it forked from.
+    ///
+    /// Returns `None` when the workspace holds no net change, so a fork that
+    /// was only read, or edited and then reverted, never acquires a node that
+    /// would keep it alive.
+    pub fn capture_thread_changes(&self, provenance: EditProvenance) -> Result<Option<ChangeNode>> {
+        let thread = self
+            .thread()
+            .context("the workspace is not assigned to a thread")?
+            .to_owned();
+        let node = self.capture(&thread, provenance, None)?;
+        // `capture` returns the previous head when nothing changed, so a node
+        // on another thread means this thread has no changes of its own.
+        if node.thread != thread {
+            return Ok(None);
+        }
+        let state = self.state()?;
+        let fork_tree = fork_point_tree(&state, &node, &thread);
+        Ok((node.tree != fork_tree).then_some(node))
+    }
+
+    /// Remove a named checkpoint and its mark, reporting whether it existed.
+    ///
+    /// The node itself stays: [`ChangeGraph::gc`] reclaims it once nothing else
+    /// reaches it, so history a join already took is never cut.
+    pub fn drop_checkpoint(&self, name: &str) -> Result<bool> {
+        let _lock = self.lock()?;
+        let mut state = self.load()?;
+        let Some(id) = state.checkpoints.remove(name) else {
+            return Ok(false);
+        };
+        for node in state.nodes.iter_mut().filter(|n| n.id == id) {
+            if node.mark.as_ref().is_some_and(|mark| mark.name == name) {
+                node.mark = None;
+            }
+        }
+        // Like `mark`, the mark lives in the journal, so rewrite it atomically.
+        self.write_nodes(&state.nodes)?;
+        self.save_header(&state)?;
+        Ok(true)
+    }
+
     pub fn export(&self, checkpoint: &str, branch: &str) -> Result<ExportResult> {
         let state = self.state()?;
         let tip = state
@@ -1450,6 +1493,29 @@ fn validate_head_name(head: &str) -> Result<()> {
         "head name must be a thread or an owner-qualified thread: {head:?}"
     );
     Ok(())
+}
+
+/// Tree of the point `thread` was forked from: the nearest ancestor of `node`
+/// that lives on another thread. A thread with no such ancestor was forked
+/// from the base, whose tree the state records.
+fn fork_point_tree(state: &GraphState, node: &ChangeNode, thread: &str) -> String {
+    let by_id: BTreeMap<&str, &ChangeNode> =
+        state.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut stack: Vec<&str> = node.parents.iter().map(String::as_str).collect();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(ancestor) = by_id.get(id) else {
+            continue;
+        };
+        if ancestor.thread != thread {
+            return ancestor.tree.clone();
+        }
+        stack.extend(ancestor.parents.iter().map(String::as_str));
+    }
+    state.base_tree.clone()
 }
 
 /// Resolve a node id or checkpoint name to its node.

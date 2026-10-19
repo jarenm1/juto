@@ -1162,3 +1162,65 @@ fn conflicting_join_reports_the_paths_and_creates_no_node() {
         "a conflicted join must not touch the workspace"
     );
 }
+
+#[test]
+fn capture_thread_changes_reports_only_net_changes_on_the_fork() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    graph.mark(&root.id, "base", "feat: base", true).unwrap();
+
+    let workspaces = tempfile::tempdir().unwrap();
+    let side_dir = workspaces.path().join("side");
+    graph.fork("side", "base", &side_dir).unwrap();
+    let side = ChangeGraph::open(&side_dir).unwrap();
+
+    // Reading the fork is not a change.
+    assert!(
+        side.capture_thread_changes(provenance("side"))
+            .unwrap()
+            .is_none()
+    );
+
+    // An edit no file tool recorded (as from a shell command) is captured.
+    fs::write(side_dir.join("base"), "edited\n").unwrap();
+    let edited = side
+        .capture_thread_changes(provenance("side"))
+        .unwrap()
+        .expect("the edit is a change");
+    assert_eq!(edited.thread, "side");
+    assert_eq!(edited.parents, vec![root.id.clone()]);
+
+    // Reverting to the fork's tree leaves no net change to keep.
+    fs::write(side_dir.join("base"), "base\n").unwrap();
+    assert!(
+        side.capture_thread_changes(provenance("side"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn drop_checkpoint_clears_the_name_and_the_mark() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    graph
+        .mark(&root.id, "subagent/a", "isolated work of subagent a", false)
+        .unwrap();
+
+    assert!(graph.drop_checkpoint("subagent/a").unwrap());
+    let state = graph.state().unwrap();
+    assert!(!state.checkpoints.contains_key("subagent/a"));
+    let node = state.nodes.iter().find(|n| n.id == root.id).unwrap();
+    assert!(node.mark.is_none());
+    assert!(!graph.drop_checkpoint("subagent/a").unwrap());
+
+    // The node is still a head of main, so gc keeps it and the name stays free.
+    assert_eq!(graph.gc().unwrap().pruned_nodes, 0);
+    graph
+        .mark(&root.id, "subagent/a", "isolated work of subagent a", false)
+        .unwrap();
+}
