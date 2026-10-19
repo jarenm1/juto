@@ -8,6 +8,7 @@ pub mod context;
 mod contextual;
 pub mod desktop_artifact;
 pub mod git_transfer;
+pub mod network;
 pub mod peers;
 pub mod replication;
 mod roles;
@@ -511,6 +512,7 @@ impl Runtime {
         if let Some(sandbox) = limits.as_mut().and_then(|limits| limits.sandbox.as_mut()) {
             sandbox.denied_paths =
                 workspace::credential_paths(std::slice::from_ref(&self.inner.data_dir));
+            sandbox.network = settings.network.policy(tier);
         }
         let mut registry = tools::builtin_tools_with_limits(&self.inner.cwd, limits)?;
         if can_delegate {

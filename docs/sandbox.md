@@ -10,7 +10,7 @@ tool runs; the tier limits what the command can reach once it runs.
 | --- | --- | --- |
 | `attended` | Ungoverned by default. With `bashScoped: true`, it runs under resource governance (CPU/memory caps in a systemd scope). Not sandboxed. | Interactive chat the user watches. Default for the top-level run (`executionTier`). |
 | `workspace` | Sandboxed systemd service with resource caps (see below). | Default for background and isolated children, and for a child whose `task` entry names no tier. |
-| `untrusted` | Same sandbox as `workspace`. | Content-triggered work. Its stricter network and output rules are not implemented yet (see Limits). |
+| `untrusted` | Same sandbox as `workspace`, with network limited to package mirrors (see Network). | Content-triggered work. Output-only proposed diffs are not implemented yet (see Limits). |
 | `full` | Ungoverned and unsandboxed. | Explicit opt-in only, set in `executionTier`. Never offered to a child. |
 
 Order: `untrusted < workspace < attended < full`.
@@ -41,6 +41,7 @@ supervisor that can apply them. Its properties:
 - `BindReadOnlyPaths=` (read): the flake checkout named by `JUTO_FLAKE`, so that
   `nix develop "$JUTO_FLAKE"` works.
 - Resource caps: the same `CPUQuota`/`MemoryMax` limits as a governed command.
+- `PrivateNetwork=yes`: the service has no network interface except loopback. HTTP(S) goes through the proxy in [Network](#network).
 
 Grants are bind mounts, not `ReadWritePaths`: `ReadWritePaths` fails with status 226
 under a hidden home or a private `/tmp`. Grants that do not exist on the host are
@@ -65,6 +66,42 @@ the runtime's process:
 Variables set explicitly on the command pass through. Everything else, including
 `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`, and `XDG_RUNTIME_DIR`, is dropped.
 
+## Network
+
+Sandboxed commands run with `PrivateNetwork=yes`: the service has only a loopback
+interface, so raw TCP and UDP connections fail. HTTP and HTTPS reach the network only
+through a proxy that the runtime runs outside the sandbox.
+
+- The runtime binds a unix socket (`proxy.sock`, mode `0600`, in a `0700` directory
+  under the system temp directory). Only this socket is bind-mounted read-only into
+  the service.
+- The command runs as `juto-cli __juto-network-forwarder <socket> <program> <args...>`
+  inside the service. The forwarder listens on loopback and sets `HTTP_PROXY`,
+  `HTTPS_PROXY`, `ALL_PROXY` (and lowercase forms) to it, and clears `NO_PROXY`.
+  Child processes inherit this environment and stay in the service.
+- The proxy accepts `CONNECT host:443` and `GET http://host/...` on port 80 only. The
+  host must be an exact DNS name on the allowlist. IP literals, wildcards, and other
+  ports are refused. Every resolved address must be public; a name that resolves to a
+  private, loopback, or link-local address is refused.
+- A refusal is an HTTP `403` that names the host and the config key, for example
+  `network host 'example.com' denied by network.allowlist`.
+
+The allowlist is `network.allowlist` in the global `config.yml` or the project
+`.juto/config.yml` (arrays replace across layers). The default is `crates.io`,
+`static.crates.io`, `index.crates.io`, and `github.com`. Validation rejects entries
+that are not exact DNS names.
+
+`untrusted` ignores the allowlist. It allows only the package mirrors `crates.io`,
+`static.crates.io`, and `index.crates.io`.
+
+The forwarder needs `juto-cli`. The runtime uses the running binary when it is
+`juto-cli`, otherwise a `juto-cli` next to the running executable, otherwise one on
+`PATH`. `JUTO_PROXY_HELPER` may name an absolute path. If none is found, the command
+fails with `sandbox network helper unavailable; install juto-cli or set JUTO_PROXY_HELPER`.
+
+The proxy does not inspect request content. An allowed host can receive anything the
+command can read in the workspace, so allowlist only hosts that may receive that data.
+
 ## Fail closed
 
 Governed commands require `systemd-run`. If it is missing, the command returns
@@ -79,6 +116,7 @@ sandboxed tier cannot run unsandboxed.
   bound read-only. It prints a non-fatal warning that it cannot read `HEAD`.
 - From inside the sandbox, `~/.ssh`, `~/.config/gh`, and juto's data directory are not
   visible, `SSH_AUTH_SOCK` is unset, and `/run/user` is empty.
+- Through the proxy, `workspace` reaches `index.crates.io` and `github.com` (HTTP 200) and gets `403` from `example.com`. `untrusted` reaches `index.crates.io` and gets `403` from `github.com`. In `workspace`, `cargo fetch` of a new project depending on `itoa` succeeds through the proxy. Raw TCP to `1.1.1.1:443` fails with "Network is unreachable".
 
 ## File tools
 
@@ -100,12 +138,8 @@ and paths outside a partial fork's sparse spec (`vcs::mutate`).
 This is containment against accidents and careless commands, not a guarantee against
 hostile code.
 
-- **Network is not restricted yet.** Sandboxed commands can reach the network. A domain
-  allowlist and a `PrivateNetwork` proxy are planned for the next change.
 - **The nix daemon is reachable.** `/nix/var/nix/daemon-socket/socket` is available, so
   builds and substitutes run in the daemon, outside the sandbox.
-- **`untrusted` is not yet distinct from `workspace`.** It gets the same filesystem
-  sandbox. Package-mirror-only network access and "output only a proposed diff" are not
-  implemented.
+- **`untrusted` output is not restricted yet.** It has the `workspace` filesystem sandbox and the package-mirror network limit, but it does not emit only a proposed diff or checkpoint.
 - **No separate unattended mode.** A top-level run takes its tier from `executionTier`.
   Setting `full` there is an explicit opt-in, and nothing stops an unattended run from using it.

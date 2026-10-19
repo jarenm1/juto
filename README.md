@@ -34,8 +34,9 @@ a capture never records Jujutsu's own directory.
 **Execution tiers.** Each run has a tier (`executionTier` in `config.yml`: `attended`, `workspace`,
 `untrusted`, `full`). Background and isolated children default to `workspace`: their bash
 runs as a sandboxed systemd service (`ProtectSystem=strict`, hidden `$HOME`, private `/tmp`,
-writes limited to the workspace and toolchain caches) and fails closed when `systemd-run` is
-missing. Tiers, grants, the environment allowlist, and known limits are in
+writes limited to the workspace and toolchain caches, no raw sockets, HTTP(S) only to hosts on
+`network.allowlist` through a proxy) and fails closed when `systemd-run` or the network helper is
+missing. Tiers, grants, the network allowlist, and known limits are in
 [docs/sandbox.md](docs/sandbox.md).
 
 **Delegating role model.** The top-level `main` role has `read`, `glob`, `grep`, `task`, `wait`,
