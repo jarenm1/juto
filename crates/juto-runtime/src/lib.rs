@@ -43,7 +43,7 @@ pub use juto_desktop::protocol;
 pub use juto_desktop::signaling::{SignalingServer, ViewerReport};
 pub use juto_desktop::supervisor::{
     AppHandle, AwakeHold, CompositorMode, EnvironmentConfig, EnvironmentStatus, IdlePolicy,
-    OutputConfig, RenderProfile, SystemLimits,
+    MAX_GRANT_SECS, OutputConfig, RenderProfile, SystemLimits,
 };
 pub use juto_desktop::{DesktopEnvironment, DesktopError, DesktopSupervisor};
 
@@ -91,7 +91,7 @@ pub use subagents::{
 };
 pub use tools::{
     DESKTOP_SESSION_ARTIFACT_VERSION, DesktopArtifactTool, DesktopSessionArtifact, DesktopTool,
-    register_desktop_tools,
+    host_identifier, register_desktop_tools,
 };
 pub use workspace::{GpuLockGuard, ResourceLimits, ScopedStdio, SubagentWorkspace, WorkspaceError};
 

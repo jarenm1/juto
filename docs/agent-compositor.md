@@ -79,10 +79,11 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   Unix socket, including event subscription.
 - Runtime `desktop` tool (`create`, `launch`, `observe`, `input`, `describe`,
   `destroy`) backed by a process-wide supervisor.
-- Same-host embedded viewer in the harness: composes from the sealed pool with no
-  codec, letterboxes, maps pointer coordinates to desktop pixels, forwards
-  pointer/scroll/keyboard input, and holds a human control lease with a
-  heartbeat.
+- Same-host embedded viewer in the harness, mounted inline in the chat card of
+  a desktop artifact and expandable to a full-window modal: composes from the
+  sealed pool with no codec, letterboxes, maps pointer coordinates to desktop
+  pixels, forwards pointer/scroll/keyboard input, and holds a human control
+  lease with a heartbeat.
 - Remote presentation: a GStreamer `webrtcbin` sender (VP8 default, H.264
   available) fed from the composed pool, a one-time-token signaling server that
   serves a browser viewer page and relays SDP/ICE over a WebSocket, pointer and

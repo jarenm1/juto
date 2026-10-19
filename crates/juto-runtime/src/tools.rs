@@ -1841,7 +1841,9 @@ fn run_desktop_action(
     }
 }
 
-pub(crate) fn host_identifier() -> String {
+/// This host's identifier, as recorded in desktop artifacts and checked by
+/// [`crate::DesktopArtifactResolver`].
+pub fn host_identifier() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .filter(|h| !h.trim().is_empty())

@@ -310,7 +310,13 @@ pub struct ChatView {
     active_control: Option<RunControl>,
     run_task: Option<Task<()>>,
     artifact_notice: Option<SharedString>,
+    /// The viewer shown in the desktop modal: `juto --desktop`, or an inline
+    /// viewer the user expanded.
     desktop_viewer: Option<Entity<crate::desktop_viewer::DesktopViewer>>,
+    /// Live viewers mounted inside desktop artifact cards, by artifact id.
+    inline_desktops: HashMap<String, Entity<crate::desktop_viewer::DesktopViewer>>,
+    /// The inline viewer currently shown in the modal instead of its card.
+    expanded_desktop: Option<String>,
     approval_requests: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalRequest>>>,
     pending_approvals: HashMap<u64, ApprovalRequest>,
     next_approval_id: u64,
@@ -485,6 +491,8 @@ impl ChatView {
             attachment_error: None,
             artifact_notice: None,
             desktop_viewer: None,
+            inline_desktops: HashMap::new(),
+            expanded_desktop: None,
             picker: None,
             scroll: ScrollHandle::new(),
             runtime,
@@ -573,11 +581,12 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Resolves a desktop artifact and opens the viewer it authorizes.
+    /// Resolves a desktop artifact and mounts a live viewer in its card.
     ///
     /// Resolution is explicit: an unknown host, environment, or grant reports
     /// `Unsupported`, `Unavailable`, `Unauthorized`, `Expired`, or `Stopped`
-    /// rather than fabricating a live stream.
+    /// rather than fabricating a live stream. Every open re-resolves, so a
+    /// revoked or expired grant cannot be reopened from a stale card.
     pub fn open_desktop_artifact(
         &mut self,
         artifact: &DesktopSessionArtifact,
@@ -590,7 +599,7 @@ impl ChatView {
         // must be rejected, and one issued to this session must be honored.
         match resolver.resolve(crate::desktop_viewer::SESSION_PRINCIPAL, artifact) {
             Ok(juto_runtime::ViewerRoute::Local { env_id, .. }) => {
-                self.open_desktop_viewer(&env_id, window, cx);
+                self.open_inline_desktop(artifact, &env_id, window, cx);
             }
             Ok(juto_runtime::ViewerRoute::Remote { url, .. }) => {
                 self.artifact_notice = Some(
@@ -611,21 +620,24 @@ impl ChatView {
         }
     }
 
-    /// Opens the embedded viewer for an existing desktop environment.
-    pub fn open_desktop_viewer(
+    /// Mounts a live viewer for `env_id` inside the artifact's chat card.
+    fn open_inline_desktop(
         &mut self,
+        artifact: &DesktopSessionArtifact,
         env_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let supervisor = self.runtime.desktop_supervisor();
-        match supervisor.get_environment(env_id) {
+        if self.inline_desktops.contains_key(&artifact.artifact_id) {
+            return;
+        }
+        match self.runtime.desktop_supervisor().get_environment(env_id) {
             Ok(env) => {
-                let title = format!("Desktop {env_id}");
+                let title = artifact.title.clone();
                 let viewer =
                     cx.new(|cx| crate::desktop_viewer::DesktopViewer::new(env, title, window, cx));
-                self.desktop_viewer = Some(viewer);
-                self.active_modal = ActiveModal::DesktopViewer;
+                self.inline_desktops
+                    .insert(artifact.artifact_id.clone(), viewer);
                 self.artifact_notice = None;
             }
             Err(err) => {
@@ -636,8 +648,44 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Creates a desktop environment, launches `argv` into it, and opens the
-    /// embedded viewer. Used by the `--desktop` developer mode.
+    /// Unmounts an inline viewer; the desktop may then go idle.
+    fn close_inline_desktop(
+        &mut self,
+        artifact_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.expanded_desktop.as_deref() == Some(artifact_id) {
+            self.close_modal(window, cx);
+        }
+        self.inline_desktops.remove(artifact_id);
+        cx.notify();
+    }
+
+    /// Moves an inline viewer into the full-window modal. Closing the modal
+    /// returns it to its card; the viewer and its control lease persist.
+    fn expand_inline_desktop(
+        &mut self,
+        artifact_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(viewer) = self.inline_desktops.get(artifact_id).cloned() else {
+            return;
+        };
+        if self.active_modal == ActiveModal::AuthModal {
+            self.auth_modal.update(cx, |modal, cx| modal.dismiss(cx));
+        }
+        viewer.read(cx).focus(window);
+        self.desktop_viewer = Some(viewer);
+        self.expanded_desktop = Some(artifact_id.to_string());
+        self.active_modal = ActiveModal::DesktopViewer;
+        cx.notify();
+    }
+
+    /// Creates a desktop environment, launches `argv` into it, and mounts it in
+    /// a chat card the way an agent's `desktop_artifact` would. Used by the
+    /// `--desktop` developer mode.
     pub fn open_desktop_command(
         &mut self,
         argv: Vec<String>,
@@ -679,7 +727,39 @@ impl ChatView {
             cx.notify();
             return;
         }
-        self.open_desktop_viewer(&env_id, window, cx);
+        let grant = env.issue_grant(
+            crate::desktop_viewer::SESSION_PRINCIPAL.to_string(),
+            vec![
+                juto_runtime::protocol::GrantRole::Owner,
+                juto_runtime::protocol::GrantRole::View,
+                juto_runtime::protocol::GrantRole::Control,
+            ],
+            "session".to_string(),
+            juto_runtime::MAX_GRANT_SECS,
+        );
+        let artifact = DesktopSessionArtifact {
+            version: juto_runtime::DESKTOP_SESSION_ARTIFACT_VERSION,
+            artifact_id: env_id.clone(),
+            title: format!(
+                "Developer desktop: {}",
+                std::path::Path::new(&argv[0])
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            ),
+            host_id: juto_runtime::host_identifier(),
+            environment_id: env_id,
+            grant_id: grant.grant_id,
+        };
+        self.messages.push(Message {
+            role: MessageRole::Assistant,
+            text: "Desktop started by `juto --desktop`.".into(),
+            attachments: Vec::new(),
+            desktop_artifacts: vec![artifact.clone()],
+            approval: None,
+            views: Vec::new(),
+        });
+        self.open_desktop_artifact(&artifact, window, cx);
     }
 
     pub fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -688,6 +768,7 @@ impl ChatView {
         }
         if self.active_modal == ActiveModal::DesktopViewer {
             self.desktop_viewer = None;
+            self.expanded_desktop = None;
         }
         self.active_modal = ActiveModal::None;
         self.focus_input(window, cx);
@@ -1340,6 +1421,14 @@ impl ChatView {
     fn message_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let messages = self.messages.clone();
         let actions = self.view_actions(cx);
+        let mut first_artifact_rows: HashMap<String, (usize, usize)> = HashMap::new();
+        for (index, message) in messages.iter().enumerate() {
+            for (art_idx, artifact) in message.desktop_artifacts.iter().enumerate() {
+                first_artifact_rows
+                    .entry(artifact.artifact_id.clone())
+                    .or_insert((index, art_idx));
+            }
+        }
         div()
             .id("messages")
             .flex_1()
@@ -1424,33 +1513,15 @@ impl ChatView {
                                     div().mt_3().flex().flex_col().gap_2().children(
                                         artifacts.into_iter().enumerate().map(
                                             |(art_idx, artifact)| {
-                                                let card_artifact = artifact.clone();
-                                                let click_artifact = artifact.clone();
-                                                let btn = div()
-                                                    .id((
-                                                        "open-desktop-btn",
-                                                        (index * 1000 + art_idx) as u32,
-                                                    ))
-                                                    .px_2p5()
-                                                    .py_1()
-                                                    .rounded_md()
-                                                    .bg(rgb(0x2563eb))
-                                                    .hover(|s| s.bg(rgb(0x1d4ed8)))
-                                                    .text_xs()
-                                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                                    .text_color(rgb(0xffffff))
-                                                    .cursor_pointer()
-                                                    .on_click(cx.listener(
-                                                        move |this, _: &ClickEvent, window, cx| {
-                                                            this.open_desktop_artifact(
-                                                                &click_artifact,
-                                                                window,
-                                                                cx,
-                                                            );
-                                                        },
-                                                    ))
-                                                    .child("Open Desktop ↗");
-                                                desktop_artifact_card(&card_artifact, btn)
+                                                let key = (index * 1000 + art_idx) as u32;
+                                                // A descriptor repeated in the transcript
+                                                // mounts its live viewer only once.
+                                                let live = first_artifact_rows
+                                                    .get(&artifact.artifact_id)
+                                                    == Some(&(index, art_idx));
+                                                self.desktop_artifact_entry(
+                                                    &artifact, key, live, cx,
+                                                )
                                             },
                                         ),
                                     ),
@@ -1463,6 +1534,75 @@ impl ChatView {
                             })
                     })),
             )
+    }
+
+    /// A desktop artifact card with its controls and, once opened, the live
+    /// viewer mounted inline. `live` is false for a repeated descriptor, which
+    /// points at the first card instead of mounting a second viewer.
+    fn desktop_artifact_entry(
+        &self,
+        artifact: &DesktopSessionArtifact,
+        key: u32,
+        live: bool,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let mounted = self.inline_desktops.get(&artifact.artifact_id).cloned();
+        let Some(viewer) = mounted.filter(|_| live) else {
+            let controls = if live {
+                let open = artifact.clone();
+                desktop_button(("open-desktop-btn", key), "Open desktop", true)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.open_desktop_artifact(&open, window, cx);
+                    }))
+                    .into_any_element()
+            } else {
+                div()
+                    .text_xs()
+                    .text_color(rgb(0x94a3b8))
+                    .child("Open it from the earlier card")
+                    .into_any_element()
+            };
+            return desktop_artifact_card(artifact, controls, None);
+        };
+
+        let expanded = self.expanded_desktop.as_deref() == Some(artifact.artifact_id.as_str());
+        let expand_id = artifact.artifact_id.clone();
+        let close_id = artifact.artifact_id.clone();
+        let controls = div()
+            .flex()
+            .gap_2()
+            .when(!expanded, |row| {
+                row.child(
+                    desktop_button(("expand-desktop-btn", key), "Expand", false).on_click(
+                        cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            this.expand_inline_desktop(&expand_id, window, cx);
+                        }),
+                    ),
+                )
+            })
+            .child(
+                desktop_button(("close-desktop-btn", key), "Close", false).on_click(cx.listener(
+                    move |this, _: &ClickEvent, window, cx| {
+                        this.close_inline_desktop(&close_id, window, cx);
+                    },
+                )),
+            );
+        let surface = if expanded {
+            div()
+                .h(px(72.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .bg(rgb(0x0f172a))
+                .text_xs()
+                .text_color(rgb(0x94a3b8))
+                .child("Showing in the expanded viewer")
+                .into_any_element()
+        } else {
+            div().w_full().h(px(420.)).child(viewer).into_any_element()
+        };
+        desktop_artifact_card(artifact, controls, Some(surface))
     }
 
     fn approval_card(&self, card: &ApprovalCard, cx: &Context<Self>) -> impl IntoElement {
@@ -1824,7 +1964,36 @@ impl ChatView {
                                 cx.stop_propagation();
                             }),
                         )
-                        .child(content),
+                        .when(self.active_modal == ActiveModal::DesktopViewer, |panel| {
+                            let label = if self.expanded_desktop.is_some() {
+                                "Back to chat"
+                            } else {
+                                "Close"
+                            };
+                            panel
+                                .w(px(900.))
+                                .h(px(660.))
+                                .p_3()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .rounded_lg()
+                                .bg(rgb(0x1f2023))
+                                .child(div().flex().justify_end().child(
+                                    desktop_button("desktop-modal-close", label, false).on_click(
+                                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                                            this.close_modal(window, cx);
+                                        }),
+                                    ),
+                                ))
+                        })
+                        .map(|panel| {
+                            if self.active_modal == ActiveModal::DesktopViewer {
+                                panel.child(div().flex_1().min_h_0().child(content))
+                            } else {
+                                panel.child(content)
+                            }
+                        }),
                 ),
         )
         .with_priority(10)
@@ -1876,13 +2045,28 @@ fn menu_item(
         .child(div().text_xs().text_color(rgb(0x909090)).child(detail))
 }
 
-fn desktop_artifact_card(artifact: &DesktopSessionArtifact, open_button: impl IntoElement) -> Div {
+/// A desktop artifact card. With `surface`, the card widens to the
+/// transcript and shows the live viewer (or its expanded placeholder) below
+/// the identifiers.
+fn desktop_artifact_card(
+    artifact: &DesktopSessionArtifact,
+    controls: impl IntoElement,
+    surface: Option<AnyElement>,
+) -> Div {
+    let live = surface.is_some();
     div()
         .flex()
         .flex_col()
+        .min_w_0()
         .gap_2()
         .p_3()
-        .max_w(px(460.))
+        .map(|card| {
+            if live {
+                card.w_full()
+            } else {
+                card.max_w(px(460.))
+            }
+        })
         .rounded_lg()
         .border_1()
         .border_color(rgb(0x3b82f6))
@@ -1898,11 +2082,20 @@ fn desktop_artifact_card(artifact: &DesktopSessionArtifact, open_button: impl In
                         .flex()
                         .items_center()
                         .gap_1p5()
+                        .min_w_0()
+                        .overflow_hidden()
                         .text_sm()
                         .font_weight(gpui::FontWeight::SEMIBOLD)
                         .text_color(rgb(0xf1f5f9))
                         .child("🖥️")
-                        .child(artifact.title.clone()),
+                        .child(
+                            div()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(artifact.title.clone()),
+                        ),
                 )
                 .child(
                     div()
@@ -1937,14 +2130,34 @@ fn desktop_artifact_card(artifact: &DesktopSessionArtifact, open_button: impl In
                 .pt_1()
                 .border_t_1()
                 .border_color(rgb(0x334155))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(0x94a3b8))
-                        .child("Remote Sharing Session (IDs-only)"),
-                )
-                .child(open_button),
+                .child(div().text_xs().text_color(rgb(0x94a3b8)).child(if live {
+                    "Live desktop: click to focus, then use mouse and keyboard"
+                } else {
+                    "Remote Sharing Session (IDs-only)"
+                }))
+                .child(controls),
         )
+        .children(surface)
+}
+
+/// Compact card/modal button; `primary` uses the accent fill.
+fn desktop_button(
+    id: impl Into<gpui::ElementId>,
+    label: &'static str,
+    primary: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .px_2p5()
+        .py_1()
+        .rounded_md()
+        .bg(rgb(if primary { 0x2563eb } else { 0x334155 }))
+        .hover(move |s| s.bg(rgb(if primary { 0x1d4ed8 } else { 0x475569 })))
+        .text_xs()
+        .font_weight(gpui::FontWeight::MEDIUM)
+        .text_color(rgb(0xffffff))
+        .cursor_pointer()
+        .child(label)
 }
 
 fn app_title() -> impl IntoElement {

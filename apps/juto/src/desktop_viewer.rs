@@ -13,7 +13,7 @@ use std::time::Duration;
 use gpui::{
     Bounds, Context, FocusHandle, KeyDownEvent, KeyUpEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, Pixels, Render, RenderImage, ScrollWheelEvent, Task,
-    Window, canvas, div, img, prelude::*, px, rgb,
+    Window, canvas, div, img, prelude::*, rgb,
 };
 use image::{Frame, ImageBuffer, Rgba};
 use juto_runtime::protocol::{InputBatch, InputEvent};
@@ -76,6 +76,11 @@ impl DesktopViewer {
         };
         viewer.start_polling(window, cx);
         viewer
+    }
+
+    /// Routes keyboard input to the desktop.
+    pub fn focus(&self, window: &mut Window) {
+        window.focus(&self.focus_handle);
     }
 
     fn start_polling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -297,8 +302,13 @@ impl Render for DesktopViewer {
         let has_control = self.has_control;
         let title = self.title.clone();
 
+        // The image is pinned to the surface box so a frame never grows the
+        // layout; `Contain` letterboxes it exactly as `fitted_geometry` assumes.
         let surface = match frame {
             Some(frame) => img(frame)
+                .absolute()
+                .top_0()
+                .left_0()
                 .size_full()
                 .object_fit(ObjectFit::Contain)
                 .into_any_element(),
@@ -397,6 +407,9 @@ impl Render for DesktopViewer {
                 }),
             )
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                // The desktop owns the wheel while the pointer is over it, so
+                // an inline viewer does not also scroll the chat transcript.
+                cx.stop_propagation();
                 let delta = event.delta.pixel_delta(window.line_height());
                 let dy = f32::from(delta.y);
                 if dy != 0.0 {
@@ -410,8 +423,6 @@ impl Render for DesktopViewer {
                 }
             }))
             .size_full()
-            .w(px(900.))
-            .h(px(620.))
             .flex()
             .flex_col()
             .gap_2()
@@ -420,10 +431,22 @@ impl Render for DesktopViewer {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .child(div().text_color(rgb(0xe8eaed)).child(title))
+                    .gap_2()
+                    .text_sm()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_color(rgb(0xe8eaed))
+                            .child(title),
+                    )
                     .child(
                         div()
                             .flex()
+                            .flex_none()
                             .gap_2()
                             .child(
                                 div()
@@ -461,8 +484,10 @@ impl Render for DesktopViewer {
             )
             .child(
                 div()
+                    .relative()
                     .flex_1()
                     .min_h_0()
+                    .overflow_hidden()
                     .bg(rgb(0x000000))
                     .child(
                         canvas(
@@ -476,10 +501,15 @@ impl Render for DesktopViewer {
                     )
                     .child(surface),
             )
-            .child(div().text_color(rgb(0x9aa0a6)).child(match &error {
-                Some(error) => format!("{status} — {error}"),
-                None => status,
-            }))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(rgb(0x9aa0a6))
+                    .child(match &error {
+                        Some(error) => format!("{status} — {error}"),
+                        None => status,
+                    }),
+            )
     }
 }
 

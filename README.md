@@ -208,14 +208,19 @@ The daemon serves a length-prefixed JSON control protocol over a private Unix
 socket (`Create`, `Launch`, `Describe`, `Observe`, `ConfigureOutput`, `Grant`,
 `Revoke`, `Control`, `Input`, `AutomationQuiesced`, `Destroy`, `Subscribe`).
 
-**Embedded viewer.** The `desktop_artifact` card's **Open Desktop ↗** resolves the
-environment through the runtime supervisor and opens a modal that renders
-composed frames from the environment's sealed shared-memory pool — no video
-codec on this path — and forwards pointer, scroll, and keyboard input to the
-virtual seat. The viewer letterboxes the frame, maps pointer coordinates to
-desktop pixels, holds a human control lease with a 2-second heartbeat, and
-reports connection state and errors instead of showing a stale frame as live.
-`juto --desktop <command> [args...]` opens the same viewer directly for
+**Embedded viewer.** A `desktop_artifact` card's **Open desktop** resolves the
+environment through the runtime supervisor and mounts a live viewer inside the
+card, in the chat transcript. The viewer renders composed frames from the
+environment's sealed shared-memory pool — no video codec on this path — and
+forwards pointer, scroll, and keyboard input to the virtual seat. Click the
+surface to focus it; the wheel scrolls the desktop rather than the chat while
+the pointer is over it. **Expand** moves the same viewer into a full-window
+modal and **Back to chat** returns it to its card, keeping its control lease;
+**Close** unmounts it so the desktop can go idle. The viewer letterboxes the
+frame, maps pointer coordinates to desktop pixels, holds a human control lease
+with a 2-second heartbeat, and reports connection state and errors instead of
+showing a stale frame as live. `juto --desktop <command> [args...]` creates a
+desktop, launches the command, and mounts it in a chat card the same way, for
 development.
 
 **Resize gating.** A resize publishes a new geometry generation and clears every
@@ -325,8 +330,10 @@ sessions in chat conversations via the `desktop_artifact` tool. Artifact descrip
 as IDs-only `DesktopSessionArtifact` records (`version`, `artifact_id`, `title`, `host_id`,
 `environment_id`, `grant_id`) without embedding bearer tokens, SDP payloads, or local paths.
 The chat view mounts typed desktop artifact cards with title, identifiers, and version badge.
-Clicking **Open Desktop ↗** resolves the environment through the runtime supervisor and opens
-the embedded viewer, or explicitly reports `Unavailable` when the environment does not exist.
+Clicking **Open desktop** resolves the environment through the runtime supervisor on every open
+and mounts the live viewer inline, or explicitly reports `Unavailable`, `Expired`, or another
+resolution error. A descriptor repeated later in the transcript points at the first card instead
+of mounting a second viewer.
 
 **Element trees in tool results.** A tool result may attach a declarative tree under
 `ToolOutput.details` as `{"type":"view","view":{tag, props, children}}`. The model-facing
@@ -616,11 +623,17 @@ scripts/agent-scope.sh -- nix develop .#smoke -c xvfb-run -a -s "-screen 0 1280x
 Observed: the `desktop` tool created an environment, launched `sleep` in a
 systemd scope, wrote a lossless PNG snapshot that begins with the PNG signature,
 reported one running application, issued a loopback viewer URL, and destroyed the
-environment. Under Xvfb/Mesa software Vulkan the `--desktop` mode opened the
-embedded viewer, which rendered the client's two-tone frame letterboxed inside
-the harness window (`live 1280x720`), and a click inside the surface acquired the
-human control lease (the button changed from **Take control** to **Renew
-control**) with no error reported.
+environment. Under Xvfb/Mesa software Vulkan the `--desktop` mode mounted the
+viewer inline in a chat card, which rendered the client's two-tone frame
+letterboxed (`live 1280x720`); a click inside the surface acquired the human
+control lease (**Take control** became **Renew control**) and reached the client
+as a pointer button press at the mapped surface coordinates. **Expand** showed
+the same viewer in the modal, **Back to chat** returned it to the card with the
+lease intact, and **Close** then **Open desktop** remounted a fresh viewer.
+
+GPUI draws on demand, so an Xvfb screenshot needs an input event (for example a
+`xdotool mousemove` over the window) shortly before `import`; otherwise the
+capture is black.
 
 The remote path is covered by an end-to-end WebRTC test and a browser smoke:
 
