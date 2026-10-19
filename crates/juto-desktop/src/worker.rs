@@ -724,6 +724,12 @@ fn accept_ready(
         .set_read_timeout(Some(Duration::from_secs(20)))
         .map_err(|e| DesktopError::Compositor(format!("worker socket: {e}")))?;
     let (payload, fd) = read_response_with_fd(&stream)?;
+    // The timeout bounds only the handshake. The event thread blocks on this
+    // stream for the environment's lifetime, including while it is idle or
+    // suspended, and a read timeout there would silently end event delivery.
+    stream
+        .set_read_timeout(None)
+        .map_err(|e| DesktopError::Compositor(format!("worker socket: {e}")))?;
     let response: WorkerResponse = serde_json::from_slice(&payload)
         .map_err(|e| DesktopError::Compositor(format!("worker handshake: {e}")))?;
     Ok((stream, response, fd))
