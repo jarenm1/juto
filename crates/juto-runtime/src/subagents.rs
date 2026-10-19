@@ -134,6 +134,10 @@ pub struct SubagentResult {
     pub stop_reason: StopReason,
     /// Path of the durable child session journal.
     pub session_path: PathBuf,
+    /// Change-graph node that keeps this run's isolated changes, when it made
+    /// any. Joined into the main workspace with `subagent_join`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
 }
 
 /// Lifecycle status of a spawned child.
@@ -336,7 +340,7 @@ pub enum SubagentEvent {
     Finished {
         id: String,
         status: SubagentStatus,
-        result: Option<SubagentResult>,
+        result: Option<Box<SubagentResult>>,
         error: Option<String>,
     },
 }
@@ -1369,7 +1373,7 @@ fn finish(
         });
     }
     let (result, error) = match &outcome {
-        Ok(result) => (Some(result.clone()), None),
+        Ok(result) => (Some(Box::new(result.clone())), None),
         Err(err) => (None, Some(err.clone())),
     };
     child.state.send_modify(|state| {
@@ -1501,6 +1505,7 @@ mod tests {
                         usage: Usage::default(),
                         stop_reason: StopReason::Stop,
                         session_path: PathBuf::from("/tmp/child.jsonl"),
+                        change_id: None,
                     }),
                     Err(_) => Err("gate closed".to_string()),
                 },
@@ -2163,6 +2168,7 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 session_path: PathBuf::from("/tmp/child.jsonl"),
+                change_id: None,
             })
         }
     }
@@ -2357,6 +2363,7 @@ mod tests {
                         usage: Usage::default(),
                         stop_reason: StopReason::Stop,
                         session_path: PathBuf::from("/tmp/child.jsonl"),
+                        change_id: None,
                     }),
                     Err(SubagentError::Timeout(msg)) => Err(format!("timeout: {msg}")),
                     Err(e) => Err(e.to_string()),
@@ -2529,6 +2536,7 @@ mod tests {
                     data: None,
                     usage: Usage::default(),
                     session_path: PathBuf::from("/tmp/test"),
+                    change_id: None,
                     stop_reason: StopReason::Stop,
                 })
             }
@@ -2576,6 +2584,7 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 session_path: PathBuf::from("/tmp/child.jsonl"),
+                change_id: None,
             })
         }
 
@@ -2667,6 +2676,7 @@ mod tests {
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
             session_path: PathBuf::from("/tmp/child.jsonl"),
+            change_id: None,
         }
     }
 
@@ -3291,6 +3301,7 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 session_path: session.path().to_path_buf(),
+                change_id: None,
             })
         }
     }
@@ -3428,6 +3439,7 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 session_path: PathBuf::from("/tmp/child.jsonl"),
+                change_id: None,
             })
         }
 

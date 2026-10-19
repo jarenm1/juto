@@ -205,12 +205,17 @@ Juto establishes strict workspace isolation:
    depend on `jj` being installed.
 2. **Execution**: The subagent executes all filesystem mutations, formatting, builds,
    and tests strictly inside that directory.
-3. **Integration**: Not wired into the subagent path. `finish_isolated_run` deletes the fork
-   directory and runs `ChangeGraph::gc` after every isolated run, success or failure, so an
-   isolated child's file edits do not reach the parent. Folding a verified builder checkpoint into
-   the parent with `ChangeGraph::join` (which merges trees into a two-parent node rather than
-   rebasing) is planned but not implemented; `join` runs only from the explicit `vcs` tool and
-   `juto-cli changes`.
+3. **Integration**: When an isolated run ends, the runtime keeps the fork's net changes as
+   the checkpoint `subagent/<id>` and only then removes the fork directory. Changes are
+   captured from the fork's files, so edits made by shell commands are kept too:
+   `ChangeGraph::capture_thread_changes` records them and `mark` names the node. A completed
+   turn sets `SubagentResult.change_id` to that node when the fork holds net changes. A failed
+   or cancelled run keeps its checkpoint only when it has changes, and its error names the
+   checkpoint. gc keeps every checkpoint, so kept changes survive until they are joined or
+   dropped. The main thread (depth 0 only) folds a checkpoint into its workspace with
+   `subagent_join`, which calls `ChangeGraph::join`: a clean merge writes a two-parent node, and
+   a conflict changes nothing and reports the paths. Uncaptured main-workspace edits block the
+   join. `subagent_drop` removes a checkpoint, after which gc may collect its changes.
 
 ### 4.2 Resource Governance (`agent-scope.sh` Model)
 To prevent parallel agents from exhausting host memory, CPU, or lock contention:
@@ -339,8 +344,9 @@ Follow-up turns: `SubagentManager::follow_up(id, prompt)` resumes a `Completed`
 child by reopening its recorded session and reusing its isolated workspace without
 re-provisioning. Queued, running, blocked, failed, and cancelled children reject
 follow-ups. A successful turn keeps its workspace so later turns share one fork; a
-failed turn is terminal and its fork is removed. Retained workspaces stay on disk
-until the main agent releases them with `subagent_release` (PR6, below).
+failed or cancelled turn is terminal and its fork is removed after its changes are kept as
+the checkpoint `subagent/<id>` (section 4.1). Retained workspaces stay on disk until the main
+agent releases them with `subagent_release` (PR6, below).
 
 PR3 adds a main mailbox. Children send messages to the main agent with
 `agent://main`, which lands in one in-memory inbox shared by the whole run tree.
@@ -378,7 +384,8 @@ VCS is visible only in focus mode.
 PR6 adds workspace release, which belongs to the main thread. `subagent_release` takes
 `{ "id" }` and is registered only for the main thread, so children never receive it.
 It calls `SubagentManager::release(id)`, which accepts only a terminal child: a running
-child is rejected with `NotTerminal` and its workspace is left alone. The fork is removed
+child is rejected with `NotTerminal` and its workspace is left alone. Otherwise its changes are
+kept as the checkpoint `subagent/<id>` (section 4.1), and the fork is removed
 through `SubagentWorkspace::cleanup`, which deletes only a directory carrying the
 `.juto-workspace.json` ownership marker. The removal runs on the blocking pool, so the
 async runtime and the GPUI foreground do not wait on disk I/O. On success the summary
@@ -518,7 +525,7 @@ implemented by a dedicated subagent concurrently, and validates against its own 
   and the `run_depth` and `TaskTool` code in `crates/juto-runtime/src/lib.rs`
 * **Implementation Details**:
   - `main` is top-level only. It has `read`, `glob`, `grep`, `task`, `wait`, `agent_send`,
-    `agent_cancel`, `agent_inbox`, `subagent_release`, and `view`. `parse_task` rejects `main` as a child agent.
+    `agent_cancel`, `agent_inbox`, `subagent_release`, `subagent_join`, `subagent_drop`, and `view`. `parse_task` rejects `main` as a child agent.
   - Built-in roles: `builder` (all tools), `scout` and `reviewer` (read-only), and `task` (all
     tools, the default). Frontmatter `tools` takes `all`, `read-only`, or a list; missing means
     read-only.

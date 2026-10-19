@@ -299,6 +299,7 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 session_path: session.path().to_path_buf(),
+                change_id: None,
             })
         }
     }

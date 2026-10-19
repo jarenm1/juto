@@ -49,7 +49,7 @@ are handled explicitly above. The mechanism is tested against a real `cargo chec
 sandbox.
 
 **Delegating role model.** The top-level `main` role has `read`, `glob`, `grep`, `task`, `wait`,
-`agent_send`, `agent_cancel`, `agent_inbox`, `subagent_release`, and `view`; it cannot edit files. Work runs in child agents defined as
+`agent_send`, `agent_cancel`, `agent_inbox`, `subagent_release`, `subagent_join`, `subagent_drop`, and `view`; it cannot edit files. Work runs in child agents defined as
 markdown roles in `crates/juto-runtime/src/roles/`: `builder` (all tools), `scout` and `reviewer`
 (read-only), and `task` (all tools, the default). A role's `tools` frontmatter takes `all`,
 `read-only`, or a list of tool names; a missing field means read-only. A `<role>.md` file in
@@ -60,9 +60,9 @@ delegation tools only below `max_recursion_depth` (default 2).
 Delegation runs through the Exec-tier `task` tool, so it requires `juto-cli --yes`
 (`ApprovalMode::Allow`) or an installed `ApprovalHandler`; in Ask mode with neither, `task` fails.
 Builders write to the shared working tree unless a call sets `isolated_workspace: true`, and
-concurrent builders on one tree can conflict. An isolated child's fork is deleted when its run
-finishes and its file edits are not folded back, so they never reach the parent; its returned
-result and session transcript are kept. Nothing folds subagent work back automatically.
+concurrent builders on one tree can conflict. When an isolated child's fork is removed, its net
+changes (shell edits included) are kept as the checkpoint `subagent/<id>`; the main thread folds
+them in with `subagent_join` or discards them with `subagent_drop`. Nothing is joined automatically.
 
 On the top-level thread, `task` does not block. It returns `queued` ids immediately, and each
 child's terminal result (completed, failed, or cancelled) reaches the running main turn as a

@@ -26,7 +26,7 @@ use std::{
 
 use parking_lot::{Mutex, RwLock};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use async_trait::async_trait;
 use futures::StreamExt;
 use juto_agent::{
@@ -93,7 +93,7 @@ pub use tools::{
 };
 pub use workspace::{GpuLockGuard, ResourceLimits, ScopedStdio, SubagentWorkspace, WorkspaceError};
 
-use crate::change_graph::{ChangeGraph, EditProvenance};
+use crate::change_graph::{ChangeGraph, EditProvenance, JoinOutcome};
 use crate::roles::{AgentRole, ToolScope};
 
 #[async_trait]
@@ -859,49 +859,95 @@ impl ChildFactory {
     }
 }
 
-/// Remove an isolated child's workspace after its run finishes.
-///
-/// Cleanup is best-effort and never masks the run's own outcome: a failed run
-/// keeps its error (with the cleanup failure appended), and a successful run
-/// keeps its result (with the cleanup failure reported on stderr).
-async fn finish_isolated_run(
-    result: Result<SubagentResult>,
-    workspace: Option<SubagentWorkspace>,
-) -> Result<SubagentResult> {
-    let Some(workspace) = workspace else {
-        return result;
-    };
-    let path = workspace.path.clone();
-    let cleanup = remove_isolated_workspace(workspace).await;
-    match cleanup {
-        Ok(()) => result,
-        Err(cleanup_error) => match result {
-            Ok(value) => {
-                eprintln!(
-                    "juto: failed to clean up isolated workspace {}: {cleanup_error}",
-                    path.display()
-                );
-                Ok(value)
-            }
-            Err(run_error) => Err(anyhow::anyhow!(
-                "{run_error:#}; isolated workspace cleanup also failed for {}: {cleanup_error}",
-                path.display()
-            )),
-        },
+/// Prefix of the checkpoints that keep isolated subagents' changes.
+const SUBAGENT_CHECKPOINT_PREFIX: &str = "subagent/";
+
+/// The checkpoint that keeps isolated subagent `subagent_id`'s changes.
+fn subagent_checkpoint_name(subagent_id: &str) -> String {
+    format!("{SUBAGENT_CHECKPOINT_PREFIX}{subagent_id}")
+}
+
+/// Provenance of changes recorded from an isolated subagent's fork.
+fn subagent_provenance(subagent_id: &str) -> EditProvenance {
+    EditProvenance {
+        session_id: subagent_id.to_owned(),
+        tool: "subagent".to_owned(),
+        selection_mode: None,
+        path: None,
     }
 }
 
-/// Remove an isolated workspace directory, then reclaim the change graph. The
-/// graph is reclaimed only after the directory is gone: the workspace head is
-/// stale by then, so gc drops it and any node only it kept alive.
-async fn remove_isolated_workspace(workspace: SubagentWorkspace) -> Result<(), WorkspaceError> {
+/// Keep the fork's net changes as its `subagent/<id>` checkpoint.
+///
+/// Returns the checkpoint's node, or `None` when the fork holds no net change.
+/// Changes made by any tool, shell commands included, are captured from the
+/// fork's files. A retried teardown replaces the checkpoint an earlier attempt
+/// made: that node is an ancestor of the new one, so nothing is lost.
+fn keep_isolated_changes(path: &Path, subagent_id: &str) -> Result<Option<String>> {
+    let graph = ChangeGraph::open(path)?;
+    let Some(node) = graph.capture_thread_changes(subagent_provenance(subagent_id))? else {
+        return Ok(None);
+    };
+    let name = subagent_checkpoint_name(subagent_id);
+    graph.drop_checkpoint(&name)?;
+    graph.mark(
+        &node.id,
+        &name,
+        &format!("isolated work of subagent {subagent_id}"),
+        false,
+    )?;
+    Ok(Some(node.id))
+}
+
+/// What reclaiming an isolated workspace did.
+struct Reclaimed {
+    /// Node of the `subagent/<id>` checkpoint, or `None` when the fork held no
+    /// net change.
+    checkpoint: Option<String>,
+    /// Why the directory was kept, when it could not be removed.
+    cleanup: Result<(), String>,
+}
+
+/// Keep an isolated fork's changes as its checkpoint, then remove the directory.
+///
+/// The changes are recorded before the directory goes. When they cannot be
+/// recorded, the directory is kept, so no edit is lost. Once the directory is
+/// gone, the fork's head is dropped and gc runs: the checkpoint now reaches the
+/// changes, so only the fork's bookkeeping is reclaimed.
+async fn reclaim_isolated_workspace(workspace: SubagentWorkspace) -> Reclaimed {
+    let path = workspace.path.clone();
     let repo_root = workspace.repo_root.clone();
-    let cleanup = workspace.cleanup().await;
+    let subagent_id = workspace.subagent_id.clone();
+    let kept = {
+        let path = path.clone();
+        let subagent_id = subagent_id.clone();
+        // Capture and mark touch the graph on disk, so they run off the async runtime.
+        tokio::task::spawn_blocking(move || keep_isolated_changes(&path, &subagent_id)).await
+    };
+    let checkpoint = match kept {
+        Ok(Ok(checkpoint)) => checkpoint,
+        Ok(Err(error)) => {
+            return Reclaimed {
+                checkpoint: None,
+                cleanup: Err(format!("could not keep its changes: {error:#}")),
+            };
+        }
+        Err(join) => {
+            return Reclaimed {
+                checkpoint: None,
+                cleanup: Err(format!("change capture task failed: {join}")),
+            };
+        }
+    };
+    let cleanup = workspace.cleanup().await.map_err(|error| error.to_string());
     if cleanup.is_ok() {
         // gc shells out to git, so it runs off the async runtime. Best-effort,
         // like the cleanup itself.
         match tokio::task::spawn_blocking(move || -> Result<()> {
-            ChangeGraph::open(&repo_root)?.gc().map(|_| ())
+            let graph = ChangeGraph::open(&repo_root)?;
+            graph.drop_head(&subagent_id)?;
+            graph.gc()?;
+            Ok(())
         })
         .await
         {
@@ -914,7 +960,93 @@ async fn remove_isolated_workspace(workspace: SubagentWorkspace) -> Result<(), W
             }
         }
     }
-    cleanup
+    Reclaimed {
+        checkpoint,
+        cleanup,
+    }
+}
+
+/// Settle one turn of an isolated child. A completed turn keeps its fork for
+/// follow-up turns and names its kept changes in `change_id`. A failed turn is
+/// terminal and reclaims its fork.
+async fn settle_isolated_turn(
+    result: Result<SubagentResult>,
+    workspace: Option<SubagentWorkspace>,
+) -> Result<SubagentResult> {
+    let Some(workspace) = workspace else {
+        return result;
+    };
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => return finish_isolated_run(Err(error), Some(workspace)).await,
+    };
+    let path = workspace.path.clone();
+    let subagent_id = workspace.subagent_id.clone();
+    let recorded = tokio::task::spawn_blocking(move || -> Result<Option<String>> {
+        let node =
+            ChangeGraph::open(&path)?.capture_thread_changes(subagent_provenance(&subagent_id))?;
+        Ok(node.map(|node| node.id))
+    })
+    .await;
+    match recorded {
+        Ok(Ok(change_id)) => Ok(SubagentResult { change_id, ..value }),
+        Ok(Err(error)) => finish_isolated_run(Err(error), Some(workspace)).await,
+        Err(join) => {
+            finish_isolated_run(
+                Err(anyhow::anyhow!("change capture task failed: {join}")),
+                Some(workspace),
+            )
+            .await
+        }
+    }
+}
+
+/// Finish a failed or released isolated run: reclaim its workspace, keeping
+/// its changes as the `subagent/<id>` checkpoint.
+///
+/// Reclaiming never masks the run's outcome. A failed run keeps its error and
+/// says where its changes went; a successful run keeps its result and reports a
+/// cleanup failure on stderr.
+async fn finish_isolated_run(
+    result: Result<SubagentResult>,
+    workspace: Option<SubagentWorkspace>,
+) -> Result<SubagentResult> {
+    let Some(workspace) = workspace else {
+        return result;
+    };
+    let path = workspace.path.clone();
+    let subagent_id = workspace.subagent_id.clone();
+    let reclaimed = reclaim_isolated_workspace(workspace).await;
+    match result {
+        Ok(mut value) => {
+            if let Some(change_id) = reclaimed.checkpoint {
+                value.change_id = Some(change_id);
+            }
+            if let Err(cleanup_error) = reclaimed.cleanup {
+                eprintln!(
+                    "juto: failed to clean up isolated workspace {}: {cleanup_error}",
+                    path.display()
+                );
+            }
+            Ok(value)
+        }
+        Err(run_error) => {
+            let mut message = format!("{run_error:#}");
+            if reclaimed.checkpoint.is_some() {
+                message.push_str(&format!(
+                    "; its changes are kept as checkpoint {}",
+                    subagent_checkpoint_name(&subagent_id)
+                ));
+            }
+            if let Err(cleanup_error) = reclaimed.cleanup {
+                message.push_str(&format!(
+                    "; isolated workspace cleanup also failed for {}: {cleanup_error}",
+                    path.display()
+                ));
+            }
+            Err(anyhow::anyhow!(message))
+        }
+    }
 }
 
 #[async_trait]
@@ -966,18 +1098,13 @@ impl subagents::SubagentFactory for ChildFactory {
                 .await?;
             turn_result(id, &session, outcome)
         }.await;
-        // The child runtime and session are dropped with the block above; only
-        // then may the fork be reclaimed. A completed turn keeps its workspace
-        // for follow-up turns; a failed turn is terminal, so its fork is
-        // removed like before.
+        // The child runtime and session are dropped above; only then may the
+        // fork be reclaimed. A completed turn keeps its fork for follow-up turns
+        // and names its kept changes; a failed turn is terminal and reclaims it.
         drop(runtime);
-        if result.is_ok() {
-            result.map_err(|error| error.to_string())
-        } else {
-            finish_isolated_run(result, workspace)
-                .await
-                .map_err(|error| error.to_string())
-        }
+        settle_isolated_turn(result, workspace)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn follow_up(
@@ -989,16 +1116,21 @@ impl subagents::SubagentFactory for ChildFactory {
         control: RunControl,
         events: mpsc::UnboundedSender<AgentEvent>,
     ) -> Result<SubagentResult, String> {
-        let runtime = if spec.isolated_workspace {
-            // The first turn provisioned this directory; attach to it without
-            // provisioning again so the whole thread shares one fork.
-            self.runtime_at(workspace_path_for(&self.runtime.inner.data_dir, id))
-                .await
-                .map_err(|e| e.to_string())?
-        } else {
-            self.runtime.clone()
-        };
+        // The first turn provisioned this directory. Every turn attaches to it,
+        // so the whole thread shares one fork. The handle is built up front so a
+        // failed turn can always reclaim the fork.
+        let workspace = spec.isolated_workspace.then(|| SubagentWorkspace {
+            path: workspace_path_for(&self.runtime.inner.data_dir, id),
+            node_id: String::new(),
+            thread: id.to_owned(),
+            repo_root: self.runtime.inner.cwd.clone(),
+            subagent_id: id.to_owned(),
+        });
         let result: Result<SubagentResult> = async {
+            let runtime = match &workspace {
+                Some(workspace) => self.runtime_at(workspace.path.clone()).await?,
+                None => self.runtime.clone(),
+            };
             let mut session = Session::open(session_path)?;
             // The journal already records the model chosen at spawn and the
             // schema instruction stays in history, so neither is re-applied;
@@ -1023,25 +1155,9 @@ impl subagents::SubagentFactory for ChildFactory {
             turn_result(id, &session, outcome)
         }
         .await;
-        drop(runtime);
-        if result.is_ok() {
-            result.map_err(|error| error.to_string())
-        } else {
-            // A failed follow-up is terminal like a failed first turn, so its
-            // fork is reclaimed too. Only path/repo_root/thread are read by
-            // cleanup (and verified against the marker), so a synthesized
-            // handle is sufficient.
-            let workspace = spec.isolated_workspace.then(|| SubagentWorkspace {
-                path: workspace_path_for(&self.runtime.inner.data_dir, id),
-                node_id: String::new(),
-                thread: id.to_owned(),
-                repo_root: self.runtime.inner.cwd.clone(),
-                subagent_id: id.to_owned(),
-            });
-            finish_isolated_run(result, workspace)
-                .await
-                .map_err(|error| error.to_string())
-        }
+        settle_isolated_turn(result, workspace)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     fn workspace_path(&self, id: &str, spec: &TaskSpec) -> Option<PathBuf> {
@@ -1066,9 +1182,7 @@ impl subagents::SubagentFactory for ChildFactory {
             repo_root: self.runtime.inner.cwd.clone(),
             subagent_id: id.to_owned(),
         };
-        remove_isolated_workspace(workspace)
-            .await
-            .map_err(|error| error.to_string())
+        reclaim_isolated_workspace(workspace).await.cleanup
     }
 }
 
@@ -1101,6 +1215,7 @@ fn turn_result(id: &str, session: &Session, outcome: RunOutcome) -> Result<Subag
         usage: outcome.usage,
         stop_reason: outcome.stop_reason,
         session_path: session.path().to_path_buf(),
+        change_id: None,
     })
 }
 
@@ -1128,6 +1243,8 @@ fn register_agent_tools(
         registry.register(Arc::new(SubagentReleaseTool {
             manager: manager.clone(),
         }))?;
+        registry.register(Arc::new(SubagentJoinTool))?;
+        registry.register(Arc::new(SubagentDropTool))?;
     }
     registry.register(Arc::new(CancelTool { manager }))?;
     Ok(())
@@ -1460,7 +1577,7 @@ impl Tool for SubagentReleaseTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "subagent_release".into(),
-            description: "Release a finished focus thread's isolated workspace. Afterwards its follow-up and transcript are refused. A running or queued thread cannot be released.".into(),
+            description: "Release a finished focus thread's isolated workspace. Afterwards its follow-up and transcript are refused. A running or queued thread cannot be released. Its changes stay kept as the checkpoint `subagent/<id>` until `subagent_join` takes them or `subagent_drop` removes them.".into(),
             parameters: json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}),
         }
     }
@@ -1473,6 +1590,110 @@ impl Tool for SubagentReleaseTool {
             .await
             .map_err(|error| error.to_string())?;
         Ok(ToolOutput::text("Workspace released."))
+    }
+}
+
+/// Joins an isolated subagent's kept changes into the main workspace.
+struct SubagentJoinTool;
+#[async_trait]
+impl Tool for SubagentJoinTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "subagent_join".into(),
+            description: "Join an isolated subagent's kept changes into the main workspace. `change` is its checkpoint `subagent/<id>` or the `change_id` from its result. The main workspace must have no uncaptured edits. A clean merge writes the combined tree into the workspace. A conflict changes nothing and lists the conflicting paths.".into(),
+            parameters: json!({"type":"object","properties":{"change":{"type":"string"}},"required":["change"],"additionalProperties":false}),
+        }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Write
+    }
+    async fn execute(&self, arguments: Value, ctx: ToolContext) -> Result<ToolOutput, String> {
+        let change = arguments["change"]
+            .as_str()
+            .ok_or("change required")?
+            .to_owned();
+        let text =
+            tokio::task::spawn_blocking(move || join_change(&ctx.cwd, &ctx.session_id, &change))
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| format!("{error:#}"))?;
+        Ok(ToolOutput::text(text))
+    }
+}
+
+/// Joins `change` (a checkpoint name or node id) into the main workspace at
+/// `cwd`. Uncaptured edits block the join: recording them would fold an
+/// unreviewed state into the merge base, so they must be captured or reverted
+/// first.
+fn join_change(cwd: &Path, session_id: &str, change: &str) -> Result<String> {
+    let graph = ChangeGraph::open(cwd)?;
+    let thread = graph.thread().unwrap_or("main").to_owned();
+    let dirty = graph.dirty_paths()?;
+    ensure!(
+        dirty.is_empty(),
+        "the main workspace has uncaptured edits ({}); capture or revert them before joining",
+        dirty.join(", ")
+    );
+    let provenance = EditProvenance {
+        session_id: session_id.to_owned(),
+        tool: "subagent_join".to_owned(),
+        selection_mode: None,
+        path: None,
+    };
+    let current = graph.capture(&thread, provenance, None)?;
+    match graph.join(&thread, &current.id, change)? {
+        JoinOutcome::Joined { node, base, .. } => Ok(format!(
+            "Joined {change} into the main workspace as {} (merge base {base}).",
+            node.id
+        )),
+        JoinOutcome::Conflicted { conflicts, .. } => bail!(
+            "{change} conflicts with the main workspace in {}; nothing was changed",
+            conflicts.join(", ")
+        ),
+    }
+}
+
+/// Drops a subagent's kept checkpoint so gc can reclaim its changes.
+struct SubagentDropTool;
+#[async_trait]
+impl Tool for SubagentDropTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "subagent_drop".into(),
+            description: "Drop a subagent's kept checkpoint `subagent/<id>` so its changes can be garbage-collected. Changes already joined into the main workspace are not affected.".into(),
+            parameters: json!({"type":"object","properties":{"checkpoint":{"type":"string"}},"required":["checkpoint"],"additionalProperties":false}),
+        }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Write
+    }
+    async fn execute(&self, arguments: Value, ctx: ToolContext) -> Result<ToolOutput, String> {
+        let checkpoint = arguments["checkpoint"]
+            .as_str()
+            .ok_or("checkpoint required")?
+            .to_owned();
+        if !checkpoint.starts_with(SUBAGENT_CHECKPOINT_PREFIX) {
+            return Err(format!(
+                "only subagent checkpoints ({SUBAGENT_CHECKPOINT_PREFIX}<id>) can be dropped, not {checkpoint}"
+            ));
+        }
+        let name = checkpoint.clone();
+        let pruned = tokio::task::spawn_blocking(move || -> Result<Option<usize>> {
+            let graph = ChangeGraph::open(&ctx.cwd)?;
+            if !graph.drop_checkpoint(&name)? {
+                return Ok(None);
+            }
+            Ok(Some(graph.gc()?.pruned_nodes))
+        })
+        .await
+        .map_err(|error| error.to_string())?
+        .map_err(|error| format!("{error:#}"))?;
+        match pruned {
+            Some(count) => Ok(ToolOutput::text(format!(
+                "Dropped {checkpoint}; garbage collection pruned {count} unreachable node(s)."
+            ))),
+            None => Err(format!("no checkpoint named {checkpoint}")),
+        }
     }
 }
 
@@ -1702,6 +1923,7 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 session_path: PathBuf::from("/tmp/session"),
+                change_id: None,
             }),
             Some(workspace),
         )
@@ -1747,6 +1969,7 @@ mod tests {
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
                 session_path: PathBuf::from("/tmp/session"),
+                change_id: None,
             }),
             Some(workspace),
         )
@@ -1765,6 +1988,260 @@ mod tests {
                 .contains_key(&key),
             "a finished run must reclaim the stale workspace head"
         );
+    }
+
+    fn main_context(repo: &Path) -> ToolContext {
+        ToolContext {
+            cwd: repo.to_path_buf(),
+            session_id: "main".to_string(),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    fn output_text(output: &ToolOutput) -> String {
+        output
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Runs the registered `subagent_join` tool against the main workspace.
+    async fn join_via_tool(repo: &Path, change: &str) -> Result<String, String> {
+        SubagentJoinTool
+            .execute(serde_json::json!({ "change": change }), main_context(repo))
+            .await
+            .map(|output| output_text(&output))
+    }
+
+    /// Runs the registered `subagent_drop` tool against the main workspace.
+    async fn drop_via_tool(repo: &Path, checkpoint: &str) -> Result<String, String> {
+        SubagentDropTool
+            .execute(
+                serde_json::json!({ "checkpoint": checkpoint }),
+                main_context(repo),
+            )
+            .await
+            .map(|output| output_text(&output))
+    }
+
+    fn checkpoints_of(repo: &Path) -> std::collections::BTreeMap<String, String> {
+        ChangeGraph::open(repo)
+            .expect("open graph")
+            .state()
+            .expect("state")
+            .checkpoints
+    }
+
+    fn completed_run(id: &str) -> SubagentResult {
+        SubagentResult {
+            id: id.to_string(),
+            output: "done".to_string(),
+            data: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            session_path: PathBuf::from("/tmp/session"),
+            change_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_builder_edit_survives_release_as_a_checkpoint_and_joins_main() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(WritingBuilder::new(data_dir.clone()));
+        let config = RuntimeConfig {
+            approval_mode: ApprovalMode::Allow,
+            ..mock_config()
+        };
+        let runtime = runtime_with(&repo, &data_dir, config, provider.clone());
+
+        let control = RunControl::new();
+        let manager = runtime.subagent_manager(&control);
+        let mut spec = TaskSpec::new("write built.txt");
+        spec.agent = Some("builder".to_string());
+        spec.isolated_workspace = true;
+        let id = manager.spawn(spec).expect("spawn builder");
+        let result = manager.wait(&id).await.expect("builder run");
+        let change = result
+            .change_id
+            .clone()
+            .expect("a finished builder reports the change its fork holds");
+
+        manager
+            .release(&id)
+            .await
+            .expect("release builder workspace");
+        let checkpoint = format!("subagent/{id}");
+        assert_eq!(
+            checkpoints_of(&repo).get(&checkpoint),
+            Some(&change),
+            "release must keep the builder's changes as a checkpoint"
+        );
+        assert!(
+            !repo.join("built.txt").exists(),
+            "keeping a checkpoint must not write into the main workspace"
+        );
+
+        join_via_tool(&repo, &checkpoint)
+            .await
+            .expect("joining the checkpoint succeeds");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("built.txt")).expect("joined file"),
+            "from builder"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_keeps_its_uncaptured_edits_as_a_joinable_checkpoint() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let workspace = provision_workspace(&repo, &data_dir, "failed-edit").await;
+        let workspace_dir = workspace.path.clone();
+        // A shell command edits the fork directly; no change-graph tool records it.
+        std::fs::write(workspace_dir.join("from-shell.txt"), "from shell\n").expect("shell edit");
+
+        let error = finish_isolated_run(
+            Err(anyhow::anyhow!("model stream dropped")),
+            Some(workspace),
+        )
+        .await
+        .expect_err("a failed run must still fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("model stream dropped"), "{message}");
+        assert!(
+            message.contains("; its changes are kept as checkpoint subagent/failed-edit"),
+            "the error must name the kept checkpoint: {message}"
+        );
+        assert!(!workspace_dir.exists(), "the failed fork is still removed");
+        assert!(checkpoints_of(&repo).contains_key("subagent/failed-edit"));
+
+        join_via_tool(&repo, "subagent/failed-edit")
+            .await
+            .expect("joining the kept checkpoint succeeds");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("from-shell.txt")).expect("joined file"),
+            "from shell\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_without_changes_keeps_no_checkpoint() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let workspace = provision_workspace(&repo, &data_dir, "idle-failure").await;
+
+        let error = finish_isolated_run(
+            Err(anyhow::anyhow!("model stream dropped")),
+            Some(workspace),
+        )
+        .await
+        .expect_err("a failed run must still fail");
+        let message = format!("{error:#}");
+        assert!(message.contains("model stream dropped"), "{message}");
+        assert!(
+            !message.contains("checkpoint"),
+            "nothing was kept, so the error must not name one: {message}"
+        );
+        assert!(!checkpoints_of(&repo).contains_key("subagent/idle-failure"));
+    }
+
+    #[tokio::test]
+    async fn a_conflicting_join_changes_nothing() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let workspace = provision_workspace(&repo, &data_dir, "clashing-child").await;
+        std::fs::write(workspace.path.join("README.md"), "# From child\n").expect("child edit");
+        finish_isolated_run(Ok(completed_run("clashing-child")), Some(workspace))
+            .await
+            .expect("run result");
+
+        // The main workspace changes the same file and captures it, so the join conflicts.
+        std::fs::write(repo.join("README.md"), "# From main\n").expect("main edit");
+        let graph = ChangeGraph::open(&repo).expect("open graph");
+        graph
+            .capture(
+                "main",
+                EditProvenance {
+                    session_id: "runtime-test".to_string(),
+                    tool: "write".to_string(),
+                    selection_mode: None,
+                    path: None,
+                },
+                None,
+            )
+            .expect("capture main edit");
+        let heads_before = graph.state().expect("state").heads;
+
+        let error = join_via_tool(&repo, "subagent/clashing-child")
+            .await
+            .expect_err("a conflicting join must be refused");
+        assert!(error.contains("README.md"), "{error}");
+        assert!(error.contains("nothing was changed"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).expect("main file"),
+            "# From main\n",
+            "a refused join must not touch the main workspace"
+        );
+        assert_eq!(
+            ChangeGraph::open(&repo)
+                .expect("reopen graph")
+                .state()
+                .expect("state")
+                .heads,
+            heads_before,
+            "a refused join must not move any head"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_checkpoint_lets_gc_collect_its_changes() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let workspace = provision_workspace(&repo, &data_dir, "dropped-child").await;
+        std::fs::write(workspace.path.join("dropped.txt"), "unwanted\n").expect("child edit");
+        let result = finish_isolated_run(Ok(completed_run("dropped-child")), Some(workspace))
+            .await
+            .expect("run result");
+        let change = result.change_id.expect("the kept change is reported");
+        let checkpoint = "subagent/dropped-child";
+        assert!(checkpoints_of(&repo).contains_key(checkpoint));
+
+        let text = drop_via_tool(&repo, checkpoint)
+            .await
+            .expect("drop checkpoint");
+        assert!(text.contains("Dropped subagent/dropped-child"), "{text}");
+        assert!(!checkpoints_of(&repo).contains_key(checkpoint));
+        let state = ChangeGraph::open(&repo)
+            .expect("open graph")
+            .state()
+            .expect("state");
+        assert!(
+            !state.nodes.iter().any(|node| node.id == change),
+            "gc must collect the dropped checkpoint's change"
+        );
+
+        let error = drop_via_tool(&repo, checkpoint)
+            .await
+            .expect_err("a second drop finds nothing");
+        assert!(error.contains("no checkpoint named"), "{error}");
+        let error = drop_via_tool(&repo, "main")
+            .await
+            .expect_err("only subagent checkpoints may be dropped");
+        assert!(error.contains("only subagent checkpoints"), "{error}");
     }
 
     /// Streams a distinct text reply per call and records every user prompt it
@@ -2011,6 +2488,8 @@ mod tests {
                 "agent_cancel",
                 "agent_inbox",
                 "subagent_release",
+                "subagent_join",
+                "subagent_drop",
             ])]
         );
     }
@@ -2320,6 +2799,7 @@ mod tests {
                     usage: Usage::default(),
                     stop_reason: StopReason::Stop,
                     session_path: PathBuf::from("/tmp/child.jsonl"),
+                    change_id: None,
                 })
             }
         }
