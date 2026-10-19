@@ -18,7 +18,7 @@ use gpui::{
     App, ClickEvent, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Render,
     ScrollHandle, SharedString, Subscription, Window, actions, div, prelude::*, px, rgb,
 };
-use juto_runtime::subagents::{BlockerReason, SubagentStatus, SubagentSummary};
+use juto_runtime::subagents::{BlockerReason, MainMessage, SubagentStatus, SubagentSummary};
 use juto_runtime::{ThreadInfo, ThreadStatus};
 
 use crate::task_card::{
@@ -71,6 +71,7 @@ pub enum SidebarEvent {
     ResumeTask { id: String, resolution: String },
     AbortTask(String),
     SteerTask { id: String, guidance: String },
+    DismissInbox(MainMessage),
     Close,
 }
 
@@ -86,7 +87,7 @@ pub struct Sidebar {
     /// Live row views by task id, with the subscription forwarding their events.
     cards: HashMap<String, (Entity<TaskCard>, Subscription)>,
     threads: ThreadList,
-    inbox: Option<juto_runtime::subagents::MainInbox>,
+    inbox: Vec<MainMessage>,
 }
 
 /// The main session's internal threads, in creation order.
@@ -112,32 +113,18 @@ impl Sidebar {
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
-            inbox: None,
+            inbox: Vec::new(),
         }
     }
 
-    /// Shows the session inbox. A push from any child re-renders the sidebar
-    /// even when no subagent lifecycle event arrives; the watcher ends with the sidebar.
-    pub fn set_inbox(&mut self, inbox: juto_runtime::subagents::MainInbox, cx: &mut Context<Self>) {
-        let watched = inbox.clone();
-        self.inbox = Some(inbox);
-        cx.spawn(async move |this, cx| {
-            loop {
-                watched.user_changed().await;
-                if this.update(cx, |_, cx| cx.notify()).is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
+    /// Shows the session inbox as the daemon last reported it.
+    pub fn set_inbox(&mut self, inbox: Vec<MainMessage>, cx: &mut Context<Self>) {
+        self.inbox = inbox;
+        cx.notify();
     }
 
     fn render_inbox(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let messages = self
-            .inbox
-            .as_ref()
-            .map(|inbox| inbox.user_messages())
-            .unwrap_or_default();
+        let messages = self.inbox.clone();
         div()
             .flex()
             .flex_col()
@@ -167,13 +154,8 @@ impl Sidebar {
                             .cursor_pointer()
                             .text_xs()
                             .child("Dismiss")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(inbox) = &this.inbox
-                                    && let Err(error) = inbox.dismiss_user_message(&dismiss)
-                                {
-                                    this.error_message = Some(error.to_string().into());
-                                }
-                                cx.notify();
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.emit(SidebarEvent::DismissInbox(dismiss.clone()));
                             })),
                     )
             }))
@@ -860,7 +842,7 @@ mod tests {
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
-            inbox: None,
+            inbox: Vec::new(),
         };
 
         let (total, active, blocked, done) = sidebar.filter_counts();
@@ -896,7 +878,7 @@ mod tests {
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
-            inbox: None,
+            inbox: Vec::new(),
         };
 
         // Truthful initial empty state
@@ -1019,7 +1001,7 @@ mod tests {
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
-            inbox: None,
+            inbox: Vec::new(),
         };
 
         assert!(sidebar.error_message.is_none());
@@ -1045,7 +1027,7 @@ mod tests {
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
-            inbox: None,
+            inbox: Vec::new(),
         };
         let summary = |id: &str, focus: bool| SubagentSummary {
             id: id.into(),
@@ -1091,7 +1073,7 @@ mod tests {
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
-            inbox: None,
+            inbox: Vec::new(),
         };
         let summary = SubagentSummary {
             id: "focus-1".into(),

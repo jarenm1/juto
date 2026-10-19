@@ -2,15 +2,15 @@
 //! VCS panel rooted at its workspace.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
+use crate::chat_request::call;
 use gpui::{
     ClickEvent, Context, Entity, EventEmitter, IntoElement, Render, ScrollHandle, SharedString,
     Subscription, Task, Window, div, prelude::*, px, rgb,
 };
-use juto_runtime::Runtime;
-use juto_runtime::subagents::{ChildState, SubagentManager, SubagentStatus, SubagentSummary};
-use tokio::sync::watch;
+use juto_daemon::client::Client;
+use juto_daemon::protocol::{Reply, Request, SubagentCommand};
+use juto_runtime::subagents::{SubagentStatus, SubagentSummary};
 
 use crate::chat::{
     DesktopCanvas, Message, MessageRole, canvas_body, desktop_artifact_card, mount_canvases,
@@ -165,8 +165,8 @@ pub enum FocusEvent {
 pub struct FocusView {
     state: FocusState<Entity<VcsSidebar>>,
     title: SharedString,
-    subagents: Arc<SubagentManager>,
-    runtime: Runtime,
+    client: Client,
+    tokio_handle: tokio::runtime::Handle,
     desktop_canvases: HashMap<String, DesktopCanvas>,
     input: Entity<ChatInput>,
     transcript_scroll: ScrollHandle,
@@ -178,43 +178,60 @@ pub struct FocusView {
 impl EventEmitter<FocusEvent> for FocusView {}
 
 impl FocusView {
-    /// `updates` is the child's state stream. The view reacts to each change event,
-    /// with no polling. Dropping the view cancels the stream task.
+    /// Subscribes to daemon state changes; reconnects reload the authoritative list.
     pub fn new(
         summary: SubagentSummary,
-        mut updates: watch::Receiver<ChildState>,
-        subagents: Arc<SubagentManager>,
-        runtime: Runtime,
+        client: Client,
         tokio_handle: tokio::runtime::Handle,
         cx: &mut Context<Self>,
     ) -> Self {
-        let status = updates.borrow().status.clone();
+        let status = summary.status.clone();
         let vcs = summary
             .workspace
-            .map(|workspace| cx.new(|cx| VcsSidebar::new(workspace, tokio_handle, cx)));
+            .clone()
+            .map(|workspace| cx.new(|cx| VcsSidebar::new(workspace, tokio_handle.clone(), cx)));
         let input = cx.new(ChatInput::new);
         let input_subscription = cx.subscribe(&input, |this, _, _: &SubmitMessage, cx| {
             this.submit_follow_up(cx);
         });
+        let mut notifications = client.subscribe();
+        let updates_client = client.clone();
+        let updates_handle = tokio_handle.clone();
+        let thread_id = summary.id.clone();
         let updates_task = cx.spawn(async move |this, cx| {
             loop {
-                let child = updates.borrow_and_update().clone();
-                if this
-                    .update(cx, |this, cx| this.apply_child_state(child, cx))
-                    .is_err()
+                let result = call(
+                    updates_client.clone(),
+                    updates_handle.clone(),
+                    Request::ListSubagents,
+                )
+                .await;
+                if let Ok(Reply::Subagents(children)) = result
+                    && let Some(child) = children.into_iter().find(|child| child.id == thread_id)
+                    && this
+                        .update(cx, |this, cx| this.apply_summary(child, cx))
+                        .is_err()
                 {
                     break;
                 }
-                if updates.changed().await.is_err() {
-                    break;
+                loop {
+                    match notifications.recv().await {
+                        Ok(juto_daemon::client::Notification::Event(
+                            juto_daemon::protocol::ServerEvent::Subagent { .. },
+                        ))
+                        | Ok(juto_daemon::client::Notification::Connected(_))
+                        | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        _ => {}
+                    }
                 }
             }
         });
         Self {
             state: FocusState::enter(summary.id, status, vcs, summary.released, summary.focus),
             title: summary.name.unwrap_or(summary.task).into(),
-            subagents,
-            runtime,
+            client,
+            tokio_handle,
             desktop_canvases: HashMap::new(),
             input,
             transcript_scroll: ScrollHandle::new(),
@@ -224,7 +241,8 @@ impl FocusView {
         }
     }
 
-    fn apply_child_state(&mut self, child: ChildState, cx: &mut Context<Self>) {
+    fn apply_summary(&mut self, child: SubagentSummary, cx: &mut Context<Self>) {
+        self.state.released = child.released;
         self.state.set_status(child.status);
         if let Some(token) = self.state.begin_transcript_load() {
             self.load_transcript(token, cx);
@@ -235,17 +253,21 @@ impl FocusView {
     /// Reads the child's session on the background executor, then converts the
     /// messages on the foreground.
     fn load_transcript(&self, token: u64, cx: &mut Context<Self>) {
-        let subagents = Arc::clone(&self.subagents);
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
         let thread_id = self.state.thread_id().to_owned();
         cx.spawn(async move |this, cx| {
-            let transcript = cx
-                .background_executor()
-                .spawn(async move {
-                    subagents
-                        .transcript(&thread_id)
-                        .map_err(|err| err.to_string())
-                })
-                .await;
+            let transcript = match call(
+                client,
+                handle,
+                Request::SubagentTranscript { id: thread_id },
+            )
+            .await
+            {
+                Ok(Reply::Transcript(messages)) => Ok(messages),
+                Ok(_) => Err("Unexpected daemon transcript response".to_owned()),
+                Err(error) => Err(error.to_string()),
+            };
             this.update(cx, |this, cx| {
                 let transcript = transcript.map(|messages| view_messages(&messages));
                 if this.state.apply_transcript(token, transcript) {
@@ -263,18 +285,31 @@ impl FocusView {
             return;
         }
         let prompt = self.input.read(cx).text();
-        match self
-            .subagents
-            .follow_up_from_user(self.state.thread_id(), prompt.to_string())
-        {
-            Ok(()) => {
-                self.input.update(cx, |input, cx| {
-                    input.take_text(cx);
-                });
-                self.error = None;
-            }
-            Err(err) => self.error = Some(format!("Follow-up rejected: {err}").into()),
-        }
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        let request = Request::SubagentCommand {
+            id: self.state.thread_id().to_owned(),
+            command: SubagentCommand::FollowUp {
+                text: prompt.to_string(),
+            },
+        };
+        cx.spawn(async move |this, cx| {
+            let result = call(client, handle, request).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(_) => {
+                        this.input.update(cx, |input, cx| {
+                            input.take_text(cx);
+                        });
+                        this.error = None;
+                    }
+                    Err(error) => this.error = Some(format!("Follow-up rejected: {error}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -325,8 +360,11 @@ impl FocusView {
             Err(_) => &[],
         };
         mount_canvases(
+            cx.entity().downgrade(),
+            |view| &mut view.desktop_canvases,
             &mut self.desktop_canvases,
-            &self.runtime,
+            &self.client,
+            &self.tokio_handle,
             messages,
             window,
             cx,
@@ -480,7 +518,6 @@ fn render_message(
     let author = match message.role {
         MessageRole::User => "You",
         MessageRole::Assistant => "Assistant",
-        MessageRole::Thread => "Thread",
     };
     div()
         .flex()

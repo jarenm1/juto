@@ -1,17 +1,19 @@
-//! Provider-first login with grouped authentication methods and background
-//! credential I/O. Backend credential namespaces remain independent.
+//! Provider-first login with grouped authentication methods. Credential storage
+//! and OAuth execution belong exclusively to the daemon.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
 
 use gpui::{
     App, ClickEvent, Context, Entity, FocusHandle, Focusable, KeyBinding, ScrollHandle,
     SharedString, Subscription, Task, Window, actions, div, prelude::*, px, rgb,
 };
 use juto_ai::{CredentialKind, CredentialSummary};
-use juto_runtime::Runtime;
-use tokio_util::sync::CancellationToken;
+use juto_catalog::Model;
+use juto_daemon::client::{Client, ClientError, Notification};
+use juto_daemon::protocol::{LoginEvent, Reply, Request, ServerEvent};
+use tokio::sync::broadcast::error::RecvError;
 
+use crate::chat_request::call;
 use crate::text_input::TextInput;
 
 actions!(auth_modal, [CloseAuthModal]);
@@ -310,9 +312,47 @@ pub const PROVIDERS: &[ProviderDefinition] = &[
     },
 ];
 
+/// Providers that have at least one chat, tiny, or judge model in the catalog.
+fn providers_with_models(models: &[Model]) -> Vec<&'static ProviderDefinition> {
+    // Providers surface when the catalog carries rows they can serve, so
+    // login can be configured for every transport juto ships. TypeSafe
+    // ships only judge-kind rows, so judge rows count too.
+    let supported: BTreeSet<&str> = models
+        .iter()
+        .filter(|model| matches!(model.kind.as_str(), "chat" | "tiny" | "judge"))
+        .map(|model| model.provider.as_str())
+        .collect();
+    PROVIDERS
+        .iter()
+        .filter(|provider| {
+            provider
+                .methods
+                .iter()
+                .any(|method| supported.contains(method.backend_id))
+        })
+        .collect()
+}
+
+/// The login a `LoginEvent` belongs to.
+fn login_event_id(event: &LoginEvent) -> u64 {
+    match event {
+        LoginEvent::Url { login_id, .. } | LoginEvent::Finished { login_id, .. } => *login_id,
+    }
+}
+
+/// A sign-in the daemon is running for one backend.
+struct OAuthLogin {
+    backend_id: String,
+    name: String,
+    /// Set once `LoginStart` is answered; events for other logins are ignored.
+    login_id: Option<u64>,
+    /// Login events that arrived before `LoginStart` was answered.
+    early_events: Vec<LoginEvent>,
+}
+
 pub struct AuthModal {
     focus_handle: FocusHandle,
-    runtime: Runtime,
+    client: Client,
     tokio_handle: tokio::runtime::Handle,
     providers: Vec<&'static ProviderDefinition>,
     search_input: Entity<TextInput>,
@@ -321,30 +361,23 @@ pub struct AuthModal {
     selected_method_id: String,
     status_cache: CachedAuthStatus,
     status_message: Option<(SharedString, bool)>,
-    in_flight_oauth: Option<String>,
+    oauth: Option<OAuthLogin>,
     in_flight_mutation: bool,
     oauth_task: Option<Task<()>>,
     refresh_task: Option<Task<()>>,
+    models_task: Option<Task<()>>,
     mutation_task: Option<Task<()>>,
-    cancel_token: Option<CancellationToken>,
     scroll_handle: ScrollHandle,
     sidebar_scroll_handle: ScrollHandle,
     _subscriptions: Vec<Subscription>,
+    _notifications_task: Task<()>,
 }
 
 impl gpui::EventEmitter<AuthModalEvent> for AuthModal {}
 
-impl Drop for AuthModal {
-    fn drop(&mut self) {
-        if let Some(cancel) = self.cancel_token.take() {
-            cancel.cancel();
-        }
-    }
-}
-
 impl AuthModal {
     pub fn new(
-        runtime: Runtime,
+        client: Client,
         tokio_handle: tokio::runtime::Handle,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -357,89 +390,130 @@ impl AuthModal {
         });
 
         let obs_search = cx.observe(&search_input, |_, _, cx| cx.notify());
-        // Providers surface when the catalog carries rows they can serve, so
-        // login can be configured for every transport juto ships. TypeSafe
-        // ships only judge-kind rows, so judge rows count too.
-        let supported: BTreeSet<&str> = runtime
-            .catalog()
-            .iter()
-            .filter(|model| matches!(model.kind.as_str(), "chat" | "tiny" | "judge"))
-            .map(|model| model.provider.as_str())
-            .collect();
-        let providers = PROVIDERS
-            .iter()
-            .filter(|provider| {
-                provider
-                    .methods
-                    .iter()
-                    .any(|method| supported.contains(method.backend_id))
-            })
-            .collect();
+        let mut notifications = client.subscribe();
+        let notifications_task = cx.spawn(async move |this, cx| {
+            loop {
+                let notification = match notifications.recv().await {
+                    Ok(notification) => notification,
+                    Err(RecvError::Lagged(_)) => {
+                        if this
+                            .update(cx, |this, cx| {
+                                // Login events are not replayed. Cancel rather than leave
+                                // a sign-in waiting forever for a missed terminal event.
+                                this.cancel_oauth_flow(cx);
+                                this.refresh_credentials(cx);
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(RecvError::Closed) => break,
+                };
+                if this
+                    .update(cx, |this, cx| this.handle_notification(notification, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
 
         let mut modal = Self {
             focus_handle: cx.focus_handle(),
-            runtime,
+            client,
             tokio_handle,
-            providers,
+            providers: Vec::new(),
             search_input,
             api_key_input,
             selected_provider_id: "openai".to_string(),
             selected_method_id: "openai-codex-oauth".to_string(),
             status_cache: CachedAuthStatus::default(),
             status_message: None,
-            in_flight_oauth: None,
+            oauth: None,
             in_flight_mutation: false,
             oauth_task: None,
             refresh_task: None,
+            models_task: None,
             mutation_task: None,
-            cancel_token: None,
             scroll_handle: ScrollHandle::new(),
             sidebar_scroll_handle: ScrollHandle::new(),
             _subscriptions: vec![obs_search],
+            _notifications_task: notifications_task,
         };
 
+        modal.refresh_models(cx);
         modal.refresh_credentials(cx);
         modal
     }
 
-    /// Refresh credential status off the GPUI thread.
+    /// Refresh credential status from the daemon.
     ///
-    /// Reads redacted stored summaries and the environment cascade using
-    /// `spawn_blocking`, then updates the UI cache.
+    /// The daemon returns redacted stored summaries and the environment
+    /// cascade; the UI cache is replaced when the reply arrives.
     pub fn refresh_credentials(&mut self, cx: &mut Context<Self>) {
-        let credentials = self.runtime.credentials();
-        let tokio_handle = self.tokio_handle.clone();
         self.status_cache = CachedAuthStatus::default();
-        let load_task = tokio_handle.spawn_blocking(move || {
-            let summaries = credentials.list()?;
-            let available =
-                credentials.available_providers(PROVIDERS.iter().flat_map(|provider| {
-                    provider.methods.iter().map(|method| method.backend_id)
-                }))?;
-            Ok::<_, juto_ai::AuthError>((summaries, available))
-        });
-
+        let providers = PROVIDERS
+            .iter()
+            .flat_map(|provider| provider.methods.iter())
+            .map(|method| method.backend_id.to_string())
+            .collect();
+        let client = self.client.clone();
+        let tokio_handle = self.tokio_handle.clone();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
-            let result = load_task.await;
-            let _ = this.update(cx, |this, cx| {
+            let result = call(
+                client,
+                tokio_handle,
+                Request::CredentialStatus { providers },
+            )
+            .await;
+            this.update(cx, |this, cx| {
                 this.status_cache.loaded = true;
                 match result {
-                    Ok(Ok((summaries, available))) => {
-                        this.status_cache.stored_summaries = summaries;
-                        this.status_cache.available_backends = available;
+                    Ok(Reply::Credentials(status)) => {
+                        this.status_cache.stored_summaries = status.summaries;
+                        this.status_cache.available_backends =
+                            status.available.into_iter().collect();
                     }
-                    Ok(Err(error)) => {
+                    Ok(_) => {
                         this.status_message =
-                            Some((format!("Could not read credentials: {error}").into(), true));
+                            Some(("Unexpected daemon reply to credential status".into(), true));
                     }
                     Err(error) => {
                         this.status_message =
-                            Some((format!("Credential lookup failed: {error}").into(), true));
+                            Some((format!("Could not read credentials: {error}").into(), true));
                     }
                 }
                 this.refresh_task = None;
                 cx.notify();
-            });
+            })
+            .ok();
+        }));
+    }
+
+    /// Load the provider list from the daemon's model catalog.
+    fn refresh_models(&mut self, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        self.models_task = Some(cx.spawn(async move |this, cx| {
+            let result = call(client, tokio_handle, Request::ListModels).await;
+            this.update(cx, |this, cx| {
+                match result {
+                    Ok(Reply::Models(models)) => this.providers = providers_with_models(&models),
+                    Ok(_) => {
+                        this.status_message =
+                            Some(("Unexpected daemon reply to model list".into(), true));
+                    }
+                    Err(error) => {
+                        this.status_message =
+                            Some((format!("Could not load providers: {error}").into(), true));
+                    }
+                }
+                this.models_task = None;
+                cx.notify();
+            })
+            .ok();
         }));
     }
 
@@ -568,7 +642,7 @@ impl AuthModal {
             return;
         }
         if self.selected_provider_id != id {
-            if self.in_flight_oauth.is_some() {
+            if self.oauth.is_some() {
                 self.cancel_oauth_flow(cx);
             }
             self.selected_provider_id = id.clone();
@@ -593,7 +667,7 @@ impl AuthModal {
             return;
         }
         if self.selected_method_id != method_id {
-            if self.in_flight_oauth.is_some() {
+            if self.oauth.is_some() {
                 self.cancel_oauth_flow(cx);
             }
             self.selected_method_id = method_id.clone();
@@ -619,7 +693,7 @@ impl AuthModal {
 
     fn save_api_key(&mut self, cx: &mut Context<Self>) {
         let key = self.api_key_input.read(cx).text().trim().to_string();
-        if self.in_flight_mutation || self.in_flight_oauth.is_some() {
+        if self.in_flight_mutation || self.oauth.is_some() {
             return;
         }
         if key.is_empty() {
@@ -637,34 +711,40 @@ impl AuthModal {
 
         self.in_flight_mutation = true;
         self.status_message = Some((format!("Saving API key for {method_name}…").into(), false));
+        // The key leaves the GUI with this request; clearing the input keeps no copy here.
+        self.api_key_input.update(cx, |input, cx| input.clear(cx));
         cx.notify();
 
-        let credentials = self.runtime.credentials();
+        let client = self.client.clone();
         let tokio_handle = self.tokio_handle.clone();
-        let save_task =
-            tokio_handle.spawn_blocking(move || credentials.set_api_key(&backend_id, &key));
-
         self.mutation_task = Some(cx.spawn(async move |this, cx| {
-            let result = save_task.await;
+            let result = call(
+                client,
+                tokio_handle,
+                Request::SetApiKey {
+                    provider: backend_id,
+                    key,
+                },
+            )
+            .await;
             this.update(cx, |this, cx| {
                 this.in_flight_mutation = false;
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(Reply::Ok) => {
                         this.status_message = Some((
                             format!("✓ API key stored securely for {method_name}").into(),
                             false,
                         ));
-                        this.api_key_input.update(cx, |input, cx| input.clear(cx));
                         cx.emit(AuthModalEvent::CredentialsChanged);
                         this.refresh_credentials(cx);
                     }
-                    Ok(Err(err)) => {
+                    Ok(_) => {
                         this.status_message =
-                            Some((format!("Failed to save key: {err}").into(), true));
+                            Some(("Unexpected daemon reply to API key save".into(), true));
                     }
-                    Err(join_err) => {
+                    Err(error) => {
                         this.status_message =
-                            Some((format!("Save task failed: {join_err}").into(), true));
+                            Some((format!("Failed to save key: {error}").into(), true));
                     }
                 }
                 cx.notify();
@@ -674,7 +754,7 @@ impl AuthModal {
     }
 
     fn remove_credential(&mut self, backend_id: &'static str, name: &str, cx: &mut Context<Self>) {
-        if self.in_flight_mutation || self.in_flight_oauth.is_some() {
+        if self.in_flight_mutation || self.oauth.is_some() {
             return;
         }
         let backend_str = backend_id.to_string();
@@ -687,16 +767,21 @@ impl AuthModal {
         ));
         cx.notify();
 
-        let credentials = self.runtime.credentials();
+        let client = self.client.clone();
         let tokio_handle = self.tokio_handle.clone();
-        let remove_task = tokio_handle.spawn_blocking(move || credentials.remove(&backend_str));
-
         self.mutation_task = Some(cx.spawn(async move |this, cx| {
-            let result = remove_task.await;
+            let result = call(
+                client,
+                tokio_handle,
+                Request::RemoveCredential {
+                    provider: backend_str,
+                },
+            )
+            .await;
             this.update(cx, |this, cx| {
                 this.in_flight_mutation = false;
                 match result {
-                    Ok(Ok(())) => {
+                    Ok(Reply::Ok) => {
                         this.status_message = Some((
                             format!("✓ Credentials cleared for {name_str}").into(),
                             false,
@@ -705,13 +790,13 @@ impl AuthModal {
                         cx.emit(AuthModalEvent::CredentialsChanged);
                         this.refresh_credentials(cx);
                     }
-                    Ok(Err(err)) => {
+                    Ok(_) => {
                         this.status_message =
-                            Some((format!("Failed to clear credentials: {err}").into(), true));
+                            Some(("Unexpected daemon reply to credential removal".into(), true));
                     }
-                    Err(join_err) => {
+                    Err(error) => {
                         this.status_message =
-                            Some((format!("Clear task failed: {join_err}").into(), true));
+                            Some((format!("Failed to clear credentials: {error}").into(), true));
                     }
                 }
                 cx.notify();
@@ -720,81 +805,178 @@ impl AuthModal {
         }));
     }
 
-    fn start_oauth_flow(
-        &mut self,
-        backend_id: &'static str,
-        name: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.in_flight_oauth.is_some() || self.in_flight_mutation {
+    fn start_oauth_flow(&mut self, backend_id: &'static str, name: &str, cx: &mut Context<Self>) {
+        if self.oauth.is_some() || self.oauth_task.is_some() || self.in_flight_mutation {
             return;
         }
 
         let backend_str = backend_id.to_string();
-        let name_str = name.to_string();
-        self.in_flight_oauth = Some(backend_str.clone());
-        let cancel = CancellationToken::new();
-        self.cancel_token = Some(cancel.clone());
-        let credentials = self.runtime.credentials();
-        let tokio_handle = self.tokio_handle.clone();
-
+        self.oauth = Some(OAuthLogin {
+            backend_id: backend_str.clone(),
+            name: name.to_string(),
+            login_id: None,
+            early_events: Vec::new(),
+        });
         self.status_message = Some((
-            format!("Opening browser for {name_str}… Waiting for callback").into(),
+            format!("Opening browser for {name}… Waiting for callback").into(),
             false,
         ));
 
-        let oauth_future = tokio_handle.spawn(async move {
-            let on_url = Arc::new(|url: &str| {
-                let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-            });
-            credentials.login(&backend_str, cancel, on_url).await
-        });
-
-        self.oauth_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let result = oauth_future.await;
-            this.update_in(cx, |this, _window, cx| {
-                this.in_flight_oauth = None;
-                this.cancel_token = None;
+        let client = self.client.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        self.oauth_task = Some(cx.spawn(async move |this, cx| {
+            let result = call(
+                client,
+                tokio_handle,
+                Request::LoginStart {
+                    provider: backend_str,
+                },
+            )
+            .await;
+            this.update(cx, |this, cx| {
                 this.oauth_task = None;
-                match result {
-                    Ok(Ok(())) => {
-                        this.status_message = Some((
-                            format!("✓ Successfully logged in to {name_str} via OAuth!").into(),
-                            false,
-                        ));
-                        cx.emit(AuthModalEvent::CredentialsChanged);
-                        this.refresh_credentials(cx);
-                    }
-                    Ok(Err(err)) => {
-                        this.status_message =
-                            Some((format!("OAuth login failed: {err}").into(), true));
-                    }
-                    Err(join_err) => {
-                        this.status_message =
-                            Some((format!("OAuth task cancelled: {join_err}").into(), true));
-                    }
-                }
-                cx.notify();
+                this.login_started(result, cx);
             })
             .ok();
         }));
-
         cx.notify();
     }
 
-    fn cancel_oauth_flow(&mut self, cx: &mut Context<Self>) {
-        if let Some(cancel) = self.cancel_token.take() {
-            cancel.cancel();
+    fn login_started(&mut self, reply: Result<Reply, ClientError>, cx: &mut Context<Self>) {
+        let login_id = match reply {
+            Ok(Reply::LoginStarted { login_id }) => login_id,
+            Ok(_) => {
+                self.fail_oauth("unexpected daemon reply to sign-in", cx);
+                return;
+            }
+            Err(error) => {
+                self.fail_oauth(&error.to_string(), cx);
+                return;
+            }
+        };
+        let Some(login) = self.oauth.as_mut() else {
+            // Cancelled while the start request was in flight; stop the daemon's login.
+            self.cancel_login(login_id, cx);
+            return;
+        };
+        login.login_id = Some(login_id);
+        let early_events = std::mem::take(&mut login.early_events);
+        for event in early_events {
+            if login_event_id(&event) == login_id {
+                self.apply_login_event(event, cx);
+            }
         }
-        self.in_flight_oauth = None;
-        self.oauth_task = None;
+        cx.notify();
+    }
+
+    fn fail_oauth(&mut self, message: &str, cx: &mut Context<Self>) {
+        self.oauth = None;
+        self.status_message = Some((format!("OAuth login failed: {message}").into(), true));
+        cx.notify();
+    }
+
+    fn handle_notification(&mut self, notification: Notification, cx: &mut Context<Self>) {
+        match notification {
+            Notification::Connected(_) => {
+                self.refresh_models(cx);
+                self.refresh_credentials(cx);
+            }
+            Notification::Event(ServerEvent::Login { event }) => {
+                self.handle_login_event(event, cx);
+            }
+            Notification::Disconnected => {
+                self.status_cache = CachedAuthStatus::default();
+                if self.oauth.is_some() {
+                    self.fail_oauth("daemon disconnected; sign in again after reconnecting", cx);
+                }
+                cx.notify();
+            }
+            Notification::Event(_) => {}
+        }
+    }
+
+    fn handle_login_event(&mut self, event: LoginEvent, cx: &mut Context<Self>) {
+        let Some(login) = self.oauth.as_mut() else {
+            return;
+        };
+        let Some(login_id) = login.login_id else {
+            login.early_events.push(event);
+            return;
+        };
+        if login_event_id(&event) == login_id {
+            self.apply_login_event(event, cx);
+        }
+    }
+
+    fn apply_login_event(&mut self, event: LoginEvent, cx: &mut Context<Self>) {
+        match event {
+            LoginEvent::Url { url, .. } => {
+                if let Err(error) = std::process::Command::new("xdg-open").arg(&url).spawn() {
+                    self.status_message = Some((
+                        format!(
+                            "Could not open a browser ({error}). Open this URL manually: {url}"
+                        )
+                        .into(),
+                        true,
+                    ));
+                    cx.notify();
+                }
+            }
+            LoginEvent::Finished { error, .. } => {
+                let Some(login) = self.oauth.take() else {
+                    return;
+                };
+                match error {
+                    None => {
+                        self.status_message = Some((
+                            format!("✓ Successfully logged in to {} via OAuth!", login.name).into(),
+                            false,
+                        ));
+                        cx.emit(AuthModalEvent::CredentialsChanged);
+                        self.refresh_credentials(cx);
+                    }
+                    Some(error) => {
+                        self.status_message =
+                            Some((format!("OAuth login failed: {error}").into(), true));
+                    }
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn cancel_oauth_flow(&mut self, cx: &mut Context<Self>) {
+        let Some(login) = self.oauth.take() else {
+            return;
+        };
+        // Without a login id the start request is still in flight; `login_started` cancels it.
+        if let Some(login_id) = login.login_id {
+            self.cancel_login(login_id, cx);
+        }
         self.status_message = Some(("OAuth login cancelled".into(), true));
         cx.notify();
     }
 
+    /// Ask the daemon to cancel a sign-in. A failed cancel is surfaced because the login keeps running.
+    fn cancel_login(&self, login_id: u64, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = call(client, tokio_handle, Request::LoginCancel { login_id }).await
+            {
+                this.update(cx, |this, cx| {
+                    this.status_message =
+                        Some((format!("Could not cancel sign-in: {error}").into(), true));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     pub fn dismiss(&mut self, cx: &mut Context<Self>) {
-        if self.in_flight_oauth.is_some() {
+        if self.oauth.is_some() {
             self.cancel_oauth_flow(cx);
         }
         self.status_message = None;
@@ -1023,7 +1205,10 @@ impl AuthModal {
         };
 
         let method_status = self.resolve_method_status(method);
-        let in_flight_oauth = self.in_flight_oauth.as_deref() == Some(method.backend_id);
+        let in_flight_oauth = self
+            .oauth
+            .as_ref()
+            .is_some_and(|login| login.backend_id == method.backend_id);
         let is_masked = self.api_key_input.read(cx).is_masked();
 
         let (provider_badge, badge_fg, badge_bg) = self.resolve_provider_badge(provider);
@@ -1389,8 +1574,8 @@ impl AuthModal {
                                             .text_color(rgb(0xffffff))
                                             .cursor_pointer()
                                             .hover(|s| s.bg(rgb(0x9333ea)))
-                                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                                this.start_oauth_flow(backend_id, method_name, window, cx);
+                                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                                this.start_oauth_flow(backend_id, method_name, cx);
                                             }))
                                             .child("Sign in with browser"),
                                     ),

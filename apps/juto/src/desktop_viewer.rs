@@ -1,14 +1,16 @@
 //! Embedded live desktop viewer.
 //!
-//! Renders the composed frames of a [`DesktopEnvironment`] inside the harness
+//! Renders the composed frames of a desktop environment inside the harness
 //! window and forwards pointer/keyboard input to the environment's virtual
-//! seat. Frames are read from the environment's sealed shared-memory pool; no
-//! video codec is involved on this path (`docs/agent-compositor.md` section 7).
+//! seat. The viewer speaks the desktop control socket: frames come from the
+//! environment's sealed shared-memory pool and input goes over the same socket
+//! (`docs/agent-compositor.md` section 7). No video codec is involved.
 
 use std::cell::Cell;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::Duration;
 
 use gpui::{
@@ -17,14 +19,19 @@ use gpui::{
     Pixels, Point, Render, RenderImage, ScrollWheelEvent, Subscription, Task, Window, canvas, div,
     img, prelude::*, px, rgb, rgba,
 };
-use juto_runtime::protocol::{DesktopEvent, GrantRole, InputBatch, InputEvent};
-use juto_runtime::{AwakeHold, DesktopEnvironment};
-use tokio::sync::broadcast::error::RecvError;
+use juto_daemon::client::Client;
+use juto_desktop::protocol::{DesktopEvent, GrantRole, InputEvent};
+use juto_desktop::{DesktopError, ViewerClient, viewer::EventStream};
 
 use crate::desktop_stream;
 
 /// Control lease renewal interval (spec section 8: heartbeat 2s, expiry 6s).
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(2);
+/// Keep-awake deadline: a live canvas renews it every heartbeat, so it lapses
+/// within one lease expiry of the canvas going away.
+const AWAKE_DEADLINE_SECS: u64 = 6;
+/// How often the viewer drains cursor events from the listener thread.
+const CURSOR_POLL: Duration = Duration::from_millis(33);
 /// Evdev codes for the modifier keys forwarded to the seat.
 const KEY_LEFTSHIFT: u32 = 42;
 const KEY_LEFTCTRL: u32 = 29;
@@ -103,15 +110,16 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// Issues the local owner's Owner/View/Control grant and returns its expiry.
-fn issue_local_grant(env: &DesktopEnvironment) -> u64 {
-    env.issue_grant(
-        SESSION_PRINCIPAL.to_string(),
-        vec![GrantRole::Owner, GrantRole::View, GrantRole::Control],
-        "session".to_string(),
-        LOCAL_GRANT_SECS,
-    )
-    .expires_at
+/// Roles of the local owner's grant: Owner, View, and Control.
+fn local_grant_roles() -> Vec<GrantRole> {
+    vec![GrantRole::Owner, GrantRole::View, GrantRole::Control]
+}
+
+/// The viewer's control connection, shared by the canvas and its heartbeat task.
+type SharedClient = Arc<Mutex<ViewerClient>>;
+
+fn lock_client(client: &SharedClient) -> MutexGuard<'_, ViewerClient> {
+    client.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Client cursor bitmap drawn over the canvas at the local pointer.
@@ -125,9 +133,17 @@ struct CursorOverlay {
 
 /// An embedded viewer for one agent-owned desktop environment.
 pub struct DesktopViewer {
-    env: DesktopEnvironment,
+    /// Control connection; `None` when the environment could not be attached.
+    client: Option<SharedClient>,
+    /// Socket and id needed to open the frame and event streams.
+    socket: PathBuf,
+    env_id: String,
+    /// Heading shown above the canvas (the artifact title).
+    title: String,
     frame: Option<Arc<RenderImage>>,
     frame_size: (u32, u32),
+    /// Geometry generation last reported by the environment; input carries it.
+    generation: u64,
     surface_bounds: Rc<Cell<Bounds<Pixels>>>,
     focus_handle: FocusHandle,
     status: String,
@@ -143,7 +159,6 @@ pub struct DesktopViewer {
     grant_expires_at: Option<u64>,
     paused: bool,
     expanded: bool,
-    input_seq: u64,
     frame_task: Option<Task<()>>,
     heartbeat_task: Option<Task<()>>,
     snapshot_task: Option<Task<()>>,
@@ -164,44 +179,70 @@ pub struct DesktopViewer {
     cursor_overlay: Option<CursorOverlay>,
     /// Pointer position in window coordinates while over the image.
     cursor_pointer: Option<Point<Pixels>>,
-    /// Resumes a suspended desktop and keeps it awake while the canvas is live.
-    /// Live frames are read from shared memory, which is not activity on its
-    /// own, so without this a watched desktop would freeze at the idle limit. A
-    /// paused canvas holds nothing, so the desktop can still go idle.
-    awake: Option<AwakeHold>,
+    /// Whether a live canvas holds the desktop awake. The heartbeat renews the
+    /// hold while this is set. Live frames are read from shared memory, which is
+    /// not activity on its own, so without this a watched desktop would freeze at
+    /// the idle limit. A paused canvas holds nothing, so the desktop can still go
+    /// idle.
+    awake: bool,
 }
 
 impl DesktopViewer {
-    /// Creates a paused viewer for `env`. It captures one still of the newest
-    /// frame and runs no frame loop until resumed.
+    /// Creates a paused viewer for environment `env_id`, reached over the
+    /// workspace desktop socket named in the daemon hello. It captures one still
+    /// of the newest frame and runs no frame loop until resumed. An environment
+    /// that cannot be attached yields a stopped viewer that shows the reason
+    /// instead of panicking.
     pub fn new(
-        env: DesktopEnvironment,
+        client: Client,
+        env_id: String,
         access: ControlAccess,
+        title: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let output = env.output();
-        let can_control = access != ControlAccess::ViewOnly;
-        let grant_expires_at = match access {
-            ControlAccess::ViewOnly => None,
-            ControlAccess::Granted { expires_at } => Some(expires_at),
-            ControlAccess::LocalOwner => Some(issue_local_grant(&env)),
+        let hello = client.hello();
+        let socket = hello
+            .as_ref()
+            .map(|hello| hello.desktop_socket.clone())
+            .unwrap_or_default();
+        let attached = match &hello {
+            Some(hello) => {
+                ViewerClient::attach(&hello.desktop_socket, &env_id).map_err(|err| err.to_string())
+            }
+            None => Err("daemon disconnected".to_string()),
         };
+        let mut error = None;
+        let (viewer_client, frame_size) = match attached {
+            Ok(viewer_client) => {
+                let info = viewer_client.info();
+                let size = (info.width, info.height);
+                (Some(Arc::new(Mutex::new(viewer_client))), size)
+            }
+            Err(err) => {
+                error = Some(format!("desktop unavailable: {err}"));
+                (None, (0, 0))
+            }
+        };
+        let can_control = access != ControlAccess::ViewOnly;
         let mut viewer = Self {
-            env,
+            client: viewer_client,
+            socket,
+            env_id,
+            title,
             frame: None,
-            frame_size: (output.width, output.height),
+            frame_size,
+            generation: 0,
             surface_bounds: Rc::new(Cell::new(Bounds::default())),
             focus_handle: cx.focus_handle(),
             status: "waiting for first frame".to_string(),
-            error: None,
+            error,
             has_control: false,
             can_control,
             access,
-            grant_expires_at,
+            grant_expires_at: None,
             paused: true,
             expanded: false,
-            input_seq: 0,
             frame_task: None,
             snapshot_task: None,
             press_started_paused: false,
@@ -213,7 +254,19 @@ impl DesktopViewer {
             cursor_task: None,
             cursor_overlay: None,
             cursor_pointer: None,
-            awake: None,
+            awake: false,
+        };
+        viewer.grant_expires_at = match access {
+            ControlAccess::ViewOnly => None,
+            ControlAccess::Granted { expires_at } => Some(expires_at),
+            ControlAccess::LocalOwner => match viewer.issue_local_grant() {
+                Ok(expires_at) => Some(expires_at),
+                Err(err) => {
+                    viewer.error = Some(format!("control grant failed: {err}"));
+                    viewer.can_control = false;
+                    None
+                }
+            },
         };
         viewer._input_guards = vec![
             cx.on_focus_out(&viewer.focus_handle, window, |this, _event, _window, cx| {
@@ -225,9 +278,11 @@ impl DesktopViewer {
                 }
             }),
         ];
-        viewer.start_heartbeat(cx);
-        viewer.start_cursor_listener(window, cx);
-        viewer.capture_snapshot(window, cx);
+        if viewer.client.is_some() {
+            viewer.start_heartbeat(cx);
+            viewer.start_cursor_listener(window, cx);
+            viewer.capture_snapshot(window, cx);
+        }
         viewer
     }
 
@@ -241,9 +296,40 @@ impl DesktopViewer {
         cx.notify();
     }
 
+    /// Runs `f` on the control connection. Fails when the environment was never
+    /// attached.
+    fn with_client<T>(
+        &self,
+        f: impl FnOnce(&mut ViewerClient) -> Result<T, DesktopError>,
+    ) -> Result<T, DesktopError> {
+        let Some(client) = &self.client else {
+            return Err(DesktopError::Protocol("desktop not attached".to_string()));
+        };
+        f(&mut lock_client(client))
+    }
+
+    /// Whether the environment still exists. A destroyed environment fails its
+    /// describe call.
+    fn is_alive(&self) -> bool {
+        self.with_client(|client| client.describe()).is_ok()
+    }
+
+    /// Issues the local owner's grant and returns its expiry.
+    fn issue_local_grant(&self) -> Result<u64, DesktopError> {
+        self.with_client(|client| {
+            client.grant(
+                SESSION_PRINCIPAL,
+                local_grant_roles(),
+                "session",
+                LOCAL_GRANT_SECS,
+            )
+        })
+        .map(|grant| grant.expires_at)
+    }
+
     /// Follows the environment's shared frame feed. Only a live viewer does this.
     fn start_frames(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut feed = desktop_stream::subscribe(&self.env);
+        let mut feed = desktop_stream::subscribe(&self.socket, &self.env_id);
         self.frame_task = Some(cx.spawn_in(window, async move |this, cx| {
             while let Some(frame) = feed.next().await {
                 let updated = this.update_in(cx, |this, window, cx| {
@@ -260,46 +346,86 @@ impl DesktopViewer {
 
     /// Mirrors the application's cursor shape and client cursor bitmap onto the
     /// canvas. Runs for the viewer's whole life, so a resume shows the current cursor.
+    ///
+    /// The event stream blocks, so a listener thread reads it and forwards each
+    /// event; the UI drains the channel on a short timer.
     fn start_cursor_listener(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut events = self.env.subscribe();
+        let (sender, receiver) = mpsc::channel::<DesktopEvent>();
+        let socket = self.socket.clone();
+        let env_id = self.env_id.clone();
+        std::thread::Builder::new()
+            .name("juto-desktop-cursor".to_string())
+            .spawn(move || {
+                let Ok(events) = EventStream::subscribe(&socket, &env_id) else {
+                    return;
+                };
+                while let Ok(event) = events.next_event() {
+                    if sender.send(event).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("failed to spawn desktop cursor listener");
         self.cursor_task = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
-                let update = match events.recv().await {
-                    Ok(DesktopEvent::CursorShapeChanged { shape, .. }) => {
-                        this.update_in(cx, |this, _window, cx| this.set_cursor_shape(&shape, cx))
+                cx.background_executor().timer(CURSOR_POLL).await;
+                let mut pending = Vec::new();
+                let mut disconnected = false;
+                loop {
+                    match receiver.try_recv() {
+                        Ok(event) => pending.push(event),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            disconnected = true;
+                            break;
+                        }
                     }
-                    Ok(DesktopEvent::CursorImageChanged {
-                        width,
-                        height,
-                        display_width,
-                        display_height,
-                        hotspot_x,
-                        hotspot_y,
-                        pixels,
-                        ..
-                    }) => {
-                        let overlay = cursor_overlay_from_event(
-                            width,
-                            height,
-                            display_width,
-                            display_height,
-                            hotspot_x,
-                            hotspot_y,
-                            pixels,
-                        );
-                        this.update_in(cx, |this, _window, cx| this.set_cursor_overlay(overlay, cx))
+                }
+                if !pending.is_empty() {
+                    let update = this.update_in(cx, |this, _window, cx| {
+                        for event in pending {
+                            this.apply_cursor_event(event, cx);
+                        }
+                    });
+                    if update.is_err() {
+                        break;
                     }
-                    Ok(_) => continue,
-                    // Missed shape changes leave the last known shape in place: the
-                    // compositor cannot re-send it, and guessing a default would be wrong too.
-                    Err(RecvError::Lagged(_)) => continue,
-                    Err(RecvError::Closed) => break,
-                };
-                if update.is_err() {
+                }
+                if disconnected {
                     break;
                 }
             }
         }));
+    }
+
+    fn apply_cursor_event(&mut self, event: DesktopEvent, cx: &mut Context<Self>) {
+        match event {
+            DesktopEvent::CursorShapeChanged { shape, .. } => self.set_cursor_shape(&shape, cx),
+            DesktopEvent::CursorImageChanged {
+                width,
+                height,
+                display_width,
+                display_height,
+                hotspot_x,
+                hotspot_y,
+                pixels,
+                ..
+            } => {
+                let overlay = cursor_overlay_from_event(
+                    width,
+                    height,
+                    display_width,
+                    display_height,
+                    hotspot_x,
+                    hotspot_y,
+                    pixels,
+                );
+                self.set_cursor_overlay(overlay, cx);
+            }
+            // Missed shape changes leave the last known shape in place: the
+            // compositor cannot re-send it, and guessing a default would be wrong too.
+            _ => {}
+        }
     }
 
     fn set_cursor_shape(&mut self, shape: &str, cx: &mut Context<Self>) {
@@ -351,7 +477,7 @@ impl DesktopViewer {
 
     /// Captures one still of the newest frame without starting the live feed.
     pub fn capture_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut feed = desktop_stream::subscribe(&self.env);
+        let mut feed = desktop_stream::subscribe(&self.socket, &self.env_id);
         self.snapshot_task = Some(cx.spawn_in(window, async move |this, cx| {
             // The worker may not have composed its first frame yet; the feed waits
             // for one and ends only when the environment does.
@@ -375,6 +501,7 @@ impl DesktopViewer {
         }
         // Input is mapped in environment pixels, not the downscaled image.
         let (width, height) = frame.source;
+        self.generation = frame.generation;
         self.frame_size = (width, height);
         if self.error.is_none() {
             self.status = if self.paused {
@@ -396,7 +523,7 @@ impl DesktopViewer {
         self.paused = true;
         self.frame_task = None;
         // A paused canvas no longer keeps the desktop awake; the idle clock starts.
-        self.awake = None;
+        self.awake = false;
         if self.has_control {
             self.release_control(cx);
         }
@@ -410,14 +537,14 @@ impl DesktopViewer {
         if !self.paused {
             return;
         }
-        if !self.env.is_alive() {
+        if !self.is_alive() {
             self.mark_stopped(cx);
             return;
         }
         // Resume a suspended desktop before the first live frame, and keep it
         // awake for as long as the canvas stays live.
-        match self.env.hold_awake() {
-            Ok(hold) => self.awake = Some(hold),
+        match self.with_client(|client| client.retain(SESSION_PRINCIPAL, AWAKE_DEADLINE_SECS)) {
+            Ok(_) => self.awake = true,
             Err(err) => {
                 self.error = Some(format!("desktop did not resume: {err}"));
                 cx.notify();
@@ -437,15 +564,11 @@ impl DesktopViewer {
         if self.paused || !self.can_control {
             return;
         }
-        match self.env.set_control(SESSION_PRINCIPAL, "acquire", true) {
-            Ok(Some(lease)) => {
+        match self.with_client(|client| client.take_control()) {
+            Ok(epoch) => {
                 self.has_control = true;
                 self.error = None;
-                self.status = format!("control held (epoch {})", lease.epoch);
-            }
-            Ok(None) => {
-                self.has_control = false;
-                self.status = "no control".to_string();
+                self.status = format!("control held (epoch {epoch})");
             }
             Err(err) => {
                 self.has_control = false;
@@ -458,12 +581,12 @@ impl DesktopViewer {
     /// Releases the human control lease.
     pub fn release_control(&mut self, cx: &mut Context<Self>) {
         self.release_held_input(cx);
-        let result = self.env.set_control(SESSION_PRINCIPAL, "release", true);
+        let result = self.with_client(|client| client.release_control());
         // Drop the local flag even when the release call fails: the lease may
         // already be gone, and keeping `has_control` would render a stale state.
         self.has_control = false;
         match result {
-            Ok(_) => {
+            Ok(()) => {
                 self.status = "control released".to_string();
                 self.error = None;
             }
@@ -476,7 +599,7 @@ impl DesktopViewer {
     /// viewer. The last frame stays on screen; input is no longer forwarded.
     fn mark_stopped(&mut self, cx: &mut Context<Self>) {
         self.frame_task = None;
-        self.awake = None;
+        self.awake = false;
         self.has_control = false;
         self.status = "stopped".to_string();
         self.error = Some("desktop stopped".to_string());
@@ -484,28 +607,64 @@ impl DesktopViewer {
     }
 
     /// Runs for the viewer's whole lifetime. Each tick it notices a destroyed
-    /// environment, keeps a local owner's grant fresh, and renews the control
-    /// lease while control is held. It sends no owner heartbeat: desktops the
-    /// harness creates set no owner timeout, and a viewer alone must never keep
-    /// an abandoned desktop alive.
+    /// environment, keeps a local owner's grant fresh, holds the desktop awake
+    /// while the canvas is live, and renews the control lease while control is
+    /// held. It sends no owner heartbeat: desktops the harness creates set no
+    /// owner timeout, and a viewer alone must never keep an abandoned desktop
+    /// alive.
     fn start_heartbeat(&mut self, cx: &mut Context<Self>) {
-        let env = self.env.clone();
+        let Some(client) = self.client.clone() else {
+            return;
+        };
         let access = self.access;
         let mut grant_expires_at = self.grant_expires_at;
         self.heartbeat_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(LEASE_HEARTBEAT).await;
-                if !env.is_alive() {
-                    let _ = this.update(cx, |this, cx| this.mark_stopped(cx));
+                let status = match lock_client(&client).describe() {
+                    Ok(status) => status,
+                    Err(_) => {
+                        let _ = this.update(cx, |this, cx| this.mark_stopped(cx));
+                        break;
+                    }
+                };
+                let Ok(awake) = this.update(cx, |this, _| {
+                    this.generation = status.generation;
+                    this.awake
+                }) else {
                     break;
-                }
+                };
                 // A local owner session keeps its own grant alive before the host
                 // cap expires it; otherwise control could not be renewed.
                 if access == ControlAccess::LocalOwner
                     && grant_expires_at
                         .is_some_and(|expires_at| expires_at <= unix_now() + LOCAL_GRANT_RENEW_SECS)
                 {
-                    grant_expires_at = Some(issue_local_grant(&env));
+                    let renewed = lock_client(&client).grant(
+                        SESSION_PRINCIPAL,
+                        local_grant_roles(),
+                        "session",
+                        LOCAL_GRANT_SECS,
+                    );
+                    match renewed {
+                        Ok(grant) => grant_expires_at = Some(grant.expires_at),
+                        Err(err) => {
+                            let _ = this.update(cx, |this, cx| {
+                                this.error = Some(format!("control grant renewal failed: {err}"));
+                                cx.notify();
+                            });
+                        }
+                    }
+                }
+                // A live canvas keeps the desktop awake; a paused one does not.
+                if awake {
+                    let held = lock_client(&client).retain(SESSION_PRINCIPAL, AWAKE_DEADLINE_SECS);
+                    if let Err(err) = held {
+                        let _ = this.update(cx, |this, cx| {
+                            this.error = Some(format!("keep-awake failed: {err}"));
+                            cx.notify();
+                        });
+                    }
                 }
                 // A resolved grant ends at its own expiry, which the host enforces
                 // too. Stop offering control and release the lease it authorized.
@@ -514,7 +673,7 @@ impl DesktopViewer {
                         break;
                     };
                     if ended {
-                        let _ = env.set_control(SESSION_PRINCIPAL, "release", true);
+                        let _ = lock_client(&client).release_control();
                     }
                 }
                 let Ok(holding) = this.update(cx, |this, _| this.has_control) else {
@@ -526,15 +685,10 @@ impl DesktopViewer {
                 // Renew only a lease this viewer already holds. Acquiring while
                 // an agent holds control would take that lease over.
                 let ours = matches!(
-                    env.get_status().active_control_lease,
+                    status.active_control_lease,
                     Some(lease) if lease.holder == SESSION_PRINCIPAL
                 );
-                let renewed = ours
-                    && env
-                        .set_control(SESSION_PRINCIPAL, "acquire", true)
-                        .ok()
-                        .flatten()
-                        .is_some();
+                let renewed = ours && lock_client(&client).take_control().is_ok();
                 if this
                     .update(cx, |this, cx| {
                         this.has_control = renewed;
@@ -565,38 +719,37 @@ impl DesktopViewer {
         true
     }
 
+    /// Sends one batch to the seat, taking control first when this viewer does
+    /// not hold the lease yet.
+    fn dispatch(&self, events: &[InputEvent]) -> Result<(), DesktopError> {
+        let generation = self.generation;
+        self.with_client(|client| {
+            if client.control_epoch().is_none() {
+                client.take_control()?;
+            }
+            client.send_input(generation, events.to_vec())
+        })
+    }
+
     fn send_events(&mut self, events: Vec<InputEvent>, cx: &mut Context<Self>) {
         // A paused or view-only viewer forwards no input; a paused click resumes instead.
-        if self.paused || !self.can_control || events.is_empty() || !self.env.is_alive() {
+        if self.paused || !self.can_control || events.is_empty() || !self.is_alive() {
             return;
         }
-        let lease = match self.env.get_status().active_control_lease {
-            Some(lease) if lease.holder == SESSION_PRINCIPAL => lease,
-            _ => match self.env.set_control(SESSION_PRINCIPAL, "acquire", true) {
-                Ok(Some(lease)) => {
-                    self.has_control = true;
-                    lease
+        match self.dispatch(&events) {
+            Ok(()) => {
+                self.has_control = true;
+                self.error = None;
+            }
+            Err(err) => {
+                // A geometry change makes the seat reject input with the old
+                // generation. Refresh it so the next event goes through.
+                if let Ok(status) = self.with_client(|client| client.describe()) {
+                    self.generation = status.generation;
                 }
-                Ok(None) => return,
-                Err(err) => {
-                    self.error = Some(err.to_string());
-                    cx.notify();
-                    return;
-                }
-            },
-        };
-        self.input_seq = self.input_seq.wrapping_add(1);
-        let batch = InputBatch {
-            seq: self.input_seq,
-            client_timestamp_us: 0,
-            events,
-        };
-        match self
-            .env
-            .dispatch_input(SESSION_PRINCIPAL, lease.epoch, self.env.generation(), batch)
-        {
-            Ok(_) => self.error = None,
-            Err(err) => self.error = Some(err.to_string()),
+                self.has_control = false;
+                self.error = Some(err.to_string());
+            }
         }
         cx.notify();
     }
@@ -704,6 +857,7 @@ impl Render for DesktopViewer {
         let error = self.error.clone();
         let has_control = self.has_control;
         let paused = self.paused;
+        let title = self.title.clone();
         let can_control = self.can_control;
         let cursor_overlay = self.cursor_overlay_element();
         let canvas_cursor = if paused {
@@ -868,8 +1022,9 @@ impl Render for DesktopViewer {
                 div()
                     .flex()
                     .items_center()
-                    .justify_end()
+                    .justify_between()
                     .h(px(30.))
+                    .child(div().text_color(rgb(0x9ca3af)).child(title))
                     .when(paused, |row| {
                         row.child(
                             div()

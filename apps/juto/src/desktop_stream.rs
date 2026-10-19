@@ -8,15 +8,17 @@
 //! or the environment has ended.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread;
 use std::time::Duration;
 
 use gpui::RenderImage;
 use image::{Frame, ImageBuffer, Rgba};
-use juto_desktop::shm::{FrameWait, ShmReader};
-use juto_runtime::DesktopEnvironment;
+use juto_desktop::protocol::DesktopEvent;
+use juto_desktop::shm::FrameWait;
+use juto_desktop::viewer::{EventStream, ViewerClient};
 use tokio::sync::watch;
 
 /// Longest shown edges are 854x480 (480p, 16:9). Larger frames are shrunk
@@ -35,6 +37,8 @@ pub(crate) struct StreamFrame {
     pub(crate) source: (u32, u32),
     /// Upload handle shared by every viewer showing this frame.
     pub(crate) image: Arc<RenderImage>,
+    /// Compositor generation the frame was composed under; input carries it back.
+    pub(crate) generation: u64,
 }
 
 /// The latest-value slot a producer publishes into.
@@ -54,9 +58,12 @@ struct Stream {
     producing: Mutex<bool>,
 }
 
-/// Live streams keyed by environment socket path. Weak, so a stream with no
-/// producer and no subscribers is freed.
-static REGISTRY: LazyLock<Mutex<HashMap<PathBuf, Weak<Stream>>>> =
+/// Identity of one live stream: environment socket path and id.
+type StreamKey = (PathBuf, String);
+
+/// Live streams keyed by environment socket path and id. Weak, so a stream with
+/// no producer and no subscribers is freed.
+static REGISTRY: LazyLock<Mutex<HashMap<StreamKey, Weak<Stream>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// A viewer's handle on one environment's frames.
@@ -85,9 +92,10 @@ impl FrameSubscription {
     }
 }
 
-/// Subscribes to `env`'s frames, starting its producer thread if none is running.
-pub(crate) fn subscribe(env: &DesktopEnvironment) -> FrameSubscription {
-    let stream = stream_for(env);
+/// Subscribes to the frames of environment `env_id` served at `socket`,
+/// starting its producer thread if none is running.
+pub(crate) fn subscribe(socket: &Path, env_id: &str) -> FrameSubscription {
+    let stream = stream_for(socket, env_id);
     // Subscribe before taking the lock: a producer deciding whether to retire
     // checks for receivers under the same lock, so it either sees this one or
     // is restarted below.
@@ -95,19 +103,21 @@ pub(crate) fn subscribe(env: &DesktopEnvironment) -> FrameSubscription {
     let mut producing = lock(&stream.producing);
     if !*producing {
         *producing = true;
-        let producer_env = env.clone();
         let producer_stream = Arc::clone(&stream);
+        let producer_socket = socket.to_path_buf();
+        let producer_env = env_id.to_string();
         thread::Builder::new()
             .name("juto-desktop-frames".to_string())
-            .spawn(move || run_producer(producer_env, producer_stream))
+            .spawn(move || run_producer(producer_socket, producer_env, producer_stream))
             .expect("failed to spawn desktop frame producer");
     }
     FrameSubscription { feed, first: true }
 }
 
-/// Returns the stream for `env`'s socket, creating it when none is live.
-fn stream_for(env: &DesktopEnvironment) -> Arc<Stream> {
-    let key = env.socket_path().to_path_buf();
+/// Returns the stream for environment `env_id` at `socket`, creating it when
+/// none is live.
+fn stream_for(socket: &Path, env_id: &str) -> Arc<Stream> {
+    let key = (socket.to_path_buf(), env_id.to_string());
     let mut streams = lock(&REGISTRY);
     streams.retain(|_, stream| stream.strong_count() > 0);
     if let Some(stream) = streams.get(&key).and_then(Weak::upgrade) {
@@ -123,23 +133,48 @@ fn stream_for(env: &DesktopEnvironment) -> Arc<Stream> {
 }
 
 /// Runs on the producer thread: publishes each newly composed frame until
-/// nobody is subscribed or the environment ends.
-fn run_producer(env: DesktopEnvironment, stream: Arc<Stream>) {
-    let pool = env.frame_pool();
+/// nobody is subscribed or the environment ends. The viewer connection keeps
+/// the environment awake while this runs; a lifecycle watcher ends the stream
+/// when the environment stops or fails.
+fn run_producer(socket: PathBuf, env_id: String, stream: Arc<Stream>) {
+    let (viewer, lifecycle) = match (
+        ViewerClient::attach(&socket, &env_id),
+        EventStream::subscribe(&socket, &env_id),
+    ) {
+        (Ok(viewer), Ok(lifecycle)) => (viewer, Arc::new(lifecycle)),
+        // The environment is gone or unreachable: no frames will arrive.
+        _ => {
+            stream.feed.send_replace(Feed::Ended);
+            *lock(&stream.producing) = false;
+            return;
+        }
+    };
+    let stopping = Arc::new(AtomicBool::new(false));
+    let watcher_stream = Arc::clone(&stream);
+    let watcher_events = Arc::clone(&lifecycle);
+    let watcher_stopping = Arc::clone(&stopping);
+    thread::Builder::new()
+        .name("juto-desktop-lifecycle".to_string())
+        .spawn(move || watch_lifecycle(&watcher_events, &watcher_stream, &watcher_stopping))
+        .expect("failed to spawn desktop lifecycle watcher");
+
     // Starting from 0 reports a frame composed before this thread started, so a
     // subscriber joining an idle environment still sees its current frame.
     let mut seen_publish = 0;
     let mut last_frame_id = None;
     loop {
-        if !env.is_alive() {
-            stream.feed.send_replace(Feed::Ended);
+        if matches!(*stream.feed.borrow(), Feed::Ended) {
+            stopping.store(true, Ordering::Release);
+            let _ = lifecycle.close();
             *lock(&stream.producing) = false;
             return;
         }
         if retire_unobserved(&stream) {
+            stopping.store(true, Ordering::Release);
+            let _ = lifecycle.close();
             return;
         }
-        match pool.wait_for_frame(seen_publish, WAIT_SLICE) {
+        match viewer.wait_for_frame(seen_publish, WAIT_SLICE) {
             Ok(FrameWait::Published(current)) => {
                 seen_publish = current;
                 // A subscriber may have left during the wait. The loop head
@@ -147,12 +182,13 @@ fn run_producer(env: DesktopEnvironment, stream: Arc<Stream>) {
                 if stream.feed.receiver_count() == 0 {
                     continue;
                 }
-                if let Some(decoded) = read_newest(&pool, last_frame_id) {
+                if let Some(decoded) = read_newest(&viewer, last_frame_id) {
                     last_frame_id = Some(decoded.frame_id);
                     let image =
                         render_image_from_bgra(decoded.pixels, decoded.width, decoded.height);
                     let frame = StreamFrame {
                         source: decoded.source,
+                        generation: decoded.generation,
                         image,
                     };
                     stream.feed.send_replace(Feed::Frame(Arc::new(frame)));
@@ -160,6 +196,26 @@ fn run_producer(env: DesktopEnvironment, stream: Arc<Stream>) {
             }
             Ok(FrameWait::TimedOut) => {}
             Err(_) => thread::sleep(RETRY_DELAY),
+        }
+    }
+}
+
+/// Ends the stream when the environment reports that it stopped or failed. A
+/// lost lifecycle connection also ends it, unless this producer closed it.
+fn watch_lifecycle(events: &EventStream, stream: &Stream, stopping: &AtomicBool) {
+    loop {
+        match events.next_event() {
+            Ok(DesktopEvent::Stopped { .. } | DesktopEvent::Failed { .. }) => {
+                stream.feed.send_replace(Feed::Ended);
+                return;
+            }
+            Ok(_) => {}
+            Err(_) => {
+                if !stopping.load(Ordering::Acquire) {
+                    stream.feed.send_replace(Feed::Ended);
+                }
+                return;
+            }
         }
     }
 }
@@ -179,37 +235,29 @@ fn retire_unobserved(stream: &Stream) -> bool {
 struct DecodedFrame {
     frame_id: u64,
     source: (u32, u32),
+    generation: u64,
     width: u32,
     height: u32,
     pixels: Vec<u8>,
 }
 
-/// Copies the newest composed frame out of shared memory and shrinks it for
-/// display. Returns `None` when there is no frame, when it is `after` (already
-/// published), or when the slot cannot be read.
-fn read_newest(pool: &ShmReader, after: Option<u64>) -> Option<DecodedFrame> {
-    let frame = pool.latest_frame().ok()??;
-    if after == Some(frame.header.frame_id) {
+/// Copies the newest composed frame out of the viewer's shared memory and
+/// shrinks it for display. Returns `None` when there is no frame, when it is
+/// `after` (already published), or when the slot cannot be read.
+fn read_newest(viewer: &ViewerClient, after: Option<u64>) -> Option<DecodedFrame> {
+    let (header, pixels) = viewer.latest_frame().ok()??;
+    if after == Some(header.frame_id) {
         return None;
     }
-    pool.acquire_slot(frame.slot);
-    // The slot stays reserved until its pixels are copied out, so the producer
-    // cannot overwrite them mid-read.
-    let decoded = pool
-        .read_slot(frame.slot, pool.slot_size())
-        .ok()
-        .and_then(|(header, pixels)| {
-            let (width, height, pixels) = fit_shown(pixels, header.width, header.height)?;
-            Some(DecodedFrame {
-                frame_id: header.frame_id,
-                source: (header.width, header.height),
-                width,
-                height,
-                pixels,
-            })
-        });
-    pool.release_slot(frame.slot);
-    decoded
+    let (width, height, pixels) = fit_shown(&pixels, header.width, header.height)?;
+    Some(DecodedFrame {
+        frame_id: header.frame_id,
+        source: (header.width, header.height),
+        generation: header.generation,
+        width,
+        height,
+        pixels,
+    })
 }
 
 /// Locks `mutex`, recovering the guard from a poisoned lock. The guarded state
@@ -333,6 +381,7 @@ mod tests {
         let image = render_image_from_bgra(vec![0, 0, 0, 255], 1, 1);
         Feed::Frame(Arc::new(StreamFrame {
             source: (width, 1),
+            generation: 0,
             image,
         }))
     }
