@@ -370,10 +370,12 @@ agent releases them with `subagent_release` (PR6, below).
 PR3 adds a main mailbox. Children send messages to the main agent with
 `agent://main`, which lands in one in-memory inbox shared by the whole run tree.
 When a child reaches a terminal state (`Completed`, `Failed`, or `Cancelled`), a
-completion notice is pushed to the same inbox; the notice is pushed before the
-terminal state is published, so a waiter sees it. The main thread drains the
-inbox with the `agent_inbox` tool, which returns each entry's `from`, `kind`, and
-`body` and clears the inbox. Reading `agent://main` fails with
+completion notice is submitted to the same inbox before terminal status is
+published. Oversized notices digest asynchronously, so `wait` and terminal status
+never wait for the digest. A `MainInboxReady` broadcast after publication wakes an
+idle main UI without stealing the runtime forwarder's notification. The main thread
+drains the inbox with `agent_inbox`, returning `from`, `name`, `kind`, `digest_of`,
+and `body`, and clearing the inbox. Reading `agent://main` fails with
 `PeerError::WriteOnly`, so draining happens only through `agent_inbox`. Children
 never write to the user UI; the main agent decides what reaches the user. The
 inbox is not persisted across process restart. Main-started turns (the first run and
@@ -385,6 +387,25 @@ Run ownership: the registry, concurrency limit, and inbox are shared by the proc
 `Runtime::subagent_manager(&control)` returns a handle that owns only the children it spawns, scoped
 to that run's control. Cancelling the run cancels its children; ending the run cancels the children
 it still has open (`ChildCancellation`). Other runs' children are left alone.
+
+Juto bounds all child-to-main report bodies, including peer messages and failures,
+to `mainReportBytes` (default 1500 UTF-8 bytes; minimum 512). Small text-only bodies
+pass through byte-exactly. Larger bodies use the `@memory` model role, prioritizing
+status and verified results, exact paths/ids/errors, then decisions and blockers.
+An overlong digest is requested once more with a smaller target; failure, cancellation,
+timeout (60 seconds per attempt), or repeated overflow produces a clearly marked
+UTF-8-safe clip of the original. Reports above 128 KiB skip the model and clip.
+Every transformed body ends with exact `wait` arguments for an in-memory report id;
+`wait` returns the original body and structured data under `report`. Small structured
+JSON is included inline; larger data is deferred to that pointer. The header retains
+the child id, optional name, kind, and original byte count. Per-sender lanes preserve
+message order even while a digest is pending, and keep its originating topic when the
+active thread changes. Each digest uses its turn's owner token, not an earlier run's.
+Weak event registrations are pruned as managers come and go; an inbox-ready event wakes
+the idle GUI after delayed publication without retaining dropped managers.
+Archives, like the inbox, last for this runtime process only. Explicit `wait` on a
+child still returns its complete terminal `SubagentResult`, and nested synchronous
+`task` results are unchanged.
 
 PR5 adds focus chat mode. Clicking a focus card opens the thread's view: its
 transcript, a follow-up composer, the VCS panel rooted at its workspace, and a

@@ -9,12 +9,14 @@
 //! Behavioral reference: oh-my-pi `packages/coding-agent/src/task` at
 //! 579da1d6; see licenses/OMP-MIT.txt.
 
-use std::collections::HashMap;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::main_report::{self, DEFAULT_MAIN_REPORT_BYTES};
 use crate::session::Session;
 use crate::tier::ExecutionTier;
 use crate::tools::DesktopSessionArtifact;
@@ -330,6 +332,23 @@ pub trait SubagentFactory: Send + Sync {
     async fn release_workspace(&self, _id: &str, _path: &Path) -> Result<(), String> {
         Err("workspace release not supported by this factory".into())
     }
+
+    /// Byte budget for one report entering the main thread. Reports over it
+    /// are digested or clipped; see `main_report`.
+    fn main_report_budget(&self) -> usize {
+        DEFAULT_MAIN_REPORT_BYTES
+    }
+
+    /// Condense an over-budget report to at most `limit` bytes of text. The
+    /// default has no model, so the report is clipped instead.
+    async fn digest_report(
+        &self,
+        _body: &str,
+        _limit: usize,
+        _cancel: CancellationToken,
+    ) -> Result<String, String> {
+        Err("digest not supported by this factory".into())
+    }
 }
 
 /// Snapshot a child exposes to waiters; the watch channel guarantees every
@@ -347,6 +366,8 @@ pub struct ChildState {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SubagentEvent {
+    /// A bounded report is now readable in the shared main inbox.
+    MainInboxReady,
     /// A child was queued. `focus` children always run isolated.
     Spawned {
         id: String,
@@ -408,8 +429,16 @@ impl MainMessageKind {
 pub struct MainMessage {
     /// Child id, or the sender placeholder used when a peer has no sender id.
     pub from: String,
+    /// The child's configured name, when it has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub kind: MainMessageKind,
+    /// The body as the main thread receives it: verbatim, or a bounded digest
+    /// ending with a pointer to the full text.
     pub body: String,
+    /// Byte length of the original report when `body` is a digest or clip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest_of: Option<usize>,
 }
 
 /// In-memory mailbox the main agent drains with `agent_inbox`. One inbox is
@@ -423,6 +452,13 @@ pub struct MainMessage {
 pub struct MainInbox {
     messages: Arc<Mutex<Vec<Queued>>>,
     arrived: Arc<Notify>,
+    /// Reports from one sender still waiting for their digest, oldest first.
+    /// A sender has a lane while any of its reports is pending, so its later
+    /// reports queue behind the digests rather than overtake them.
+    lanes: Arc<Mutex<HashMap<String, VecDeque<PendingReport>>>>,
+    /// Full text of every digested or clipped report, by pointer id.
+    archive: Arc<Mutex<HashMap<String, ArchivedReport>>>,
+    event_senders: Arc<Mutex<Vec<broadcast::WeakSender<SubagentEvent>>>>,
 }
 
 struct Queued {
@@ -442,6 +478,17 @@ impl MainInbox {
             .lock()
             .expect("main inbox poisoned")
             .push(Queued { origin, message });
+        self.event_senders
+            .lock()
+            .expect("main inbox poisoned")
+            .retain(|weak| {
+                if let Some(sender) = weak.upgrade() {
+                    let _ = sender.send(SubagentEvent::MainInboxReady);
+                    true
+                } else {
+                    false
+                }
+            });
         // Stores a permit when no waiter is parked, so a push racing a drain
         // is not missed by the next `arrived` wait.
         self.arrived.notify_one();
@@ -502,6 +549,174 @@ impl MainInbox {
             origin,
             taken.into_iter().map(|queued| queued.message).collect(),
         ))
+    }
+
+    /// Queue a child report for the main thread. A report within its budget
+    /// enters at once unless its sender still has reports pending. Otherwise
+    /// it waits in the sender's lane and is bounded in arrival order, so a
+    /// sender's reports never overtake one another.
+    pub fn submit(
+        &self,
+        report: MainReport,
+        factory: Arc<dyn SubagentFactory>,
+        cancel: CancellationToken,
+    ) {
+        let budget = factory.main_report_budget();
+        let mut lanes = self.lanes.lock().expect("main inbox poisoned");
+        if !lanes.contains_key(&report.from) && report.body.len() <= budget && report.data.is_none()
+        {
+            self.push_from(
+                report.origin,
+                MainMessage {
+                    from: report.from,
+                    kind: report.kind,
+                    name: report.name,
+                    digest_of: None,
+                    body: report.body,
+                },
+            );
+            return;
+        }
+        let from = report.from.clone();
+        let pending = PendingReport {
+            report,
+            factory,
+            cancel,
+            budget,
+        };
+        match lanes.entry(from.clone()) {
+            Entry::Vacant(lane) => {
+                lane.insert(VecDeque::from([pending]));
+                tokio::spawn(drain_lane(self.clone(), from));
+            }
+            Entry::Occupied(mut lane) => lane.get_mut().push_back(pending),
+        }
+    }
+
+    /// Full text of a digested or clipped report, as `wait` returns it.
+    pub fn archived(&self, id: &str) -> Option<Value> {
+        self.archive
+            .lock()
+            .expect("main inbox poisoned")
+            .get(id)
+            .map(|report| serde_json::to_value(report).expect("archived report serializes"))
+    }
+}
+
+/// A child report on its way to the main thread, before it is bounded.
+pub struct MainReport {
+    /// Topic that spawned the report; retained while asynchronous digestion runs.
+    pub origin: Option<String>,
+    pub from: String,
+    pub name: Option<String>,
+    pub kind: MainMessageKind,
+    pub body: String,
+    /// Structured output of the child, shown in the bounded body when small.
+    pub data: Option<Value>,
+}
+
+/// A report waiting in its sender's lane for its digest.
+struct PendingReport {
+    report: MainReport,
+    factory: Arc<dyn SubagentFactory>,
+    cancel: CancellationToken,
+    budget: usize,
+}
+
+/// Full text of a digested or clipped report, returned by `wait` under its
+/// pointer id.
+#[derive(Serialize)]
+struct ArchivedReport {
+    from: String,
+    name: Option<String>,
+    kind: MainMessageKind,
+    body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
+}
+
+/// Bounds and delivers one sender's queued reports in arrival order, then
+/// retires the lane. The lane lock is never held across an await.
+async fn drain_lane(inbox: MainInbox, from: String) {
+    loop {
+        let popped = {
+            let mut lanes = inbox.lanes.lock().expect("main inbox poisoned");
+            let popped = lanes.get_mut(&from).and_then(VecDeque::pop_front);
+            if popped.is_none() {
+                lanes.remove(&from);
+            }
+            popped
+        };
+        let Some(next) = popped else { return };
+        let origin = next.report.origin.clone();
+        let message = bound_pending(&inbox, next).await;
+        inbox.push_from(origin, message);
+    }
+}
+
+async fn bound_pending(inbox: &MainInbox, pending: PendingReport) -> MainMessage {
+    let PendingReport {
+        report:
+            MainReport {
+                origin: _,
+                from,
+                name,
+                kind,
+                body,
+                data,
+            },
+        factory,
+        cancel,
+        budget,
+    } = pending;
+    let key = Uuid::now_v7().to_string();
+    let view = main_report::Report {
+        body: &body,
+        data: data.as_ref(),
+        key: &key,
+    };
+    let text = body.as_str();
+    let bounded = main_report::bound(view, budget, main_report::DIGEST_TIMEOUT, move |limit| {
+        let factory = factory.clone();
+        let cancel = cancel.clone();
+        async move {
+            tokio::select! {
+                _ = cancel.cancelled() => Err("cancelled".into()),
+                result = factory.digest_report(text, limit, cancel.clone()) => result,
+            }
+        }
+    })
+    .await;
+    match bounded {
+        None => MainMessage {
+            from,
+            kind,
+            name,
+            digest_of: None,
+            body,
+        },
+        Some(bounded) => {
+            let digest_of = Some(body.len());
+            let archived = ArchivedReport {
+                from: from.clone(),
+                name: name.clone(),
+                kind,
+                body,
+                data,
+            };
+            inbox
+                .archive
+                .lock()
+                .expect("main inbox poisoned")
+                .insert(key, archived);
+            MainMessage {
+                from,
+                kind,
+                name,
+                digest_of,
+                body: bounded,
+            }
+        }
     }
 }
 
@@ -609,6 +824,15 @@ impl SubagentManager {
         main_inbox: MainInbox,
         origin: Option<String>,
     ) -> Self {
+        let events = broadcast::channel(EVENT_CAPACITY).0;
+        {
+            let mut senders = main_inbox
+                .event_senders
+                .lock()
+                .expect("main inbox poisoned");
+            senders.retain(|sender| sender.upgrade().is_some());
+            senders.push(events.downgrade());
+        }
         Self {
             inner: Arc::new(Inner {
                 factory,
@@ -616,7 +840,7 @@ impl SubagentManager {
                 main_inbox,
                 origin,
                 children: Mutex::new(HashMap::new()),
-                events: broadcast::channel(EVENT_CAPACITY).0,
+                events,
             }),
             owner,
         }
@@ -646,6 +870,27 @@ impl SubagentManager {
             inner: Arc::clone(&self.inner),
             owner,
         }
+    }
+
+    /// Route peer messages through the same ordered, bounded report lane as completion.
+    pub fn report_to_main(&self, from: String, body: String) {
+        let child = self.child(&from).ok();
+        let name = child.as_ref().and_then(|child| child.spec.name.clone());
+        let origin = child
+            .and_then(|child| child.spec.origin.clone())
+            .or_else(|| self.inner.origin.clone());
+        self.inner.main_inbox.submit(
+            MainReport {
+                origin,
+                from,
+                name,
+                kind: MainMessageKind::Message,
+                body,
+                data: None,
+            },
+            self.inner.factory.clone(),
+            self.owner.clone(),
+        );
     }
 
     /// Subscribe to lifecycle events for every child this manager owns. A
@@ -1258,17 +1503,17 @@ async fn acquire_permit(
     let permit = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
-            finish(inner, child, SubagentStatus::Cancelled, Err("cancelled while queued".into()), origin);
+            finish(inner, child, SubagentStatus::Cancelled, Err("cancelled while queued".into()), origin, owner);
             return None;
         }
         _ = owner.cancelled() => {
-            finish(inner, child, SubagentStatus::Cancelled, Err("cancelled with parent while queued".into()), origin);
+            finish(inner, child, SubagentStatus::Cancelled, Err("cancelled with parent while queued".into()), origin, owner);
             return None;
         }
         permit = inner.semaphore.clone().acquire_owned() => match permit {
             Ok(permit) => permit,
             Err(_) => {
-                finish(inner, child, SubagentStatus::Failed, Err("subagent semaphore closed".into()), origin);
+                finish(inner, child, SubagentStatus::Failed, Err("subagent semaphore closed".into()), origin, owner);
                 return None;
             }
         },
@@ -1443,7 +1688,7 @@ async fn run_turn<F, Fut>(
         Err(_) if cancelled => SubagentStatus::Cancelled,
         Err(_) => SubagentStatus::Failed,
     };
-    finish(inner, child, status, outcome, origin);
+    finish(inner, child, status, outcome, origin, owner);
 }
 
 /// Prepended to follow-ups the user types in a focus thread. The contract main
@@ -1460,14 +1705,16 @@ enum TurnOrigin {
 }
 
 /// Publish the terminal state for a turn — exactly once per turn. The main
-/// inbox notice is pushed before the state is published, so a waiter woken by
-/// the state already observes the notice.
+/// inbox notice is submitted before the state is published. An over-budget
+/// report may still be digesting when the waiter wakes: its digest does not
+/// delay the state, and the notice enters the inbox once the digest completes.
 fn finish(
     inner: &Inner,
     child: &Child,
     status: SubagentStatus,
     outcome: Result<SubagentResult, String>,
     origin: TurnOrigin,
+    owner: &CancellationToken,
 ) {
     debug_assert!(status.is_terminal());
     let kind = MainMessageKind::from_terminal(&status).filter(|_| origin == TurnOrigin::Main);
@@ -1476,13 +1723,18 @@ fn finish(
             Ok(result) => result.output.clone(),
             Err(err) => err.clone(),
         };
-        inner.main_inbox.push_from(
-            child.spec.origin.clone(),
-            MainMessage {
+        let data = outcome.as_ref().ok().and_then(|result| result.data.clone());
+        inner.main_inbox.submit(
+            MainReport {
+                origin: child.spec.origin.clone(),
                 from: child.id.clone(),
+                name: child.spec.name.clone(),
                 kind,
                 body,
+                data,
             },
+            inner.factory.clone(),
+            owner.clone(),
         );
     }
     let (result, error) = match &outcome {
@@ -1521,6 +1773,8 @@ async fn report_desktops(
         };
         main_inbox.push(MainMessage {
             from: child_id.clone(),
+            name: None,
+            digest_of: None,
             kind: MainMessageKind::Desktop,
             body: format!(
                 "Desktop '{}' is open: environment {}, artifact {}.",
@@ -2963,6 +3217,8 @@ mod tests {
             vec![MainMessage {
                 from: id.clone(),
                 kind: MainMessageKind::Completed,
+                name: None,
+                digest_of: None,
                 body: "done:thread".into(),
             }]
         );
@@ -2986,6 +3242,8 @@ mod tests {
             vec![MainMessage {
                 from: id,
                 kind: MainMessageKind::Completed,
+                name: None,
+                digest_of: None,
                 body: "again:report".into(),
             }]
         );
@@ -2997,6 +3255,8 @@ mod tests {
         let note = |body: &str| MainMessage {
             from: "child".into(),
             kind: MainMessageKind::Message,
+            name: None,
+            digest_of: None,
             body: body.into(),
         };
         inbox.push(note("third"));
@@ -3071,11 +3331,15 @@ mod tests {
             vec![
                 MainMessage {
                     from: id.clone(),
+                    name: None,
+                    digest_of: None,
                     kind: MainMessageKind::Desktop,
                     body: "Desktop 'Game' is open: environment env-1, artifact live.".into(),
                 },
                 MainMessage {
                     from: id,
+                    name: None,
+                    digest_of: None,
                     kind: MainMessageKind::Completed,
                     body: "done".into(),
                 },
@@ -3088,6 +3352,8 @@ mod tests {
         let inbox = MainInbox::default();
         let note = |body: &str| MainMessage {
             from: "child".into(),
+            name: None,
+            digest_of: None,
             kind: MainMessageKind::Completed,
             body: body.into(),
         };
@@ -3154,7 +3420,7 @@ mod tests {
                     assert_eq!(status, SubagentStatus::Completed);
                     break;
                 }
-                SubagentEvent::StatusChanged { .. } => {}
+                SubagentEvent::StatusChanged { .. } | SubagentEvent::MainInboxReady => {}
                 other => panic!("unexpected event {other:?}"),
             }
         }
@@ -3427,6 +3693,8 @@ mod tests {
             vec![MainMessage {
                 from: id,
                 kind: MainMessageKind::Completed,
+                name: None,
+                digest_of: None,
                 body: "done:alpha".into(),
             }]
         );
@@ -3454,6 +3722,8 @@ mod tests {
             vec![MainMessage {
                 from: id,
                 kind: MainMessageKind::Failed,
+                name: None,
+                digest_of: None,
                 body: "boom".into(),
             }]
         );
@@ -3486,6 +3756,8 @@ mod tests {
             vec![MainMessage {
                 from: id,
                 kind: MainMessageKind::Cancelled,
+                name: None,
+                digest_of: None,
                 body: "cancelled".into(),
             }]
         );
@@ -3538,6 +3810,8 @@ mod tests {
             vec![MainMessage {
                 from: id,
                 kind: MainMessageKind::Completed,
+                name: None,
+                digest_of: None,
                 body: "done:alpha".into(),
             }]
         );
@@ -3876,5 +4150,128 @@ mod tests {
         let summary = summary_of(&manager, &id);
         assert_eq!(summary.workspace, None);
         assert!(!summary.released);
+    }
+
+    #[tokio::test]
+    async fn dropped_managers_release_event_channels_and_prune_registrations() {
+        let inbox = MainInbox::default();
+        let factory = Arc::new(DesktopFactory);
+        let root =
+            SubagentManager::new(factory.clone(), 1, CancellationToken::new(), inbox.clone());
+        let mut root_events = root.subscribe_events();
+        for _ in 0..64 {
+            let nested = SubagentManager::with_origin(
+                factory.clone(),
+                1,
+                CancellationToken::new(),
+                inbox.clone(),
+                Some("topic".into()),
+            );
+            let mut nested_events = nested.subscribe_events();
+            drop(nested);
+            assert!(matches!(
+                nested_events.try_recv(),
+                Err(broadcast::error::TryRecvError::Closed)
+            ));
+        }
+        root.report_to_main("sender".into(), "ready".into());
+        assert!(matches!(
+            root_events.recv().await.unwrap(),
+            SubagentEvent::MainInboxReady
+        ));
+        assert_eq!(inbox.event_senders.lock().unwrap().len(), 1);
+    }
+
+    struct OwnerDigestFactory {
+        entered: Semaphore,
+        release: Semaphore,
+    }
+
+    #[async_trait]
+    impl SubagentFactory for OwnerDigestFactory {
+        async fn run(
+            &self,
+            id: &str,
+            _spec: TaskSpec,
+            _control: RunControl,
+            _events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<SubagentResult, String> {
+            Ok(turn_result(id, "first report ".repeat(2000)))
+        }
+
+        async fn follow_up(
+            &self,
+            id: &str,
+            _spec: &TaskSpec,
+            _path: &Path,
+            _prompt: String,
+            _control: RunControl,
+            _events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<SubagentResult, String> {
+            Ok(turn_result(id, "follow-up report ".repeat(2000)))
+        }
+
+        async fn digest_report(
+            &self,
+            _body: &str,
+            _limit: usize,
+            _cancel: CancellationToken,
+        ) -> Result<String, String> {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok("Follow-up verified; no blockers.".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn digest_cancellation_uses_each_turn_owner_not_the_previous_owner() {
+        let factory = Arc::new(OwnerDigestFactory {
+            entered: Semaphore::new(0),
+            release: Semaphore::new(0),
+        });
+        let owner = CancellationToken::new();
+        let manager = manager(factory.clone(), 1, owner.clone());
+        let mut task = spec("work");
+        task.origin = Some("topic-a".into());
+        let id = manager.spawn(task).unwrap();
+        manager.wait(&id).await.unwrap();
+        timeout(WAIT_TIMEOUT, factory.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        owner.cancel();
+        let inbox = manager.main_inbox();
+        timeout(WAIT_TIMEOUT, inbox.arrived()).await.unwrap();
+        assert!(inbox.drain_for("topic-b").is_empty());
+        let first = inbox.drain_for("topic-a");
+        assert_eq!(first.len(), 1);
+        assert!(first[0].body.contains("digest unavailable: cancelled"));
+        assert!(first[0].body.len() <= main_report::DEFAULT_MAIN_REPORT_BYTES);
+
+        let fresh_owner = CancellationToken::new();
+        let follow_up = manager.scoped(fresh_owner.clone());
+        follow_up.send(&id, "continue".into()).unwrap();
+        follow_up.wait(&id).await.unwrap();
+        timeout(WAIT_TIMEOUT, factory.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        assert!(
+            inbox.drain().is_empty(),
+            "a fresh owner must not inherit cancellation"
+        );
+        factory.release.add_permits(1);
+        timeout(WAIT_TIMEOUT, inbox.arrived()).await.unwrap();
+        assert!(inbox.drain_for("topic-b").is_empty());
+        let second = inbox.drain_for("topic-a");
+        assert_eq!(second.len(), 1);
+        assert!(
+            second[0]
+                .body
+                .starts_with("Follow-up verified; no blockers.")
+        );
+        assert!(!fresh_owner.is_cancelled());
     }
 }

@@ -18,6 +18,12 @@ inspect the repository and delegate everything else through `task`.
 - Write each child's contract in its `task` prompt: what to deliver and what to
   report back. To continue a completed child, `agent_send` it a message; its
   result arrives in `agent_inbox`.
+- Reports arrive as bounded digests when they exceed `mainReportBytes`. A digest
+  or clearly marked clip ends with `[full report: wait {"ids":["..."]}]`.
+  Use those exact `wait` arguments to recover the original body and structured
+  data under `report`; use the child id to retrieve its terminal `result`.
+  Read the full report when exact evidence or omitted details matter. A digest
+  is not additional verification.
 - Report only what a child reported. You cannot run tests yourself. If no child
   reported a command's result, say that it was not verified.
 - `recall {}` lists this branch's original messages, including compacted history;

@@ -13,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::main_report::{DEFAULT_MAIN_REPORT_BYTES, MIN_MAIN_REPORT_BYTES};
 use juto_catalog::Model;
 use serde::{Deserialize, Serialize};
 
@@ -140,6 +141,9 @@ pub struct RuntimeConfig {
     /// this many, the least recently routed thread goes dormant; dormant
     /// threads are reached by history lookup.
     pub max_active_threads: usize,
+    /// Byte budget for one child report entering the main thread. Larger
+    /// reports are digested, and their full text stays one `wait` away.
+    pub main_report_bytes: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -164,6 +168,7 @@ impl Default for RuntimeConfig {
             network: crate::network::NetworkConfig::default(),
             bash_scoped: false,
             max_active_threads: default_max_active_threads(),
+            main_report_bytes: DEFAULT_MAIN_REPORT_BYTES,
         }
     }
 }
@@ -236,6 +241,12 @@ impl RuntimeConfig {
         {
             return Err(ConfigError::Validation(format!(
                 "temperature must be a non-negative finite number, got {t}"
+            )));
+        }
+        if self.main_report_bytes < MIN_MAIN_REPORT_BYTES {
+            return Err(ConfigError::Validation(format!(
+                "mainReportBytes must be at least {MIN_MAIN_REPORT_BYTES}, got {}",
+                self.main_report_bytes
             )));
         }
         if let Some(level) = &self.thinking
