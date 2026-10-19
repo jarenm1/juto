@@ -127,14 +127,17 @@
             commonArgs
             // {
               inherit cargoArtifacts;
-              cargoExtraArgs = "-p juto --bin juto";
+              cargoExtraArgs = "-p juto -p juto-daemon --bins";
               doInstallCargoArtifacts = false;
               installPhaseCommand = ''
                 mkdir -p $out/bin
-                cp target/release/juto $out/bin/juto
+                cp target/release/juto target/release/juto-daemon $out/bin/
               '';
               postFixup = ''
                 wrapProgram $out/bin/juto \
+                  --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath nativeLibraries}" \
+                  --set GST_PLUGIN_SYSTEM_PATH_1_0 "${gstPluginPath}"
+                wrapProgram $out/bin/juto-daemon \
                   --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath nativeLibraries}" \
                   --set GST_PLUGIN_SYSTEM_PATH_1_0 "${gstPluginPath}"
               '';
