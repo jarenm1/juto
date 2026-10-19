@@ -9,6 +9,7 @@ pub mod context;
 mod contextual;
 pub mod desktop_artifact;
 pub mod git_transfer;
+mod main_inbox_store;
 mod main_report;
 pub mod network;
 pub mod peers;
@@ -443,23 +444,47 @@ impl Runtime {
     /// children it spawns: cancelling this run stops them, while ending another
     /// run leaves its children alone.
     pub fn subagent_manager(&self, control: &RunControl) -> Arc<SubagentManager> {
+        Arc::new(self.main_template().scoped(control.token().child_token()))
+    }
+
+    /// Make the main inbox durable under `main`'s session file, so undrained
+    /// messages survive a restart. The file is keyed by the main session, not
+    /// by thread: every thread of one session shares it. Binding the same
+    /// session again is a no-op; binding a different one fails, because this
+    /// process serves one main session.
+    pub fn open_main_inbox(&self, main: &MainSession) -> Result<()> {
+        let id = main.id();
+        anyhow::ensure!(
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+            "session id `{id}` cannot name an inbox file"
+        );
+        let path = self.data_dir().join("inbox").join(format!("{id}.json"));
+        self.main_template().main_inbox().bind(path)
+    }
+
+    /// The process-wide handle every run scopes from, created on first use.
+    fn main_template(&self) -> Arc<SubagentManager> {
         let mut guard = self.inner.subagent_manager.lock();
-        let template = guard.get_or_insert_with(|| {
-            let inbox = subagents::MainInbox::default();
-            // The template's owner is never cancelled: every handle handed out
-            // below is scoped to a run's own token.
-            Arc::new(SubagentManager::new(
-                Arc::new(ChildFactory {
-                    runtime: self.clone(),
-                    depth: 1,
-                    inbox: inbox.clone(),
-                }),
-                self.config().max_concurrency,
-                CancellationToken::new(),
-                inbox,
-            ))
-        });
-        Arc::new(template.scoped(control.token().child_token()))
+        guard
+            .get_or_insert_with(|| {
+                let inbox = subagents::MainInbox::default();
+                // The template's owner is never cancelled: every handle handed out
+                // scopes from it with its run's own token.
+                Arc::new(SubagentManager::new(
+                    Arc::new(ChildFactory {
+                        runtime: self.clone(),
+                        depth: 1,
+                        inbox: inbox.clone(),
+                    }),
+                    self.config().max_concurrency,
+                    CancellationToken::new(),
+                    inbox,
+                ))
+            })
+            .clone()
     }
 
     pub async fn run(
@@ -2277,6 +2302,79 @@ mod tests {
         );
         Runtime::with_provider(repo, data_dir, config, credentials, provider, None)
             .expect("runtime")
+    }
+
+    fn main_note(from: &str, body: &str) -> crate::subagents::MainMessage {
+        crate::subagents::MainMessage {
+            from: from.into(),
+            name: None,
+            kind: crate::subagents::MainMessageKind::Completed,
+            body: body.into(),
+            digest_of: None,
+        }
+    }
+
+    /// Undrained messages survive a restart with their origins: the next
+    /// process binds the same main session, and each thread receives only the
+    /// messages addressed to it.
+    #[tokio::test]
+    async fn undrained_main_messages_survive_restart_with_their_origins() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        let data = root.path().join("data");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let session_path = {
+            let runtime = mock_runtime(&repo, &data);
+            let main = runtime.new_main_session().expect("main session");
+            runtime.open_main_inbox(&main).expect("bind");
+            let inbox = runtime.subagent_manager(&RunControl::new()).main_inbox();
+            inbox.push_from(Some("thread-a".into()), main_note("child-a", "first"));
+            inbox.push_from(Some("thread-b".into()), main_note("child-b", "second"));
+            main.path().to_path_buf()
+        };
+
+        let runtime = mock_runtime(&repo, &data);
+        let main = MainSession::open(&session_path).expect("reopen main session");
+        runtime.open_main_inbox(&main).expect("rebind");
+        let inbox = runtime.subagent_manager(&RunControl::new()).main_inbox();
+        assert_eq!(
+            inbox.drain_for("thread-b"),
+            vec![main_note("child-b", "second")]
+        );
+        assert_eq!(
+            inbox.drain_for("thread-a"),
+            vec![main_note("child-a", "first")]
+        );
+        assert!(inbox.drain().is_empty());
+    }
+
+    /// One process serves one main session: a second session cannot bind the
+    /// inbox, and an unreadable inbox file fails the bind without being
+    /// overwritten, so its messages are not discarded.
+    #[tokio::test]
+    async fn main_inbox_refuses_second_session_and_unreadable_file() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo");
+        let data = root.path().join("data");
+        let runtime = mock_runtime(&repo, &data);
+        let first = runtime.new_main_session().expect("first session");
+        let second = runtime.new_main_session().expect("second session");
+        runtime.open_main_inbox(&first).expect("bind first");
+        runtime
+            .open_main_inbox(&first)
+            .expect("binding the same session again is a no-op");
+        assert!(runtime.open_main_inbox(&second).is_err());
+
+        let other = root.path().join("other");
+        let corrupt_runtime = mock_runtime(&repo, &other);
+        let main = corrupt_runtime.new_main_session().expect("session");
+        let inbox_dir = other.join("inbox");
+        std::fs::create_dir_all(&inbox_dir).expect("inbox dir");
+        let file = inbox_dir.join(format!("{}.json", main.id()));
+        std::fs::write(&file, b"not json").expect("write corrupt inbox");
+        assert!(corrupt_runtime.open_main_inbox(&main).is_err());
+        assert_eq!(std::fs::read(&file).expect("read"), b"not json");
     }
 
     #[tokio::test]

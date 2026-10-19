@@ -422,8 +422,12 @@ drains the inbox with `agent_inbox`, returning `from`, `name`, `kind`, `digest_o
 and `body`, and clearing the inbox. Reading `agent://main` fails with
 `PeerError::WriteOnly`, so draining happens only through `agent_inbox`. Children
 never write to the user UI; the main agent decides what reaches the user. The
-inbox is not persisted across process restart. Main-started turns (the first run and
-an `agent_send` to a completed child) push a notice on every terminal publication. A
+inbox is persisted under `data_dir/inbox/<main-session-id>.json` once `Runtime::open_main_inbox`
+binds it to the main session (the desktop app and CLI do this after opening the session). Each
+undrained message keeps its `origin`, the top-level session it is addressed to, so each thread
+drains only its own. Reports still waiting for a digest are not persisted; a restart before the
+digest finishes drops them. A file that cannot be read fails the bind instead of being replaced.
+Main-started turns (the first run and an `agent_send` to a completed child) push a notice on every terminal publication. A
 turn the user types in a focus thread pushes none; its result reaches the user through
 the focus view.
 
@@ -447,7 +451,8 @@ message order even while a digest is pending, and keep its originating topic whe
 active thread changes. Each digest uses its turn's owner token, not an earlier run's.
 Weak event registrations are pruned as managers come and go; an inbox-ready event wakes
 the idle GUI after delayed publication without retaining dropped managers.
-Archives, like the inbox, last for this runtime process only. Explicit `wait` on a
+Archives persist with the inbox, so a digest pointer returned before a restart still resolves
+after it. Explicit `wait` on a
 child still returns its complete terminal `SubagentResult`, and nested synchronous
 `task` results are unchanged.
 

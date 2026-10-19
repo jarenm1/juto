@@ -157,6 +157,10 @@ fn run() -> ExitCode {
         },
     };
 
+    if let Err(err) = runtime.open_main_inbox(&session) {
+        eprintln!("error: failed to open main inbox: {err}");
+        return ExitCode::from(1);
+    }
     Application::new().run(move |cx: &mut App| {
         chat::init(cx);
         chat_input::init(cx);

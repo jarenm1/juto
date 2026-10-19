@@ -14,8 +14,9 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::main_inbox_store;
 use crate::main_report::{self, DEFAULT_MAIN_REPORT_BYTES};
 use crate::session::Session;
 use crate::tier::ExecutionTier;
@@ -398,7 +399,7 @@ pub enum SubagentEvent {
 const EVENT_CAPACITY: usize = 256;
 
 /// Kind of message delivered to the main agent's inbox.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MainMessageKind {
     /// A child sent a message to `agent://main`.
@@ -425,7 +426,7 @@ impl MainMessageKind {
 }
 
 /// One entry in the main agent's inbox.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MainMessage {
     /// Child id, or the sender placeholder used when a peer has no sender id.
     pub from: String,
@@ -441,13 +442,16 @@ pub struct MainMessage {
     pub digest_of: Option<usize>,
 }
 
-/// In-memory mailbox the main agent drains with `agent_inbox`. One inbox is
-/// shared by every manager in a run tree, so nested children write into the
-/// same main thread. Not persisted: messages are lost when the process exits.
+/// Main agent's inbox, shared by every manager in a run tree, so nested
+/// children write into the same main thread. Each message remembers the
+/// session id of the top-level run that spawned its sender (`origin`), so a
+/// main session with several internal threads delivers a report to the thread
+/// that asked for it.
 ///
-/// Each message remembers the session id of the top-level run that spawned
-/// its sender (`origin`), so a main session with several internal threads
-/// delivers a report to the thread that asked for it.
+/// Once [`MainInbox::bind`] attaches a file, every change to the queue or to
+/// the digest archive is written to it. Reports still waiting in a sender's
+/// lane for their digest are not persisted: the digest needs the live model,
+/// so a restart before it finishes drops them.
 #[derive(Clone, Default)]
 pub struct MainInbox {
     messages: Arc<Mutex<Vec<Queued>>>,
@@ -459,14 +463,49 @@ pub struct MainInbox {
     /// Full text of every digested or clipped report, by pointer id.
     archive: Arc<Mutex<HashMap<String, ArchivedReport>>>,
     event_senders: Arc<Mutex<Vec<broadcast::WeakSender<SubagentEvent>>>>,
+    /// Backing file, set once by `bind`.
+    store: Arc<OnceLock<PathBuf>>,
 }
 
-struct Queued {
-    origin: Option<String>,
-    message: MainMessage,
+/// One queued message and the top-level session it is addressed to.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct Queued {
+    pub(crate) origin: Option<String>,
+    pub(crate) message: MainMessage,
 }
 
 impl MainInbox {
+    /// Attach the inbox to the file at `path` and restore what it holds.
+    /// Messages already queued in this process stay behind the restored ones.
+    /// Binding the same path again is a no-op; binding a different path fails,
+    /// because one inbox serves one main session. A file that cannot be read
+    /// fails the bind and leaves the inbox unattached.
+    pub fn bind(&self, path: PathBuf) -> anyhow::Result<()> {
+        let mut messages = self.messages.lock().expect("main inbox poisoned");
+        if let Some(bound) = self.store.get() {
+            anyhow::ensure!(
+                *bound == path,
+                "main inbox is already bound to {}",
+                bound.display()
+            );
+            return Ok(());
+        }
+        let loaded = main_inbox_store::load(&path)?;
+        let restored = !loaded.queued.is_empty();
+        let mut archive = self.archive.lock().expect("main inbox poisoned");
+        archive.extend(loaded.archive);
+        messages.splice(0..0, loaded.queued);
+        // Checked above under the `messages` lock, so no other bind can have set it.
+        let _ = self.store.set(path);
+        self.persist_with(&messages, &archive);
+        drop(archive);
+        drop(messages);
+        if restored {
+            self.announce();
+        }
+        Ok(())
+    }
+
     /// Queue a message with no known origin; any top-level run may take it.
     pub fn push(&self, message: MainMessage) {
         self.push_from(None, message);
@@ -474,10 +513,16 @@ impl MainInbox {
 
     /// Queue a message addressed to the top-level session `origin`.
     pub fn push_from(&self, origin: Option<String>, message: MainMessage) {
-        self.messages
-            .lock()
-            .expect("main inbox poisoned")
-            .push(Queued { origin, message });
+        {
+            let mut messages = self.messages.lock().expect("main inbox poisoned");
+            messages.push(Queued { origin, message });
+            self.persist(&messages);
+        }
+        self.announce();
+    }
+
+    /// Wake waiters and event subscribers: a message is ready to drain.
+    fn announce(&self) {
         self.event_senders
             .lock()
             .expect("main inbox poisoned")
@@ -492,6 +537,24 @@ impl MainInbox {
         // Stores a permit when no waiter is parked, so a push racing a drain
         // is not missed by the next `arrived` wait.
         self.arrived.notify_one();
+    }
+
+    /// Write the queue and archive to the bound file, if any. Callers hold the
+    /// `messages` lock, so writes are ordered with the change they record. A
+    /// failed write is reported on stderr and the state stays in memory; the
+    /// next successful write stores all of it again.
+    fn persist(&self, messages: &[Queued]) {
+        let archive = self.archive.lock().expect("main inbox poisoned");
+        self.persist_with(messages, &archive);
+    }
+
+    fn persist_with(&self, messages: &[Queued], archive: &HashMap<String, ArchivedReport>) {
+        let Some(path) = self.store.get() else {
+            return;
+        };
+        if let Err(error) = main_inbox_store::save(path, messages, archive) {
+            eprintln!("juto: {error:#}");
+        }
     }
 
     /// Resolves once a message is pushed. Pending messages are read with `drain`.
@@ -509,19 +572,22 @@ impl MainInbox {
             origin: origin.map(str::to_owned),
             message,
         });
-        self.messages
-            .lock()
-            .expect("main inbox poisoned")
-            .splice(0..0, queued);
+        let mut guard = self.messages.lock().expect("main inbox poisoned");
+        guard.splice(0..0, queued);
+        self.persist(&guard);
+        drop(guard);
         self.arrived.notify_one();
     }
 
     /// Remove and return every pending message in arrival order.
     pub fn drain(&self) -> Vec<MainMessage> {
-        std::mem::take(&mut *self.messages.lock().expect("main inbox poisoned"))
-            .into_iter()
-            .map(|queued| queued.message)
-            .collect()
+        let mut guard = self.messages.lock().expect("main inbox poisoned");
+        if guard.is_empty() {
+            return Vec::new();
+        }
+        let taken = std::mem::take(&mut *guard);
+        self.persist(&guard);
+        taken.into_iter().map(|queued| queued.message).collect()
     }
 
     /// Remove and return the messages a run of session `session_id` should
@@ -533,6 +599,9 @@ impl MainInbox {
             .into_iter()
             .partition(|queued| queued.origin.as_deref().is_none_or(|o| o == session_id));
         *guard = kept;
+        if !taken.is_empty() {
+            self.persist(&guard);
+        }
         taken.into_iter().map(|queued| queued.message).collect()
     }
 
@@ -545,6 +614,7 @@ impl MainInbox {
             .into_iter()
             .partition(|queued| queued.origin == origin);
         *guard = kept;
+        self.persist(&guard);
         Some((
             origin,
             taken.into_iter().map(|queued| queued.message).collect(),
@@ -625,14 +695,14 @@ struct PendingReport {
 
 /// Full text of a digested or clipped report, returned by `wait` under its
 /// pointer id.
-#[derive(Serialize)]
-struct ArchivedReport {
-    from: String,
-    name: Option<String>,
-    kind: MainMessageKind,
-    body: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
+#[derive(Serialize, Deserialize)]
+pub(crate) struct ArchivedReport {
+    pub(crate) from: String,
+    pub(crate) name: Option<String>,
+    pub(crate) kind: MainMessageKind,
+    pub(crate) body: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub(crate) data: Option<Value>,
 }
 
 /// Bounds and delivers one sender's queued reports in arrival order, then
@@ -704,11 +774,12 @@ async fn bound_pending(inbox: &MainInbox, pending: PendingReport) -> MainMessage
                 body,
                 data,
             };
-            inbox
-                .archive
-                .lock()
-                .expect("main inbox poisoned")
-                .insert(key, archived);
+            {
+                let messages = inbox.messages.lock().expect("main inbox poisoned");
+                let mut archive = inbox.archive.lock().expect("main inbox poisoned");
+                archive.insert(key, archived);
+                inbox.persist_with(&messages, &archive);
+            }
             MainMessage {
                 from,
                 kind,
@@ -4273,5 +4344,45 @@ mod tests {
                 .starts_with("Follow-up verified; no blockers.")
         );
         assert!(!fresh_owner.is_cancelled());
+    }
+
+    /// A digested report's pointer still resolves after the inbox restarts:
+    /// the archive is persisted alongside the queue that points into it.
+    #[tokio::test]
+    async fn digested_report_pointer_resolves_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("inbox.json");
+        let factory = Arc::new(OwnerDigestFactory {
+            entered: Semaphore::new(0),
+            release: Semaphore::new(1),
+        });
+        let manager = manager(factory, 1, CancellationToken::new());
+        let inbox = manager.main_inbox();
+        inbox.bind(path.clone()).unwrap();
+        let id = manager.spawn(spec("work")).unwrap();
+        manager.wait(&id).await.unwrap();
+        timeout(WAIT_TIMEOUT, inbox.arrived()).await.unwrap();
+        let message = inbox.drain().pop().unwrap();
+        let pointer = message
+            .body
+            .split("\"ids\":[\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let restarted = MainInbox::default();
+        restarted.bind(path).unwrap();
+        let archived = restarted
+            .archived(&pointer)
+            .expect("pointer resolves after restart");
+        assert!(
+            archived["body"]
+                .as_str()
+                .unwrap()
+                .starts_with("first report ")
+        );
     }
 }
