@@ -1156,6 +1156,11 @@ impl subagents::SubagentFactory for ChildFactory {
         };
         let result: Result<SubagentResult> = async {
             let mut session = Session::create(&runtime.inner.data_dir.join("sessions/subagents"), &runtime.inner.cwd)?;
+            if let Some(snapshot) = &spec.main_snapshot {
+                session.append(EntryKind::Message {
+                    message: Message::developer(snapshot.as_ref()),
+                })?;
+            }
             let settings = runtime.config();
             let role = spec.agent.as_deref().unwrap_or(roles::DEFAULT_ROLE);
             let role_models = roles::load(&runtime.inner.cwd, &runtime.inner.data_dir)?
@@ -1394,10 +1399,18 @@ impl Tool for TaskTool {
             .iter()
             .map(|value| self.parse_task(value, context))
             .collect::<Result<Vec<_>, _>>()?;
+        let snapshot: Option<Arc<str>> = self
+            .main_session
+            .as_deref()
+            .map(recall::snapshot)
+            .transpose()
+            .map_err(|error| format!("reading main thread snapshot: {error:#}"))?
+            .map(Arc::from);
         // A top-level run's children report back to its session; a nested
         // manager overrides this with the root session it reports to.
         for spec in &mut specs {
             spec.origin = Some(ctx.session_id.clone());
+            spec.main_snapshot = snapshot.clone();
         }
         let queued: Vec<(Option<String>, bool)> = specs
             .iter()
@@ -1462,6 +1475,7 @@ impl TaskTool {
         Ok(TaskSpec {
             name: value.get("name").and_then(Value::as_str).map(str::to_owned),
             main_session: self.main_session.clone(),
+            main_snapshot: None,
             agent,
             task: if context.is_empty() {
                 task.to_owned()
@@ -1825,6 +1839,111 @@ mod tests {
     use tokio::sync::watch;
     use tokio::time::{Duration, timeout};
     use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn task_siblings_share_main_snapshot_and_follow_up_does_not_repeat_it() {
+        let root = tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let data = root.path().join("data");
+        let runtime = runtime_with(&repo, &data, mock_config(), Arc::new(MockProvider));
+        let mut main = runtime.new_session().unwrap();
+        main.append(EntryKind::Message {
+            message: Message::user("original hidden request"),
+        })
+        .unwrap();
+        main.compact("Keep the main context small.".into(), 0)
+            .unwrap();
+        main.append(EntryKind::Message {
+            message: Message::user("current main request"),
+        })
+        .unwrap();
+        let control = RunControl::new();
+        let manager = runtime.subagent_manager(&control);
+        let tool = TaskTool {
+            manager: manager.clone(),
+            catalog: Arc::new(roles::load(&repo, &data).unwrap()),
+            allow_focus: true,
+            async_results: false,
+            main_session: Some(main.path().to_path_buf()),
+        };
+        let ctx = ToolContext {
+            cwd: repo.clone(),
+            session_id: "fixture".into(),
+            cancel: CancellationToken::new(),
+        };
+        tool.execute(
+            json!({"context": "shared contract", "tasks": [
+                {"task": "first assignment"}, {"task": "second assignment"}
+            ]}),
+            ctx.clone(),
+        )
+        .await
+        .unwrap();
+        let mut snapshots = Vec::new();
+        let evidence = std::env::var_os("JUTO_RECALL_EVIDENCE").map(PathBuf::from);
+        if let Some(dir) = &evidence {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let children = manager.list();
+        for child in &children {
+            let result = manager.wait(&child.id).await.unwrap();
+            let session = Session::open(&result.session_path).unwrap();
+            let messages = session.messages().unwrap();
+            let Message::Developer { content, .. } = &messages[0] else {
+                panic!("snapshot must be the first message");
+            };
+            let prefix = serde_json::to_string(content).unwrap();
+            assert!(prefix.contains("Keep the main context small."));
+            assert!(prefix.contains("1|user: current main request"));
+            assert!(!prefix.contains("original hidden request"));
+            assert!(
+                serde_json::to_string(&messages[1])
+                    .unwrap()
+                    .contains("shared contract")
+            );
+            snapshots.push(prefix);
+            if let Some(dir) = &evidence {
+                std::fs::copy(
+                    &result.session_path,
+                    dir.join(format!("{}.jsonl", child.id)),
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(snapshots[0], snapshots[1]);
+        manager
+            .follow_up(&children[0].id, "continue".into())
+            .unwrap();
+        let result = manager.wait(&children[0].id).await.unwrap();
+        let session = Session::open(&result.session_path).unwrap();
+        assert_eq!(
+            session
+                .messages()
+                .unwrap()
+                .iter()
+                .filter(|m| matches!(m, Message::Developer { .. }))
+                .count(),
+            1
+        );
+        let recall = recall::RecallTool::new(main.path().to_path_buf());
+        let index = recall.execute(json!({}), ctx.clone()).await.unwrap();
+        let original = recall.execute(json!({"id": 0}), ctx).await.unwrap();
+        assert!(!index.is_error && !original.is_error);
+        if let Some(dir) = evidence {
+            std::fs::copy(main.path(), dir.join("main.jsonl")).unwrap();
+            std::fs::write(
+                dir.join("recall-index.json"),
+                serde_json::to_string_pretty(&index.content).unwrap(),
+            )
+            .unwrap();
+            std::fs::write(
+                dir.join("recall-original.json"),
+                serde_json::to_string_pretty(&original.content).unwrap(),
+            )
+            .unwrap();
+        }
+    }
 
     /// Streams one text response and stops, so an isolated child run completes
     /// without touching a real provider.

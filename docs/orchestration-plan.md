@@ -184,6 +184,14 @@ Subagents coordinate as specialized coworkers rather than an uncontrolled group 
     addresses an explicit child list and reports per-child failures.
   * `history://<id>` reads the active journal entries for a successfully completed child.
     The URI resolves through the subagent result; it is never treated as a filesystem path.
+  * `recall {}` reads the main journal's active-path index, including compacted
+    originals. `from`/`count` page the list; `recall {"id": N, "at": 0}` reads a
+    message with byte-offset continuation hints. Pages are about 16 KB, and
+    images appear as MIME placeholders. Branch switches select a new index path.
+  * A `task` call captures one main-view snapshot for all siblings: a developer
+    message containing the latest compaction summary and newest visible index
+    lines within 12 KB. Explicit shared `context` still works. Nested children
+    snapshot and recall the main session too; follow-ups do not reinsert snapshots.
 
 ---
 
