@@ -221,6 +221,52 @@ impl ViewerClient {
         }
     }
 
+    /// Releases the human control lease held by this viewer.
+    pub fn release_control(&mut self) -> Result<(), DesktopError> {
+        let command = DesktopCommand::Control {
+            env_id: self.env_id.clone(),
+            action: "release".to_string(),
+            is_human: true,
+        };
+        let payload = serde_json::to_vec(&DesktopRequest::new(command))
+            .map_err(|e| DesktopError::Protocol(format!("encode control: {e}")))?;
+        write_frame(&self.stream, &payload)?;
+        match self.read_response()? {
+            DesktopResponse::ControlChanged { .. } => {
+                self.epoch = None;
+                Ok(())
+            }
+            DesktopResponse::Error { code, message } => {
+                Err(DesktopError::Protocol(format!("{code}: {message}")))
+            }
+            other => Err(DesktopError::Protocol(format!(
+                "unexpected control response: {other:?}"
+            ))),
+        }
+    }
+
+    /// Renews the environment's owner lifetime. The viewer is the human owner
+    /// while it is open, so the environment is not retired as abandoned.
+    pub fn heartbeat_owner(&mut self) -> Result<(), DesktopError> {
+        let command = DesktopCommand::Heartbeat {
+            env_id: self.env_id.clone(),
+            target: "owner".to_string(),
+            epoch: None,
+        };
+        let payload = serde_json::to_vec(&DesktopRequest::new(command))
+            .map_err(|e| DesktopError::Protocol(format!("encode heartbeat: {e}")))?;
+        write_frame(&self.stream, &payload)?;
+        match self.read_response()? {
+            DesktopResponse::HeartbeatExtended { .. } => Ok(()),
+            DesktopResponse::Error { code, message } => {
+                Err(DesktopError::Protocol(format!("{code}: {message}")))
+            }
+            other => Err(DesktopError::Protocol(format!(
+                "unexpected heartbeat response: {other:?}"
+            ))),
+        }
+    }
+
     /// Sends input for the held lease.
     pub fn send_input(
         &mut self,
