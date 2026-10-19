@@ -371,7 +371,7 @@ mod tests {
             report.failed[0].error,
             SubagentError::Unknown("missing".into())
         );
-        manager.cancel_all();
+        manager.owner().cancel();
     }
     #[tokio::test]
     async fn history_uri_rejects_children_without_a_completed_transcript() {
@@ -393,7 +393,7 @@ mod tests {
                 ..
             })
         ));
-        manager.cancel_all();
+        manager.owner().cancel();
         assert!(matches!(
             manager.wait(&id).await,
             Err(SubagentError::Cancelled)

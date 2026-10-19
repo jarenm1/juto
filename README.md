@@ -72,6 +72,10 @@ is the host's job; the runtime does not start a run on its own. Lifecycle events
 `status_changed`, `finished`) are available from `SubagentManager::subscribe_events`. Child agents
 that call `task` still wait for their own children.
 
+Each run owns the children it starts. The subagent registry, concurrency limit, and main inbox are
+shared process-wide, but cancelling a run, or ending it, cancels only the children that run still
+has open; children started by other runs are unaffected.
+
 **Native live-change DAG and Git transfer.** Juto tracks live agent edits in its own
 version control DAG rather than synthesizing premature Git commits or depending on
 jj at runtime. Edits capture immutable trees with session/thread provenance,
