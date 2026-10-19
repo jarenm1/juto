@@ -3,7 +3,7 @@
 
 use juto_agent::ViewNode;
 use juto_runtime::DesktopSessionArtifact;
-use juto_runtime::subagents::{MainMessage, SubagentStatus};
+use juto_runtime::subagents::SubagentStatus;
 use serde_json::{Map, json};
 
 use crate::chat::{Message, MessageRole, desktop_row, view_row};
@@ -109,22 +109,6 @@ pub fn attach_desktop_artifact(
         Some(index) => messages.insert(index + 1, desktop_row(artifact)),
         None => messages.push(desktop_row(artifact)),
     }
-}
-
-/// The prompt that wakes an idle main thread with completions that arrived while no
-/// run was active. Uses the `[subagent <from> <kind>]` framing the runtime uses when
-/// it steers an active run, so the model reads both paths the same way.
-pub fn completion_prompt(arrivals: &[MainMessage]) -> String {
-    arrivals
-        .iter()
-        .map(|message| {
-            format!(
-                "[subagent {} {:?}]\n{}",
-                message.from, message.kind, message.body
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
 }
 
 #[cfg(test)]
