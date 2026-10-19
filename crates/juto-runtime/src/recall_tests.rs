@@ -150,7 +150,7 @@ fn compaction_marker_sits_before_the_first_message_after_it() {
     for i in 0..5 {
         session.append(user(&format!("m{i}"))).unwrap();
     }
-    session.compact("summary".into(), 2).unwrap();
+    session.compact("summary".into(), None, 2).unwrap();
     session.append(user("m5")).unwrap();
     let text = text_of(&read(session.path(), Args::default()).unwrap());
     assert!(
@@ -166,7 +166,7 @@ fn hidden_messages_stay_readable_by_index_after_compaction() {
     for i in 0..5 {
         session.append(user(&format!("m{i}"))).unwrap();
     }
-    session.compact("summary".into(), 2).unwrap();
+    session.compact("summary".into(), None, 2).unwrap();
     let args = Args {
         index: Some(0),
         ..Args::default()
@@ -243,7 +243,7 @@ fn snapshot_caps_summary_and_keeps_newest_visible_messages() {
     let dir = tempfile::tempdir().unwrap();
     let mut session = Session::create(dir.path(), Path::new("/work")).unwrap();
     session.append(user("hidden-original")).unwrap();
-    session.compact("summary ".repeat(2000), 0).unwrap();
+    session.compact("summary ".repeat(2000), None, 0).unwrap();
     for i in 0..200 {
         session
             .append(user(&format!("visible-{i} {}", "é".repeat(200))))

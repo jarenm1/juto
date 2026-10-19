@@ -75,6 +75,30 @@ impl ApprovalMode {
     }
 }
 
+/// How compaction archives the history it discards. Set by `compactionMethod`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CompactionMethod {
+    /// Page images when the model accepts image input, otherwise an LLM summary.
+    Auto,
+    /// Always archive as page images. Fails on models without image input.
+    Snapcompact,
+    /// Always write an LLM summary.
+    #[default]
+    Summary,
+}
+
+impl CompactionMethod {
+    /// Whether discarded history is archived as page images for a model with this input capability.
+    pub fn archives_frames(self, accepts_images: bool) -> bool {
+        match self {
+            Self::Auto => accepts_images,
+            Self::Snapcompact => true,
+            Self::Summary => false,
+        }
+    }
+}
+
 fn default_system_prompt() -> String {
     String::new()
 }
@@ -122,6 +146,9 @@ pub struct RuntimeConfig {
     pub compaction_threshold: f64,
     /// Messages preserved verbatim across a compaction boundary.
     pub keep_recent_messages: usize,
+    /// How discarded history is archived. Defaults to `summary`; page images
+    /// require explicit `auto` or `snapcompact` opt-in.
+    pub compaction_method: CompactionMethod,
     /// Tool allowlist; empty means all builtin tools.
     pub tools: Vec<String>,
     /// User-defined models merged over the bundled registry.
@@ -158,6 +185,7 @@ impl Default for RuntimeConfig {
             auto_compact: default_auto_compact(),
             compaction_threshold: default_compaction_threshold(),
             keep_recent_messages: default_keep_recent(),
+            compaction_method: CompactionMethod::Summary,
             tools: Vec::new(),
             custom_models: Vec::new(),
             execution_tier: ExecutionTier::Attended,
@@ -410,6 +438,16 @@ mod tests {
         assert!(!ApprovalMode::ReadOnly.permits(juto_agent::ToolTier::Write));
         assert!(!ApprovalMode::ReadOnly.permits(juto_agent::ToolTier::Exec));
         assert!(ApprovalMode::Allow.permits(juto_agent::ToolTier::Exec));
+    }
+
+    #[test]
+    fn compaction_method_selects_archive_by_model_input() {
+        assert!(CompactionMethod::Auto.archives_frames(true));
+        assert!(!CompactionMethod::Auto.archives_frames(false));
+        assert!(CompactionMethod::Snapcompact.archives_frames(false));
+        assert!(!CompactionMethod::Summary.archives_frames(true));
+        let parsed: CompactionMethod = serde_yaml::from_str("snapcompact").unwrap();
+        assert_eq!(parsed, CompactionMethod::Snapcompact);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::snapcompact::{Archive, Shape, build_archive};
 use juto_ai::ContentBlock;
 
 use super::*;
@@ -121,7 +122,7 @@ fn compact_keeps_tool_groups_whole() {
     s.append(user("q2")).unwrap();
     // keep_recent_messages=2 would naively keep [toolResult, q2],
     // orphaning the result from its call.
-    s.compact("sum".into(), 2).unwrap();
+    s.compact("sum".into(), None, 2).unwrap();
     let msgs = s.messages().unwrap();
     // summary + assistant toolCall + toolResult + q2
     assert_eq!(msgs.len(), 4);
@@ -252,7 +253,7 @@ fn path_view_indices_survive_compaction() {
         .iter()
         .map(|m| (m.index, m.id.to_owned()))
         .collect();
-    s.compact("summary".into(), 2).unwrap();
+    s.compact("summary".into(), None, 2).unwrap();
     s.append(user("m5")).unwrap();
     let view = s.path_view().unwrap();
     let after: Vec<(usize, String)> = view.messages[..5]
@@ -273,7 +274,7 @@ fn compaction_that_keeps_nothing_hides_the_whole_prefix_but_keeps_it_indexed() {
     let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
     s.append(user("a")).unwrap();
     s.append(user("b")).unwrap();
-    s.compact("summary".into(), 0).unwrap();
+    s.compact("summary".into(), None, 0).unwrap();
     let view = s.path_view().unwrap();
     let mark = view.compaction.unwrap();
     assert_eq!((mark.at, mark.first_visible), (2, 2));
@@ -299,4 +300,69 @@ fn branch_renumbers_the_active_path() {
         .map(|m| (m.index, m.message.text()))
         .collect();
     assert_eq!(texts, [(0, "a".to_owned()), (1, "d".to_owned())]);
+}
+
+#[test]
+fn archive_reopens_as_user_text_and_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = build_archive(None, "q1", Shape::ANTHROPIC, 1)
+        .unwrap()
+        .unwrap();
+    let frame = archive.frames[0].png.clone();
+    let path;
+    {
+        let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+        s.append(user("q1")).unwrap();
+        s.append(user("q2")).unwrap();
+        s.compact("lead".into(), Some(archive), 1).unwrap();
+        path = s.path().to_path_buf();
+    }
+    let s = Session::open(&path).unwrap();
+    let msgs = s.messages().unwrap();
+    assert_eq!(msgs.len(), 2);
+    let Message::User { content, .. } = &msgs[0] else {
+        panic!("archived history should be user content");
+    };
+    assert!(msgs[0].text().contains("lead"));
+    assert!(
+        matches!(&content[1], ContentBlock::Image { data, mime_type }
+        if data == &frame && mime_type == "image/png")
+    );
+    assert_eq!(msgs[1].text(), "q2");
+    assert_eq!(s.path_view().unwrap().messages[0].message.text(), "q1");
+}
+
+#[test]
+fn compaction_entries_without_archive_still_load() {
+    let kind: EntryKind =
+        serde_json::from_str(r#"{"type":"compaction","summary":"s","first_kept_id":null}"#)
+            .unwrap();
+    assert!(matches!(kind, EntryKind::Compaction { archive: None, .. }));
+}
+
+#[test]
+fn old_archive_ignores_removed_truncation_metadata() {
+    let archive: Archive =
+        serde_json::from_str(r#"{"source":"original text","truncated_chars":0,"frames":[]}"#)
+            .unwrap();
+    assert_eq!(archive.text(), "original text");
+}
+
+#[test]
+fn compaction_plan_reports_previous_and_discarded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    s.append(user("q1")).unwrap();
+    s.append(user("q2")).unwrap();
+    s.append(user("q3")).unwrap();
+    s.compact("first".into(), None, 2).unwrap();
+    s.append(user("q4")).unwrap();
+    let plan = s.compaction_plan(1).unwrap();
+    assert_eq!(plan.previous.unwrap().summary, "first");
+    let discarded: Vec<String> = plan
+        .discarded
+        .iter()
+        .map(|message| message.text())
+        .collect();
+    assert_eq!(discarded, ["q2", "q3"]);
 }

@@ -420,6 +420,7 @@ branchable by construction). Orchestration lives in coding-agent (§3.3).
   adds `Inherit|Off` over catalog `Effort`.
 - Snapcompact: `@oh-my-pi/snapcompact` — deterministic serialization + **PNG raster of
   discarded history** for vision-model compaction (native `renderSnapcompactPng`).
+  Juto ports this in `crates/juto-runtime/src/snapcompact`; see `docs/orchestration-plan.md` §3.3.
 
 ### 2.4 Hooks seam
 
