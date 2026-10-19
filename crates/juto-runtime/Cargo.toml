@@ -22,6 +22,7 @@ ignore.workspace = true
 jsonschema.workspace = true
 libc.workspace = true
 parking_lot = "0.12"
+png.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true

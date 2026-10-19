@@ -193,6 +193,50 @@ Subagents coordinate as specialized coworkers rather than an uncontrolled group 
     lines within 12 KB. Explicit shared `context` still works. Nested children
     snapshot and recall the main session too; follow-ups do not reinsert snapshots.
 
+### 3.3 Juto Main-Thread Compaction (Snapcompact)
+Juto auto-compacts when the estimated prompt exceeds `compactionThreshold` of the
+context window, preserving the newest `keepRecentMessages` messages and whole tool-call/
+result groups. This Rust port follows oh-my-pi snapcompact at
+`579da1d661c5cb8d43bc2ddd429ab72e67165ad8` (MIT, `licenses/OMP-MIT.txt`), without
+claiming complete OMP feature parity.
+
+* `compactionMethod: summary` is the default and always uses the LLM summarizer.
+  Bitmap compaction is experimental and explicitly opt-in: `auto` uses deterministic
+  images when the active model accepts images and the complete archive fits the frame
+  budget, otherwise it summarizes. `snapcompact` requires vision and sufficient budget,
+  returning an error without changing the journal otherwise. No real-model reading
+  accuracy or token savings have been established for this port.
+* The public-domain X.org misc-fixed 8x13 Latin-1 glyph table is embedded in `font.rs`
+  with its source and public-domain notice; no unused BDF is vendored. Anthropic uses
+  11px advance/16px pitch; OpenAI/default uses 8px advance/22px pitch. Frames are
+  1568px wide, or 1932px for known high-resolution Claude lines, 2048px for Google;
+  height follows printed rows, with a 64px minimum.
+* ANSI is stripped, whitespace collapsed, and newline runs become `█`. Common symbols
+  fold to ASCII. Unlike OMP, this port omits Silver: unsupported Unicode, including
+  combining marks and non-Latin identifiers, becomes visible `\u{HEX}` escapes rather
+  than silently becoming `?` or disappearing. Symbol folding and whitespace
+  normalization remain lossy; original messages stay in the journal.
+* Tool arguments/results have character caps with explicit elision markers. A FILES
+  section records paths from read/write/edit tool calls (not proof of success).
+* Frame budget is `min(provider limit, 80, window/4/4096)` (80 without a known window).
+  Provider limits: Anthropic/Bedrock/OpenRouter 90, OpenAI/Google 200, otherwise 5.
+  Overflow never drops the oldest archive: auto falls back to summarization.
+* Compaction entries durably store normalized source and base64 PNGs; old entries
+  without an archive remain readable. Recompaction combines previous source with new
+  discarded messages. Context rebuilds attach frames to a **user** message because
+  developer/system-role images are not portable across providers.
+* Summary priority: near-verbatim user orders, decisions and corrections; lasting
+  effects and failures; findings/open questions; tool steps last. Names, paths, IDs,
+  and errors must be exact, without overstating completion. Both paths are cancellable;
+  cancelled work does not append a compaction.
+
+Known limits: summarizing an accumulated archive can exceed the summarizer's context;
+that provider error surfaces without changing the journal. Switching an already
+image-compacted session to a non-vision model requires explicit summary compaction
+before continuing, because providers drop unsupported images. Image token accounting
+uses a conservative 4096-token estimate, not model-specific billing. Provider OCR
+accuracy and token savings versus summaries are not established by local tests.
+
 ---
 
 ## 4. Workspace Isolation & Resource Governance

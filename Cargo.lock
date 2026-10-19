@@ -3707,6 +3707,7 @@ dependencies = [
  "juto-desktop",
  "libc",
  "parking_lot",
+ "png 0.18.1",
  "regex",
  "reqwest",
  "serde",

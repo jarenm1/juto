@@ -1,7 +1,7 @@
 //! Append-only JSONL session trees. Navigation and compaction are durable records.
 //! Behavioral reference: OMP 579da1d6; Juto's journal is not byte-compatible with OMP.
 use fs2::FileExt;
-use juto_ai::{Message, timestamp_ms};
+use juto_ai::{ContentBlock, Message, timestamp_ms};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -10,6 +10,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use uuid::Uuid;
+
+use crate::snapcompact::Archive;
 
 pub const SESSION_VERSION: u32 = 1;
 #[derive(Debug, thiserror::Error)]
@@ -75,6 +77,9 @@ pub enum EntryKind {
     Compaction {
         summary: String,
         first_kept_id: Option<String>,
+        /// Page images of the discarded history; absent for text summaries and old journals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archive: Option<Archive>,
     },
     Branch {
         target: Option<String>,
@@ -113,6 +118,7 @@ pub struct PathMessage<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct CompactionMark<'a> {
     pub summary: &'a str,
+    pub archive: Option<&'a Archive>,
     /// Index of the first message after the compaction entry.
     pub at: usize,
     /// Index of the first message the model still sees; equal to `at` when the
@@ -133,6 +139,19 @@ impl<'a> PathView<'a> {
         let start = self.compaction.map_or(0, |mark| mark.first_visible);
         &self.messages[start..]
     }
+}
+
+/// History discarded by a compaction and the preceding summary or frame archive.
+#[derive(Debug)]
+pub struct CompactionPlan {
+    pub previous: Option<PriorCompaction>,
+    pub discarded: Vec<Message>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PriorCompaction {
+    pub summary: String,
+    pub archive: Option<Archive>,
 }
 
 impl Session {
@@ -306,11 +325,17 @@ impl Session {
                 EntryKind::Compaction {
                     summary,
                     first_kept_id,
-                } => Some((position, summary.as_str(), first_kept_id.as_deref())),
+                    archive,
+                } => Some((
+                    position,
+                    summary.as_str(),
+                    first_kept_id.as_deref(),
+                    archive.as_ref(),
+                )),
                 _ => None,
             });
         let floor = match boundary {
-            Some((position, _, Some(id))) => Some(
+            Some((position, _, Some(id), _)) => Some(
                 entries[..position]
                     .iter()
                     .position(|entry| entry.id == id)
@@ -327,7 +352,7 @@ impl Session {
             if Some(position) == floor {
                 first_visible = Some(messages.len());
             }
-            if boundary.is_some_and(|(compaction_at, _, _)| compaction_at == position) {
+            if boundary.is_some_and(|(compaction_at, _, _, _)| compaction_at == position) {
                 at = messages.len();
             }
             if let EntryKind::Message { message } = &entry.kind {
@@ -338,8 +363,9 @@ impl Session {
                 });
             }
         }
-        let compaction = boundary.map(|(_, summary, _)| CompactionMark {
+        let compaction = boundary.map(|(_, summary, _, archive)| CompactionMark {
             summary,
+            archive,
             at,
             first_visible: first_visible.unwrap_or(at),
         });
@@ -354,10 +380,30 @@ impl Session {
         let mut messages =
             Vec::with_capacity(visible.len() + usize::from(view.compaction.is_some()));
         if let Some(mark) = view.compaction {
-            messages.push(Message::developer(format!(
-                "[Earlier conversation summary — originals: recall]\n{}",
-                mark.summary
-            )));
+            if let Some(archive) = mark.archive {
+                // Anthropic system/developer prompts cannot carry images. User content
+                // supports frames on both supported vision wire formats.
+                let mut content = Vec::with_capacity(archive.frames.len() + 1);
+                content.push(ContentBlock::Text {
+                    text: format!(
+                        "[Earlier conversation archive — originals: recall]\n{}",
+                        mark.summary
+                    ),
+                });
+                content.extend(archive.frames.iter().map(|frame| ContentBlock::Image {
+                    data: frame.png.clone(),
+                    mime_type: "image/png".into(),
+                }));
+                messages.push(Message::User {
+                    content,
+                    timestamp: timestamp_ms(),
+                });
+            } else {
+                messages.push(Message::developer(format!(
+                    "[Earlier conversation summary — originals: recall]\n{}",
+                    mark.summary
+                )));
+            }
         }
         messages.extend(visible.iter().map(|entry| entry.message.clone()));
         Ok(messages)
@@ -386,48 +432,76 @@ impl Session {
             &self.active_entries()?,
         )
     }
-    pub fn compact(&mut self, summary: String, keep_recent_messages: usize) -> Result<()> {
+    pub fn compaction_plan(&self, keep_recent_messages: usize) -> Result<CompactionPlan> {
+        let view = self.path_view()?;
+        let visible = view.visible();
+        let start = kept_start(visible, keep_recent_messages);
+        Ok(CompactionPlan {
+            previous: view.compaction.map(|mark| PriorCompaction {
+                summary: mark.summary.to_owned(),
+                archive: mark.archive.cloned(),
+            }),
+            discarded: visible[..start]
+                .iter()
+                .map(|entry| entry.message.clone())
+                .collect(),
+        })
+    }
+
+    pub fn compact(
+        &mut self,
+        summary: String,
+        archive: Option<Archive>,
+        keep_recent_messages: usize,
+    ) -> Result<()> {
         let first_kept_id = {
             let view = self.path_view()?;
-            let messages = view.visible();
-            let mut start = messages.len().saturating_sub(keep_recent_messages);
-            let mut calls = HashMap::new();
-            let mut groups = Vec::new();
-            for (index, entry) in messages.iter().enumerate() {
-                match entry.message {
-                    Message::Assistant(assistant) => {
-                        for call in assistant.tool_calls() {
-                            calls.insert(call.id.as_str(), index);
-                        }
-                    }
-                    Message::ToolResult { tool_call_id, .. } => {
-                        if let Some(call) = calls.get(tool_call_id.as_str()) {
-                            groups.push((*call, index));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            loop {
-                let previous = start;
-                for (call, result) in &groups {
-                    if *result >= start && *call < start {
-                        start = *call;
-                    }
-                }
-                if previous == start {
-                    break;
-                }
-            }
-            messages.get(start).map(|entry| entry.id.to_owned())
+            let visible = view.visible();
+            visible
+                .get(kept_start(visible, keep_recent_messages))
+                .map(|entry| entry.id.to_owned())
         };
         self.append(EntryKind::Compaction {
             summary,
             first_kept_id,
+            archive,
         })?;
         Ok(())
     }
 }
+/// Move the retained boundary back until every retained tool result has its call.
+fn kept_start(messages: &[PathMessage<'_>], keep_recent_messages: usize) -> usize {
+    let mut start = messages.len().saturating_sub(keep_recent_messages);
+    let mut calls = HashMap::new();
+    let mut groups = Vec::new();
+    for (index, entry) in messages.iter().enumerate() {
+        match entry.message {
+            Message::Assistant(assistant) => {
+                for call in assistant.tool_calls() {
+                    calls.insert(call.id.as_str(), index);
+                }
+            }
+            Message::ToolResult { tool_call_id, .. } => {
+                if let Some(call) = calls.get(tool_call_id.as_str()) {
+                    groups.push((*call, index));
+                }
+            }
+            _ => {}
+        }
+    }
+    loop {
+        let previous = start;
+        for (call, result) in &groups {
+            if *result >= start && *call < start {
+                start = *call;
+            }
+        }
+        if previous == start {
+            return start;
+        }
+    }
+}
+
 fn resolve_target(journal: &Journal, target: Option<&str>) -> Result<Option<String>> {
     let mut current = target;
     while let Some(id) = current {
