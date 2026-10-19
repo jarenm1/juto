@@ -1,8 +1,7 @@
-//! Chat UI wired to the agent runtime and session persistence.
+//! Chat UI consuming workspace-daemon snapshots and events.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::Quit;
 use crate::auth_modal::{AuthModal, AuthModalEvent};
@@ -18,12 +17,14 @@ use gpui::{
     MouseButton, MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Stateful,
     Subscription, Task, Window, actions, deferred, div, prelude::*, px, rgb, rgba,
 };
-use juto_agent::{AgentEvent, RunControl, RunOutcome, ToolTier, ViewNode, view_from_details};
+use juto_agent::{AgentEvent, ToolTier, ViewNode, view_from_details};
 use juto_ai::{Message as AiMessage, ProviderEvent, StopReason, ToolCall};
-use juto_runtime::subagents::SubagentEvent;
-use juto_runtime::{ApprovalRequest, DesktopSessionArtifact, EntryKind, Runtime, Session};
-use tokio::sync::Mutex;
-use tokio::sync::broadcast::error::RecvError;
+use juto_daemon::client::{Client, Notification};
+use juto_daemon::protocol::{
+    PendingApproval, Reply, Request, ServerEvent, SessionEvent, SessionView, SubagentCommand,
+};
+use juto_runtime::{DesktopSessionArtifact, EntryKind, SubagentSummary};
+use tokio::sync::broadcast::{self, error::RecvError};
 
 actions!(
     chat,
@@ -133,10 +134,7 @@ pub fn extract_desktop_artifacts(message: &AiMessage) -> Vec<DesktopSessionArtif
     artifacts
 }
 
-pub fn load_messages(session: &Session) -> Vec<Message> {
-    let Ok(entries) = session.active_entries() else {
-        return Vec::new();
-    };
+pub fn load_messages(entries: &[juto_runtime::SessionEntry]) -> Vec<Message> {
     view_messages(entries.iter().filter_map(|entry| match &entry.kind {
         EntryKind::Message { message } => Some(message),
         _ => None,
@@ -292,7 +290,7 @@ pub struct ChatView {
     sidebar: Entity<Sidebar>,
     focus: Option<Entity<FocusView>>,
     _focus_subscription: Option<Subscription>,
-    subagents: Arc<juto_runtime::subagents::SubagentManager>,
+    subagents: Vec<SubagentSummary>,
     show_sidebar: bool,
     active_modal: ActiveModal,
     active_model: SharedString,
@@ -303,58 +301,37 @@ pub struct ChatView {
     attachment_error: Option<SharedString>,
     picker: Option<Task<()>>,
     scroll: ScrollHandle,
-    runtime: Runtime,
-    session: Arc<Mutex<Session>>,
+    client: Client,
+    session_id: String,
+    committed: u64,
+    streaming_row: Option<usize>,
     tokio_handle: tokio::runtime::Handle,
     is_running: bool,
-    active_control: Option<RunControl>,
-    run_task: Option<Task<()>>,
+    connected: bool,
     artifact_notice: Option<SharedString>,
     desktop_viewer: Option<Entity<crate::desktop_viewer::DesktopViewer>>,
-    approval_requests: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalRequest>>>,
-    pending_approvals: HashMap<u64, ApprovalRequest>,
-    next_approval_id: u64,
+    pending_approvals: HashMap<u64, PendingApproval>,
     _subscriptions: Vec<Subscription>,
-    _subagent_events: Task<()>,
-}
-impl Drop for ChatView {
-    fn drop(&mut self) {
-        if let Some(control) = self.active_control.take() {
-            control.cancel();
-        }
-    }
+    _daemon_events: Task<()>,
 }
 
 impl ChatView {
     pub fn new(
-        runtime: Runtime,
-        session: Session,
+        client: Client,
         tokio_handle: tokio::runtime::Handle,
-        approval_requests: tokio::sync::mpsc::UnboundedReceiver<ApprovalRequest>,
+        session: SessionView,
+        default_model: String,
+        mut notifications: broadcast::Receiver<Notification>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(ChatInput::new);
         input.read(cx).focus_handle(cx).focus(window);
-        let initial_model = if runtime.config().model.is_empty() {
-            "anthropic/claude-sonnet-4-5".to_string()
-        } else {
-            runtime.config().model.clone()
-        };
-        let model_picker = cx.new(|cx| {
-            let mut picker =
-                ModelPicker::new(&initial_model, &runtime.config(), runtime.catalog(), cx);
-            picker.refresh_credentials(runtime.clone(), tokio_handle.clone(), cx);
-            picker
-        });
-        let auth_modal = cx.new(|cx| AuthModal::new(runtime.clone(), tokio_handle.clone(), cx));
-        let subagent_control = RunControl::new();
-        let subagents = runtime.subagent_manager(&subagent_control);
+        let initial_model = session.info.model.clone().unwrap_or(default_model);
+        let model_picker =
+            cx.new(|cx| ModelPicker::new(client.clone(), tokio_handle.clone(), &initial_model, cx));
+        let auth_modal = cx.new(|cx| AuthModal::new(client.clone(), tokio_handle.clone(), cx));
         let sidebar = cx.new(Sidebar::new);
-        let initial_summaries = subagents.list();
-        sidebar.update(cx, |s, cx| {
-            s.sync_from_summaries(&initial_summaries, cx);
-        });
         let submitted =
             cx.subscribe_in(&input, window, |this, _, _: &SubmitMessage, window, cx| {
                 this.send_message(window, cx);
@@ -385,11 +362,7 @@ impl ChatView {
                 }
                 AuthModalEvent::CredentialsChanged => {
                     this.model_picker.update(cx, |picker, cx| {
-                        picker.refresh_credentials(
-                            this.runtime.clone(),
-                            this.tokio_handle.clone(),
-                            cx,
-                        );
+                        picker.refresh_credentials(cx);
                     });
                     cx.notify();
                 }
@@ -403,67 +376,86 @@ impl ChatView {
             }
             SidebarEvent::SelectTask(id) => this.enter_focus(id, cx),
             SidebarEvent::PauseTask(id) => {
-                if let Err(err) = this.subagents.pause(id) {
-                    this.sidebar.update(cx, |s, cx| {
-                        s.set_error(Some(format!("Pause rejected: {err}").into()), cx);
-                    });
-                } else {
-                    this.sync_subagents(cx);
-                }
+                this.subagent_command(id.clone(), SubagentCommand::Pause, cx)
             }
             SidebarEvent::AbortTask(id) => {
-                if let Err(err) = this.subagents.cancel(id) {
-                    this.sidebar.update(cx, |s, cx| {
-                        s.set_error(Some(format!("Abort rejected: {err}").into()), cx);
-                    });
-                } else {
-                    this.sync_subagents(cx);
-                }
+                this.subagent_command(id.clone(), SubagentCommand::Cancel, cx)
             }
-            SidebarEvent::ResumeTask { id, resolution } => {
-                if let Err(err) = this.subagents.unblock(id, resolution) {
-                    this.sidebar.update(cx, |s, cx| {
-                        s.set_error(Some(format!("Unblock rejected: {err}").into()), cx);
-                    });
-                } else {
-                    this.sync_subagents(cx);
-                }
-            }
-            SidebarEvent::SteerTask { id, guidance } => {
-                if let Err(err) = this.subagents.send(id, guidance.clone()) {
-                    this.sidebar.update(cx, |s, cx| {
-                        s.set_error(Some(format!("Steer rejected: {err}").into()), cx);
-                    });
-                } else {
-                    this.sync_subagents(cx);
-                }
-            }
+            SidebarEvent::ResumeTask { id, resolution } => this.subagent_command(
+                id.clone(),
+                SubagentCommand::Unblock {
+                    resolution: resolution.clone(),
+                },
+                cx,
+            ),
+            SidebarEvent::SteerTask { id, guidance } => this.subagent_command(
+                id.clone(),
+                SubagentCommand::Send {
+                    text: guidance.clone(),
+                },
+                cx,
+            ),
         });
 
-        let mut messages = load_messages(&session);
-        for summary in &initial_summaries {
-            subagent_card::upsert_subagent_card(
-                &mut messages,
-                &summary.id,
-                summary.name.as_deref(),
-                &summary.status,
-                false,
-            );
-        }
-        let mut events = subagents.subscribe_events();
-        let subagent_events = cx.spawn_in(window, async move |this, cx| {
+        let messages = load_messages(&session.entries);
+        let event_client = client.clone();
+        let event_handle = tokio_handle.clone();
+        let session_id = session.info.id.clone();
+        let reattach_id = session_id.clone();
+        let daemon_events = cx.spawn_in(window, async move |this, cx| {
+            // Subscribe before taking snapshots. Journal indexes make replay idempotent.
+            let mut reattach = true;
             loop {
-                let update = match events.recv().await {
-                    Ok(event) => this.update_in(cx, |this, window, cx| {
-                        this.handle_subagent_event(event, window, cx);
-                    }),
-                    Err(RecvError::Lagged(_)) => this.update_in(cx, |this, window, cx| {
-                        this.resync_subagents(window, cx);
-                    }),
+                if reattach {
+                    let result = crate::chat_request::call(
+                        event_client.clone(),
+                        event_handle.clone(),
+                        Request::OpenSession {
+                            session_id: reattach_id.clone(),
+                        },
+                    )
+                    .await;
+                    if this
+                        .update_in(cx, |this, _, cx| {
+                            match result {
+                                Ok(Reply::Session(view)) => this.apply_snapshot(view, cx),
+                                Ok(_) => this.report_error("Unexpected session reply".into(), cx),
+                                Err(error) => this.report_error(error.to_string(), cx),
+                            }
+                            this.sync_subagents(cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    reattach = false;
+                }
+                match notifications.recv().await {
+                    Ok(Notification::Connected(_)) | Err(RecvError::Lagged(_)) => reattach = true,
+                    Ok(Notification::Disconnected) => {
+                        if this
+                            .update_in(cx, |this, _, cx| {
+                                this.connected = false;
+                                this.artifact_notice =
+                                    Some("Daemon disconnected; reconnecting…".into());
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(Notification::Event(event)) => {
+                        if this
+                            .update_in(cx, |this, window, cx| {
+                                this.handle_server_event(event, window, cx)
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Err(RecvError::Closed) => break,
-                };
-                if update.is_err() {
-                    break;
                 }
             }
         });
@@ -474,7 +466,7 @@ impl ChatView {
             sidebar,
             focus: None,
             _focus_subscription: None,
-            subagents,
+            subagents: Vec::new(),
             show_sidebar: true,
             active_modal: ActiveModal::None,
             active_model: initial_model.into(),
@@ -487,15 +479,14 @@ impl ChatView {
             desktop_viewer: None,
             picker: None,
             scroll: ScrollHandle::new(),
-            runtime,
-            session: Arc::new(Mutex::new(session)),
+            client,
+            session_id,
+            committed: session.committed,
+            streaming_row: None,
             tokio_handle,
-            is_running: false,
-            active_control: None,
-            run_task: None,
-            approval_requests: Arc::new(Mutex::new(approval_requests)),
+            is_running: session.info.run.is_some(),
+            connected: true,
             pending_approvals: HashMap::new(),
-            next_approval_id: 0,
             _subscriptions: vec![
                 submitted,
                 changed,
@@ -503,15 +494,10 @@ impl ChatView {
                 auth_modal_sub,
                 sidebar_sub,
             ],
-            _subagent_events: subagent_events,
+            _daemon_events: daemon_events,
         }
     }
 
-    /// Persist `selector` to `role` (`modelRoles` in the global config layer,
-    /// `model` for `default`) and update the picker. Assigning `default` also
-    /// switches the session model and closes the picker, matching the OMP
-    /// model hub; other roles keep the picker open so several roles can be
-    /// assigned in one pass.
     fn assign_role(
         &mut self,
         role: String,
@@ -519,38 +505,31 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Err(error) = self.runtime.set_model_role(&role, &selector) {
-            self.model_picker.update(cx, |picker, cx| {
-                picker.set_error(Some(format!("Could not assign @{role}: {error}")), cx);
-            });
-            return;
-        }
+        // The picker persists role assignments before emitting this event.
         if role == "default" {
             self.set_model(selector, window, cx);
-        } else {
-            self.model_picker.update(cx, |picker, cx| {
-                picker.set_error(None, cx);
-                picker.apply_assignment(&role, &selector, cx);
-            });
-            cx.notify();
         }
     }
 
     pub fn set_model(&mut self, selector: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.active_model = selector.clone().into();
-        self.model_picker.update(cx, |picker, cx| {
-            picker.set_error(None, cx);
-            picker.apply_assignment("default", &selector, cx);
-        });
-        let runtime = self.runtime.clone();
-        let session = self.session.clone();
-        let tokio_handle = self.tokio_handle.clone();
-        let sel = selector.clone();
-        tokio_handle.spawn(async move {
-            let mut session_guard = session.lock().await;
-            let _ = runtime.switch_model(&mut session_guard, &sel);
-        });
-        self.close_modal(window, cx);
+        let request = Request::SetSessionModel {
+            session_id: self.session_id.clone(),
+            selector: selector.clone(),
+        };
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = crate::chat_request::call(client, handle, request).await;
+            let _ = this.update_in(cx, |this, window, cx| match result {
+                Ok(Reply::Ok) => {
+                    this.active_model = selector.into();
+                    this.close_modal(window, cx);
+                }
+                Ok(_) => this.report_error("Unexpected model reply".into(), cx),
+                Err(error) => this.report_error(error.to_string(), cx),
+            });
+        })
+        .detach();
     }
 
     pub fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -559,7 +538,7 @@ impl ChatView {
         }
         self.active_modal = ActiveModal::ModelPicker;
         self.model_picker.update(cx, |picker, cx| {
-            picker.refresh_credentials(self.runtime.clone(), self.tokio_handle.clone(), cx);
+            picker.refresh_credentials(cx);
         });
         self.model_picker.read(cx).focus(window, cx);
         cx.notify();
@@ -584,100 +563,74 @@ impl ChatView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let resolver = self.runtime.desktop_artifact_resolver();
-        // Resolution is bound to this session's authenticated principal, not
-        // to whoever issued the grant: a grant issued to another principal
-        // must be rejected, and one issued to this session must be honored.
-        match resolver.resolve(crate::desktop_viewer::SESSION_PRINCIPAL, artifact) {
-            Ok(juto_runtime::ViewerRoute::Local { env_id, .. }) => {
-                self.open_desktop_viewer(&env_id, window, cx);
-            }
-            Ok(juto_runtime::ViewerRoute::Remote { url, .. }) => {
-                self.artifact_notice = Some(
-                    format!(
-                        "Desktop '{}' is available remotely at {url} (one-time token, 60s). \
-                         External-browser play is not inline GPUI interaction.",
-                        artifact.title
-                    )
-                    .into(),
-                );
+        let request = Request::ResolveDesktopArtifact {
+            artifact: serde_json::to_value(artifact).expect("serializable desktop artifact"),
+        };
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = crate::chat_request::call(client, handle, request).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(Reply::Route(Some(juto_runtime::ViewerRoute::Local { env_id, .. }))) => {
+                        this.open_desktop_viewer(&env_id, window, cx)
+                    }
+                    Ok(Reply::Route(Some(juto_runtime::ViewerRoute::Remote { url, .. }))) => {
+                        this.artifact_notice =
+                            Some(format!("Remote desktop: {url} (one-time token, 60s)").into())
+                    }
+                    Ok(Reply::Route(None)) => {
+                        this.artifact_notice =
+                            Some("Desktop artifact cannot be routed by this daemon".into())
+                    }
+                    Ok(_) => this.report_error("Unexpected artifact reply".into(), cx),
+                    Err(error) => this.report_error(error.to_string(), cx),
+                }
                 cx.notify();
-            }
-            Err(err) => {
-                self.artifact_notice =
-                    Some(format!("Desktop '{}' cannot be opened: {err}", artifact.title).into());
-                cx.notify();
-            }
-        }
+            });
+        })
+        .detach();
     }
 
-    /// Opens the embedded viewer for an existing desktop environment.
     pub fn open_desktop_viewer(
         &mut self,
         env_id: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let supervisor = self.runtime.desktop_supervisor();
-        match supervisor.get_environment(env_id) {
-            Ok(env) => {
-                let title = format!("Desktop {env_id}");
-                let viewer =
-                    cx.new(|cx| crate::desktop_viewer::DesktopViewer::new(env, title, window, cx));
-                self.desktop_viewer = Some(viewer);
-                self.active_modal = ActiveModal::DesktopViewer;
-                self.artifact_notice = None;
-            }
-            Err(err) => {
-                self.artifact_notice =
-                    Some(format!("Desktop environment '{env_id}' is unavailable: {err}").into());
-            }
-        }
+        let client = self.client.clone();
+        let title = format!("Desktop {env_id}");
+        self.desktop_viewer = Some(cx.new(|cx| {
+            crate::desktop_viewer::DesktopViewer::new(client, env_id.to_owned(), title, window, cx)
+        }));
+        self.active_modal = ActiveModal::DesktopViewer;
+        self.artifact_notice = None;
         cx.notify();
     }
 
-    /// Creates a desktop environment, launches `argv` into it, and opens the
-    /// embedded viewer. Used by the `--desktop` developer mode.
     pub fn open_desktop_command(
         &mut self,
         argv: Vec<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let supervisor = self.runtime.desktop_supervisor();
-        let env_id = format!("desk-{}", uuid::Uuid::now_v7());
-        let config = juto_runtime::EnvironmentConfig {
-            env_id: env_id.clone(),
-            owner_principal: crate::desktop_viewer::SESSION_PRINCIPAL.to_string(),
-            output: juto_runtime::OutputConfig {
-                width: 1280,
-                height: 720,
-                scale: 1,
-                fps: 30,
-            },
-            render_profile: juto_runtime::RenderProfile::Software,
-            limits: juto_runtime::SystemLimits::default(),
-            workspace_dir: self.runtime.cwd().to_path_buf(),
-            lease_ttl_secs: 6,
-            compositor_mode: juto_runtime::CompositorMode::Worker,
-            owner_heartbeat_timeout_secs: 60,
-        };
-        let request_id = uuid::Uuid::now_v7().to_string();
-        let env = match supervisor.create_environment(config, &request_id) {
-            Ok(env) => env,
-            Err(err) => {
-                self.artifact_notice = Some(format!("cannot create desktop: {err}").into());
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result =
+                crate::chat_request::call(client, handle, Request::DesktopOpen { argv }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(Reply::DesktopEnvironment(env)) => {
+                        this.open_desktop_viewer(&env.env_id, window, cx)
+                    }
+                    Ok(_) => this.report_error("Unexpected desktop reply".into(), cx),
+                    Err(error) => this.report_error(error.to_string(), cx),
+                }
                 cx.notify();
-                return;
-            }
-        };
-        if let Err(err) = env.launch("desktop-app", &argv, None, &[], &request_id) {
-            self.artifact_notice = Some(format!("cannot launch desktop application: {err}").into());
-            env.destroy();
-            cx.notify();
-            return;
-        }
-        self.open_desktop_viewer(&env_id, window, cx);
+            });
+        })
+        .detach();
     }
 
     pub fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -701,24 +654,15 @@ impl ChatView {
     fn enter_focus(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(summary) = self
             .subagents
-            .list()
-            .into_iter()
+            .iter()
             .find(|summary| summary.id == id)
+            .cloned()
         else {
             return;
         };
-        let updates = match self.subagents.subscribe(id) {
-            Ok(updates) => updates,
-            Err(err) => {
-                self.sidebar.update(cx, |s, cx| {
-                    s.set_error(Some(format!("Focus rejected: {err}").into()), cx);
-                });
-                return;
-            }
-        };
-        let subagents = Arc::clone(&self.subagents);
+        let client = self.client.clone();
         let tokio_handle = self.tokio_handle.clone();
-        let focus = cx.new(|cx| FocusView::new(summary, updates, subagents, tokio_handle, cx));
+        let focus = cx.new(|cx| FocusView::new(summary, client, tokio_handle, cx));
         let subscription = cx.subscribe(&focus, |this, _, _: &FocusEvent, cx| {
             this.exit_focus(cx);
         });
@@ -737,93 +681,161 @@ impl ChatView {
     }
 
     pub fn sync_subagents(&mut self, cx: &mut Context<Self>) {
-        let summaries = self.subagents.list();
-        self.sidebar.update(cx, |sidebar, cx| {
-            sidebar.sync_from_summaries(&summaries, cx);
-        });
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let result = crate::chat_request::call(client, handle, Request::ListSubagents).await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(Reply::Subagents(summaries)) => {
+                    this.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.sync_from_summaries(&summaries, cx)
+                    });
+                    for summary in &summaries {
+                        subagent_card::upsert_subagent_card(
+                            &mut this.messages,
+                            &summary.id,
+                            summary.name.as_deref(),
+                            &summary.status,
+                            this.is_running,
+                        );
+                    }
+                    this.subagents = summaries;
+                    cx.notify();
+                }
+                Ok(_) => this.report_error("Unexpected subagent reply".into(), cx),
+                Err(error) => this.report_error(error.to_string(), cx),
+            });
+        })
+        .detach();
     }
 
-    /// Applies one subagent lifecycle event: keeps its card current, refreshes the
-    /// sidebar, and wakes an idle main thread when a child finishes.
-    fn handle_subagent_event(
+    fn subagent_command(&mut self, id: String, command: SubagentCommand, cx: &mut Context<Self>) {
+        self.send_request(Request::SubagentCommand { id, command }, cx);
+    }
+
+    fn send_request(&mut self, request: Request, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let result = crate::chat_request::call(client, handle, request).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Err(error) = result {
+                    this.report_error(error.to_string(), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn report_error(&mut self, error: String, cx: &mut Context<Self>) {
+        self.artifact_notice = Some(error.into());
+        cx.notify();
+    }
+
+    fn apply_snapshot(&mut self, view: SessionView, cx: &mut Context<Self>) {
+        self.connected = true;
+        self.artifact_notice = None;
+        self.is_running = view.info.run.is_some();
+        if let Some(model) = view.info.model {
+            self.active_model = model.into();
+        }
+        self.committed = view.committed;
+        self.messages = load_messages(&view.entries);
+        self.streaming_row = None;
+        self.pending_approvals.clear();
+        for approval in view.pending_approvals {
+            self.handle_approval_request(approval, cx);
+        }
+        cx.notify();
+    }
+
+    fn reattach(&mut self, cx: &mut Context<Self>) {
+        self.connected = false;
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        let session_id = self.session_id.clone();
+        cx.spawn(async move |this, cx| {
+            let result =
+                crate::chat_request::call(client, handle, Request::OpenSession { session_id })
+                    .await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(Reply::Session(view)) => this.apply_snapshot(view, cx),
+                Ok(_) => this.report_error("Unexpected session reply".into(), cx),
+                Err(error) => this.report_error(error.to_string(), cx),
+            });
+        })
+        .detach();
+    }
+
+    fn handle_server_event(
         &mut self,
-        event: SubagentEvent,
+        event: ServerEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match &event {
-            SubagentEvent::Spawned {
-                id, name, status, ..
-            } => {
-                subagent_card::upsert_subagent_card(
-                    &mut self.messages,
-                    id,
-                    name.as_deref(),
-                    status,
-                    self.is_running,
-                );
-                self.scroll.scroll_to_bottom();
+        match event {
+            ServerEvent::Session { session_id, event } if session_id == self.session_id => {
+                match event {
+                    SessionEvent::RunStarted { .. } => {
+                        self.is_running = true;
+                    }
+                    SessionEvent::Agent { event } => self.handle_agent_event(event, cx),
+                    SessionEvent::MessageCommitted { index, message } => {
+                        if index < self.committed {
+                            return;
+                        }
+                        if index != self.committed {
+                            self.reattach(cx);
+                            return;
+                        }
+                        self.committed = index + 1;
+                        if matches!(&message, AiMessage::Assistant(_))
+                            && let Some(row) = self.streaming_row.take()
+                        {
+                            self.messages.remove(row);
+                        }
+                        self.messages
+                            .extend(view_messages(std::iter::once(&message)));
+                        self.sync_subagents(cx);
+                    }
+                    SessionEvent::ApprovalRequested { approval } => {
+                        self.handle_approval_request(approval, cx)
+                    }
+                    SessionEvent::ApprovalResolved { approval_id } => {
+                        self.pending_approvals.remove(&approval_id);
+                        self.set_approval_state(approval_id, ApprovalState::Cancelled);
+                    }
+                    SessionEvent::RunFinished {
+                        stop_reason, error, ..
+                    } => {
+                        self.is_running = false;
+                        self.cancel_pending_approvals();
+                        if let Some(error) = error {
+                            self.report_error(error, cx);
+                        } else if stop_reason == Some(StopReason::Aborted) {
+                            self.report_error("Run cancelled".into(), cx);
+                        }
+                        self.focus_input(window, cx);
+                        self.sync_subagents(cx);
+                    }
+                }
             }
-            SubagentEvent::StatusChanged { id, status }
-            | SubagentEvent::Finished { id, status, .. } => {
-                subagent_card::upsert_subagent_card(
-                    &mut self.messages,
-                    id,
-                    None,
-                    status,
-                    self.is_running,
-                );
-            }
+            ServerEvent::Subagent { .. } => self.sync_subagents(cx),
+            _ => {}
         }
-        self.sync_subagents(cx);
-        if matches!(event, SubagentEvent::Finished { .. }) {
-            self.wake_if_idle(window, cx);
-        }
+        self.scroll.scroll_to_bottom();
         cx.notify();
-    }
-
-    /// Rebuilds subagent cards from the manager after the event stream lagged and may
-    /// have dropped events. A missed finish is recovered by the idle wake.
-    fn resync_subagents(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for summary in self.subagents.list() {
-            subagent_card::upsert_subagent_card(
-                &mut self.messages,
-                &summary.id,
-                summary.name.as_deref(),
-                &summary.status,
-                self.is_running,
-            );
-        }
-        self.sync_subagents(cx);
-        self.wake_if_idle(window, cx);
-        cx.notify();
-    }
-
-    /// Starts a run with completions waiting in the main inbox, when no run is active.
-    /// While a run is active the runtime steers arrivals into it instead.
-    fn wake_if_idle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_running {
-            return;
-        }
-        let arrivals = self.subagents.main_inbox().drain();
-        if arrivals.is_empty() {
-            return;
-        }
-        self.start_run(subagent_card::completion_prompt(&arrivals), window, cx);
-    }
-
-    #[allow(dead_code)]
-    pub fn subagents(&self) -> &Arc<juto_runtime::subagents::SubagentManager> {
-        &self.subagents
     }
     /// Whether a new run may start, ignoring what the composer holds.
     fn can_submit(&self, cx: &App) -> bool {
-        !self.is_running && !self.input.read(cx).is_composing()
+        self.connected && !self.is_running && !self.input.read(cx).is_composing()
     }
 
     fn can_send(&self, cx: &App) -> bool {
         let input = self.input.read(cx);
-        self.can_submit(cx) && (input.has_text() || !self.attachments.is_empty())
+        self.connected
+            && !input.is_composing()
+            && (input.has_text() || !self.attachments.is_empty())
     }
 
     /// Actions for rendered views. A `Button` submits a turn only while one can start.
@@ -848,7 +860,12 @@ impl ChatView {
         let text = self.input.update(cx, |input, cx| input.take_text(cx));
         let attachments = std::mem::take(&mut self.attachments);
         let prompt = format_prompt(&text, &attachments);
-        self.submit_turn(text, attachments, prompt, window, cx);
+        if self.is_running {
+            self.steer(prompt, cx);
+            self.focus_input(window, cx);
+        } else {
+            self.submit_turn(text, attachments, prompt, window, cx);
+        }
     }
 
     /// Submits a `Button` click: the prompt is shown and sent unchanged.
@@ -864,24 +881,12 @@ impl ChatView {
     /// `attachments` are what the transcript shows; `prompt` is what the model gets.
     fn submit_turn(
         &mut self,
-        text: SharedString,
-        attachments: Vec<Attachment>,
+        _text: SharedString,
+        _attachments: Vec<Attachment>,
         prompt: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.messages.push(Message {
-            role: MessageRole::User,
-            text: if text.trim().is_empty() {
-                SharedString::default()
-            } else {
-                text
-            },
-            attachments,
-            desktop_artifacts: Vec::new(),
-            approval: None,
-            views: Vec::new(),
-        });
         self.attachment_error = None;
         self.artifact_notice = None;
         self.scroll.scroll_to_bottom();
@@ -889,65 +894,59 @@ impl ChatView {
         self.start_run(prompt, window, cx);
     }
 
-    /// Starts a run for `prompt` and streams its events into the transcript until the
-    /// run ends. Callers record any user-visible message first.
+    /// Requests a foreground run. Only committed daemon events create transcript rows.
     fn start_run(&mut self, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
         self.is_running = true;
-
-        let control = RunControl::new();
-        self.active_control = Some(control.clone());
-        let runtime = self.runtime.clone();
-        let session = self.session.clone();
-        let tokio_handle = self.tokio_handle.clone();
-        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
-
-        let run_future = tokio_handle.spawn(async move {
-            let mut session_guard = session.lock().await;
-            runtime
-                .run(&mut session_guard, prompt, events_tx, control)
-                .await
-        });
-
-        let approval_requests = self.approval_requests.clone();
-        self.run_task = Some(cx.spawn_in(window, async move |this, cx| {
-            let mut approvals = approval_requests.lock_owned().await;
-            loop {
-                tokio::select! {
-                    biased;
-                    event = events_rx.recv() => {
-                        let Some(event) = event else { break };
-                        let updated = this.update_in(cx, |this, _window, cx| {
-                            this.handle_agent_event(event, cx);
-                        });
-                        if updated.is_err() {
-                            break;
-                        }
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        let request = Request::Prompt {
+            session_id: self.session_id.clone(),
+            text: prompt,
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = crate::chat_request::call(client, handle, request).await;
+            let _ = this.update_in(cx, |this, _, cx| {
+                match result {
+                    Ok(Reply::Started { .. }) => {}
+                    Ok(_) => {
+                        this.is_running = false;
+                        this.report_error("Unexpected prompt reply".into(), cx);
                     }
-                    Some(request) = approvals.recv() => {
-                        let updated = this.update_in(cx, |this, _window, cx| {
-                            this.handle_approval_request(request, cx);
-                        });
-                        if updated.is_err() {
-                            break;
-                        }
+                    Err(error) => {
+                        this.is_running = false;
+                        this.report_error(error.to_string(), cx);
                     }
                 }
-            }
-            drop(approvals);
-
-            let outcome = run_future.await;
-            this.update_in(cx, |this, window, cx| {
-                this.finish_run(outcome, window, cx);
-            })
-            .ok();
-        }));
-
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
+    }
+
+    pub fn steer(&mut self, text: String, cx: &mut Context<Self>) {
+        self.send_request(
+            Request::Steer {
+                session_id: self.session_id.clone(),
+                text,
+            },
+            cx,
+        );
+    }
+
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        self.send_request(
+            Request::Cancel {
+                session_id: self.session_id.clone(),
+            },
+            cx,
+        );
     }
 
     fn handle_agent_event(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
         match event {
             AgentEvent::MessageStart => {
+                self.streaming_row = Some(self.messages.len());
                 self.messages.push(Message {
                     role: MessageRole::Assistant,
                     text: SharedString::default(),
@@ -967,17 +966,6 @@ impl ChatView {
                 {
                     let mut text = last.text.to_string();
                     text.push_str(&delta);
-                    last.text = text.into();
-                    self.scroll.scroll_to_bottom();
-                    cx.notify();
-                }
-            }
-            AgentEvent::MessageEnd { message } => {
-                let text = message.text();
-                if let Some(last) = self.messages.last_mut()
-                    && last.role == MessageRole::Assistant
-                    && matches!(message, AiMessage::Assistant(_))
-                {
                     last.text = text.into();
                     self.scroll.scroll_to_bottom();
                     cx.notify();
@@ -1018,50 +1006,22 @@ impl ChatView {
             AgentEvent::ToolExecutionStart { .. } => {
                 self.sync_subagents(cx);
             }
-            AgentEvent::ToolExecutionEnd { result, .. } => {
-                let artifacts = extract_desktop_artifacts(&result);
-                if !artifacts.is_empty() {
-                    if let Some(last) = self.messages.last_mut()
-                        && last.role == MessageRole::Assistant
-                    {
-                        last.desktop_artifacts.extend(artifacts);
-                    } else {
-                        self.messages.push(Message {
-                            role: MessageRole::Assistant,
-                            text: SharedString::default(),
-                            attachments: Vec::new(),
-                            desktop_artifacts: artifacts,
-                            approval: None,
-                            views: Vec::new(),
-                        });
-                    }
-                    self.scroll.scroll_to_bottom();
-                    cx.notify();
-                }
-                if let AiMessage::ToolResult { details, .. } = &result
-                    && let Some(view) = view_from_details(details)
-                {
-                    self.messages.push(view_row(view));
-                    self.scroll.scroll_to_bottom();
-                    cx.notify();
-                }
-                self.sync_subagents(cx);
-            }
+            // Tool results enter the transcript only through MessageCommitted.
+            AgentEvent::ToolExecutionEnd { .. } => self.sync_subagents(cx),
             _ => {}
         }
     }
 
-    fn handle_approval_request(&mut self, request: ApprovalRequest, cx: &mut Context<Self>) {
-        if request.is_abandoned() {
+    fn handle_approval_request(&mut self, request: PendingApproval, cx: &mut Context<Self>) {
+        let id = request.approval_id;
+        if self.pending_approvals.contains_key(&id) {
             return;
         }
-        let id = self.next_approval_id;
-        self.next_approval_id += 1;
-        let call = request.call();
+        let call = &request.call;
         let card = ApprovalCard {
             id,
             tool: call.name.clone().into(),
-            tier: request.tier(),
+            tier: request.tier,
             detail: approval_detail(call).into(),
             cwd: approval_cwd(call).map(|cwd| SharedString::from(cwd.to_owned())),
             state: ApprovalState::Pending,
@@ -1080,17 +1040,41 @@ impl ChatView {
     }
 
     fn resolve_approval(&mut self, id: u64, allow: bool, cx: &mut Context<Self>) {
-        let Some(request) = self.pending_approvals.remove(&id) else {
+        if !self.pending_approvals.contains_key(&id) {
             return;
-        };
-        request.respond(allow);
-        let state = if allow {
-            ApprovalState::Allowed
-        } else {
-            ApprovalState::Denied
-        };
-        self.set_approval_state(id, state);
-        cx.notify();
+        }
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let result = crate::chat_request::call(
+                client,
+                handle,
+                Request::ApprovalRespond {
+                    approval_id: id,
+                    allow,
+                },
+            )
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(Reply::Ok) => {
+                        this.pending_approvals.remove(&id);
+                        this.set_approval_state(
+                            id,
+                            if allow {
+                                ApprovalState::Allowed
+                            } else {
+                                ApprovalState::Denied
+                            },
+                        );
+                    }
+                    Ok(_) => this.report_error("Unexpected approval reply".into(), cx),
+                    Err(error) => this.report_error(error.to_string(), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn set_approval_state(&mut self, id: u64, state: ApprovalState) {
@@ -1105,8 +1089,7 @@ impl ChatView {
         }
     }
 
-    /// Ends outstanding approvals when a run stops. Dropping the responders
-    /// fails any tool call still waiting on them instead of leaving it hung.
+    /// Clears the display state; the daemon owns approval responder lifetimes.
     fn cancel_pending_approvals(&mut self) {
         self.pending_approvals.clear();
         for card in self
@@ -1118,86 +1101,6 @@ impl ChatView {
                 card.state = ApprovalState::Cancelled;
             }
         }
-    }
-
-    fn finish_run(
-        &mut self,
-        outcome: Result<Result<RunOutcome, anyhow::Error>, tokio::task::JoinError>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.is_running = false;
-        self.cancel_pending_approvals();
-        self.active_control = None;
-        self.run_task = None;
-        match outcome {
-            Ok(Ok(outcome)) => {
-                if outcome.stop_reason == StopReason::Aborted
-                    && let Some(last) = self.messages.last_mut()
-                    && last.role == MessageRole::Assistant
-                {
-                    let mut text = last.text.to_string();
-                    if !text.is_empty() {
-                        text.push_str("\n\n[Run cancelled]");
-                    } else {
-                        text.push_str("[Run cancelled]");
-                    }
-                    last.text = text.into();
-                } else if outcome.stop_reason == StopReason::Error
-                    && let Some(last) = self.messages.last_mut()
-                    && last.role == MessageRole::Assistant
-                    && last.text.is_empty()
-                {
-                    last.text = "Error: Run failed".into();
-                }
-            }
-            Ok(Err(err)) => {
-                let error_msg = format!("Error: {err}");
-                if let Some(last) = self.messages.last_mut() {
-                    if last.role == MessageRole::Assistant && last.text.is_empty() {
-                        last.text = error_msg.into();
-                    } else if last.role == MessageRole::Assistant {
-                        let mut text = last.text.to_string();
-                        text.push_str(&format!("\n\n{error_msg}"));
-                        last.text = text.into();
-                    } else {
-                        self.messages.push(Message {
-                            role: MessageRole::Assistant,
-                            text: error_msg.into(),
-                            attachments: Vec::new(),
-                            desktop_artifacts: Vec::new(),
-                            approval: None,
-                            views: Vec::new(),
-                        });
-                    }
-                } else {
-                    self.messages.push(Message {
-                        role: MessageRole::Assistant,
-                        text: error_msg.into(),
-                        attachments: Vec::new(),
-                        desktop_artifacts: Vec::new(),
-                        approval: None,
-                        views: Vec::new(),
-                    });
-                }
-            }
-            Err(join_err) => {
-                let error_msg = format!("Error: Task panicked or was cancelled: {join_err}");
-                self.messages.push(Message {
-                    role: MessageRole::Assistant,
-                    text: error_msg.into(),
-                    attachments: Vec::new(),
-                    desktop_artifacts: Vec::new(),
-                    approval: None,
-                    views: Vec::new(),
-                });
-            }
-        }
-        self.sync_subagents(cx);
-        self.scroll.scroll_to_bottom();
-        self.focus_input(window, cx);
-        self.wake_if_idle(window, cx);
-        cx.notify();
     }
 
     fn close_attachment_menu(
@@ -1770,6 +1673,11 @@ impl ChatView {
                                         )
                                     },
                                 ))
+                                .when(self.is_running, |row| row.child(
+                                    header_button("cancel-run", false)
+                                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx)))
+                                        .child("Stop")
+                                ))
                                 .child(send_button),
                         ),
                 )
@@ -2026,7 +1934,7 @@ impl Render for ChatView {
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    use juto_runtime::Session;
     #[test]
     fn bash_approval_shows_exact_command_and_cwd() {
         let call = ToolCall {
@@ -2129,7 +2037,13 @@ mod tests {
             })
             .unwrap();
 
-        let messages = load_messages(&session);
+        let entries: Vec<juto_runtime::SessionEntry> = session
+            .active_entries()
+            .unwrap()
+            .into_iter()
+            .cloned()
+            .collect();
+        let messages = load_messages(&entries);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, MessageRole::User);
         assert_eq!(messages[0].text.as_ref(), "Hello from user");
@@ -2172,7 +2086,13 @@ mod tests {
             })
             .unwrap();
 
-        let messages = load_messages(&session);
+        let entries: Vec<juto_runtime::SessionEntry> = session
+            .active_entries()
+            .unwrap()
+            .into_iter()
+            .cloned()
+            .collect();
+        let messages = load_messages(&entries);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, MessageRole::Assistant);
         assert_eq!(messages[0].desktop_artifacts.len(), 1);
@@ -2226,7 +2146,13 @@ mod tests {
             })
             .unwrap();
 
-        let messages = load_messages(&session);
+        let entries: Vec<juto_runtime::SessionEntry> = session
+            .active_entries()
+            .unwrap()
+            .into_iter()
+            .cloned()
+            .collect();
+        let messages = load_messages(&entries);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].text.as_ref(), "Spawned a worker");
         assert!(messages[0].views.is_empty());

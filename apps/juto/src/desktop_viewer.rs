@@ -1,13 +1,13 @@
 //! Embedded live desktop viewer.
 //!
-//! Renders the composed frames of a [`DesktopEnvironment`] inside the harness
+//! Renders the composed frames of a desktop environment inside the harness
 //! window and forwards pointer/keyboard input to the environment's virtual
 //! seat. Frames are read from the environment's sealed shared-memory pool; no
 //! video codec is involved on this path (`docs/agent-compositor.md` section 7).
 
 use std::cell::Cell;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use gpui::{
@@ -16,83 +16,113 @@ use gpui::{
     Window, canvas, div, img, prelude::*, px, rgb,
 };
 use image::{Frame, ImageBuffer, Rgba};
-use juto_runtime::DesktopEnvironment;
-use juto_runtime::protocol::{InputBatch, InputEvent};
+use juto_daemon::client::Client;
+use juto_desktop::protocol::InputEvent;
+use juto_desktop::shm::ShmSlotHeader;
+use juto_desktop::{DesktopError, ViewerClient};
 
 /// Frame polling interval (~30 fps).
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// Control lease renewal interval (spec section 8: heartbeat 2s, expiry 6s).
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(2);
 
-/// The authenticated principal this interactive session acts as: the local
-/// human viewing the desktop. Grants and artifact resolution are bound to it.
-pub(crate) const SESSION_PRINCIPAL: &str = "human:viewer";
-
 /// An embedded viewer for one agent-owned desktop environment.
 pub struct DesktopViewer {
-    env: DesktopEnvironment,
+    client: Client,
+    env_id: String,
     title: String,
+    /// The attached viewer, shared with the frame poller and the lease heartbeat.
+    viewer: Option<Arc<Mutex<ViewerClient>>>,
     frame: Option<Arc<RenderImage>>,
     frame_size: (u32, u32),
+    frame_generation: u64,
     surface_bounds: Rc<Cell<Bounds<Pixels>>>,
     focus_handle: FocusHandle,
     status: String,
     error: Option<String>,
     has_control: bool,
-    input_seq: u64,
     poll_task: Option<Task<()>>,
     heartbeat_task: Option<Task<()>>,
 }
 
 impl DesktopViewer {
-    /// Creates a viewer for `env` and starts polling frames.
+    /// Creates a viewer using the desktop socket advertised by the daemon.
+    /// Frame dimensions remain unknown until the first composed frame arrives.
     pub fn new(
-        env: DesktopEnvironment,
+        client: Client,
+        env_id: String,
         title: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let output = env.output();
         let mut viewer = Self {
-            env,
+            client,
+            env_id,
             title,
+            viewer: None,
             frame: None,
-            frame_size: (output.width, output.height),
+            frame_size: (0, 0),
+            frame_generation: 0,
             surface_bounds: Rc::new(Cell::new(Bounds::default())),
             focus_handle: cx.focus_handle(),
             status: "connecting".to_string(),
             error: None,
             has_control: false,
-            input_seq: 0,
             poll_task: None,
             heartbeat_task: None,
         };
-        viewer.start_polling(window, cx);
+        viewer.start_attach(window, cx);
         viewer
     }
 
-    fn start_polling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let env = self.env.clone();
+    /// Attaches to the environment, then polls its composed frames.
+    fn start_attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(hello) = self.client.hello() else {
+            self.status = "unavailable".to_string();
+            self.error = Some("cannot attach to desktop: daemon is disconnected".to_string());
+            cx.notify();
+            return;
+        };
+        let socket = hello.desktop_socket;
+        let env_id = self.env_id.clone();
         self.poll_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let attached = cx
+                .background_executor()
+                .spawn(async move { ViewerClient::attach(&socket, &env_id) })
+                .await;
+            let viewer = match attached {
+                Ok(viewer) => Arc::new(Mutex::new(viewer)),
+                Err(err) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.status = "unavailable".to_string();
+                        this.error = Some(format!("cannot attach to desktop: {err}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            if this
+                .update(cx, |this, _| this.viewer = Some(viewer.clone()))
+                .is_err()
+            {
+                return;
+            }
             loop {
                 cx.background_executor().timer(FRAME_INTERVAL).await;
-                let pool = env.frame_pool();
+                let reader = viewer.clone();
                 let read = cx
                     .background_executor()
                     .spawn(async move {
-                        let frame = pool.latest_frame().ok()??;
-                        pool.acquire_slot(frame.slot);
-                        let read = pool.read_slot(frame.slot, pool.slot_size());
-                        pool.release_slot(frame.slot);
-                        let (header, pixels) = read.ok()?;
-                        Some((header, pixels.to_vec()))
+                        let guard = lock_viewer(&reader);
+                        let (header, pixels) = guard.latest_frame().ok()??;
+                        Some((header, pixels))
                     })
                     .await;
                 let Some((header, pixels)) = read else {
                     continue;
                 };
                 let updated = this.update_in(cx, |this, window, cx| {
-                    this.set_frame(header.width, header.height, pixels, window, cx);
+                    this.set_frame(header, pixels, window, cx);
                 });
                 if updated.is_err() {
                     break;
@@ -103,34 +133,47 @@ impl DesktopViewer {
 
     fn set_frame(
         &mut self,
-        width: u32,
-        height: u32,
+        header: ShmSlotHeader,
         pixels: Vec<u8>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let image = render_image_from_bgra(&pixels, width, height);
+        let image = render_image_from_bgra(&pixels, header.width, header.height);
         let previous = self.frame.replace(image);
         if let Some(previous) = previous {
             cx.drop_image(previous, Some(window));
         }
-        self.frame_size = (width, height);
+        self.frame_size = (header.width, header.height);
+        self.frame_generation = header.generation;
         if self.error.is_none() {
-            self.status = format!("live {width}x{height}");
+            self.status = format!("live {}x{}", header.width, header.height);
         }
         cx.notify();
     }
 
+    /// The attached viewer. Before attachment completes, reports that and returns `None`.
+    fn attached_viewer(&mut self, cx: &mut Context<Self>) -> Option<Arc<Mutex<ViewerClient>>> {
+        if self.viewer.is_none() {
+            self.error = Some("desktop is still connecting".to_string());
+            cx.notify();
+        }
+        self.viewer.clone()
+    }
+
     /// Acquires (or renews) the human control lease.
     pub fn take_control(&mut self, cx: &mut Context<Self>) {
-        match self.env.set_control(SESSION_PRINCIPAL, "acquire", true) {
-            Ok(Some(lease)) => {
+        let Some(viewer) = self.attached_viewer(cx) else {
+            return;
+        };
+        let result = lock_viewer(&viewer).take_control();
+        match result {
+            Ok(epoch) => {
                 self.has_control = true;
                 self.error = None;
-                self.status = format!("control held (epoch {})", lease.epoch);
-                self.start_heartbeat(cx);
+                self.status = format!("control held (epoch {epoch})");
+                self.start_heartbeat(viewer, cx);
             }
-            Ok(None) => {
+            Err(DesktopError::ControlBusy { .. }) => {
                 self.has_control = false;
                 self.status = "no control".to_string();
             }
@@ -145,8 +188,12 @@ impl DesktopViewer {
     /// Releases the human control lease.
     pub fn release_control(&mut self, cx: &mut Context<Self>) {
         self.heartbeat_task = None;
-        match self.env.set_control(SESSION_PRINCIPAL, "release", true) {
-            Ok(_) => {
+        let Some(viewer) = self.attached_viewer(cx) else {
+            return;
+        };
+        let result = lock_viewer(&viewer).release_control();
+        match result {
+            Ok(()) => {
                 self.has_control = false;
                 self.status = "control released".to_string();
                 self.error = None;
@@ -156,22 +203,24 @@ impl DesktopViewer {
         cx.notify();
     }
 
-    fn start_heartbeat(&mut self, cx: &mut Context<Self>) {
+    fn start_heartbeat(&mut self, viewer: Arc<Mutex<ViewerClient>>, cx: &mut Context<Self>) {
         if self.heartbeat_task.is_some() {
             return;
         }
-        let env = self.env.clone();
         self.heartbeat_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(LEASE_HEARTBEAT).await;
-                // The viewer is the human owner while it is open, so the
-                // environment is not retired as abandoned.
-                let _ = env.heartbeat("owner", None);
-                let renewed = env
-                    .set_control(SESSION_PRINCIPAL, "acquire", true)
-                    .ok()
-                    .flatten()
-                    .is_some();
+                let lease = viewer.clone();
+                let renewed = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let mut guard = lock_viewer(&lease);
+                        // The viewer is the human owner while it is open, so the
+                        // environment is not retired as abandoned.
+                        let _ = guard.heartbeat_owner();
+                        guard.take_control().is_ok()
+                    })
+                    .await;
                 if this
                     .update(cx, |this, cx| {
                         this.has_control = renewed;
@@ -195,35 +244,18 @@ impl DesktopViewer {
         if events.is_empty() {
             return;
         }
-        let owner = self.env.get_status().owner_principal;
-        let lease = match self.env.get_status().active_control_lease {
-            Some(lease) if lease.holder == SESSION_PRINCIPAL => lease,
-            _ => match self.env.set_control(SESSION_PRINCIPAL, "acquire", true) {
-                Ok(Some(lease)) => {
-                    self.has_control = true;
-                    self.start_heartbeat(cx);
-                    lease
-                }
-                Ok(None) => return,
-                Err(err) => {
-                    self.error = Some(err.to_string());
-                    cx.notify();
-                    return;
-                }
-            },
+        let Some(viewer) = self.attached_viewer(cx) else {
+            return;
         };
-        let _ = owner;
-        self.input_seq = self.input_seq.wrapping_add(1);
-        let batch = InputBatch {
-            seq: self.input_seq,
-            client_timestamp_us: 0,
-            events,
-        };
-        match self
-            .env
-            .dispatch_input(SESSION_PRINCIPAL, lease.epoch, self.env.generation(), batch)
-        {
-            Ok(_) => self.error = None,
+        if !self.has_control {
+            self.take_control(cx);
+            if !self.has_control {
+                return;
+            }
+        }
+        let result = lock_viewer(&viewer).send_input(self.frame_generation, events);
+        match result {
+            Ok(()) => self.error = None,
             Err(err) => self.error = Some(err.to_string()),
         }
         cx.notify();
@@ -477,6 +509,11 @@ impl Render for DesktopViewer {
                 None => status,
             }))
     }
+}
+
+/// Locks the shared viewer, recovering from poisoning so frame polling keeps running.
+fn lock_viewer(viewer: &Mutex<ViewerClient>) -> MutexGuard<'_, ViewerClient> {
+    viewer.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// Builds a gpui `RenderImage` from BGRA8 pixels with straight alpha.

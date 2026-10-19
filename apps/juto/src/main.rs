@@ -1,8 +1,10 @@
-//! Juto's native chat interface wired to the agent runtime.
+//! Juto's native chat interface, served by the workspace daemon.
 
 mod auth_modal;
 mod chat;
+mod chat_error;
 mod chat_input;
+mod chat_request;
 mod desktop_viewer;
 mod focus_view;
 mod model_picker;
@@ -14,20 +16,25 @@ mod theme;
 mod vcs_sidebar;
 mod view_element;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use anyhow::{Context as _, bail};
 use gpui::{
     App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, actions,
     prelude::*, px, size,
 };
-use juto_runtime::{ChannelApprovalHandler, Runtime, RuntimeConfig, Session, default_data_dir};
+use juto_daemon::client::{Client, Notification};
+use juto_daemon::protocol::{Reply, Request, SessionView};
+use tokio::sync::broadcast;
 
 actions!(juto, [Quit]);
 
+const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-5";
+
 const USAGE: &str = "Usage: juto [--version] [--help] [--session <path>] [--model <model>]
             juto --desktop <command> [args...]
-Opens the Juto local chat window connected to the agent runtime.
+Opens the Juto chat window, connected to this workspace's daemon.
 
 Options:
   --session <path>  Open an existing session journal
@@ -39,6 +46,85 @@ Options:
 
 fn print_version() {
     println!("juto {}", env!("CARGO_PKG_VERSION"));
+}
+
+/// Everything the chat window needs from the daemon before it can open.
+struct Startup {
+    client: Client,
+    notifications: broadcast::Receiver<Notification>,
+    session: SessionView,
+    default_model: String,
+}
+
+/// Connects to the workspace daemon and opens (or creates) the session the
+/// window shows. Failures are returned so the window can report them.
+async fn start_workspace(
+    cwd: &Path,
+    session_path: Option<PathBuf>,
+    model: Option<String>,
+) -> anyhow::Result<Startup> {
+    let client = Client::connect(cwd)
+        .await
+        .context("failed to connect to the workspace daemon")?;
+    let notifications = client.subscribe();
+
+    let Reply::Config(config) = client
+        .request(Request::GetConfig)
+        .await
+        .context("failed to load runtime config")?
+    else {
+        bail!("daemon sent an unexpected reply to GetConfig");
+    };
+    let model = model.filter(|model| !model.trim().is_empty());
+    let default_model = model.clone().unwrap_or(config.model);
+    let default_model = if default_model.trim().is_empty() {
+        DEFAULT_MODEL.into()
+    } else {
+        default_model
+    };
+
+    let request = match session_path {
+        Some(path) => Request::OpenSessionPath { path },
+        None => Request::CreateSession,
+    };
+    let Reply::Session(mut session) = client
+        .request(request)
+        .await
+        .context("failed to open or create a session")?
+    else {
+        bail!("daemon sent an unexpected reply to session open");
+    };
+
+    if let Some(model) = model {
+        client
+            .request(Request::SetSessionModel {
+                session_id: session.info.id.clone(),
+                selector: model.clone(),
+            })
+            .await
+            .context("failed to set session model")?;
+        session.info.model = Some(model);
+    }
+
+    Ok(Startup {
+        client,
+        notifications,
+        session,
+        default_model,
+    })
+}
+
+fn window_options(cx: &mut App) -> WindowOptions {
+    let bounds = Bounds::centered(None, size(px(960.0), px(720.0)), cx);
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Juto".into()),
+            ..Default::default()
+        }),
+        app_id: Some("dev.juto".into()),
+        ..Default::default()
+    }
 }
 
 fn run() -> ExitCode {
@@ -96,7 +182,6 @@ fn run() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let _guard = tokio_runtime.enter();
     let tokio_handle = tokio_runtime.handle().clone();
 
     let cwd = match env::current_dir() {
@@ -106,55 +191,7 @@ fn run() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let data_dir = match default_data_dir() {
-        Ok(dir) => dir,
-        Err(err) => {
-            eprintln!("error: failed to determine default data directory: {err}");
-            return ExitCode::from(1);
-        }
-    };
-    let mut config =
-        match RuntimeConfig::load(&data_dir.join("config.yml"), &cwd.join(".juto/config.yml")) {
-            Ok(config) => config,
-            Err(err) => {
-                eprintln!("error: failed to load runtime config: {err}");
-                return ExitCode::from(1);
-            }
-        };
-    if let Some(model) = model_arg {
-        config.model = model;
-    }
-    if config.model.trim().is_empty() {
-        config.model = "anthropic/claude-sonnet-4-5".into();
-    }
-    let (approval_handler, approval_requests) = ChannelApprovalHandler::channel();
-    let runtime =
-        match Runtime::from_config_with_approval(&cwd, &data_dir, config, Some(approval_handler)) {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                eprintln!("error: failed to initialize agent runtime: {err}");
-                return ExitCode::from(1);
-            }
-        };
-    let session = match session_path {
-        Some(path) => match Session::open(&path) {
-            Ok(session) => session,
-            Err(err) => {
-                eprintln!(
-                    "error: failed to open session at `{}`: {err}",
-                    path.display()
-                );
-                return ExitCode::from(1);
-            }
-        },
-        None => match runtime.new_session() {
-            Ok(session) => session,
-            Err(err) => {
-                eprintln!("error: failed to create new session: {err}");
-                return ExitCode::from(1);
-            }
-        },
-    };
+    let startup = tokio_runtime.block_on(start_workspace(&cwd, session_path, model_arg));
 
     Application::new().run(move |cx: &mut App| {
         chat::init(cx);
@@ -175,37 +212,39 @@ fn run() -> ExitCode {
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(960.0), px(720.0)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Juto".into()),
-                    ..Default::default()
-                }),
-                app_id: Some("dev.juto".into()),
-                ..Default::default()
-            },
-            |window, cx| {
-                let chat = cx.new(|cx| {
-                    chat::ChatView::new(
-                        runtime,
-                        session,
-                        tokio_handle,
-                        approval_requests,
-                        window,
-                        cx,
-                    )
-                });
-                if let Some(argv) = desktop_argv.clone() {
-                    chat.update(cx, |chat, cx| {
-                        chat.open_desktop_command(argv, window, cx);
+        match startup {
+            Ok(startup) => {
+                let options = window_options(cx);
+                cx.open_window(options, |window, cx| {
+                    let chat = cx.new(|cx| {
+                        chat::ChatView::new(
+                            startup.client,
+                            tokio_handle,
+                            startup.session,
+                            startup.default_model,
+                            startup.notifications,
+                            window,
+                            cx,
+                        )
                     });
-                }
-                chat
-            },
-        )
-        .unwrap();
+                    if let Some(argv) = desktop_argv.clone() {
+                        chat.update(cx, |chat, cx| {
+                            chat.open_desktop_command(argv, window, cx);
+                        });
+                    }
+                    chat
+                })
+                .unwrap();
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                let options = window_options(cx);
+                cx.open_window(options, |_, cx| {
+                    cx.new(|_| chat_error::StartupError::new(message))
+                })
+                .unwrap();
+            }
+        }
         cx.activate(true);
     });
 

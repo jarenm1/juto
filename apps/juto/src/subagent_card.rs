@@ -2,7 +2,7 @@
 //! created when a child is first seen, then updated in place as its status changes.
 
 use juto_agent::ViewNode;
-use juto_runtime::subagents::{MainMessage, SubagentStatus};
+use juto_runtime::subagents::SubagentStatus;
 use serde_json::{Map, json};
 
 use crate::chat::{Message, MessageRole, view_row};
@@ -84,26 +84,8 @@ pub fn upsert_subagent_card(
     }
 }
 
-/// The prompt that wakes an idle main thread with completions that arrived while no
-/// run was active. Uses the `[subagent <from> <kind>]` framing the runtime uses when
-/// it steers an active run, so the model reads both paths the same way.
-pub fn completion_prompt(arrivals: &[MainMessage]) -> String {
-    arrivals
-        .iter()
-        .map(|message| {
-            format!(
-                "[subagent {} {:?}]\n{}",
-                message.from, message.kind, message.body
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
-}
-
 #[cfg(test)]
 mod tests {
-    use juto_runtime::subagents::MainMessageKind;
-
     use super::*;
 
     fn assistant(text: &str) -> Message {
@@ -175,26 +157,5 @@ mod tests {
 
         assert_eq!(card_count(&messages), 1);
         assert_eq!(messages[0].views[0].props.get("name"), Some(&json!("w2")));
-    }
-
-    #[test]
-    fn completion_prompt_frames_each_arrival_for_the_model() {
-        let arrivals = vec![
-            MainMessage {
-                from: "w1".into(),
-                kind: MainMessageKind::Completed,
-                body: "tests pass".into(),
-            },
-            MainMessage {
-                from: "w2".into(),
-                kind: MainMessageKind::Failed,
-                body: "build error".into(),
-            },
-        ];
-
-        assert_eq!(
-            completion_prompt(&arrivals),
-            "[subagent w1 Completed]\ntests pass\n\n[subagent w2 Failed]\nbuild error"
-        );
     }
 }
