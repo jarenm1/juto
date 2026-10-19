@@ -458,6 +458,7 @@ impl ChatView {
         let initial_summaries = subagents.list();
         let initial_threads = session.threads().to_vec();
         sidebar.update(cx, |s, cx| {
+            s.set_inbox(subagents.main_inbox().clone(), cx);
             s.sync_from_summaries(&initial_summaries, cx);
             s.set_threads(initial_threads, cx);
         });

@@ -420,8 +420,9 @@ never wait for the digest. A `MainInboxReady` broadcast after publication wakes 
 idle main UI without stealing the runtime forwarder's notification. The main thread
 drains the inbox with `agent_inbox`, returning `from`, `name`, `kind`, `digest_of`,
 and `body`, and clearing the inbox. Reading `agent://main` fails with
-`PeerError::WriteOnly`, so draining happens only through `agent_inbox`. Children
-never write to the user UI; the main agent decides what reaches the user. The
+`PeerError::WriteOnly`, so model acknowledgment happens only through `agent_inbox`.
+Children cannot author arbitrary user UI; their messages and notices are displayed
+as host-rendered sidebar inbox entries. The
 inbox is persisted under `data_dir/inbox/<main-session-id>.json` once `Runtime::open_main_inbox`
 binds it to the main session (the desktop app and CLI do this after opening the session). Each
 undrained message keeps its `origin`, the top-level session it is addressed to, so each thread
@@ -430,6 +431,8 @@ digest finishes drops them. A file that cannot be read fails the bind instead of
 Main-started turns (the first run and an `agent_send` to a completed child) push a notice on every terminal publication. A
 turn the user types in a focus thread pushes none; its result reaches the user through
 the focus view.
+
+The desktop sidebar's Inbox section lists the notices the user has not dismissed. Reading it never drains the model's queue. Its Dismiss button removes only the user's copy, so the model still receives that message through `agent_inbox`. The user's copies and the model's queue persist in the same file, and dismissals survive a restart.
 
 Run ownership: the registry, concurrency limit, and inbox are shared by the process, but
 `Runtime::subagent_manager(&control)` returns a handle that owns only the children it spawns, scoped
@@ -483,8 +486,12 @@ cleanup keeps the workspace recorded and returns `WorkspaceRelease`, so the rele
 be retried. After release, `follow_up` and `transcript` both return `WorkspaceReleased`.
 The focus view treats a missing workspace as no VCS panel and a released thread as
 follow-up disabled. A focus view already open at release time is not updated; its next
-send is refused and shows the error. Completion notices are still not rendered in the UI:
-the main agent reads them through `agent_inbox` and decides what reaches the user.
+send is refused and shows the error. The sidebar Inbox renders child messages and
+completion notices independently of model delivery. Reading is non-destructive;
+Dismiss removes only the user's copy, while `agent_inbox` drains only the model's
+copy. Both queues persist in the session inbox file, so model wake-ups cannot hide
+notices before the user sees them, and dismissals survive restart. Blocked workers
+also appear as task cards with their blocker prompt and resume controls.
 
 Limitation: a failed cleanup restores the recorded workspace, so follow-ups are accepted
 again until a release succeeds, even if the directory was partly removed.

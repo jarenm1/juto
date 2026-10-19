@@ -86,6 +86,7 @@ pub struct Sidebar {
     /// Live row views by task id, with the subscription forwarding their events.
     cards: HashMap<String, (Entity<TaskCard>, Subscription)>,
     threads: ThreadList,
+    inbox: Option<juto_runtime::subagents::MainInbox>,
 }
 
 /// The main session's internal threads, in creation order.
@@ -111,7 +112,71 @@ impl Sidebar {
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
+            inbox: None,
         }
+    }
+
+    /// Shows the session inbox. A push from any child re-renders the sidebar
+    /// even when no subagent lifecycle event arrives; the watcher ends with the sidebar.
+    pub fn set_inbox(&mut self, inbox: juto_runtime::subagents::MainInbox, cx: &mut Context<Self>) {
+        let watched = inbox.clone();
+        self.inbox = Some(inbox);
+        cx.spawn(async move |this, cx| {
+            loop {
+                watched.user_changed().await;
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn render_inbox(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let messages = self
+            .inbox
+            .as_ref()
+            .map(|inbox| inbox.user_messages())
+            .unwrap_or_default();
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .child(format!("Inbox · {}", messages.len()))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(theme::TEXT_FAINT))
+                    .child("Dismissal does not remove the agent’s copy."),
+            )
+            .children(messages.into_iter().enumerate().map(|(index, message)| {
+                let dismiss = message.clone();
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .border_1()
+                    .border_color(rgb(theme::TEXT_FAINT))
+                    .child(format!("{} · {:?}", message.from, message.kind))
+                    .child(div().text_sm().child(message.body))
+                    .child(
+                        div()
+                            .id(("dismiss-inbox", index))
+                            .cursor_pointer()
+                            .text_xs()
+                            .child("Dismiss")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(inbox) = &this.inbox
+                                    && let Err(error) = inbox.dismiss_user_message(&dismiss)
+                                {
+                                    this.error_message = Some(error.to_string().into());
+                                }
+                                cx.notify();
+                            })),
+                    )
+            }))
     }
 
     /// Sample tasks demonstrating all lifecycle states and Zed live diff cards.
@@ -263,10 +328,16 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Mirrors focus threads only: worker summaries (`focus == false`) are not
-    /// Mission Control cards.
+    /// Focus threads and blocked workers are visible. Once a worker has been
+    /// shown, keep updating its card so resolving a blocker clears the prompt.
     pub fn apply_summaries(&mut self, summaries: &[SubagentSummary]) {
-        for summary in summaries.iter().filter(|summary| summary.focus) {
+        for summary in summaries {
+            if !summary.focus
+                && !summary.status.is_blocked()
+                && !self.tasks.iter().any(|task| task.id == summary.id)
+            {
+                continue;
+            }
             let workspace = summary
                 .workspace
                 .as_ref()
@@ -752,6 +823,7 @@ impl Render for Sidebar {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
+                    .child(self.render_inbox(cx))
                     .child(
                         div()
                             .flex()
@@ -788,6 +860,7 @@ mod tests {
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
+            inbox: None,
         };
 
         let (total, active, blocked, done) = sidebar.filter_counts();
@@ -823,6 +896,7 @@ mod tests {
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
+            inbox: None,
         };
 
         // Truthful initial empty state
@@ -945,6 +1019,7 @@ mod tests {
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
+            inbox: None,
         };
 
         assert!(sidebar.error_message.is_none());
@@ -959,7 +1034,7 @@ mod tests {
     }
 
     #[test]
-    fn only_focus_summaries_become_cards() {
+    fn focus_and_blocked_worker_summaries_become_cards() {
         let mut sidebar = Sidebar {
             focus_handle: None,
             scroll_handle: ScrollHandle::new(),
@@ -970,6 +1045,7 @@ mod tests {
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
+            inbox: None,
         };
         let summary = |id: &str, focus: bool| SubagentSummary {
             id: id.into(),
@@ -988,6 +1064,17 @@ mod tests {
 
         let ids: Vec<&str> = sidebar.tasks().iter().map(|t| t.id.as_str()).collect();
         assert_eq!(ids, vec!["focus-1"]);
+
+        let mut worker = summary("worker-1", false);
+        worker.status = SubagentStatus::Blocked {
+            reason: BlockerReason::UserInput,
+            prompt: "Choose a target".into(),
+        };
+        sidebar.apply_summaries(&[worker.clone()]);
+        assert!(sidebar.tasks()[1].status.is_blocked());
+        worker.status = SubagentStatus::Running;
+        sidebar.apply_summaries(&[worker]);
+        assert!(!sidebar.tasks()[1].status.is_blocked());
     }
 
     #[test]
@@ -1004,6 +1091,7 @@ mod tests {
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
+            inbox: None,
         };
         let summary = SubagentSummary {
             id: "focus-1".into(),
