@@ -1532,6 +1532,23 @@ fn environment_slice_aggregates_limits_and_contains_apps() {
         "slice limits: {properties}"
     );
 
+    // Slice limits must be transient. A persistent drop-in would outlive the
+    // environment and keep applying to a later slice that reuses the name.
+    let config_root = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        })
+        .expect("config directory");
+    let dropin = config_root
+        .join("systemd/user.control")
+        .join(format!("{slice}.d"));
+    assert!(
+        !dropin.exists(),
+        "persistent slice drop-in: {}",
+        dropin.display()
+    );
+
     // Applications run inside the slice, not beside it.
     let handle = env
         .launch(
