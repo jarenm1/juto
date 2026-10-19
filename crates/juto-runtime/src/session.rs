@@ -100,6 +100,41 @@ pub struct Session {
     file: File,
     journal: Journal,
 }
+
+/// One message on the active path, numbered from the root.
+#[derive(Debug, Clone, Copy)]
+pub struct PathMessage<'a> {
+    pub index: usize,
+    pub id: &'a str,
+    pub message: &'a Message,
+}
+
+/// The latest compaction on the active path.
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionMark<'a> {
+    pub summary: &'a str,
+    /// Index of the first message after the compaction entry.
+    pub at: usize,
+    /// Index of the first message the model still sees; equal to `at` when the
+    /// compaction kept nothing.
+    pub first_visible: usize,
+}
+
+/// The active path as recall addresses it.
+#[derive(Debug, Clone)]
+pub struct PathView<'a> {
+    pub messages: Vec<PathMessage<'a>>,
+    pub compaction: Option<CompactionMark<'a>>,
+}
+
+impl<'a> PathView<'a> {
+    /// Messages the model sees: those from the first kept message onward.
+    pub fn visible(&self) -> &[PathMessage<'a>] {
+        let start = self.compaction.map_or(0, |mark| mark.first_visible);
+        &self.messages[start..]
+    }
+}
+
 impl Session {
     pub fn create(directory: &Path, cwd: &Path) -> Result<Self> {
         Self::create_from(directory, cwd, None, &[])
@@ -256,66 +291,75 @@ impl Session {
         entries.reverse();
         Ok(entries)
     }
-    fn visible_messages(&self) -> Result<(Option<&str>, Vec<&SessionEntry>)> {
+    /// The active path as recall addresses it: every message entry numbered
+    /// from the root, with the latest compaction placed among them. Numbers
+    /// stay put when a compaction is appended and change only when the active
+    /// path changes (a branch).
+    pub fn path_view(&self) -> Result<PathView<'_>> {
         let entries = self.active_entries()?;
         let boundary = entries
             .iter()
-            .rposition(|entry| matches!(entry.kind, EntryKind::Compaction { .. }));
-        if let Some(boundary) = boundary {
-            let EntryKind::Compaction {
-                summary,
-                first_kept_id,
-            } = &entries[boundary].kind
-            else {
-                unreachable!()
-            };
-            let floor = match first_kept_id {
-                Some(id) => entries[..boundary]
+            .copied()
+            .enumerate()
+            .rev()
+            .find_map(|(position, entry)| match &entry.kind {
+                EntryKind::Compaction {
+                    summary,
+                    first_kept_id,
+                } => Some((position, summary.as_str(), first_kept_id.as_deref())),
+                _ => None,
+            });
+        let floor = match boundary {
+            Some((position, _, Some(id))) => Some(
+                entries[..position]
                     .iter()
-                    .position(|entry| entry.id == *id)
+                    .position(|entry| entry.id == id)
                     .ok_or_else(|| {
                         corrupt(&self.path, "compaction references a missing retained entry")
                     })?,
-                None => boundary,
-            };
-            let visible = entries
-                .into_iter()
-                .enumerate()
-                .filter_map(|(index, entry)| {
-                    if index >= floor
-                        && index != boundary
-                        && matches!(entry.kind, EntryKind::Message { .. })
-                    {
-                        Some(entry)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            Ok((Some(summary), visible))
-        } else {
-            Ok((
-                None,
-                entries
-                    .into_iter()
-                    .filter(|entry| matches!(entry.kind, EntryKind::Message { .. }))
-                    .collect(),
-            ))
-        }
-    }
-    pub fn messages(&self) -> Result<Vec<Message>> {
-        let (summary, entries) = self.visible_messages()?;
-        let mut messages = Vec::with_capacity(entries.len() + usize::from(summary.is_some()));
-        if let Some(summary) = summary {
-            messages.push(Message::developer(format!(
-                "[Earlier conversation summary]\n{summary}"
-            )));
-        }
-        for entry in entries {
+            ),
+            _ => None,
+        };
+        let mut messages = Vec::new();
+        let mut at = 0;
+        let mut first_visible = None;
+        for (position, &entry) in entries.iter().enumerate() {
+            if Some(position) == floor {
+                first_visible = Some(messages.len());
+            }
+            if boundary.is_some_and(|(compaction_at, _, _)| compaction_at == position) {
+                at = messages.len();
+            }
             if let EntryKind::Message { message } = &entry.kind {
-                messages.push(message.clone());
+                messages.push(PathMessage {
+                    index: messages.len(),
+                    id: entry.id.as_str(),
+                    message,
+                });
             }
         }
+        let compaction = boundary.map(|(_, summary, _)| CompactionMark {
+            summary,
+            at,
+            first_visible: first_visible.unwrap_or(at),
+        });
+        Ok(PathView {
+            messages,
+            compaction,
+        })
+    }
+    pub fn messages(&self) -> Result<Vec<Message>> {
+        let view = self.path_view()?;
+        let visible = view.visible();
+        let mut messages =
+            Vec::with_capacity(visible.len() + usize::from(view.compaction.is_some()));
+        if let Some(mark) = view.compaction {
+            messages.push(Message::developer(format!(
+                "[Earlier conversation summary — originals: recall]\n{}",
+                mark.summary
+            )));
+        }
+        messages.extend(visible.iter().map(|entry| entry.message.clone()));
         Ok(messages)
     }
     pub fn current_model(&self) -> Option<String> {
@@ -343,13 +387,14 @@ impl Session {
         )
     }
     pub fn compact(&mut self, summary: String, keep_recent_messages: usize) -> Result<()> {
-        let (_, messages) = self.visible_messages()?;
-        let mut start = messages.len().saturating_sub(keep_recent_messages);
-        let mut calls = HashMap::new();
-        let mut groups = Vec::new();
-        for (index, entry) in messages.iter().enumerate() {
-            if let EntryKind::Message { message } = &entry.kind {
-                match message {
+        let first_kept_id = {
+            let view = self.path_view()?;
+            let messages = view.visible();
+            let mut start = messages.len().saturating_sub(keep_recent_messages);
+            let mut calls = HashMap::new();
+            let mut groups = Vec::new();
+            for (index, entry) in messages.iter().enumerate() {
+                match entry.message {
                     Message::Assistant(assistant) => {
                         for call in assistant.tool_calls() {
                             calls.insert(call.id.as_str(), index);
@@ -363,19 +408,19 @@ impl Session {
                     _ => {}
                 }
             }
-        }
-        loop {
-            let previous = start;
-            for (call, result) in &groups {
-                if *result >= start && *call < start {
-                    start = *call;
+            loop {
+                let previous = start;
+                for (call, result) in &groups {
+                    if *result >= start && *call < start {
+                        start = *call;
+                    }
+                }
+                if previous == start {
+                    break;
                 }
             }
-            if previous == start {
-                break;
-            }
-        }
-        let first_kept_id = messages.get(start).map(|entry| entry.id.clone());
+            messages.get(start).map(|entry| entry.id.to_owned())
+        };
         self.append(EntryKind::Compaction {
             summary,
             first_kept_id,
