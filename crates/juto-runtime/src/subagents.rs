@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::session::Session;
+use crate::tier::ExecutionTier;
 use async_trait::async_trait;
 use futures::FutureExt;
 use juto_agent::{AgentEvent, RunControl};
@@ -60,6 +61,11 @@ pub struct TaskSpec {
     /// isolated and may only be spawned by the main thread.
     #[serde(default, skip_serializing_if = "is_false")]
     pub focus: bool,
+    /// Execution tier for the child. The `task` tool always resolves it against
+    /// the parent's tier; `None` (specs built in code) means the fail-closed
+    /// default, `workspace`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<ExecutionTier>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -90,6 +96,7 @@ impl TaskSpec {
             isolated_workspace: false,
             solution_space: None,
             focus: false,
+            tier: None,
         }
     }
 }
@@ -1446,6 +1453,7 @@ mod tests {
             isolated_workspace: false,
             solution_space: None,
             focus: false,
+            tier: None,
         }
     }
 

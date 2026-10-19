@@ -1,14 +1,18 @@
-//! Behavioral tests for the workspace resource/sandbox command construction.
+//! Live tests for the workspace sandbox and resource governance.
 //!
-//! The argument-construction tests build a scoped command exactly like the
-//! inline `test_scoped_command_construction` unit test does, and assert on the
-//! resulting `systemd-run` argv. The live test actually spawns a sandboxed
-//! command and observes the filesystem boundary.
+//! Each test runs a real command through `systemd-run` and observes what the
+//! kernel allowed it to do: which files it could read or write, and which
+//! environment variables it saw. Tests that need `systemd-run` or `$HOME` skip
+//! with a message rather than fail. Workspaces live under `$HOME` because the
+//! sandbox gives the command a private `/tmp`.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 
 use juto_runtime::workspace::{
-    ProtectHome, ResourceLimits, Sandbox, ScopedStdio, SubagentWorkspace, is_systemd_run_available,
+    ResourceLimits, Sandbox, ScopedStdio, SubagentWorkspace, WorkspaceError,
+    is_systemd_run_available,
 };
 
 /// Serializes tests that mutate process-global environment variables.
@@ -18,6 +22,51 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Sets a process environment variable until dropped, then restores it.
+///
+/// Hold [`env_lock`] for as long as the guard lives.
+struct EnvVar {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVar {
+    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        // SAFETY: serialized by ENV_LOCK.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        // SAFETY: serialized by ENV_LOCK, which the test holds.
+        match &self.previous {
+            Some(value) => unsafe { std::env::set_var(self.key, value) },
+            None => unsafe { std::env::remove_var(self.key) },
+        }
+    }
+}
+
+/// A file under `$HOME` that is removed when the test ends, even on failure.
+struct HomeFile(PathBuf);
+
+impl HomeFile {
+    /// A path under `home` that does not exist yet.
+    fn new(home: &Path, name: &str) -> Self {
+        let path = home.join(format!(".{name}-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Self(path)
+    }
+}
+
+impl Drop for HomeFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn workspace_at(path: &Path) -> SubagentWorkspace {
@@ -30,432 +79,322 @@ fn workspace_at(path: &Path) -> SubagentWorkspace {
     }
 }
 
-fn args_of(cmd: &std::process::Command) -> Vec<String> {
-    cmd.get_args()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect()
-}
-
-fn index_of(args: &[String], needle: &str) -> usize {
-    args.iter()
-        .position(|arg| arg == needle)
-        .unwrap_or_else(|| panic!("missing arg {needle:?} in {args:?}"))
-}
-
-/// The workspace path as the sandbox helper resolves it (canonicalized).
-fn resolved_workspace(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-#[test]
-fn sandbox_properties_emitted_on_non_gpu_path() {
+/// `$HOME`, where live tests place their files. `None` skips the test: it needs
+/// `systemd-run` to sandbox anything, and a home directory to place files in.
+fn live_home(test: &str) -> Option<PathBuf> {
     if !is_systemd_run_available() {
-        eprintln!("skipping: systemd-run unavailable");
-        return;
+        eprintln!("skipping {test}: systemd-run unavailable");
+        return None;
     }
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let ws = workspace_at(dir.path());
-
-    let mut orig = std::process::Command::new("cargo");
-    orig.arg("build").arg("--release");
-
-    let limits = ResourceLimits::default().with_sandbox(Sandbox::default());
-    let scoped = ws
-        .build_scoped_std_command(&orig, &limits)
-        .expect("build scoped");
-
-    assert_eq!(scoped.get_program(), "systemd-run");
-    let args = args_of(&scoped);
-    let dashdash = index_of(&args, "--");
-
-    for prop in [
-        "ProtectSystem=strict",
-        "ProtectHome=read-only",
-        "PrivateTmp=yes",
-    ] {
-        let idx = index_of(&args, prop);
-        assert!(idx < dashdash, "{prop} must precede `--`: {args:?}");
-    }
-
-    let read_write = format!(
-        "ReadWritePaths={}",
-        resolved_workspace(dir.path()).display()
-    );
-    let idx = index_of(&args, &read_write);
-    assert!(idx < dashdash, "{read_write} must precede `--`: {args:?}");
-
-    // The scoped program still follows `--`.
-    assert_eq!(args[dashdash + 1], "cargo");
-    assert_eq!(args[dashdash + 2], "build");
-    assert_eq!(args[dashdash + 3], "--release");
-
-    // Namespace properties are unsupported by transient scopes, so a sandboxed
-    // command runs as a transient service instead.
-    assert!(args.iter().any(|arg| arg == "--pipe"), "{args:?}");
-    assert!(!args.iter().any(|arg| arg == "--scope"), "{args:?}");
-}
-
-#[test]
-fn sandbox_properties_emitted_on_gpu_path() {
-    if !is_systemd_run_available() {
-        eprintln!("skipping: systemd-run unavailable");
-        return;
-    }
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let ws = workspace_at(dir.path());
-
-    let mut orig = std::process::Command::new("cargo");
-    orig.arg("run");
-
-    let limits = ResourceLimits::default()
-        .with_gpu(true)
-        .with_sandbox(Sandbox::default());
-    let scoped = ws
-        .build_scoped_std_command(&orig, &limits)
-        .expect("build scoped with gpu");
-
-    assert_eq!(scoped.get_program(), "flock");
-    let args = args_of(&scoped);
-
-    // `flock <lock>` prefix, then the systemd-run invocation.
-    assert!(args[0].contains("gpu.lock"), "{args:?}");
-    let systemd = index_of(&args, "systemd-run");
-    assert!(systemd > 0, "{args:?}");
-    let dashdash = index_of(&args, "--");
-    assert!(dashdash > systemd, "{args:?}");
-
-    for prop in [
-        "ProtectSystem=strict",
-        "ProtectHome=read-only",
-        "PrivateTmp=yes",
-    ] {
-        let idx = index_of(&args, prop);
-        assert!(
-            idx > systemd && idx < dashdash,
-            "{prop} must appear after `flock <lock>` and before `--`: {args:?}"
-        );
-    }
-
-    let read_write = format!(
-        "ReadWritePaths={}",
-        resolved_workspace(dir.path()).display()
-    );
-    let idx = index_of(&args, &read_write);
-    assert!(idx > systemd && idx < dashdash, "{args:?}");
-}
-
-#[test]
-fn no_sandbox_properties_when_sandbox_is_none() {
-    if !is_systemd_run_available() {
-        eprintln!("skipping: systemd-run unavailable");
-        return;
-    }
-
-    // `ResourceLimits::default()` reads AGENT_SANDBOX; serialize against the
-    // env test and clear it so the default is deterministic.
-    let _guard = env_lock();
-    // SAFETY: serialized by ENV_LOCK.
-    unsafe { std::env::remove_var("AGENT_SANDBOX") };
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let ws = workspace_at(dir.path());
-
-    let mut orig = std::process::Command::new("cargo");
-    orig.arg("build");
-
-    let limits = ResourceLimits::default();
-    assert!(limits.sandbox.is_none(), "sandbox must be opt-in");
-
-    let scoped = ws
-        .build_scoped_std_command(&orig, &limits)
-        .expect("build scoped");
-    let args = args_of(&scoped);
-
-    for prop in [
-        "ProtectSystem=strict",
-        "ProtectHome=read-only",
-        "ProtectHome=yes",
-        "PrivateTmp=yes",
-    ] {
-        assert!(
-            !args.iter().any(|arg| arg == prop),
-            "unexpected {prop} without a sandbox: {args:?}"
-        );
-    }
-    assert!(
-        !args.iter().any(|arg| arg.starts_with("ReadWritePaths=")),
-        "unexpected ReadWritePaths without a sandbox: {args:?}"
-    );
-    // Without a sandbox the invocation keeps the transient scope.
-    assert!(args.iter().any(|arg| arg == "--scope"), "{args:?}");
-}
-
-#[test]
-fn sandbox_write_paths_and_protect_home_variants() {
-    if !is_systemd_run_available() {
-        eprintln!("skipping: systemd-run unavailable");
-        return;
-    }
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let ws = workspace_at(dir.path());
-    let extra = dir.path().join("extra");
-    std::fs::create_dir_all(&extra).expect("create extra dir");
-
-    let sandbox = Sandbox {
-        protect_system: false,
-        protect_home: ProtectHome::Off,
-        private_tmp: false,
-        write_paths: vec![extra.clone(), PathBuf::from("relative-dir")],
-    };
-    let limits = ResourceLimits::default().with_sandbox(sandbox);
-
-    let orig = std::process::Command::new("true");
-    let scoped = ws
-        .build_scoped_std_command(&orig, &limits)
-        .expect("build scoped");
-    let args = args_of(&scoped);
-
-    assert!(!args.iter().any(|arg| arg == "ProtectSystem=strict"));
-    assert!(!args.iter().any(|arg| arg.starts_with("ProtectHome=")));
-    assert!(!args.iter().any(|arg| arg == "PrivateTmp=yes"));
-
-    let workspace = resolved_workspace(dir.path());
-    assert!(
-        args.contains(&format!("ReadWritePaths={}", workspace.display())),
-        "workspace must always be writable: {args:?}"
-    );
-    assert!(
-        args.contains(&format!(
-            "ReadWritePaths={}",
-            extra.canonicalize().expect("canonicalize extra").display()
-        )),
-        "absolute write path must be emitted: {args:?}"
-    );
-    assert!(
-        args.contains(&format!(
-            "ReadWritePaths={}",
-            workspace.join("relative-dir").display()
-        )),
-        "relative write path must resolve against the workspace: {args:?}"
-    );
-}
-
-#[test]
-fn sandbox_protect_home_yes_emits_property() {
-    if !is_systemd_run_available() {
-        eprintln!("skipping: systemd-run unavailable");
-        return;
-    }
-
-    let dir = tempfile::tempdir().expect("tempdir");
-    let ws = workspace_at(dir.path());
-
-    let sandbox = Sandbox {
-        protect_home: ProtectHome::Yes,
-        ..Sandbox::default()
-    };
-    let limits = ResourceLimits::default().with_sandbox(sandbox);
-
-    let orig = std::process::Command::new("true");
-    let scoped = ws
-        .build_scoped_std_command(&orig, &limits)
-        .expect("build scoped");
-    let args = args_of(&scoped);
-
-    assert!(args.iter().any(|arg| arg == "ProtectHome=yes"), "{args:?}");
-    assert!(!args.iter().any(|arg| arg == "ProtectHome=read-only"));
-}
-
-#[test]
-fn agent_sandbox_env_enables_the_toolchain_sandbox() {
-    let _guard = env_lock();
-
-    // SAFETY: serialized by ENV_LOCK.
-    unsafe { std::env::remove_var("AGENT_SANDBOX") };
-    assert!(
-        ResourceLimits::default().sandbox.is_none(),
-        "sandbox must be off by default"
-    );
-
-    // SAFETY: serialized by ENV_LOCK.
-    unsafe { std::env::set_var("AGENT_SANDBOX", "1") };
-    assert_eq!(
-        ResourceLimits::default().sandbox,
-        Some(Sandbox::for_agent_workspace()),
-        "AGENT_SANDBOX=1 must enable the toolchain sandbox"
-    );
-
-    // SAFETY: serialized by ENV_LOCK.
-    unsafe { std::env::set_var("AGENT_SANDBOX", "true") };
-    assert_eq!(
-        ResourceLimits::default().sandbox,
-        Some(Sandbox::for_agent_workspace()),
-        "AGENT_SANDBOX=true must enable the toolchain sandbox"
-    );
-
-    // SAFETY: serialized by ENV_LOCK.
-    unsafe { std::env::set_var("AGENT_SANDBOX", "0") };
-    assert!(
-        ResourceLimits::default().sandbox.is_none(),
-        "AGENT_SANDBOX=0 must not enable the sandbox"
-    );
-
-    // SAFETY: serialized by ENV_LOCK.
-    unsafe { std::env::remove_var("AGENT_SANDBOX") };
-}
-
-#[test]
-fn toolchain_sandbox_grants_the_build_directories() {
-    let _guard = env_lock();
-    let previous = std::env::var_os("CARGO_HOME");
-
-    // SAFETY: serialized by ENV_LOCK.
-    unsafe { std::env::set_var("CARGO_HOME", "/tmp/juto-cargo-home") };
-    let sandbox = Sandbox::for_agent_workspace();
-    assert!(
-        sandbox
-            .write_paths
-            .contains(&PathBuf::from("/tmp/juto-cargo-home")),
-        "an explicit CARGO_HOME must be granted: {:?}",
-        sandbox.write_paths
-    );
-    // The base defaults are unchanged.
-    assert!(sandbox.protect_system);
-    assert_eq!(sandbox.protect_home, ProtectHome::ReadOnly);
-    assert!(sandbox.private_tmp);
-
-    // SAFETY: serialized by ENV_LOCK.
-    match previous {
-        Some(value) => unsafe { std::env::set_var("CARGO_HOME", value) },
-        None => unsafe { std::env::remove_var("CARGO_HOME") },
-    }
-}
-
-/// Live proof that the sandbox is enforced by the kernel, not just by argv.
-///
-/// The workspace must live outside `/tmp`: `PrivateTmp=yes` gives the command a
-/// private `/tmp`, so a workspace under `/tmp` would not be visible inside the
-/// sandbox. A workspace under `$HOME` is visible (read-only) and granted write
-/// access through `ReadWritePaths`.
-#[tokio::test]
-async fn sandbox_allows_workspace_writes_and_denies_home_writes() {
-    if !is_systemd_run_available() {
-        eprintln!("skipping sandbox live test: systemd-run unavailable");
-        return;
-    }
-
-    let Some(home) = std::env::var_os("HOME")
+    let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-    else {
-        eprintln!("skipping sandbox live test: HOME unset");
+        .map(PathBuf::from);
+    if home.is_none() {
+        eprintln!("skipping {test}: HOME unset");
+    }
+    home
+}
+
+fn tempdir_in(home: &Path, prefix: &str) -> Option<tempfile::TempDir> {
+    match tempfile::Builder::new().prefix(prefix).tempdir_in(home) {
+        Ok(dir) => Some(dir),
+        Err(err) => {
+            eprintln!("skipping: cannot create {prefix}* under HOME: {err}");
+            None
+        }
+    }
+}
+
+/// Runs `script` under `sh -c` in the sandbox described by `limits`, with the
+/// workspace as its working directory, and waits for it to exit.
+fn run_sandboxed(ws: &SubagentWorkspace, limits: &ResourceLimits, script: &str) -> ExitStatus {
+    let mut original = std::process::Command::new("sh");
+    original.arg("-c").arg(script).current_dir(&ws.path);
+    run_command_sandboxed(ws, limits, &original)
+}
+
+/// Runs `original` in the sandbox described by `limits` and waits for it to exit.
+fn run_command_sandboxed(
+    ws: &SubagentWorkspace,
+    limits: &ResourceLimits,
+    original: &std::process::Command,
+) -> ExitStatus {
+    ws.build_scoped_std_command(original, limits)
+        .expect("build sandboxed command")
+        .status()
+        .expect("run sandboxed command")
+}
+
+#[test]
+fn sandbox_allows_workspace_writes_and_denies_home_writes() {
+    let test = "sandbox_allows_workspace_writes_and_denies_home_writes";
+    let Some(home) = live_home(test) else {
         return;
     };
-
-    let ws_dir = match tempfile::Builder::new()
-        .prefix("juto-sandbox-ws-")
-        .tempdir_in(&home)
-    {
-        Ok(dir) => dir,
-        Err(err) => {
-            eprintln!("skipping sandbox live test: cannot create workspace under HOME: {err}");
-            return;
-        }
+    let Some(ws_dir) = tempdir_in(&home, "juto-sandbox-ws-") else {
+        return;
     };
-
     let ws = workspace_at(ws_dir.path());
     let limits = ResourceLimits::default().with_sandbox(Sandbox::default());
 
-    // (a) A write inside the workspace succeeds: ReadWritePaths grants it.
-    let mut inside = tokio::process::Command::new("sh");
-    inside.arg("-c").arg("echo ok > inside.txt");
-    let status = ws
-        .run_scoped(&mut inside, limits.clone())
-        .await
-        .expect("run scoped inside");
+    let inside = run_sandboxed(&ws, &limits, "echo ok > inside.txt");
     assert!(
-        status.success(),
-        "write inside the workspace must succeed: {status:?}"
+        inside.success(),
+        "a write inside the workspace must succeed: {inside:?}"
     );
-    assert!(
-        ws_dir.path().join("inside.txt").exists(),
-        "inside.txt must exist in the workspace"
-    );
+    assert!(ws_dir.path().join("inside.txt").exists());
 
-    // (b) A write outside the workspace (under $HOME) fails: ProtectHome=read-only.
-    let canary = home.join(format!(".juto-sandbox-canary-{}", std::process::id()));
-    let _ = std::fs::remove_file(&canary);
-    let mut outside = tokio::process::Command::new("sh");
-    outside
-        .arg("-c")
-        .arg(format!("echo canary > {}", canary.display()));
-    let status = ws
-        .run_scoped(&mut outside, limits)
-        .await
-        .expect("run scoped outside");
+    let outside = HomeFile::new(&home, "juto-sandbox-outside");
+    let status = run_sandboxed(
+        &ws,
+        &limits,
+        &format!("echo canary > {}", outside.0.display()),
+    );
     assert!(
         !status.success(),
-        "write outside the workspace must fail: {status:?}"
+        "a write under $HOME, outside the workspace, must fail: {status:?}"
     );
-    assert!(!canary.exists(), "canary must not be created");
-    let _ = std::fs::remove_file(&canary);
+    assert!(!outside.0.exists(), "the sandbox must not create the file");
 }
 
-/// Live proof that a sandboxed command keeps the caller's environment.
-///
-/// A transient *service* runs in the user manager's environment, so without
-/// explicit forwarding a sandboxed build loses `PATH` and fails with
-/// ``linker `clang` not found``. A scope inherits the environment; a service
-/// does not.
-#[tokio::test]
-async fn sandboxed_service_inherits_the_caller_environment() {
-    if !is_systemd_run_available() {
-        eprintln!("skipping sandbox live test: systemd-run unavailable");
-        return;
-    }
-
-    let Some(home) = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-    else {
-        eprintln!("skipping sandbox live test: HOME unset");
+#[test]
+fn sandbox_hides_credentials_under_home() {
+    let test = "sandbox_hides_credentials_under_home";
+    let Some(home) = live_home(test) else {
         return;
     };
-
-    let ws_dir = match tempfile::Builder::new()
-        .prefix("juto-sandbox-env-")
-        .tempdir_in(&home)
-    {
-        Ok(dir) => dir,
-        Err(err) => {
-            eprintln!("skipping sandbox live test: cannot create workspace under HOME: {err}");
-            return;
-        }
+    let Some(ws_dir) = tempdir_in(&home, "juto-sandbox-cred-") else {
+        return;
     };
-
     let ws = workspace_at(ws_dir.path());
     let limits = ResourceLimits::default().with_sandbox(Sandbox::default());
 
-    let mut command = tokio::process::Command::new("sh");
-    command
+    let secret = HomeFile::new(&home, "juto-sandbox-secret");
+    std::fs::write(&secret.0, "credential-canary").unwrap();
+
+    let status = run_sandboxed(
+        &ws,
+        &limits,
+        &format!("cat {} > leaked.txt", secret.0.display()),
+    );
+    assert!(
+        !status.success(),
+        "reading a file under $HOME must fail inside the sandbox: {status:?}"
+    );
+    let leaked = std::fs::read_to_string(ws_dir.path().join("leaked.txt")).unwrap_or_default();
+    assert!(
+        !leaked.contains("credential-canary"),
+        "the credential must not reach the workspace"
+    );
+}
+
+#[test]
+fn sandbox_grants_expose_only_the_listed_paths() {
+    let test = "sandbox_grants_expose_only_the_listed_paths";
+    let Some(home) = live_home(test) else {
+        return;
+    };
+    let Some(ws_dir) = tempdir_in(&home, "juto-sandbox-grants-") else {
+        return;
+    };
+    let Some(read_dir) = tempdir_in(&home, "juto-sandbox-ro-") else {
+        return;
+    };
+    let Some(write_dir) = tempdir_in(&home, "juto-sandbox-rw-") else {
+        return;
+    };
+    let Some(hidden_dir) = tempdir_in(&home, "juto-sandbox-hidden-") else {
+        return;
+    };
+    std::fs::write(read_dir.path().join("note.txt"), "granted").unwrap();
+    std::fs::write(hidden_dir.path().join("note.txt"), "hidden").unwrap();
+
+    let ws = workspace_at(ws_dir.path());
+    let limits = ResourceLimits::default().with_sandbox(Sandbox {
+        read_paths: vec![read_dir.path().to_path_buf()],
+        write_paths: vec![write_dir.path().to_path_buf()],
+        ..Sandbox::default()
+    });
+
+    let read = run_sandboxed(
+        &ws,
+        &limits,
+        &format!("cat {}/note.txt > read.txt", read_dir.path().display()),
+    );
+    assert!(read.success(), "a read grant must be readable: {read:?}");
+    assert_eq!(
+        std::fs::read_to_string(ws_dir.path().join("read.txt")).unwrap(),
+        "granted"
+    );
+
+    let read_only_write = run_sandboxed(
+        &ws,
+        &limits,
+        &format!("echo x > {}/new.txt", read_dir.path().display()),
+    );
+    assert!(
+        !read_only_write.success(),
+        "a read grant must not be writable: {read_only_write:?}"
+    );
+    assert!(!read_dir.path().join("new.txt").exists());
+
+    let write = run_sandboxed(
+        &ws,
+        &limits,
+        &format!("echo ok > {}/new.txt", write_dir.path().display()),
+    );
+    assert!(write.success(), "a write grant must be writable: {write:?}");
+    assert_eq!(
+        std::fs::read_to_string(write_dir.path().join("new.txt"))
+            .unwrap()
+            .trim(),
+        "ok"
+    );
+
+    let hidden = run_sandboxed(
+        &ws,
+        &limits,
+        &format!("cat {}/note.txt > hidden.txt", hidden_dir.path().display()),
+    );
+    assert!(
+        !hidden.success(),
+        "an ungranted directory under $HOME must be hidden: {hidden:?}"
+    );
+}
+
+/// The sandbox sees the caller's allowlisted environment, not the whole of it.
+#[test]
+fn sandboxed_command_sees_only_the_allowlisted_environment() {
+    let test = "sandboxed_command_sees_only_the_allowlisted_environment";
+    let Some(home) = live_home(test) else {
+        return;
+    };
+    let Some(ws_dir) = tempdir_in(&home, "juto-sandbox-env-") else {
+        return;
+    };
+    let ws = workspace_at(ws_dir.path());
+    let limits = ResourceLimits::default().with_sandbox(Sandbox::default());
+
+    let _lock = env_lock();
+    let _agent = EnvVar::set("SSH_AUTH_SOCK", "/nonexistent/juto-probe.sock");
+
+    let status = run_sandboxed(&ws, &limits, "env > env.txt");
+    assert!(status.success(), "the env probe must run: {status:?}");
+    let env = std::fs::read_to_string(ws_dir.path().join("env.txt")).unwrap();
+    assert!(
+        !env.lines().any(|line| line.starts_with("SSH_AUTH_SOCK=")),
+        "the agent socket must not reach a sandboxed command"
+    );
+    assert!(
+        env.lines().any(|line| line.starts_with("PATH=")),
+        "a sandboxed command must still get PATH"
+    );
+}
+
+/// Explicit `Command` environment entries reach the sandbox. An override wins over
+/// the inherited value, an explicit removal unsets it, and an explicit entry outside
+/// the allowlist is still forwarded.
+#[test]
+fn explicit_environment_entries_reach_the_sandbox() {
+    let test = "explicit_environment_entries_reach_the_sandbox";
+    let Some(home) = live_home(test) else {
+        return;
+    };
+    let Some(ws_dir) = tempdir_in(&home, "juto-sandbox-explicit-env-") else {
+        return;
+    };
+    let ws = workspace_at(ws_dir.path());
+    let limits = ResourceLimits::default().with_sandbox(Sandbox::default());
+
+    let _lock = env_lock();
+    let _overridden = EnvVar::set("CARGO_JUTO_PROBE_OVERRIDDEN", "inherited");
+    let _removed = EnvVar::set("CARGO_JUTO_PROBE_REMOVED", "present");
+
+    let mut original = std::process::Command::new("sh");
+    original
         .arg("-c")
-        .arg("test -n \"$JUTO_SANDBOX_PROBE\" && printf '%s' \"$JUTO_SANDBOX_PROBE\" > probe.txt");
-    command.env("JUTO_SANDBOX_PROBE", "inherited");
-    let status = ws
-        .run_scoped(&mut command, limits)
-        .await
-        .expect("run scoped env probe");
+        .arg("env > env.txt")
+        .current_dir(ws_dir.path())
+        .env("CARGO_JUTO_PROBE_OVERRIDDEN", "overridden")
+        .env("JUTO_PROBE_EXPLICIT", "explicit")
+        .env_remove("CARGO_JUTO_PROBE_REMOVED");
+    let status = run_command_sandboxed(&ws, &limits, &original);
+    assert!(status.success(), "the env probe must run: {status:?}");
+
+    let env = std::fs::read_to_string(ws_dir.path().join("env.txt")).unwrap();
+    let lines: Vec<&str> = env.lines().collect();
+    assert!(
+        lines.contains(&"CARGO_JUTO_PROBE_OVERRIDDEN=overridden"),
+        "the override must win over the inherited value:\n{env}"
+    );
+    assert!(
+        lines.contains(&"JUTO_PROBE_EXPLICIT=explicit"),
+        "an explicit entry must be forwarded:\n{env}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.starts_with("CARGO_JUTO_PROBE_REMOVED=")),
+        "an explicitly removed variable must not reach the sandbox:\n{env}"
+    );
+}
+
+/// The agent sandbox makes the cargo home writable, so `cargo` can fetch and
+/// build inside the sandbox.
+#[test]
+fn agent_workspace_sandbox_writes_the_cargo_home() {
+    let test = "agent_workspace_sandbox_writes_the_cargo_home";
+    let Some(home) = live_home(test) else {
+        return;
+    };
+    let Some(ws_dir) = tempdir_in(&home, "juto-sandbox-cargo-ws-") else {
+        return;
+    };
+    let Some(cargo_home) = tempdir_in(&home, "juto-sandbox-cargo-home-") else {
+        return;
+    };
+    let ws = workspace_at(ws_dir.path());
+    let _lock = env_lock();
+    let _cargo = EnvVar::set("CARGO_HOME", cargo_home.path());
+    // `for_agent_workspace` reads CARGO_HOME when it is built, so it must be built
+    // after the variable is set.
+    let limits = ResourceLimits::default().with_sandbox(Sandbox::for_agent_workspace());
+
+    let status = run_sandboxed(&ws, &limits, "echo ok > \"$CARGO_HOME/probe.txt\"");
     assert!(
         status.success(),
-        "the probe must see its variable: {status:?}"
+        "the cargo home must be writable: {status:?}"
     );
-    assert_eq!(
-        std::fs::read_to_string(ws_dir.path().join("probe.txt")).unwrap(),
-        "inherited",
-        "a sandboxed service must inherit the caller's environment"
+    assert!(cargo_home.path().join("probe.txt").exists());
+}
+
+/// Without `systemd-run` a governed command is refused, never run bare.
+#[test]
+fn missing_systemd_run_refuses_the_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+    let ws = workspace_at(dir.path());
+    let mut original = std::process::Command::new("sh");
+    original
+        .arg("-c")
+        .arg("echo ran > marker.txt")
+        .current_dir(dir.path());
+
+    let _lock = env_lock();
+    let _path = EnvVar::set("PATH", empty_path.path());
+
+    let capped = ws.build_scoped_std_command(&original, &ResourceLimits::default());
+    assert!(
+        matches!(capped, Err(WorkspaceError::SystemdUnavailable)),
+        "a capped command must be refused without systemd-run"
+    );
+    let sandboxed = ws.build_scoped_std_command(
+        &original,
+        &ResourceLimits::default().with_sandbox(Sandbox::default()),
+    );
+    assert!(
+        matches!(sandboxed, Err(WorkspaceError::SystemdUnavailable)),
+        "a sandboxed command must be refused without systemd-run"
     );
 }
 
@@ -474,30 +413,13 @@ fn unit_is_active(unit: &str) -> bool {
 /// cancelled command would keep working.
 #[tokio::test]
 async fn dropping_a_sandboxed_child_stops_its_unit() {
-    if !is_systemd_run_available() {
-        eprintln!("skipping sandbox live test: systemd-run unavailable");
-        return;
-    }
-
-    let Some(home) = std::env::var_os("HOME")
-        .filter(|home| !home.is_empty())
-        .map(PathBuf::from)
-    else {
-        eprintln!("skipping sandbox live test: HOME unset");
+    let test = "dropping_a_sandboxed_child_stops_its_unit";
+    let Some(home) = live_home(test) else {
         return;
     };
-
-    let ws_dir = match tempfile::Builder::new()
-        .prefix("juto-sandbox-stop-")
-        .tempdir_in(&home)
-    {
-        Ok(dir) => dir,
-        Err(err) => {
-            eprintln!("skipping sandbox live test: cannot create workspace under HOME: {err}");
-            return;
-        }
+    let Some(ws_dir) = tempdir_in(&home, "juto-sandbox-stop-") else {
+        return;
     };
-
     let ws = workspace_at(ws_dir.path());
     let limits = ResourceLimits::default().with_sandbox(Sandbox::default());
 

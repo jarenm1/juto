@@ -85,6 +85,8 @@ pub(crate) struct AgentRole {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) tools: ToolScope,
+    /// Optional execution-tier ceiling; a role can tighten, never loosen a run.
+    pub(crate) tier: Option<crate::tier::ExecutionTier>,
     /// Markdown body, appended to the run's system prompt.
     pub(crate) instructions: String,
 }
@@ -95,6 +97,8 @@ struct RoleFrontmatter {
     description: String,
     /// Omitted means read-only, so a role must grant write access explicitly.
     tools: Option<ToolsField>,
+    #[serde(default)]
+    tier: Option<crate::tier::ExecutionTier>,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +139,7 @@ fn parse_role(path: &Path, name: &str, text: &str) -> Result<AgentRole> {
         name: name.to_owned(),
         description: fm.description,
         tools,
+        tier: fm.tier,
         instructions: body.trim().to_owned(),
     })
 }
@@ -245,6 +250,17 @@ mod tests {
         assert_eq!(auditor.instructions, "Look closely.");
         assert!(auditor.tools.allows("read"));
         assert!(!auditor.tools.allows("write"));
+    }
+
+    #[test]
+    fn role_parses_execution_tier_ceiling() {
+        let role = parse_role(
+            Path::new("auditor.md"),
+            "auditor",
+            "---\ndescription: audits\ntier: untrusted\n---\n",
+        )
+        .unwrap();
+        assert_eq!(role.tier, Some(crate::tier::ExecutionTier::Untrusted));
     }
 
     #[test]

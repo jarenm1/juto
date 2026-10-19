@@ -214,9 +214,13 @@ Juto establishes strict workspace isolation:
 
 ### 4.2 Resource Governance (`agent-scope.sh` Model)
 To prevent parallel agents from exhausting host memory, CPU, or lock contention:
-1. **cgroups / systemd User Scope**:
-   * All heavy commands (Cargo builds, tests, language servers) run inside a systemd
-     scope under a shared slice (`agents.slice`).
+1. **systemd units under `agents.slice`**:
+   * Developer heavy commands (Cargo builds, tests, language servers) run through
+     `scripts/agent-scope.sh` in a systemd scope under a shared slice (`agents.slice`).
+   * Runtime bash in a `workspace` or `untrusted` tier (or `attended` with `bashScoped`)
+     runs as a systemd unit under the same slice. Sandboxed tiers also confine its filesystem
+     and environment ([docs/sandbox.md](sandbox.md)). A governed command fails when
+     `systemd-run` is unavailable rather than running without its caps.
    * Default aggregate ceiling: 600% CPU, 16 GiB RAM.
    * Per-agent ceiling: 200–400% CPU, 4–8 GiB RAM.
    * Cargo build jobs auto-scaled to the assigned CPU quota (`CARGO_BUILD_JOBS`).

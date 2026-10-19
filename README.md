@@ -31,22 +31,12 @@ two-parent node rather than rebasing. They are explicit operations (the `vcs` to
 not invoke it. The only place `jj` appears in the runtime is the `.jj` metadata-path exclusion, so
 a capture never records Jujutsu's own directory.
 
-**Sandboxed commands (opt-in).** `ResourceLimits::sandbox` adds a real filesystem boundary:
-`ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=yes`, and `ReadWritePaths` covering the
-workspace plus the toolchain directories a build must write (`CARGO_HOME`, `RUSTUP_HOME`,
-`XDG_CACHE_HOME`). Enable it with `AGENT_SANDBOX=1` or `ResourceLimits::with_sandbox`.
-
-Two details matter in practice. Transient *scopes* reject namespace properties, so a sandboxed
-command runs as a transient *service* instead — which does not inherit the caller's environment, so
-the caller's variables are forwarded explicitly with `--setenv`. And a service outlives its
-`systemd-run` client, so the unit is named and stopped when the child is dropped; otherwise a
-cancelled command would keep running.
-
-It is **not the default**: `ResourceLimits::default()` leaves `sandbox` unset. Enabling it turns a
-missing `systemd-run` into a hard failure rather than an uncapped run, and it changes how a command
-is supervised — a service rather than a scope, which is why the environment and the unit lifecycle
-are handled explicitly above. The mechanism is tested against a real `cargo check` inside the
-sandbox.
+**Execution tiers.** Each run has a tier (`executionTier` in `config.yml`: `attended`, `workspace`,
+`untrusted`, `full`). Background and isolated children default to `workspace`: their bash
+runs as a sandboxed systemd service (`ProtectSystem=strict`, hidden `$HOME`, private `/tmp`,
+writes limited to the workspace and toolchain caches) and fails closed when `systemd-run` is
+missing. Tiers, grants, the environment allowlist, and known limits are in
+[docs/sandbox.md](docs/sandbox.md).
 
 **Delegating role model.** The top-level `main` role has `read`, `glob`, `grep`, `task`, `wait`,
 `agent_send`, `agent_cancel`, `agent_inbox`, `subagent_release`, and `view`; it cannot edit files. Work runs in child agents defined as
