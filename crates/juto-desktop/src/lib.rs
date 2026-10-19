@@ -4,6 +4,7 @@
 //! Architectural specification: `docs/agent-compositor.md`.
 
 pub mod compositor;
+pub mod control;
 pub mod error;
 mod pacing;
 pub mod png;
