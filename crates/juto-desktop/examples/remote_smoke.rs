@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 fps: 30,
             },
             render_profile: RenderProfile::Software,
-            limits: SystemLimits::default(),
+            limits: SystemLimits::measured().expect("measure host capacity"),
             workspace_dir: std::env::temp_dir(),
             lease_ttl_secs: 6,
             compositor_mode: juto_desktop::CompositorMode::Worker,

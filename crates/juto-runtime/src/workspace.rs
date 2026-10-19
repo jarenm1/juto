@@ -17,6 +17,7 @@ use std::{
 };
 
 use fs2::FileExt;
+use juto_capacity::MachineCapacity;
 use serde::Deserialize;
 use thiserror::Error;
 pub use tokio::process::Command;
@@ -24,7 +25,7 @@ use uuid::Uuid;
 
 use crate::change_graph::ChangeGraph;
 use crate::git_transfer::GitRepository;
-use crate::resources::{USAGE_WRAPPER, UsageStore, UsageTicket, command_class};
+use crate::resources::{USAGE_WRAPPER, UsageStore, UsageTicket, command_class, command_grant};
 
 /// Name of the native fork link marker written at the root of every fork workspace.
 const WORKSPACE_MARKER: &str = ".juto-workspace.json";
@@ -54,23 +55,18 @@ fn env_var_nonempty(name: &str) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
-/// Default CPU quota assigned to a single subagent scope.
-pub const DEFAULT_CPU_QUOTA: &str = "400%";
-
-/// Default maximum memory assigned to a single subagent scope.
-pub const DEFAULT_MEMORY_MAX: &str = "8G";
-
 /// Default memory swap max assigned to a single subagent scope (no swap).
 pub const DEFAULT_MEMORY_SWAP_MAX: &str = "0";
 
 /// Default shared systemd slice under which all agent scopes run.
-pub const DEFAULT_SLICE: &str = "agents.slice";
+pub const DEFAULT_SLICE: &str = juto_capacity::AGENTS_SLICE;
 
-/// Default aggregate CPU quota for the shared slice.
-pub const DEFAULT_SLICE_CPU_QUOTA: &str = "600%";
+/// CPU weight of every scope and the shared slice. Equal shares; priority
+/// weighting arrives with the resource broker.
+pub const DEFAULT_CPU_WEIGHT: u32 = 100;
 
-/// Default aggregate memory max for the shared slice.
-pub const DEFAULT_SLICE_MEMORY_MAX: &str = "16G";
+/// I/O weight of every scope and the shared slice.
+pub const DEFAULT_IO_WEIGHT: u32 = 100;
 
 /// Errors that can occur during workspace lifecycle and resource-scoped execution.
 #[derive(Debug, Error)]
@@ -98,6 +94,12 @@ pub enum WorkspaceError {
 
     #[error("scoped command failed: {0}")]
     ExecutionFailed(String),
+
+    #[error("resource capacity unavailable: {0}")]
+    Capacity(String),
+
+    #[error("shared slice limits not applied: {0}")]
+    Slice(String),
 
     #[error("GPU lock failed on `{path}`: {source}")]
     GpuLockFailed {
@@ -313,17 +315,17 @@ pub(crate) fn credential_paths(extra: &[PathBuf]) -> Vec<PathBuf> {
 /// is no uncapped fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLimits {
-    /// Per-scope CPU quota (e.g. "400%", "200%").
-    pub cpu_quota: String,
-    /// Per-scope memory limit (e.g. "8G", "4G").
-    pub memory_max: String,
+    /// Explicit per-scope CPU cap (e.g. "200%"); unset leaves CPU shared by weight.
+    pub cpu_quota: Option<String>,
+    /// Explicit per-scope memory cap (e.g. "4G"); unset derives it from capacity and history.
+    pub memory_max: Option<String>,
     /// Per-scope swap limit (e.g. "0").
     pub memory_swap_max: String,
     /// Shared systemd slice under which scopes run (e.g. "agents.slice").
     pub slice: Option<String>,
-    /// Aggregate CPU quota for the shared slice (e.g. "600%").
+    /// Explicit aggregate CPU cap for the shared slice (e.g. "600%"); unset leaves it uncapped.
     pub slice_cpu_quota: Option<String>,
-    /// Aggregate memory limit for the shared slice (e.g. "16G").
+    /// Explicit aggregate memory cap for the shared slice; unset derives it from measured capacity.
     pub slice_memory_max: Option<String>,
     /// Whether to serialize execution behind a shared GPU flock.
     pub gpu: bool,
@@ -337,15 +339,11 @@ pub struct ResourceLimits {
 
 impl Default for ResourceLimits {
     fn default() -> Self {
-        let cpu_quota =
-            env_var_nonempty("AGENT_CPU_QUOTA").unwrap_or_else(|| DEFAULT_CPU_QUOTA.to_string());
-        let memory_max =
-            env_var_nonempty("AGENT_MEMORY_MAX").unwrap_or_else(|| DEFAULT_MEMORY_MAX.to_string());
+        let cpu_quota = env_var_nonempty("AGENT_CPU_QUOTA");
+        let memory_max = env_var_nonempty("AGENT_MEMORY_MAX");
         let slice = env_var_nonempty("AGENT_SLICE").or_else(|| Some(DEFAULT_SLICE.to_string()));
-        let slice_cpu_quota = env_var_nonempty("AGENT_SLICE_CPU_QUOTA")
-            .or_else(|| Some(DEFAULT_SLICE_CPU_QUOTA.to_string()));
-        let slice_memory_max = env_var_nonempty("AGENT_SLICE_MEMORY_MAX")
-            .or_else(|| Some(DEFAULT_SLICE_MEMORY_MAX.to_string()));
+        let slice_cpu_quota = env_var_nonempty("AGENT_SLICE_CPU_QUOTA");
+        let slice_memory_max = env_var_nonempty("AGENT_SLICE_MEMORY_MAX");
         let gpu_lock = env_var_nonempty("AGENT_GPU_LOCK")
             .map(PathBuf::from)
             .or_else(|| Some(default_gpu_lock_path()));
@@ -374,13 +372,13 @@ impl ResourceLimits {
 
     /// Set explicit per-scope CPU quota.
     pub fn with_cpu_quota(mut self, quota: impl Into<String>) -> Self {
-        self.cpu_quota = quota.into();
+        self.cpu_quota = Some(quota.into());
         self
     }
 
     /// Set explicit per-scope memory ceiling.
     pub fn with_memory_max(mut self, mem: impl Into<String>) -> Self {
-        self.memory_max = mem.into();
+        self.memory_max = Some(mem.into());
         self
     }
 
@@ -933,20 +931,10 @@ impl SubagentWorkspace {
             _ => None,
         };
 
-        if let Some(slice) = &limits.slice {
-            let cpu_quota = limits
-                .slice_cpu_quota
-                .as_deref()
-                .unwrap_or(DEFAULT_SLICE_CPU_QUOTA);
-            let mem_max = limits
-                .slice_memory_max
-                .as_deref()
-                .unwrap_or(DEFAULT_SLICE_MEMORY_MAX);
-            configure_slice_properties(slice, cpu_quota, mem_max);
-        }
-
-        // Derive CARGO_BUILD_JOBS from cpu_quota if not already present
-        let jobs = calculate_cargo_build_jobs(&limits.cpu_quota);
+        // Resolve every limit from measured capacity and this command's history.
+        let repo = self.repo_root.display().to_string();
+        let resolved = limits.resolve(&program, &orig_args, &repo)?;
+        resolved.apply_slice()?;
 
         let mut cmd = if limits.gpu {
             let gpu_lock = limits
@@ -981,11 +969,7 @@ impl SubagentWorkspace {
             cmd.arg(format!("--unit={unit}"));
         }
         cmd.arg("--quiet");
-        cmd.arg("-p").arg(format!("CPUQuota={}", limits.cpu_quota));
-        cmd.arg("-p")
-            .arg(format!("MemoryMax={}", limits.memory_max));
-        cmd.arg("-p")
-            .arg(format!("MemorySwapMax={}", limits.memory_swap_max));
+        push_scope_properties(&mut cmd, &resolved);
         if let Some(slice) = &limits.slice {
             cmd.arg(format!("--slice={}", slice));
         }
@@ -1011,7 +995,7 @@ impl SubagentWorkspace {
                     cmd.arg("-p")
                         .arg(format!("BindReadOnlyPaths={}", path.display()));
                 }
-                let env = sandbox_environment(original, jobs);
+                let env = sandbox_environment(original, resolved.cargo_jobs);
                 let mut forwarded = vec![
                     OsString::from(crate::network::FORWARDER_ARGUMENT),
                     socket.into_os_string(),
@@ -1045,21 +1029,139 @@ impl SubagentWorkspace {
             || std::env::var_os("CARGO_BUILD_JOBS").is_some();
 
         if !has_cargo_jobs {
-            cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
+            cmd.env("CARGO_BUILD_JOBS", resolved.cargo_jobs.to_string());
         }
 
         Ok((cmd, usage))
     }
 }
 
-/// Calculate the recommended `CARGO_BUILD_JOBS` from a CPU quota string (e.g. "400%" -> 4).
-pub fn calculate_cargo_build_jobs(cpu_quota: &str) -> usize {
-    let digits = cpu_quota.trim().trim_end_matches('%');
-    if let Ok(pct) = digits.parse::<usize>() {
-        let jobs = pct / 100;
-        jobs.max(1)
-    } else {
-        1
+/// Every limit a scoped command receives: explicit settings applied over values
+/// derived from measured capacity and the command's recorded history.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ResolvedLimits {
+    /// `CPUQuota`; present only when explicitly configured.
+    pub cpu_quota: Option<String>,
+    /// `CPUWeight`.
+    pub cpu_weight: u32,
+    /// `IOWeight`.
+    pub io_weight: u32,
+    /// `MemoryMax` in bytes, or the explicit setting.
+    pub memory_max: String,
+    /// `MemoryHigh` in bytes; absent when `memory_max` is explicit.
+    pub memory_high: Option<String>,
+    /// `MemorySwapMax`.
+    pub memory_swap_max: String,
+    /// `TasksMax`.
+    pub tasks_max: u32,
+    /// `CARGO_BUILD_JOBS` for the command.
+    pub cargo_jobs: usize,
+    /// Shared slice the scope joins.
+    pub slice: Option<String>,
+    /// Explicit aggregate CPU cap for the slice, if any.
+    pub slice_cpu_quota: Option<String>,
+    /// `MemoryMax` for the slice in bytes, or the explicit setting.
+    pub slice_memory_max: String,
+    /// `MemoryHigh` for the slice; absent when `slice_memory_max` is explicit.
+    pub slice_memory_high: Option<String>,
+    /// Whether the memory grant came from recorded history rather than the first-run rule.
+    pub from_history: bool,
+}
+
+impl ResolvedLimits {
+    /// `KEY=VALUE` systemd properties for the command's scope.
+    pub fn scope_properties(&self) -> Vec<String> {
+        let mut properties = vec![
+            format!("CPUWeight={}", self.cpu_weight),
+            format!("IOWeight={}", self.io_weight),
+            format!("MemoryMax={}", self.memory_max),
+            format!("MemorySwapMax={}", self.memory_swap_max),
+            format!("TasksMax={}", self.tasks_max),
+        ];
+        if let Some(quota) = &self.cpu_quota {
+            properties.push(format!("CPUQuota={quota}"));
+        }
+        if let Some(high) = &self.memory_high {
+            properties.push(format!("MemoryHigh={high}"));
+        }
+        properties
+    }
+}
+
+impl ResolvedLimits {
+    /// Apply the shared slice's transient limits. A no-op without a slice.
+    pub fn apply_slice(&self) -> Result<(), WorkspaceError> {
+        match &self.slice {
+            Some(slice) => configure_slice_properties(
+                slice,
+                self.slice_cpu_quota.as_deref(),
+                &self.slice_memory_max,
+                self.slice_memory_high.as_deref(),
+            ),
+            None => Ok(()),
+        }
+    }
+}
+
+impl ResourceLimits {
+    /// Measure the host's capacity, the basis of every derived limit.
+    pub fn capacity(&self) -> Result<MachineCapacity, WorkspaceError> {
+        let slice = self.slice.as_deref().unwrap_or(DEFAULT_SLICE);
+        MachineCapacity::measure(slice).map_err(capacity_error)
+    }
+
+    /// Resolve every limit for `program args` run in `repo`. Measures the host and
+    /// reads the usage store, so the result reflects current capacity and history.
+    pub fn resolve(
+        &self,
+        program: &OsStr,
+        args: &[OsString],
+        repo: &str,
+    ) -> Result<ResolvedLimits, WorkspaceError> {
+        let capacity = self.capacity()?;
+        let class = command_class(program, args);
+        let grant = command_grant(&capacity, self.usage_store.as_ref(), repo, &class)
+            .map_err(capacity_error)?;
+        let (memory_max, memory_high) = match &self.memory_max {
+            Some(explicit) => (explicit.clone(), None),
+            None => (
+                grant.memory_max_bytes.to_string(),
+                Some(grant.memory_high_bytes.to_string()),
+            ),
+        };
+        let (slice_memory_max, slice_memory_high) = match &self.slice_memory_max {
+            Some(explicit) => (explicit.clone(), None),
+            None => (
+                capacity.budget_bytes.to_string(),
+                Some(capacity.slice_memory_high_bytes.to_string()),
+            ),
+        };
+        Ok(ResolvedLimits {
+            cpu_quota: self.cpu_quota.clone(),
+            cpu_weight: DEFAULT_CPU_WEIGHT,
+            io_weight: DEFAULT_IO_WEIGHT,
+            memory_max,
+            memory_high,
+            memory_swap_max: self.memory_swap_max.clone(),
+            tasks_max: grant.tasks_max,
+            cargo_jobs: grant.cargo_jobs,
+            slice: self.slice.clone(),
+            slice_cpu_quota: self.slice_cpu_quota.clone(),
+            slice_memory_max,
+            slice_memory_high,
+            from_history: grant.from_history,
+        })
+    }
+}
+
+fn capacity_error(error: std::io::Error) -> WorkspaceError {
+    WorkspaceError::Capacity(error.to_string())
+}
+
+/// Append a scope's systemd properties as `-p KEY=VALUE` arguments.
+fn push_scope_properties(cmd: &mut std::process::Command, resolved: &ResolvedLimits) {
+    for property in resolved.scope_properties() {
+        cmd.arg("-p").arg(property);
     }
 }
 
@@ -1462,53 +1564,65 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-/// Best-effort systemd slice property initialization matching `scripts/agent-scope.sh`.
-fn configure_slice_properties(slice: &str, cpu_quota: &str, mem_max: &str) {
+/// Applies the shared slice's limits at runtime only. A failed `systemctl` call
+/// is returned so that unattended runs fail closed instead of running unbounded.
+///
+/// A property already set to a finite value is left alone, since a person may
+/// have set it; only an unset (`infinity`) property is replaced. `--runtime`
+/// keeps the value out of the persistent user drop-in directory.
+fn configure_slice_properties(
+    slice: &str,
+    cpu_quota: Option<&str>,
+    mem_max: &str,
+    mem_high: Option<&str>,
+) -> Result<(), WorkspaceError> {
     let mut props: Vec<String> = Vec::new();
+    if let Some(quota) = cpu_quota
+        && slice_property_unset(slice, "CPUQuotaPerSecUSec")
+    {
+        props.push(format!("CPUQuota={quota}"));
+    }
+    if slice_property_unset(slice, "MemoryMax") {
+        props.push(format!("MemoryMax={mem_max}"));
+    }
+    if let Some(high) = mem_high
+        && slice_property_unset(slice, "MemoryHigh")
+    {
+        props.push(format!("MemoryHigh={high}"));
+    }
+    if props.is_empty() {
+        return Ok(());
+    }
+    let mut cmd = std::process::Command::new("systemctl");
+    cmd.arg("--user")
+        .arg("--runtime")
+        .arg("set-property")
+        .arg(slice)
+        .args(props);
+    let output = cmd
+        .output()
+        .map_err(|error| WorkspaceError::Slice(error.to_string()))?;
+    if !output.status.success() {
+        return Err(WorkspaceError::Slice(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(())
+}
 
-    let cpu_now = std::process::Command::new("systemctl")
+fn slice_property_unset(slice: &str, property: &str) -> bool {
+    let value = std::process::Command::new("systemctl")
         .arg("--user")
         .arg("show")
         .arg(slice)
         .arg("-p")
-        .arg("CPUQuotaPerSecUSec")
+        .arg(property)
         .arg("--value")
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-
-    if cpu_now.is_empty() || cpu_now == "infinity" {
-        props.push(format!("CPUQuota={}", cpu_quota));
-    }
-
-    let mem_now = std::process::Command::new("systemctl")
-        .arg("--user")
-        .arg("show")
-        .arg(slice)
-        .arg("-p")
-        .arg("MemoryMax")
-        .arg("--value")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-
-    if mem_now.is_empty() || mem_now == "infinity" {
-        props.push(format!("MemoryMax={}", mem_max));
-    }
-
-    if !props.is_empty() {
-        let mut cmd = std::process::Command::new("systemctl");
-        cmd.arg("--user")
-            .arg("--runtime")
-            .arg("set-property")
-            .arg(slice);
-        for prop in props {
-            cmd.arg(prop);
-        }
-        let _ = cmd.output();
-    }
+    value.is_empty() || value == "infinity"
 }
 
 #[cfg(test)]
@@ -1572,8 +1686,8 @@ mod tests {
             "AGENT_GPU_LOCK",
         ]);
         let limits = ResourceLimits::default();
-        assert_eq!(limits.cpu_quota, DEFAULT_CPU_QUOTA);
-        assert_eq!(limits.memory_max, DEFAULT_MEMORY_MAX);
+        assert_eq!(limits.cpu_quota, None);
+        assert_eq!(limits.memory_max, None);
         assert_eq!(limits.memory_swap_max, DEFAULT_MEMORY_SWAP_MAX);
         assert_eq!(limits.slice.as_deref(), Some(DEFAULT_SLICE));
         assert!(!limits.gpu);
@@ -1585,20 +1699,57 @@ mod tests {
             .with_gpu(true)
             .with_sandbox(Sandbox::default());
 
-        assert_eq!(customized.cpu_quota, "200%");
-        assert_eq!(customized.memory_max, "4G");
+        assert_eq!(customized.cpu_quota.as_deref(), Some("200%"));
+        assert_eq!(customized.memory_max.as_deref(), Some("4G"));
         assert!(customized.gpu);
         assert_eq!(customized.sandbox, Some(Sandbox::default()));
     }
 
     #[test]
-    fn test_cargo_build_jobs_calculation() {
-        assert_eq!(calculate_cargo_build_jobs("400%"), 4);
-        assert_eq!(calculate_cargo_build_jobs("200%"), 2);
-        assert_eq!(calculate_cargo_build_jobs("100%"), 1);
-        assert_eq!(calculate_cargo_build_jobs("50%"), 1);
-        assert_eq!(calculate_cargo_build_jobs("0%"), 1);
-        assert_eq!(calculate_cargo_build_jobs("invalid"), 1);
+    fn test_scope_properties_derive_weights_and_omit_unset_quota() {
+        let resolved = ResolvedLimits {
+            cpu_quota: None,
+            cpu_weight: DEFAULT_CPU_WEIGHT,
+            io_weight: DEFAULT_IO_WEIGHT,
+            memory_max: "2147483648".to_string(),
+            memory_high: Some("1932735283".to_string()),
+            memory_swap_max: DEFAULT_MEMORY_SWAP_MAX.to_string(),
+            tasks_max: 512,
+            cargo_jobs: 2,
+            slice: Some(DEFAULT_SLICE.to_string()),
+            slice_cpu_quota: None,
+            slice_memory_max: "21474836480".to_string(),
+            slice_memory_high: Some("19327352832".to_string()),
+            from_history: false,
+        };
+        let properties = resolved.scope_properties();
+        assert!(properties.contains(&"CPUWeight=100".to_string()));
+        assert!(properties.contains(&"MemoryMax=2147483648".to_string()));
+        assert!(properties.contains(&"MemoryHigh=1932735283".to_string()));
+        assert!(!properties.iter().any(|p| p.starts_with("CPUQuota=")));
+
+        let capped = ResolvedLimits {
+            cpu_quota: Some("200%".to_string()),
+            memory_high: None,
+            ..resolved
+        };
+        let properties = capped.scope_properties();
+        assert!(properties.contains(&"CPUQuota=200%".to_string()));
+        assert!(!properties.iter().any(|p| p.starts_with("MemoryHigh=")));
+    }
+
+    #[test]
+    fn test_resolve_explicit_limits_override_derived_values() {
+        let limits = ResourceLimits::default()
+            .with_cpu_quota("200%")
+            .with_memory_max("4G");
+        let resolved = limits
+            .resolve(std::ffi::OsStr::new("cargo"), &[], "/repo")
+            .expect("resolve");
+        assert_eq!(resolved.cpu_quota.as_deref(), Some("200%"));
+        assert_eq!(resolved.memory_max, "4G");
+        assert_eq!(resolved.memory_high, None);
+        assert_eq!(resolved.cpu_weight, DEFAULT_CPU_WEIGHT);
     }
 
     #[test]
@@ -2053,7 +2204,8 @@ mod tests {
     fn test_slice_preexisting_limits_preserved() {
         // If agents.slice already exists and has non-infinity properties,
         // configure_slice_properties should not fail or clobber them.
-        configure_slice_properties("agents.slice", "200%", "2G");
+        configure_slice_properties("agents.slice", Some("200%"), "2G", Some("1G"))
+            .expect("existing slice limits are left alone");
     }
 
     #[test]
@@ -2143,17 +2295,11 @@ mod tests {
         unsafe { std::env::set_var("AGENT_MEMORY_MAX", "   ") };
 
         let limits = ResourceLimits::default();
-        assert_eq!(limits.cpu_quota, DEFAULT_CPU_QUOTA);
-        assert_eq!(limits.memory_max, DEFAULT_MEMORY_MAX);
+        assert_eq!(limits.cpu_quota, None);
+        assert_eq!(limits.memory_max, None);
         assert_eq!(limits.slice.as_deref(), Some(DEFAULT_SLICE));
-        assert_eq!(
-            limits.slice_cpu_quota.as_deref(),
-            Some(DEFAULT_SLICE_CPU_QUOTA)
-        );
-        assert_eq!(
-            limits.slice_memory_max.as_deref(),
-            Some(DEFAULT_SLICE_MEMORY_MAX)
-        );
+        assert_eq!(limits.slice_cpu_quota, None);
+        assert_eq!(limits.slice_memory_max, None);
         assert_eq!(
             limits.gpu_lock.as_deref(),
             Some(default_gpu_lock_path().as_path())

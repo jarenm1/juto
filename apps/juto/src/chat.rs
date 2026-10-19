@@ -701,6 +701,14 @@ impl ChatView {
     ) {
         let supervisor = self.runtime.desktop_supervisor();
         let env_id = format!("desk-{}", uuid::Uuid::now_v7());
+        let limits = match juto_runtime::SystemLimits::measured() {
+            Ok(limits) => limits,
+            Err(err) => {
+                self.artifact_notice = Some(format!("cannot measure host capacity: {err}").into());
+                cx.notify();
+                return;
+            }
+        };
         let config = juto_runtime::EnvironmentConfig {
             env_id: env_id.clone(),
             owner_principal: crate::desktop_viewer::SESSION_PRINCIPAL.to_string(),
@@ -711,7 +719,7 @@ impl ChatView {
                 fps: 60,
             },
             render_profile: juto_runtime::RenderProfile::Software,
-            limits: juto_runtime::SystemLimits::default(),
+            limits,
             workspace_dir: self.runtime.cwd().to_path_buf(),
             lease_ttl_secs: 6,
             compositor_mode: juto_runtime::CompositorMode::Worker,

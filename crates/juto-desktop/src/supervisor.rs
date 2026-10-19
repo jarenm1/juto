@@ -6,6 +6,7 @@
 //! in a per-environment systemd scope (or an explicit, loudly logged unscoped
 //! development mode) and are terminated as a process tree on destroy.
 
+use juto_capacity::{AGENTS_SLICE, MachineCapacity};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -145,13 +146,24 @@ pub struct SystemLimits {
     pub remote_bitrate_max_bps: u64,
 }
 
-impl Default for SystemLimits {
-    fn default() -> Self {
+impl SystemLimits {
+    /// Limits derived from this host's measured capacity: the same agent memory
+    /// budget and per-scope task cap the runtime grants. Fails when capacity
+    /// cannot be measured, so no environment starts on guessed limits.
+    pub fn measured() -> std::io::Result<Self> {
+        Ok(Self::from_capacity(&MachineCapacity::measure(
+            AGENTS_SLICE,
+        )?))
+    }
+
+    /// Limits for a given capacity. The CPU cap is every core, so the
+    /// environment is bounded by the machine rather than a fixed percentage.
+    pub fn from_capacity(capacity: &MachineCapacity) -> Self {
         Self {
-            cpu_quota: "400%".to_string(),
-            memory_max: "8G".to_string(),
+            cpu_quota: format!("{}%", capacity.cores * 100),
+            memory_max: capacity.budget_bytes.to_string(),
             memory_swap_max: "0".to_string(),
-            tasks_max: 512,
+            tasks_max: capacity.tasks_max,
             remote_bitrate_max_bps: 12_000_000,
         }
     }

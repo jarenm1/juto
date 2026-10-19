@@ -444,15 +444,16 @@ Initial host policy (configurable downward; raising ceilings requires host appro
 | Default output | 1280×720, scale 1, 60 FPS | 1920×1080, scale 1, 60 FPS |
 | Admitted dimensions | 320–3840 per axis, up to 8,294,400 pixels | Same |
 | Admitted FPS | 1–60; default pixel-rate ceiling 62,208,000 pixels/s | 1–120; default ceiling 497,664,000 pixels/s |
-| Per-environment CPU / RAM / swap | 400% / 8 GiB / 0 | Same |
-| Tasks / output buffers / active viewers | 512 / 3 per negotiated frame pool / 2 | Same |
+| Per-environment CPU / RAM / swap | all cores (`cores × 100%`) / measured agent budget / 0 | Same |
+| Tasks / output buffers / active viewers | cores × 128 / 3 per negotiated frame pool / 2 | Same |
 | Per-environment remote bitrate ceiling | 12 Mbit/s total media | Same |
 
 These are policy ceilings, not performance claims. Admission also checks host
 aggregate pixel rate, compositor/encoder memory estimates, viewers, CPU/RAM/task
-budgets, and GPU lock availability. The existing shared `agents.slice` policy is
-600% CPU/16 GiB; preserve stricter human-set limits [S5]. CPUQuota percentages
-refer to one CPU, so 400% is four CPUs' bandwidth, not four dedicated cores [S6].
+budgets, and GPU lock availability. Environment limits are derived from the host's
+measured capacity (see `docs/resources.md`); CPU is capped at all cores, so the
+environment is bounded by the machine rather than a fixed share. CPUQuota
+percentages refer to one CPU, so `2400%` is 24 CPUs' bandwidth on a 24-core host.
 MemoryHigh/MemoryMax, MemorySwapMax, and TasksMax apply to the full environment
 including encoder and audio. Verify required controllers and effective properties;
 unavailable enforcement makes creation fail. Disk/scratch quotas require host

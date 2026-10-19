@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 juto-ai.workspace = true
 juto-agent.workspace = true
+juto-capacity.workspace = true
 juto-catalog.workspace = true
 juto-desktop.workspace = true
 anyhow.workspace = true

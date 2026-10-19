@@ -234,17 +234,20 @@ To prevent parallel agents from exhausting host memory, CPU, or lock contention:
      runs as a systemd unit under the same slice. Sandboxed tiers also confine its filesystem
      and environment ([docs/sandbox.md](sandbox.md)). A governed command fails when
      `systemd-run` is unavailable rather than running without its caps.
-   * Default aggregate ceiling: 600% CPU, 16 GiB RAM.
-   * Per-agent ceiling: 200–400% CPU, 4–8 GiB RAM.
-   * Cargo build jobs auto-scaled to the assigned CPU quota (`CARGO_BUILD_JOBS`).
+   * Limits derive from measured capacity, not fixed percentages: the agent memory
+     budget is total memory minus the session reserve; each scope's `MemoryMax`
+     comes from recorded history (see `docs/resources.md`). CPU and IO are shared
+     by `CPUWeight`/`IOWeight`, and `CPUQuota` is set only when requested.
+   * Cargo build jobs derive from the granted memory (`CARGO_BUILD_JOBS`).
 2. **GPU Serialization**:
    * Hardware GPU access is serialized via a shared file lock (`flock`).
    * Automated visual tests use headless software Vulkan (Mesa / Xvfb) to avoid blocking
      the host GPU.
-3. **Measured usage** (implemented): every scoped command run through the runtime records peak
-   memory, CPU, OOM kills, and IO per command class in `<data-dir>/resources/usage.jsonl`, read
-   from inside the unit's cgroup. Admission and capacity derivation build on these records and
-   are not implemented yet. See `docs/resources.md`.
+3. **Measured usage and capacity** (implemented): every scoped command run through the runtime
+   records peak memory, CPU, OOM kills, and IO per command class in
+   `<data-dir>/resources/usage.jsonl`, read from inside the unit's cgroup. Grants and capacity
+   are derived from these records and the measured host. Admission, queueing, and the desk,
+   provider, and review pools are not implemented yet. See `docs/resources.md`.
 
 ### 4.3 Repository Setup Skill
 The harness installs the `juto-repo-setup` skill in its global skill directory.

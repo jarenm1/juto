@@ -189,3 +189,34 @@ fn run_passes_the_exit_code_through_and_records_the_command() {
     assert_eq!(classes[0]["class"], "exit 4");
     assert_eq!(classes[0]["count"], 1);
 }
+
+#[test]
+fn grant_shell_prints_assignments_for_scripts_to_eval() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let output = juto_cli(dir.path())
+        .args([
+            "resources",
+            "grant",
+            "--shell",
+            "--memory-max",
+            "2G",
+            "--no-slice",
+            "--",
+            "cargo",
+            "build",
+        ])
+        .output()
+        .expect("run juto-cli");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("GRANT_SLICE=''\n"), "{stdout}");
+    assert!(stdout.contains("GRANT_CARGO_JOBS='"), "{stdout}");
+    assert!(stdout.contains("'CPUWeight=100'"), "{stdout}");
+    assert!(stdout.contains("'MemoryMax=2G'"), "{stdout}");
+    assert!(stdout.contains(")\n"), "{stdout}");
+    assert!(!stdout.contains(" )"), "{stdout}");
+}

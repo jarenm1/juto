@@ -1,8 +1,9 @@
 # Resource usage records
 
-Juto records what each governed command actually used, so scheduling can later
-rely on measured history instead of guesses. This document covers recording and
-inspection. It does not cover admission, capacity derivation, or queuing.
+Juto records what each governed command actually used, and derives the limits
+each command runs under from the host's measured capacity. This document covers
+recording, inspection, capacity, and grants. Admission, queueing, and the
+desk/provider pools are described where they are implemented.
 
 ## Where records live
 
@@ -83,6 +84,57 @@ memory peak, CPU time, and wall time. Missing values print as `-`.
 
 `--json` is a global flag, so its help text describes runtime events. For
 `resources` it selects the JSON listing.
+
+## Capacity and grants
+
+`juto-capacity` measures the host once per decision (`MachineCapacity::measure`):
+
+| field | derivation |
+| --- | --- |
+| `mem_total_bytes` | `MemTotal` from `/proc/meminfo` |
+| `cores` | `available_parallelism()` |
+| `reserved_bytes` | memory of the user's session outside `agents.slice` (its cgroup `memory.current`, minus the slice's), plus one tenth of total memory as host headroom. Without a `user-<uid>.slice`, this is `MemTotal - MemAvailable` |
+| `budget_bytes` | `mem_total_bytes - reserved_bytes`; measurement fails when this is not positive |
+| `slice_memory_high_bytes` | `budget_bytes` × 9/10 |
+| `tasks_max` | `cores` × 128 |
+
+A command's grant is its memory cap (`MemoryMax`), with `MemoryHigh` at 9/10 of
+it. Its cargo parallelism is `min(cores, memory / 1 GiB)`, at least one job.
+
+The memory cap for a command class comes from its recorded history:
+
+- With history: the p95 of recorded memory peaks plus a quarter of that peak
+  (nearest-rank p95 over `usage.jsonl`).
+- If any recorded run for the class was OOM-killed: the larger of the grant
+  computed above and twice the largest recorded peak.
+- First run (no history): half the budget.
+
+Every grant is clamped to `[1 byte, budget_bytes]`. CPU and IO use
+`CPUWeight`/`IOWeight` of 100, which shares the machine with other scopes and
+uses idle cores. `CPUQuota` is set only when requested explicitly.
+
+`TasksMax` is `tasks_max`. `MemorySwapMax` is `0`.
+
+The shared `agents.slice` is configured the same way. Properties already set on
+it, by an administrator or a drop-in, are kept and not overwritten. Only unset
+properties are applied, with `systemctl --user --runtime set-property`, so no
+transient limit is written into persistent user configuration. If a shared
+property cannot be applied, the command fails instead of running uncapped.
+
+Inspect and apply the same derivation:
+
+```sh
+juto-cli resources capacity                       # measured capacity, JSON with --json
+juto-cli resources grant -- cargo build -p juto   # grant for one command
+juto-cli resources grant --shell -- cargo build   # shell assignments for scripts
+```
+
+`scripts/agent-scope.sh` evaluates `resources grant --shell --apply-slice`, so
+it uses the same numbers. It fails closed when `juto-cli` cannot be found. Build
+it first with `cargo build -p juto-cli` when it is not on `PATH`.
+
+Without systemd, no limits are applied and `CARGO_BUILD_JOBS` is left to cargo.
+Callers that need enforcement fail closed before running.
 
 ## Limitations
 

@@ -30,12 +30,14 @@ scripts/agent-scope.sh --gpu -- nix develop "$JUTO_FLAKE" -c cargo run -p juto
 scripts/agent-scope.sh -- nix develop "$JUTO_FLAKE#smoke" -c <visual-smoke-command>
 ```
 
-- Defaults: 400% CPU and 8 GiB per scope, no swap; shared `agents.slice` at
-  600% CPU and 16 GiB.
-- Override with `--cpu-quota`, `--memory-max`, `--slice`, or `AGENT_*`
-  variables. Do not bypass caps.
+- Limits derive from measured capacity (see `docs/resources.md`): the memory
+  budget is total memory minus the session reserve, each scope's `MemoryMax` is
+  its share of that budget, and CPU and IO are shared by weight, not capped.
+- Override with `--cpu-quota`, `--memory-max`, `--slice`, `--no-slice`, or
+  `AGENT_*` variables. Explicit values win; derived values fill only what is
+  unset. Do not bypass caps.
 - Requires a working systemd user manager. Fails rather than running uncapped
-  if `systemd-run` is absent.
+  if `systemd-run` is absent or the shared slice cannot be configured.
 - This script governs developer commands only. The runtime's own bash sandbox and execution
   tiers are documented in [docs/sandbox.md](sandbox.md).
 - The GPU lock is shared with jtech. `smoke` uses software Vulkan and needs no

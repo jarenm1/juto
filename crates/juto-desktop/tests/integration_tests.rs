@@ -34,7 +34,7 @@ fn test_config(env_id: &str) -> EnvironmentConfig {
             fps: 30,
         },
         render_profile: RenderProfile::Software,
-        limits: SystemLimits::default(),
+        limits: SystemLimits::measured().expect("measure host capacity"),
         workspace_dir: std::env::temp_dir(),
         lease_ttl_secs: 6,
         compositor_mode: juto_desktop::CompositorMode::Worker,
@@ -1497,8 +1497,10 @@ fn virtual_clock_paces_without_catch_up_bursts() {
 fn environment_slice_aggregates_limits_and_contains_apps() {
     let supervisor = DesktopSupervisor::new();
     let env_id = unique_env_id("slice");
+    let config = test_config(&env_id);
+    let limits = config.limits.clone();
     let env = supervisor
-        .create_environment(test_config(&env_id), &unique_env_id("req"))
+        .create_environment(config, &unique_env_id("req"))
         .expect("create environment");
 
     let slice = env.slice().expect("environment slice").to_string();
@@ -1515,13 +1517,15 @@ fn environment_slice_aggregates_limits_and_contains_apps() {
     assert!(unit_is_active(&slice), "slice must be active");
 
     let properties = systemctl_show(&slice, &["MemoryMax", "TasksMax", "CPUQuotaPerSecUSec"]);
+    let expected_memory = format!("MemoryMax={}", limits.memory_max);
+    let expected_tasks = format!("TasksMax={}", limits.tasks_max);
     assert!(
-        properties.contains("MemoryMax=8589934592"),
-        "slice limits: {properties}"
+        properties.contains(&expected_memory),
+        "slice limits: {properties}; expected {expected_memory}"
     );
     assert!(
-        properties.contains("TasksMax=512"),
-        "slice limits: {properties}"
+        properties.contains(&expected_tasks),
+        "slice limits: {properties}; expected {expected_tasks}"
     );
     assert!(
         !properties.contains("CPUQuotaPerSecUSec=infinity"),
