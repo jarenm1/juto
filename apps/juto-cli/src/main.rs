@@ -1,4 +1,5 @@
 mod changes;
+mod resources;
 
 use std::{
     collections::BTreeSet,
@@ -50,6 +51,14 @@ enum Command {
     Changes {
         #[command(subcommand)]
         command: changes::ChangesCommand,
+    },
+    /// Show measured resource use per command class, or run a command under governance.
+    Resources {
+        /// Summarize only commands recorded for this repository root.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        #[command(subcommand)]
+        command: Option<resources::ResourcesCommand>,
     },
     /// Stream a turn in a new or existing main session. The request is routed to one of
     /// the session's internal threads. A prompt of '-' reads stdin.
@@ -118,6 +127,24 @@ async fn main() -> Result<()> {
     if let Command::Changes { command } = &arguments.command {
         return changes::run(&cwd, command);
     }
+    if let Command::Resources { repo, command } = &arguments.command {
+        let data_dir = match &arguments.data_dir {
+            Some(path) => path.clone(),
+            None => default_data_dir()?,
+        };
+        let code = resources::run(
+            &cwd,
+            &data_dir,
+            repo.as_deref(),
+            command.as_ref(),
+            arguments.json,
+        )
+        .await?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
     let data_dir = match arguments.data_dir {
         Some(path) => path,
         None => default_data_dir()?,
@@ -143,6 +170,7 @@ async fn main() -> Result<()> {
     let runtime = Runtime::from_config(cwd, data_dir, config)?;
     match arguments.command {
         Command::Changes { .. } => unreachable!("handled before runtime initialization"),
+        Command::Resources { .. } => unreachable!("handled before runtime initialization"),
         Command::Run { prompt, session } => {
             let resumed = session.is_some();
             let prompt = if prompt == "-" {

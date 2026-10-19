@@ -3639,6 +3639,7 @@ dependencies = [
  "juto-runtime",
  "rpassword",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]

@@ -1,0 +1,199 @@
+//! `juto-cli resources`: measured resource use per command class, and `run`,
+//! which executes a command under the agent resource governance so that its
+//! usage is recorded.
+
+use std::{ffi::OsString, io::Write as _, path::Path, process::ExitStatus};
+
+use anyhow::{Context as _, Result};
+use clap::Subcommand;
+use juto_runtime::{
+    ResourceLimits, ScopedStdio, SubagentWorkspace,
+    resources::{ClassSummary, UsageRecord, UsageStore, summarize},
+};
+use tokio::process::Command;
+
+#[derive(Subcommand)]
+pub enum ResourcesCommand {
+    /// Run a command under agent resource governance, recording its usage.
+    ///
+    /// Everything after `run` is passed through unchanged, including flags.
+    Run {
+        #[arg(
+            required = true,
+            num_args = 1..,
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        argv: Vec<OsString>,
+    },
+}
+
+/// Execute `resources` and return the process exit code.
+///
+/// `cwd` is the repository root the usage is attributed to; `data_dir` holds
+/// the usage store under `resources/`. A listing returns zero; `run` returns
+/// the child's exit code.
+pub async fn run(
+    cwd: &Path,
+    data_dir: &Path,
+    repo: Option<&Path>,
+    command: Option<&ResourcesCommand>,
+    json: bool,
+) -> Result<i32> {
+    let store = UsageStore::new(data_dir.join("resources"));
+    match command {
+        None => {
+            list(&store, repo, json)?;
+            Ok(0)
+        }
+        Some(ResourcesCommand::Run { argv }) => run_command(cwd, &store, argv).await,
+    }
+}
+
+async fn run_command(cwd: &Path, store: &UsageStore, argv: &[OsString]) -> Result<i32> {
+    let (program, args) = argv.split_first().context("no command given")?;
+    let workspace = SubagentWorkspace {
+        path: cwd.to_path_buf(),
+        node_id: String::new(),
+        thread: String::new(),
+        repo_root: cwd.to_path_buf(),
+        subagent_id: String::new(),
+    };
+    // Default limits enforce the scope: if systemd cannot apply it, the command
+    // fails instead of running unbounded.
+    let limits = ResourceLimits::default().with_usage_store(store.clone());
+    let mut command = Command::new(program);
+    command.args(args);
+    let mut child = workspace
+        .spawn_scoped(&mut command, limits, ScopedStdio::default())
+        .await?;
+    let status = child.wait().await.context("waiting for the command")?;
+    Ok(exit_code(status))
+}
+
+/// The shell convention: the code, or `128 + signal` for a signalled child.
+fn exit_code(status: ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        status.signal().map_or(1, |signal| 128 + signal)
+    }
+    #[cfg(not(unix))]
+    {
+        1
+    }
+}
+
+fn list(store: &UsageStore, repo: Option<&Path>, json: bool) -> Result<()> {
+    let repo_key = repo.map(|path| {
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .display()
+            .to_string()
+    });
+    let records: Vec<UsageRecord> = store
+        .read()
+        .with_context(|| format!("reading {}", store.log_path().display()))?
+        .into_iter()
+        .filter(|record| repo_key.as_deref().is_none_or(|key| record.repo == key))
+        .collect();
+    let summaries = summarize(&records);
+
+    let mut out = std::io::stdout().lock();
+    if json {
+        serde_json::to_writer_pretty(&mut out, &summaries)?;
+        writeln!(out)?;
+    } else if summaries.is_empty() {
+        writeln!(
+            out,
+            "no resource usage recorded in {}",
+            store.dir().display()
+        )?;
+    } else {
+        write_table(&mut out, &summaries)?;
+    }
+    Ok(())
+}
+
+fn write_table(out: &mut impl std::io::Write, summaries: &[ClassSummary]) -> std::io::Result<()> {
+    let mut rows = vec![
+        [
+            "CLASS", "RUNS", "ABORTED", "OOM", "MEM P50", "MEM P95", "CPU P50", "CPU P95",
+            "WALL P50", "WALL P95",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+    ];
+    for summary in summaries {
+        rows.push(vec![
+            summary.class.clone(),
+            summary.count.to_string(),
+            summary.aborted.to_string(),
+            summary.oom_kills.to_string(),
+            mebibytes(summary.memory_peak_bytes.p50),
+            mebibytes(summary.memory_peak_bytes.p95),
+            cpu_seconds(summary.cpu_usec.p50),
+            cpu_seconds(summary.cpu_usec.p95),
+            wall_seconds(summary.wall_ms.p50),
+            wall_seconds(summary.wall_ms.p95),
+        ]);
+    }
+    let widths: Vec<usize> = (0..rows[0].len())
+        .map(|column| rows.iter().map(|row| row[column].len()).max().unwrap_or(0))
+        .collect();
+    for row in &rows {
+        let cells: Vec<String> = row
+            .iter()
+            .enumerate()
+            .map(|(column, cell)| format!("{cell:<width$}", width = widths[column]))
+            .collect();
+        writeln!(out, "{}", cells.join("  ").trim_end())?;
+    }
+    Ok(())
+}
+
+fn mebibytes(bytes: Option<u64>) -> String {
+    bytes.map_or_else(
+        || "-".to_string(),
+        |bytes| format!("{:.0} MiB", bytes as f64 / 1_048_576.0),
+    )
+}
+
+fn cpu_seconds(usec: Option<u64>) -> String {
+    usec.map_or_else(
+        || "-".to_string(),
+        |usec| format!("{:.2} s", usec as f64 / 1_000_000.0),
+    )
+}
+
+fn wall_seconds(ms: Option<u64>) -> String {
+    ms.map_or_else(
+        || "-".to_string(),
+        |ms| format!("{:.2} s", ms as f64 / 1_000.0),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_missing_values_as_dashes() {
+        assert_eq!(mebibytes(None), "-");
+        assert_eq!(cpu_seconds(None), "-");
+        assert_eq!(wall_seconds(None), "-");
+        assert_eq!(mebibytes(Some(3 * 1_048_576)), "3 MiB");
+        assert_eq!(cpu_seconds(Some(1_500_000)), "1.50 s");
+        assert_eq!(wall_seconds(Some(2_250)), "2.25 s");
+    }
+
+    #[test]
+    fn exit_code_follows_shell_convention_for_signals() {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(exit_code(ExitStatus::from_raw(3 << 8)), 3);
+        assert_eq!(exit_code(ExitStatus::from_raw(9)), 128 + 9);
+    }
+}

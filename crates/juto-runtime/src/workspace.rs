@@ -24,6 +24,7 @@ use uuid::Uuid;
 
 use crate::change_graph::ChangeGraph;
 use crate::git_transfer::GitRepository;
+use crate::resources::{USAGE_WRAPPER, UsageStore, UsageTicket, command_class};
 
 /// Name of the native fork link marker written at the root of every fork workspace.
 const WORKSPACE_MARKER: &str = ".juto-workspace.json";
@@ -330,6 +331,8 @@ pub struct ResourceLimits {
     pub gpu_lock: Option<PathBuf>,
     /// Filesystem sandbox for the command. `None` runs it under caps only; see [`Sandbox`].
     pub sandbox: Option<Sandbox>,
+    /// Store that records each scoped command's resource usage; `None` records nothing.
+    pub usage_store: Option<UsageStore>,
 }
 
 impl Default for ResourceLimits {
@@ -357,6 +360,7 @@ impl Default for ResourceLimits {
             gpu: false,
             gpu_lock,
             sandbox: None,
+            usage_store: None,
         }
     }
 }
@@ -383,6 +387,15 @@ impl ResourceLimits {
     /// Enable filesystem sandboxing for this limit set.
     pub fn with_sandbox(mut self, sandbox: Sandbox) -> Self {
         self.sandbox = Some(sandbox);
+        self
+    }
+
+    /// Record each scoped command's resource usage in `store`.
+    ///
+    /// Recording applies to the spawn and run paths when systemd measures the
+    /// command. The default records nothing.
+    pub fn with_usage_store(mut self, store: UsageStore) -> Self {
+        self.usage_store = Some(store);
         self
     }
 }
@@ -445,6 +458,8 @@ pub struct ScopedChild {
     /// `None` only after [`ScopedChild::wait_with_output`] has taken it.
     child: Option<tokio::process::Child>,
     unit: Option<String>,
+    /// Usage ticket finished when the child is reaped; `None` when not recording.
+    usage: Option<UsageTicket>,
 }
 
 impl ScopedChild {
@@ -457,6 +472,7 @@ impl ScopedChild {
         Self {
             child: Some(child),
             unit: None,
+            usage: None,
         }
     }
 
@@ -507,9 +523,13 @@ impl ScopedChild {
         Ok(())
     }
 
-    /// Wait for the child to exit.
+    /// Wait for the child to exit, recording its usage when recording is on.
     pub async fn wait(&mut self) -> std::io::Result<ExitStatus> {
-        self.child_mut().wait().await
+        let status = self.child_mut().wait().await?;
+        if let Some(usage) = self.usage.take() {
+            usage.finish(status);
+        }
+        Ok(status)
     }
 
     /// Wait for the child to exit, collecting its piped output.
@@ -518,7 +538,11 @@ impl ScopedChild {
     /// is stopped even though the child itself is consumed.
     pub async fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
         let child = self.child.take().expect("child is present");
-        child.wait_with_output().await
+        let output = child.wait_with_output().await?;
+        if let Some(usage) = self.usage.take() {
+            usage.finish(output.status);
+        }
+        Ok(output)
     }
 }
 
@@ -748,7 +772,9 @@ impl SubagentWorkspace {
             .sandbox
             .is_some()
             .then(|| format!("juto-{}", Uuid::now_v7()));
-        let mut scoped = self.build_scoped_command_named(cmd.as_std(), &limits, unit.as_deref())?;
+        let (built, usage) =
+            self.build_scoped_with_usage(cmd.as_std(), &limits, unit.as_deref(), true)?;
+        let mut scoped = Command::from(built);
         scoped
             .stdin(stdio.stdin)
             .stdout(stdio.stdout)
@@ -768,6 +794,7 @@ impl SubagentWorkspace {
         Ok(ScopedChild {
             child: Some(child),
             unit,
+            usage,
         })
     }
 
@@ -780,11 +807,16 @@ impl SubagentWorkspace {
         cmd: &mut std::process::Command,
         limits: ResourceLimits,
     ) -> Result<ExitStatus, WorkspaceError> {
-        let mut child = self.spawn_scoped_blocking(cmd, limits, ScopedStdio::default())?;
+        let (mut child, usage) =
+            self.spawn_blocking_with_usage(cmd, limits, ScopedStdio::default(), true)?;
 
-        child
+        let status = child
             .wait()
-            .map_err(|source| WorkspaceError::ExecutionFailed(source.to_string()))
+            .map_err(|source| WorkspaceError::ExecutionFailed(source.to_string()))?;
+        if let Some(usage) = usage {
+            usage.finish(status);
+        }
+        Ok(status)
     }
 
     /// Spawn a synchronous `std::process::Command` inside this workspace under
@@ -795,18 +827,31 @@ impl SubagentWorkspace {
         limits: ResourceLimits,
         stdio: ScopedStdio,
     ) -> Result<std::process::Child, WorkspaceError> {
-        let mut scoped = self.build_scoped_std_command(cmd, &limits)?;
+        self.spawn_blocking_with_usage(cmd, limits, stdio, false)
+            .map(|(child, _)| child)
+    }
+
+    /// Spawn a blocking scoped child, attaching a usage ticket when `record` is set.
+    fn spawn_blocking_with_usage(
+        &self,
+        cmd: &mut std::process::Command,
+        limits: ResourceLimits,
+        stdio: ScopedStdio,
+        record: bool,
+    ) -> Result<(std::process::Child, Option<UsageTicket>), WorkspaceError> {
+        let (mut scoped, usage) = self.build_scoped_with_usage(cmd, &limits, None, record)?;
         scoped
             .stdin(stdio.stdin)
             .stdout(stdio.stdout)
             .stderr(stdio.stderr);
 
-        scoped
+        let child = scoped
             .spawn()
             .map_err(|source| WorkspaceError::CommandSpawnFailed {
                 command: format!("{:?}", cmd.get_program()),
                 source,
-            })
+            })?;
+        Ok((child, usage))
     }
 
     /// Build a resource-scoped `tokio::process::Command` from an existing `std::process::Command`.
@@ -849,6 +894,19 @@ impl SubagentWorkspace {
         limits: &ResourceLimits,
         unit: Option<&str>,
     ) -> Result<std::process::Command, WorkspaceError> {
+        self.build_scoped_with_usage(original, limits, unit, false)
+            .map(|(cmd, _)| cmd)
+    }
+
+    /// Build a scoped command, attaching a usage ticket when `record` is set
+    /// and the limits name a usage store.
+    fn build_scoped_with_usage(
+        &self,
+        original: &std::process::Command,
+        limits: &ResourceLimits,
+        unit: Option<&str>,
+        record: bool,
+    ) -> Result<(std::process::Command, Option<UsageTicket>), WorkspaceError> {
         let program = original.get_program().to_os_string();
         let orig_args: Vec<OsString> = original.get_args().map(|s| s.to_os_string()).collect();
         let work_dir = validate_scoped_cwd(&self.path, original.get_current_dir())?;
@@ -858,6 +916,22 @@ impl SubagentWorkspace {
         if !is_systemd_run_available() {
             return Err(WorkspaceError::SystemdUnavailable);
         }
+        // Usage is measured from inside the unit's cgroup, so it needs systemd,
+        // which the check above guarantees.
+        let usage = match (record, &limits.usage_store) {
+            (true, Some(store)) => {
+                let repo = self.path.display().to_string();
+                let class = command_class(&program, &orig_args);
+                match UsageTicket::start(store, repo, class) {
+                    Ok(ticket) => Some(ticket),
+                    Err(error) => {
+                        eprintln!("juto: resource usage not recorded: {error}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
 
         if let Some(slice) = &limits.slice {
             let cpu_quota = limits
@@ -918,7 +992,13 @@ impl SubagentWorkspace {
 
         match &limits.sandbox {
             Some(sandbox) => {
-                emit_sandbox_properties(&mut cmd, sandbox, &self.path);
+                emit_sandbox_properties(
+                    &mut cmd,
+                    sandbox,
+                    &self.path,
+                    usage.as_ref().map(UsageTicket::pending_dir),
+                );
+                push_usage_grant(&mut cmd, usage.as_ref());
                 let helper = crate::network::helper()
                     .map_err(|error| WorkspaceError::Other(error.to_string()))?;
                 let socket = sandbox
@@ -935,14 +1015,13 @@ impl SubagentWorkspace {
                 let mut forwarded = vec![
                     OsString::from(crate::network::FORWARDER_ARGUMENT),
                     socket.into_os_string(),
-                    program.clone(),
                 ];
-                forwarded.extend(orig_args.iter().cloned());
+                forwarded.extend(payload_argv(&program, &orig_args, usage.as_ref()));
                 append_sandbox_command(&mut cmd, &env, helper.as_os_str(), &forwarded);
             }
             None => {
                 cmd.arg("--");
-                cmd.arg(&program).args(&orig_args);
+                cmd.args(payload_argv(&program, &orig_args, usage.as_ref()));
             }
         }
 
@@ -969,7 +1048,7 @@ impl SubagentWorkspace {
             cmd.env("CARGO_BUILD_JOBS", jobs.to_string());
         }
 
-        Ok(cmd)
+        Ok((cmd, usage))
     }
 }
 
@@ -1128,13 +1207,71 @@ fn append_sandbox_command(
     cmd.arg(program).args(args);
 }
 
+/// The argv a payload runs: the program and its arguments, wrapped by the
+/// usage reporter when a ticket is attached.
+fn payload_argv(program: &OsStr, args: &[OsString], usage: Option<&UsageTicket>) -> Vec<OsString> {
+    let mut argv = Vec::new();
+    if let Some(ticket) = usage {
+        argv.push(OsString::from("sh"));
+        argv.push(OsString::from("-c"));
+        argv.push(OsString::from(USAGE_WRAPPER));
+        argv.push(OsString::from("juto-usage"));
+        argv.push(ticket.pending_file().as_os_str().to_os_string());
+    }
+    argv.push(program.to_os_string());
+    argv.extend(args.iter().cloned());
+    argv
+}
+
+/// Grant a sandboxed payload write access to its usage report directory, the
+/// only path the reporter adds beyond the sandbox's own grants.
+fn push_usage_grant(cmd: &mut std::process::Command, usage: Option<&UsageTicket>) {
+    if let Some(ticket) = usage {
+        let dir = ticket.pending_dir();
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+        cmd.arg("-p").arg(format!("BindPaths={}", dir.display()));
+    }
+}
+
+/// The paths to mask so that `denied` is inaccessible except along the way to `keep`.
+///
+/// Masking the whole directory would hide `keep` as well, and systemd cannot bind
+/// a path beneath a masked directory, so the masks are the directory's entries
+/// other than the chain leading to `keep`.
+fn masked_paths(denied: &Path, keep: Option<&Path>) -> Vec<PathBuf> {
+    let Some(keep) = keep.filter(|keep| keep.starts_with(denied) && *keep != denied) else {
+        return vec![denied.to_path_buf()];
+    };
+    let mut masked = Vec::new();
+    let Ok(entries) = std::fs::read_dir(denied) else {
+        return masked;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        if keep.starts_with(&path) {
+            masked.extend(masked_paths(&path, Some(keep)));
+        } else {
+            masked.push(path);
+        }
+    }
+    masked
+}
+
 /// Emit the `systemd-run` properties that implement `sandbox`.
 ///
 /// Grants are bind mounts (`BindPaths`, `BindReadOnlyPaths`), not
 /// `ReadWritePaths`: a bind creates its mount point inside the hidden home or
 /// the private `/tmp`, where `ReadWritePaths` fails with status 226. Grants that
 /// do not exist on the host are skipped. The workspace is always writable.
-fn emit_sandbox_properties(cmd: &mut std::process::Command, sandbox: &Sandbox, workspace: &Path) {
+fn emit_sandbox_properties(
+    cmd: &mut std::process::Command,
+    sandbox: &Sandbox,
+    workspace: &Path,
+    keep: Option<&Path>,
+) {
     cmd.arg("-p").arg("PrivateNetwork=yes");
     if sandbox.protect_system {
         cmd.arg("-p").arg("ProtectSystem=strict");
@@ -1148,8 +1285,10 @@ fn emit_sandbox_properties(cmd: &mut std::process::Command, sandbox: &Sandbox, w
     for path in &sandbox.denied_paths {
         // A missing credential path is harmless. Existing paths remain
         // inaccessible even when a cache or explicit grant contains them.
-        cmd.arg("-p")
-            .arg(format!("InaccessiblePaths=-{}", path.display()));
+        for masked in masked_paths(path, keep) {
+            cmd.arg("-p")
+                .arg(format!("InaccessiblePaths=-{}", masked.display()));
+        }
     }
 
     let workspace = workspace
