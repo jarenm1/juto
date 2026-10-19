@@ -64,6 +64,10 @@ pub struct TaskSpec {
     /// reports to `agent://main` return to that session; never model-supplied.
     #[serde(skip)]
     pub origin: Option<String>,
+    /// The main thread's session file, which `recall` reads. The runtime sets
+    /// it when a `task` call spawns children; the model never does.
+    #[serde(skip)]
+    pub main_session: Option<PathBuf>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -95,6 +99,7 @@ impl TaskSpec {
             solution_space: None,
             focus: false,
             origin: None,
+            main_session: None,
         }
     }
 }
@@ -1547,6 +1552,7 @@ mod tests {
             solution_space: None,
             focus: false,
             origin: None,
+            main_session: None,
         }
     }
 

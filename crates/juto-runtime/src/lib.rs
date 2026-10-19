@@ -10,6 +10,7 @@ mod contextual;
 pub mod desktop_artifact;
 pub mod git_transfer;
 pub mod peers;
+mod recall;
 pub mod replication;
 mod roles;
 pub mod session;
@@ -455,11 +456,13 @@ impl Runtime {
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
     ) -> Result<RunOutcome> {
+        let main_session = session.path().to_path_buf();
         let placement = RunPlacement {
             depth: 0,
             role: roles::MAIN_ROLE,
             read_only: false,
             sender: None,
+            main_session: Some(&main_session),
         };
         let manager = self.subagent_manager(&control);
         let inbox = manager.main_inbox();
@@ -489,6 +492,7 @@ impl Runtime {
             role: role_name,
             read_only,
             sender,
+            main_session,
         } = placement;
         if session.header().cwd != self.inner.cwd {
             bail!("session belongs to a different working directory");
@@ -530,12 +534,24 @@ impl Runtime {
             .bash_scoped
             .then(|| ResourceLimits::default().with_enforce_scope(false));
         let mut registry = tools::builtin_tools_with_limits(&self.inner.cwd, limits)?;
+        if let Some(main_session) = main_session {
+            registry.register(Arc::new(recall::RecallTool::new(
+                main_session.to_path_buf(),
+            )))?;
+        }
         if can_delegate {
             let peers = match sender {
                 Some(id) => PeerBus::for_child(manager.clone(), id),
                 None => PeerBus::new(manager.clone()),
             };
-            register_agent_tools(&mut registry, manager, peers, catalog.clone(), depth == 0)?;
+            register_agent_tools(
+                &mut registry,
+                manager,
+                peers,
+                catalog.clone(),
+                depth == 0,
+                main_session.map(Path::to_path_buf),
+            )?;
         }
         browser::register_browser_tool(&mut registry, self.inner.browser.clone(), &self.inner.cwd)?;
         if scope.allows("desktop") {
@@ -808,6 +824,9 @@ struct RunPlacement<'a> {
     /// Id of the child running here, if any. Its messages to `agent://main`
     /// carry this id as `from`; `None` for the main thread.
     sender: Option<&'a str>,
+    /// The main thread's session file, which `recall` reads. Children carry
+    /// it from the `task` call that spawned them.
+    main_session: Option<&'a Path>,
 }
 
 struct ChildFactory {
@@ -1167,6 +1186,7 @@ impl subagents::SubagentFactory for ChildFactory {
                         role,
                         read_only: spec.read_only,
                         sender: Some(id),
+                        main_session: spec.main_session.as_deref(),
                     },
                     manager,
                 )
@@ -1223,6 +1243,7 @@ impl subagents::SubagentFactory for ChildFactory {
                         role,
                         read_only: spec.read_only,
                         sender: Some(id),
+                        main_session: spec.main_session.as_deref(),
                     },
                     manager,
                 )
@@ -1300,12 +1321,14 @@ fn register_agent_tools(
     peers: PeerBus,
     catalog: Arc<BTreeMap<String, AgentRole>>,
     main: bool,
+    main_session: Option<PathBuf>,
 ) -> Result<()> {
     registry.register(Arc::new(TaskTool {
         manager: manager.clone(),
         catalog,
         allow_focus: main,
         async_results: main,
+        main_session,
     }))?;
     registry.register(Arc::new(WaitTool {
         manager: manager.clone(),
@@ -1335,6 +1358,8 @@ struct TaskTool {
     /// the main inbox. Child calls wait, because a child's completions never
     /// reach the main inbox.
     async_results: bool,
+    /// The session `recall` reads: the main thread's, which children inherit.
+    main_session: Option<PathBuf>,
 }
 #[async_trait]
 impl Tool for TaskTool {
@@ -1436,6 +1461,7 @@ impl TaskTool {
         }
         Ok(TaskSpec {
             name: value.get("name").and_then(Value::as_str).map(str::to_owned),
+            main_session: self.main_session.clone(),
             agent,
             task: if context.is_empty() {
                 task.to_owned()
@@ -2622,6 +2648,7 @@ mod tests {
                 "view",
                 "glob",
                 "grep",
+                "recall",
                 "task",
                 "wait",
                 "agent_send",
@@ -2656,7 +2683,7 @@ mod tests {
 
         assert_eq!(
             provider.requests(),
-            vec![tool_set(&["read", "glob", "grep"])]
+            vec![tool_set(&["read", "glob", "grep", "recall"])]
         );
     }
 
@@ -2847,6 +2874,7 @@ mod tests {
                     role: "builder",
                     read_only: false,
                     sender: None,
+                    main_session: None,
                 },
                 runtime.subagent_manager(&RunControl::new()),
             )
@@ -2881,6 +2909,7 @@ mod tests {
             catalog: Arc::new(roles::load(&repo, &data_dir).expect("roles")),
             allow_focus: false,
             async_results: false,
+            main_session: None,
         };
         let context = ToolContext {
             cwd: repo.clone(),
@@ -2963,6 +2992,7 @@ mod tests {
             catalog: Arc::new(BTreeMap::new()),
             allow_focus: false,
             async_results: false,
+            main_session: None,
         };
         let error = tool
             .execute(arguments.clone(), context.clone())
@@ -2980,6 +3010,7 @@ mod tests {
             catalog: Arc::new(BTreeMap::new()),
             allow_focus: true,
             async_results: false,
+            main_session: None,
         };
         tool.execute(arguments, context)
             .await
