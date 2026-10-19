@@ -234,11 +234,25 @@ stream — only received frames establish that.
 **Owner lifetime and retention.** An environment records an owner heartbeat;
 `Heartbeat` renews either the owner deadline or the control lease (matching the
 current epoch), and input traffic never renews either implicitly. A reaper retires
-an environment whose heartbeat has lapsed, so an abandoned desktop does not
-outlive its task. `Retain` transfers lifetime responsibility to an authenticated
-human session with a host-bounded deadline (default maximum 30 minutes). The
-runtime's `desktop` tool heartbeats on every action, and the embedded viewer
-heartbeats while it is open.
+an environment whose heartbeat has lapsed, so a daemon client that disappears
+does not leave its desktop behind. `Retain` transfers lifetime responsibility to
+an authenticated human session with a host-bounded deadline (default maximum 30
+minutes). Environments created by the harness (the runtime's `desktop` tool and
+`juto --desktop`) are owned by the harness process itself: they set no owner
+timeout and live until destroyed, reclaimed as idle, or the harness exits (the
+next harness start reconciles what an exit left behind), so an agent can leave
+a desktop waiting for a human to verify it. The runtime renews the session
+viewer's grant before it lapses, so the chat card still opens hours later.
+
+**Idle suspension.** Activity is any launch, observation, input, control
+acquisition, resize, or viewer attach, plus the continuous presence of an
+attached viewer, an open embedded viewer, or a live control lease. After
+`idle.suspendAfterSecs` (default 5 minutes) without activity the environment
+slice is frozen with `systemctl --user freeze`: applications, the compositor
+worker, and the audio server stop running and keep their memory. The next
+activity thaws it before the operation proceeds, and `Describe` reports
+`suspended`. After `idle.destroyAfterSecs` (default 24 hours) without activity
+the environment is destroyed. Either limit is disabled by setting it to 0.
 
 **Compositor worker process.** The compositor runs in its own process inside the
 environment slice (`juto-desktop-<env>-compositor.scope`), so its CPU and memory

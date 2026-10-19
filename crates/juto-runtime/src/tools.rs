@@ -1442,7 +1442,12 @@ impl Tool for DesktopTool {
             description: "Owns an isolated headless desktop environment: create it, launch \
                           applications into it, observe lossless snapshots, inject input, and \
                           destroy it. The desktop has no host display; applications run in a \
-                          per-environment systemd scope with enforced CPU/memory/task limits."
+                          per-environment systemd scope with enforced CPU/memory/task limits. \
+                          A desktop lives until destroyed or the harness exits. After 5 minutes \
+                          with no actions and no viewer it is suspended (frozen, state kept) and \
+                          any action resumes it; after 24 hours idle it is destroyed. To let the \
+                          user verify it, mount it in chat with `desktop_artifact` using the \
+                          `hostId`, `envId`, and `grantId` from `create`."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -1598,7 +1603,12 @@ fn run_desktop_action(
                 } else {
                     juto_desktop::supervisor::CompositorMode::InProcess
                 },
-                owner_heartbeat_timeout_secs: 60,
+                // This process owns the environment and tears it down when it
+                // exits; an agent waiting for a human to verify its work sends
+                // no heartbeats, so no owner timeout applies. The idle policy
+                // suspends the desktop while unused and reclaims it after a day.
+                owner_heartbeat_timeout_secs: 0,
+                idle: juto_desktop::IdlePolicy::default(),
             };
             // One request per tool call; the control protocol's request ids are
             // what make a retried Create/Launch idempotent.
@@ -1610,7 +1620,7 @@ fn run_desktop_action(
             // authenticated principal, so the mountable grant is issued to
             // that human viewer rather than to the agent session itself.
             let grant = env.issue_grant(
-                "human:viewer".to_string(),
+                crate::SESSION_VIEWER_PRINCIPAL.to_string(),
                 vec![
                     juto_desktop::protocol::GrantRole::Owner,
                     juto_desktop::protocol::GrantRole::View,
@@ -1766,7 +1776,11 @@ fn run_desktop_action(
             let summary = format!(
                 "Environment {} is {} at {}x{}@{} (generation {}), {} window(s), {} app(s).",
                 status.env_id,
-                if status.is_ready { "ready" } else { "stopped" },
+                match (status.is_ready, status.suspended) {
+                    (false, _) => "stopped",
+                    (true, true) => "suspended (idle; the next action resumes it)",
+                    (true, false) => "ready",
+                },
                 status.output.width,
                 status.output.height,
                 status.output.fps,

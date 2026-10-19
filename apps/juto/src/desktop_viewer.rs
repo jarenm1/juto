@@ -16,8 +16,8 @@ use gpui::{
     Window, canvas, div, img, prelude::*, px, rgb,
 };
 use image::{Frame, ImageBuffer, Rgba};
-use juto_runtime::DesktopEnvironment;
 use juto_runtime::protocol::{InputBatch, InputEvent};
+use juto_runtime::{AwakeHold, DesktopEnvironment};
 
 /// Frame polling interval (~30 fps).
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -26,7 +26,7 @@ const LEASE_HEARTBEAT: Duration = Duration::from_secs(2);
 
 /// The authenticated principal this interactive session acts as: the local
 /// human viewing the desktop. Grants and artifact resolution are bound to it.
-pub(crate) const SESSION_PRINCIPAL: &str = "human:viewer";
+pub(crate) const SESSION_PRINCIPAL: &str = juto_runtime::SESSION_VIEWER_PRINCIPAL;
 
 /// An embedded viewer for one agent-owned desktop environment.
 pub struct DesktopViewer {
@@ -42,6 +42,8 @@ pub struct DesktopViewer {
     input_seq: u64,
     poll_task: Option<Task<()>>,
     heartbeat_task: Option<Task<()>>,
+    /// Resumes a suspended desktop and keeps it awake while the viewer is open.
+    _awake: Option<AwakeHold>,
 }
 
 impl DesktopViewer {
@@ -53,6 +55,10 @@ impl DesktopViewer {
         cx: &mut Context<Self>,
     ) -> Self {
         let output = env.output();
+        let (awake, error) = match env.hold_awake() {
+            Ok(hold) => (Some(hold), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
         let mut viewer = Self {
             env,
             title,
@@ -61,11 +67,12 @@ impl DesktopViewer {
             surface_bounds: Rc::new(Cell::new(Bounds::default())),
             focus_handle: cx.focus_handle(),
             status: "connecting".to_string(),
-            error: None,
+            error,
             has_control: false,
             input_seq: 0,
             poll_task: None,
             heartbeat_task: None,
+            _awake: awake,
         };
         viewer.start_polling(window, cx);
         viewer
@@ -164,9 +171,6 @@ impl DesktopViewer {
         self.heartbeat_task = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(LEASE_HEARTBEAT).await;
-                // The viewer is the human owner while it is open, so the
-                // environment is not retired as abandoned.
-                let _ = env.heartbeat("owner", None);
                 let renewed = env
                     .set_control(SESSION_PRINCIPAL, "acquire", true)
                     .ok()

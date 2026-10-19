@@ -50,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             lease_ttl_secs: 6,
             compositor_mode: juto_desktop::CompositorMode::Worker,
             owner_heartbeat_timeout_secs: 60,
+            idle: juto_desktop::IdlePolicy::default(),
         },
         &unique_env_id("req"),
     )?;

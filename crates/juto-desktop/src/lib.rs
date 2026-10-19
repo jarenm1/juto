@@ -31,8 +31,9 @@ pub use remote::{
 pub use shm::{ShmFrame, ShmFramePool, ShmReader, ShmWriter};
 pub use signaling::{AttachGrant, SignalingServer, ViewerReport};
 pub use supervisor::{
-    AppHandle, CompositorMode, DesktopEnvironment, DesktopSupervisor, EnvironmentConfig,
-    EnvironmentStatus, OutputConfig, OutputProfile, ReconcileReport, RenderProfile, SystemLimits,
+    AppHandle, AwakeHold, CompositorMode, DesktopEnvironment, DesktopSupervisor, EnvironmentConfig,
+    EnvironmentStatus, IdlePolicy, OutputConfig, OutputProfile, ReconcileReport, RenderProfile,
+    SystemLimits,
 };
 pub use viewer::{AttachInfo, ViewerClient};
 pub use worker::{

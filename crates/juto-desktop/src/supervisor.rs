@@ -13,7 +13,7 @@ use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
@@ -176,10 +176,38 @@ pub struct EnvironmentConfig {
     /// Owner heartbeat timeout in seconds; 0 disables expiry (spec section 3).
     #[serde(default = "default_owner_timeout")]
     pub owner_heartbeat_timeout_secs: u64,
+    /// When an unattended environment is suspended and when it is reclaimed.
+    #[serde(default)]
+    pub idle: IdlePolicy,
 }
 
 fn default_owner_timeout() -> u64 {
     60
+}
+
+/// How an environment with no agent or human activity is treated.
+///
+/// Activity is any operation that reaches the desktop (launch, observe, input,
+/// control, resize, viewer attach) plus the continuous presence of an attached
+/// viewer, an awake hold, or a live control lease. Owner heartbeats only keep
+/// the owner alive; they are not activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdlePolicy {
+    /// Idle seconds before the environment slice is frozen; 0 disables. Any
+    /// later activity thaws it with application state intact.
+    pub suspend_after_secs: u64,
+    /// Idle seconds before the environment is destroyed; 0 disables.
+    pub destroy_after_secs: u64,
+}
+
+impl Default for IdlePolicy {
+    fn default() -> Self {
+        Self {
+            suspend_after_secs: 300,
+            destroy_after_secs: 24 * 60 * 60,
+        }
+    }
 }
 
 /// Name of the private audio sink created inside each environment.
@@ -304,6 +332,9 @@ pub struct EnvironmentStatus {
     pub active_control_lease: Option<ControlLease>,
     pub mapped_windows: Vec<WindowInfo>,
     pub active_grants: Vec<Grant>,
+    /// The environment is frozen by its idle policy; the next activity resumes it.
+    #[serde(default)]
+    pub suspended: bool,
 }
 
 /// A launched application tracked by the environment.
@@ -337,6 +368,13 @@ struct InnerEnvironment {
     owner_heartbeat: Mutex<u64>,
     /// Explicit human retention of the environment's lifetime.
     retention: Mutex<Option<Retention>>,
+    /// Last agent or human activity (see [`IdlePolicy`]).
+    last_activity: Mutex<Instant>,
+    /// Live [`AwakeHold`]s; any hold keeps the environment awake.
+    awake_holds: AtomicUsize,
+    /// Whether the environment slice is frozen. The lock also serializes
+    /// freeze and thaw.
+    suspended: Mutex<bool>,
     destroyed: AtomicBool,
     use_scope: bool,
     slice: Option<String>,
@@ -356,6 +394,19 @@ struct InnerEnvironment {
 #[derive(Clone)]
 pub struct DesktopEnvironment {
     inner: Arc<InnerEnvironment>,
+}
+
+/// Keeps an environment awake while held; see [`DesktopEnvironment::hold_awake`].
+pub struct AwakeHold {
+    env: DesktopEnvironment,
+}
+
+impl Drop for AwakeHold {
+    fn drop(&mut self) {
+        // The idle clock starts when the last holder lets go.
+        *self.env.inner.last_activity.lock() = Instant::now();
+        self.env.inner.awake_holds.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl DesktopEnvironment {
@@ -512,6 +563,9 @@ impl DesktopEnvironment {
             geometry_ready: Mutex::new(HashMap::new()),
             owner_heartbeat: Mutex::new(now_secs()),
             retention: Mutex::new(None),
+            last_activity: Mutex::new(Instant::now()),
+            awake_holds: AtomicUsize::new(0),
+            suspended: Mutex::new(false),
             destroyed: AtomicBool::new(false),
             use_scope,
             slice,
@@ -583,6 +637,42 @@ impl DesktopEnvironment {
         self.inner.destroyed.load(Ordering::SeqCst)
     }
 
+    /// Records activity and resumes a suspended environment.
+    ///
+    /// Every operation that reaches the desktop calls this first, so a frozen
+    /// application or compositor worker is running again before it is asked to
+    /// do anything.
+    pub fn wake(&self) -> Result<(), DesktopError> {
+        *self.inner.last_activity.lock() = Instant::now();
+        let mut suspended = self.inner.suspended.lock();
+        if !*suspended {
+            return Ok(());
+        }
+        if let Some(slice) = self.inner.slice.as_deref() {
+            systemctl_user(&["thaw", slice]).map_err(|reason| {
+                DesktopError::EnvironmentFailed(
+                    self.env_id().to_string(),
+                    format!("cannot resume the suspended environment: {reason}"),
+                )
+            })?;
+        }
+        *suspended = false;
+        let _ = self.inner.events.send(DesktopEvent::Resumed {
+            env_id: self.env_id().to_string(),
+        });
+        Ok(())
+    }
+
+    /// Resumes the environment and keeps it awake until the hold is dropped.
+    ///
+    /// An open viewer holds one so a human watching a still desktop does not
+    /// see it frozen underneath them.
+    pub fn hold_awake(&self) -> Result<AwakeHold, DesktopError> {
+        self.wake()?;
+        self.inner.awake_holds.fetch_add(1, Ordering::SeqCst);
+        Ok(AwakeHold { env: self.clone() })
+    }
+
     /// Issues an authenticated grant for a principal.
     pub fn issue_grant(
         &self,
@@ -609,6 +699,27 @@ impl DesktopEnvironment {
     /// Looks up a grant by id, including one that has expired.
     pub fn grant(&self, grant_id: &str) -> Option<Grant> {
         self.inner.grants.lock().get(grant_id).cloned()
+    }
+
+    /// Extends an unexpired grant, keeping its id (spec section 4).
+    ///
+    /// The renewed lifetime is bounded by [`MAX_GRANT_SECS`] from now, and an
+    /// expired grant stays expired.
+    pub fn renew_grant(&self, grant_id: &str, expiry_seconds: u64) -> Result<Grant, DesktopError> {
+        let now_s = now_secs();
+        let mut grants = self.inner.grants.lock();
+        let grant = grants
+            .get_mut(grant_id)
+            .ok_or_else(|| DesktopError::Protocol(format!("unknown grant `{grant_id}`")))?;
+        if grant.expires_at <= now_s {
+            return Err(DesktopError::Protocol(format!(
+                "grant `{grant_id}` has expired and cannot be renewed"
+            )));
+        }
+        grant.expires_at = grant
+            .expires_at
+            .max(now_s + expiry_seconds.min(MAX_GRANT_SECS));
+        Ok(grant.clone())
     }
 
     /// Revokes an existing grant and releases control held through it.
@@ -638,6 +749,9 @@ impl DesktopEnvironment {
         action: &str,
         is_human: bool,
     ) -> Result<Option<ControlLease>, DesktopError> {
+        if action == "acquire" {
+            self.wake()?;
+        }
         let mut lease = self.inner.lease.lock();
         match action {
             "acquire" => {
@@ -720,6 +834,7 @@ impl DesktopEnvironment {
                 "environment is destroyed".to_string(),
             ));
         }
+        self.wake()?;
         if argv.is_empty() {
             return Err(DesktopError::ExecutableUnavailable {
                 path: PathBuf::new(),
@@ -921,6 +1036,8 @@ impl DesktopEnvironment {
             .remove(app_id)
             .ok_or_else(|| DesktopError::Protocol(format!("unknown application `{app_id}`")))?;
         drop(apps);
+        // A frozen unit refuses `systemctl stop`.
+        self.wake()?;
         terminate_app(&handle);
         Ok(())
     }
@@ -984,6 +1101,7 @@ impl DesktopEnvironment {
         }
         drop(lease);
 
+        self.wake()?;
         let compositor = self.compositor()?;
         for event in batch.events {
             compositor.send(WorkerRequest::Input(event))?;
@@ -1099,6 +1217,7 @@ impl DesktopEnvironment {
 
     /// Forces a fresh composition and returns the resulting frame metadata.
     pub fn observe(&self, timeout: Duration) -> Result<SnapshotInfo, DesktopError> {
+        self.wake()?;
         self.compositor()?.snapshot(timeout)
     }
 
@@ -1107,6 +1226,7 @@ impl DesktopEnvironment {
     /// A rejected viewer receives no frame pool descriptor, so it cannot read
     /// composed pixels (spec section 6).
     pub fn admit_viewer(&self, viewer_id: &str) -> Result<(), DesktopError> {
+        self.wake()?;
         let mut viewers = self.inner.viewers.lock();
         if viewers.len() >= MAX_ACTIVE_VIEWERS {
             return Err(DesktopError::LimitExceeded(format!(
@@ -1125,6 +1245,8 @@ impl DesktopEnvironment {
     pub fn release_viewer(&self, viewer_id: &str) {
         self.inner.viewers.lock().remove(viewer_id);
         self.inner.geometry_ready.lock().remove(viewer_id);
+        // The idle clock starts when the last viewer leaves.
+        *self.inner.last_activity.lock() = Instant::now();
     }
 
     /// GStreamer description of the environment's private audio source.
@@ -1181,6 +1303,7 @@ impl DesktopEnvironment {
         }
 
         let new_gen = current_gen + 1;
+        self.wake()?;
         let compositor = self.compositor()?;
         compositor.send(WorkerRequest::Configure {
             width: new_mode.width,
@@ -1221,6 +1344,7 @@ impl DesktopEnvironment {
             active_control_lease: lease,
             mapped_windows: self.inner.windows.lock().values().cloned().collect(),
             active_grants: grants,
+            suspended: *self.inner.suspended.lock(),
         }
     }
 
@@ -1257,6 +1381,67 @@ impl DesktopEnvironment {
         self.destroy();
     }
 
+    /// Applies the idle policy: suspends, then destroys, an environment that
+    /// nobody is using.
+    fn apply_idle_policy(&self) {
+        let policy = self.inner.config.idle;
+        let lease_held = self
+            .inner
+            .lease
+            .lock()
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at > now_secs());
+        let present = lease_held
+            || self.inner.awake_holds.load(Ordering::SeqCst) > 0
+            || !self.inner.viewers.lock().is_empty();
+        if present {
+            *self.inner.last_activity.lock() = Instant::now();
+            return;
+        }
+        let idle = self.inner.last_activity.lock().elapsed();
+        if policy.destroy_after_secs > 0 && idle.as_secs() >= policy.destroy_after_secs {
+            let _ = self.inner.events.send(DesktopEvent::Failed {
+                env_id: self.env_id().to_string(),
+                reason: format!("idle for {}s; destroyed by idle policy", idle.as_secs()),
+            });
+            self.destroy();
+            return;
+        }
+        if policy.suspend_after_secs > 0 && idle.as_secs() >= policy.suspend_after_secs {
+            self.suspend(Duration::from_secs(policy.suspend_after_secs));
+        }
+    }
+
+    /// Freezes the environment slice: applications, the compositor worker, and
+    /// the audio server stop being scheduled, and memory stays resident.
+    ///
+    /// Without a slice (unscoped development mode) there is nothing to freeze
+    /// and the environment keeps running.
+    fn suspend(&self, threshold: Duration) {
+        let Some(slice) = self.inner.slice.as_deref() else {
+            return;
+        };
+        let mut suspended = self.inner.suspended.lock();
+        // Re-check under the lock: a concurrent `wake` records its activity
+        // before taking this lock, so it either wins here or thaws after us.
+        if *suspended || self.inner.last_activity.lock().elapsed() < threshold {
+            return;
+        }
+        match systemctl_user(&["freeze", slice]) {
+            Ok(()) => {
+                *suspended = true;
+                let _ = self.inner.events.send(DesktopEvent::Suspended {
+                    env_id: self.env_id().to_string(),
+                });
+            }
+            Err(reason) => {
+                tracing::warn!(env_id = %self.env_id(), %reason, "cannot suspend idle environment");
+                // Retry after another idle interval rather than every tick.
+                *self.inner.last_activity.lock() = Instant::now();
+            }
+        }
+    }
+
     /// Clears an expired control lease and reports the change.
     fn expire_lease_if_stale(&self) {
         let mut lease = self.inner.lease.lock();
@@ -1279,6 +1464,14 @@ impl DesktopEnvironment {
     pub fn destroy(&self) {
         if self.inner.destroyed.swap(true, Ordering::SeqCst) {
             return;
+        }
+
+        // A frozen worker cannot acknowledge shutdown and systemd refuses to
+        // stop a frozen unit, so resume before tearing anything down.
+        if std::mem::take(&mut *self.inner.suspended.lock())
+            && let Some(slice) = self.inner.slice.as_deref()
+        {
+            let _ = systemctl_user(&["thaw", slice]);
         }
 
         let apps: Vec<AppHandle> = self.inner.apps.lock().drain().map(|(_, a)| a).collect();
@@ -1334,6 +1527,11 @@ impl DesktopEnvironment {
 impl Drop for InnerEnvironment {
     fn drop(&mut self) {
         if !self.destroyed.swap(true, Ordering::SeqCst) {
+            if *self.suspended.get_mut()
+                && let Some(slice) = self.slice.as_deref()
+            {
+                let _ = systemctl_user(&["thaw", slice]);
+            }
             if let Some(compositor) = self.compositor.lock().take() {
                 compositor.shutdown();
             }
@@ -1519,7 +1717,8 @@ fn spawn_pressure_monitor(inner: std::sync::Weak<InnerEnvironment>) {
 }
 
 /// Periodically clears expired control leases so a stale holder cannot keep
-/// control after its heartbeat stops.
+/// control after its heartbeat stops, retires abandoned environments, and
+/// applies the idle policy.
 fn spawn_lease_reaper(inner: std::sync::Weak<InnerEnvironment>) {
     let _ = std::thread::Builder::new()
         .name("juto-desktop-lease-reaper".to_string())
@@ -1535,6 +1734,9 @@ fn spawn_lease_reaper(inner: std::sync::Weak<InnerEnvironment>) {
                 let env = DesktopEnvironment { inner };
                 env.expire_lease_if_stale();
                 env.expire_owner_if_abandoned();
+                if !env.is_destroyed() {
+                    env.apply_idle_policy();
+                }
             }
         });
 }
@@ -1887,6 +2089,11 @@ impl DesktopSupervisor {
             .ok_or_else(|| DesktopError::EnvironmentNotFound(env_id.to_string()))
     }
 
+    /// Every environment this supervisor currently owns.
+    pub fn environments(&self) -> Vec<DesktopEnvironment> {
+        self.environments.lock().values().cloned().collect()
+    }
+
     pub fn destroy_environment(&self, env_id: &str) -> Result<(), DesktopError> {
         let env = self.environments.lock().remove(env_id);
         match env {
@@ -1954,6 +2161,9 @@ impl DesktopSupervisor {
             }
             let mut units = scopes_for_environment(&name);
             units.push(environment_slice_name(&name));
+            // A supervisor that died while the environment was suspended left
+            // the slice frozen, and systemd refuses to stop a frozen unit.
+            let _ = systemctl_user(&["thaw", &environment_slice_name(&name)]);
             for unit in units {
                 let _ = Command::new("systemctl")
                     .args(["--user", "stop", &unit])
@@ -2141,6 +2351,21 @@ fn environment_slice_name(env_id: &str) -> String {
         .map(|c| if c == '-' { '_' } else { c })
         .collect();
     format!("juto-desktop-{escaped}.slice")
+}
+
+/// Runs `systemctl --user <args>`, returning systemd's message on failure.
+fn systemctl_user(args: &[&str]) -> Result<(), String> {
+    let output = Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("systemctl: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
 }
 
 /// Creates the environment slice and applies the aggregate limits.

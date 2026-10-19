@@ -374,6 +374,14 @@ pub enum DesktopEvent {
         env_id: String,
         reason: String,
     },
+    /// The idle policy froze the environment; the next activity resumes it.
+    Suspended {
+        env_id: String,
+    },
+    /// A suspended environment is running again.
+    Resumed {
+        env_id: String,
+    },
     Stopped {
         env_id: String,
     },
