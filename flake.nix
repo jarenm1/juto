@@ -129,11 +129,11 @@
               inherit cargoArtifacts;
               # juto-cli ships beside juto: sandboxed commands run under its
               # network proxy forwarder, found as a sibling of the executable.
-              cargoExtraArgs = "-p juto --bin juto -p juto-cli --bin juto-cli";
+              cargoExtraArgs = "-p juto --bin juto -p juto-cli --bin juto-cli -p juto-daemon --bins";
               doInstallCargoArtifacts = false;
               installPhaseCommand = ''
                 mkdir -p $out/bin
-                cp target/release/juto $out/bin/juto
+                cp target/release/juto target/release/juto-daemon $out/bin/
                 cp target/release/juto-cli $out/bin/juto-cli
               '';
               postFixup = ''
@@ -141,6 +141,9 @@
                   --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath nativeLibraries}" \
                   --set GST_PLUGIN_SYSTEM_PATH_1_0 "${gstPluginPath}" \
                   --set-default JUTO_CHROMIUM "${pkgs.chromium}/bin/chromium"
+                wrapProgram $out/bin/juto-daemon \
+                  --prefix LD_LIBRARY_PATH : "/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath nativeLibraries}" \
+                  --set GST_PLUGIN_SYSTEM_PATH_1_0 "${gstPluginPath}"
               '';
               meta = {
                 description = "Native GPUI agent runtime";
