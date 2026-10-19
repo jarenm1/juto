@@ -4,7 +4,7 @@ use fs2::FileExt;
 use juto_ai::{ContentBlock, Message, timestamp_ms};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{File, OpenOptions},
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -312,16 +312,7 @@ impl Session {
         Ok(id)
     }
     fn append_locked(&mut self, kind: EntryKind) -> Result<String> {
-        let size = self.file.metadata().map_err(io_err(&self.path))?.len();
-        if size != self.journal.size {
-            let next = read_journal(&self.path, &mut self.file)?;
-            if next.header.id != self.journal.header.id
-                || next.header.cwd != self.journal.header.cwd
-            {
-                return Err(corrupt(&self.path, "journal identity changed"));
-            }
-            self.journal = next;
-        }
+        self.refresh_locked()?;
         let target = match &kind {
             EntryKind::Branch { target } => resolve_target(&self.journal, target.as_deref())?,
             _ => None,
@@ -361,6 +352,86 @@ impl Session {
             .insert(entry.id.clone(), self.journal.entries.len());
         self.journal.entries.push(entry);
         Ok(id)
+    }
+
+    /// Records an interrupted run. Every tool call on the active branch without
+    /// a result gets an error `ToolResult`, then one `run_interrupted` marker is
+    /// appended. A repeat call with nothing left unpaired is a no-op.
+    pub fn append_interrupted(&mut self, run_id: &str, reason: &str) -> Result<()> {
+        FileExt::lock_exclusive(&self.file).map_err(io_err(&self.path))?;
+        let result = self.append_interrupted_locked(run_id, reason);
+        let unlock = FileExt::unlock(&self.file).map_err(io_err(&self.path));
+        result?;
+        unlock
+    }
+    fn append_interrupted_locked(&mut self, run_id: &str, reason: &str) -> Result<()> {
+        self.refresh_locked()?;
+        let mut calls = Vec::new();
+        let mut answered = HashSet::new();
+        let mut marked = false;
+        for entry in self.active_entries()? {
+            match &entry.kind {
+                EntryKind::Message {
+                    message: Message::Assistant(assistant),
+                } => calls.extend(
+                    assistant
+                        .tool_calls()
+                        .map(|call| (call.id.clone(), call.name.clone())),
+                ),
+                EntryKind::Message {
+                    message: Message::ToolResult { tool_call_id, .. },
+                } => {
+                    answered.insert(tool_call_id.clone());
+                }
+                EntryKind::Custom { custom_type, data }
+                    if custom_type == "run_interrupted" && data["run_id"] == run_id =>
+                {
+                    marked = true;
+                }
+                _ => {}
+            }
+        }
+        let unpaired: Vec<_> = calls
+            .into_iter()
+            .filter(|(id, _)| !answered.contains(id))
+            .collect();
+        if unpaired.is_empty() && marked {
+            return Ok(());
+        }
+        for (id, name) in unpaired {
+            self.append_locked(EntryKind::Message {
+                message: Message::ToolResult {
+                    tool_call_id: id,
+                    tool_name: name,
+                    content: vec![ContentBlock::Text {
+                        text: format!("Tool call interrupted: {reason}"),
+                    }],
+                    is_error: true,
+                    details: serde_json::Value::Null,
+                    timestamp: timestamp_ms(),
+                },
+            })?;
+        }
+        if !marked {
+            self.append_locked(EntryKind::Custom {
+                custom_type: "run_interrupted".into(),
+                data: serde_json::json!({ "run_id": run_id, "reason": reason }),
+            })?;
+        }
+        Ok(())
+    }
+    fn refresh_locked(&mut self) -> Result<()> {
+        let size = self.file.metadata().map_err(io_err(&self.path))?.len();
+        if size != self.journal.size {
+            let next = read_journal(&self.path, &mut self.file)?;
+            if next.header.id != self.journal.header.id
+                || next.header.cwd != self.journal.header.cwd
+            {
+                return Err(corrupt(&self.path, "journal identity changed"));
+            }
+            self.journal = next;
+        }
+        Ok(())
     }
     pub fn active_entries(&self) -> Result<Vec<&SessionEntry>> {
         let mut entries = Vec::new();

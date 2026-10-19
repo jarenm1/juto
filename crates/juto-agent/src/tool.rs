@@ -7,13 +7,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use juto_ai::{ContentBlock, ToolDefinition};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::AgentError;
 
 /// Side-effect classification of a tool; hosts use it for approval policy.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolTier {
     /// Reads state only (read, glob, grep, ...).
     #[default]

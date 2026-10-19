@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use juto_ai::{Context, Message, ProviderEvent, StopReason, StreamOptions, ToolCall, Usage};
 use juto_catalog::Model;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use crate::tool::ToolTier;
@@ -17,7 +17,7 @@ use crate::tool::ToolTier;
 /// per committed context message and is the only event the session layer
 /// persists; `ToolExecutionEnd` carries the same `ToolResult` message but does
 /// not imply a second `MessageEnd` beyond its own single emission.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "snake_case",
