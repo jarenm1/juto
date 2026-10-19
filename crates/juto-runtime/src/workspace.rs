@@ -178,6 +178,8 @@ pub struct Sandbox {
     pub read_paths: Vec<PathBuf>,
     /// Credential locations hidden even when an enclosing directory is granted.
     pub denied_paths: Vec<PathBuf>,
+    /// Exact-host HTTP/HTTPS policy; all sandboxed commands have PrivateNetwork.
+    pub network: crate::network::NetworkPolicy,
 }
 
 impl Default for Sandbox {
@@ -189,6 +191,7 @@ impl Default for Sandbox {
             write_paths: Vec::new(),
             read_paths: Vec::new(),
             denied_paths: credential_paths(&[]),
+            network: crate::network::NetworkPolicy::default(),
         }
     }
 }
@@ -916,8 +919,26 @@ impl SubagentWorkspace {
         match &limits.sandbox {
             Some(sandbox) => {
                 emit_sandbox_properties(&mut cmd, sandbox, &self.path);
+                let helper = crate::network::helper()
+                    .map_err(|error| WorkspaceError::Other(error.to_string()))?;
+                let socket = sandbox
+                    .network
+                    .socket()
+                    .map_err(|error| WorkspaceError::Other(error.to_string()))?;
+                // PrivateTmp/ProtectHome hide both locations unless explicitly
+                // mounted. Only this policy's socket crosses the network boundary.
+                for path in [&helper, &socket] {
+                    cmd.arg("-p")
+                        .arg(format!("BindReadOnlyPaths={}", path.display()));
+                }
                 let env = sandbox_environment(original, jobs);
-                append_sandbox_command(&mut cmd, &env, &program, &orig_args);
+                let mut forwarded = vec![
+                    OsString::from(crate::network::FORWARDER_ARGUMENT),
+                    socket.into_os_string(),
+                    program.clone(),
+                ];
+                forwarded.extend(orig_args.iter().cloned());
+                append_sandbox_command(&mut cmd, &env, helper.as_os_str(), &forwarded);
             }
             None => {
                 cmd.arg("--");
@@ -1114,6 +1135,7 @@ fn append_sandbox_command(
 /// the private `/tmp`, where `ReadWritePaths` fails with status 226. Grants that
 /// do not exist on the host are skipped. The workspace is always writable.
 fn emit_sandbox_properties(cmd: &mut std::process::Command, sandbox: &Sandbox, workspace: &Path) {
+    cmd.arg("-p").arg("PrivateNetwork=yes");
     if sandbox.protect_system {
         cmd.arg("-p").arg("ProtectSystem=strict");
     }

@@ -80,10 +80,16 @@ fn workspace_at(path: &Path) -> SubagentWorkspace {
 }
 
 /// `$HOME`, where live tests place their files. `None` skips the test: it needs
-/// `systemd-run` to sandbox anything, and a home directory to place files in.
+/// `systemd-run` to sandbox anything, the network proxy helper (`juto-cli`, or
+/// `JUTO_PROXY_HELPER`) that every sandboxed command runs under, and a home
+/// directory to place files in.
 fn live_home(test: &str) -> Option<PathBuf> {
     if !is_systemd_run_available() {
         eprintln!("skipping {test}: systemd-run unavailable");
+        return None;
+    }
+    if let Err(err) = juto_runtime::network::helper() {
+        eprintln!("skipping {test}: {err}");
         return None;
     }
     let home = std::env::var_os("HOME")

@@ -3469,6 +3469,10 @@ mod tests {
             eprintln!("skipping sandboxed-bash test: systemd-run unavailable");
             return;
         }
+        if let Err(err) = crate::network::helper() {
+            eprintln!("skipping sandboxed-bash test: {err}");
+            return;
+        }
         let Some(home) = std::env::var_os("HOME")
             .filter(|home| !home.is_empty())
             .map(PathBuf::from)

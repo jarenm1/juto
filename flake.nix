@@ -127,11 +127,14 @@
             commonArgs
             // {
               inherit cargoArtifacts;
-              cargoExtraArgs = "-p juto --bin juto";
+              # juto-cli ships beside juto: sandboxed commands run under its
+              # network proxy forwarder, found as a sibling of the executable.
+              cargoExtraArgs = "-p juto --bin juto -p juto-cli --bin juto-cli";
               doInstallCargoArtifacts = false;
               installPhaseCommand = ''
                 mkdir -p $out/bin
                 cp target/release/juto $out/bin/juto
+                cp target/release/juto-cli $out/bin/juto-cli
               '';
               postFixup = ''
                 wrapProgram $out/bin/juto \
