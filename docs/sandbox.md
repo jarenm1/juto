@@ -80,6 +80,21 @@ sandboxed tier cannot run unsandboxed.
 - From inside the sandbox, `~/.ssh`, `~/.config/gh`, and juto's data directory are not
   visible, `SSH_AUTH_SOCK` is unset, and `/run/user` is empty.
 
+## File tools
+
+`read`, `glob`, and `grep` run in-process. When a run has a sandbox, each path is
+canonicalized (symlinks followed) and must fall under the run's workspace root or a
+granted root (`read_paths` or `write_paths`). Anything else is refused with
+`file access denied: outside workspace and granted roots`. Credential paths are refused
+with `file access denied: credential path`, even when a grant contains them.
+
+Runs without a sandbox (`attended`) keep the existing behavior: these tools read any
+path the process can read.
+
+`write` and `edit` always require the target to lie inside the workspace root. Before
+touching the file they refuse symlinked components, `.git`/`.jj`/native metadata paths,
+and paths outside a partial fork's sparse spec (`vcs::mutate`).
+
 ## Limits
 
 This is containment against accidents and careless commands, not a guarantee against
@@ -87,9 +102,6 @@ hostile code.
 
 - **Network is not restricted yet.** Sandboxed commands can reach the network. A domain
   allowlist and a `PrivateNetwork` proxy are planned for the next change.
-- **File tools are not confined.** `read`, `write`, `edit`, `grep`, and `glob` run
-  in-process and resolve absolute paths. Confinement to the workspace is planned for the
-  next change.
 - **The nix daemon is reachable.** `/nix/var/nix/daemon-socket/socket` is available, so
   builds and substitutes run in the daemon, outside the sandbox.
 - **`untrusted` is not yet distinct from `workspace`.** It gets the same filesystem
