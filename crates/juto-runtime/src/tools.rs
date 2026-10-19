@@ -1055,8 +1055,9 @@ impl Drop for ProcessGroupGuard {
 
 struct BashTool {
     cwd: PathBuf,
-    /// When set, the command runs under the workspace's resource governance
-    /// (a systemd user scope with CPU/memory caps) instead of a bare spawn.
+    /// When set, the command runs under resource governance (a systemd service or
+    /// scope with CPU/memory caps). A sandboxed tier also confines its filesystem
+    /// and environment. A missing `systemd-run` fails the command.
     limits: Option<ResourceLimits>,
 }
 
@@ -1121,20 +1122,24 @@ impl Tool for BashTool {
             .kill_on_drop(true);
         #[cfg(unix)]
         command.process_group(0);
-        // Under governance the command runs inside a systemd user scope, so the
-        // caps apply to the whole tree. `enforce_scope` is the caller's choice:
-        // with it off, a host without `systemd-run` degrades to a bare spawn
-        // rather than failing the tool.
-        // The governed path goes through `spawn_scoped`, whose guard stops the
-        // transient unit on drop: a sandboxed command runs as a service that
-        // outlives its client, so killing the child alone would leave it running.
+        // Governed commands run under `spawn_scoped`, so the caps apply to the whole
+        // process tree. Its guard stops the transient unit on drop: a sandboxed
+        // command outlives its client, so killing the child alone would leave it
+        // running. A sandboxed command writes only under the run's workspace, so it
+        // is rooted there and its cwd must stay inside. An unsandboxed governed
+        // command is rooted at its own cwd, as before.
         let mut child = match &self.limits {
             Some(limits) => {
+                let root = if limits.sandbox.is_some() {
+                    base_cwd.to_path_buf()
+                } else {
+                    cwd.clone()
+                };
                 let workspace = SubagentWorkspace {
-                    path: cwd.clone(),
+                    path: root.clone(),
                     node_id: String::new(),
                     thread: String::new(),
-                    repo_root: cwd.clone(),
+                    repo_root: root,
                     subagent_id: String::new(),
                 };
                 workspace
@@ -1189,9 +1194,16 @@ impl Tool for BashTool {
         };
 
         let exit_status = if timed_out || cancelled {
+            // Kill the `systemd-run` client first: the unit exists only once systemd
+            // has taken the client's start request, so stopping the unit before that
+            // would find nothing and leave the service running.
             if let Some(pid) = pid {
                 kill_process_group(pid);
             }
+            child
+                .kill_unit()
+                .await
+                .map_err(|e| format!("failed to terminate sandbox unit: {e}"))?;
             guard.disarm();
             // Reap the leader; the group has been signalled.
             child.wait().await.map_err(|e| e.to_string())?
@@ -2291,8 +2303,8 @@ pub fn builtin_tools(cwd: &Path) -> Result<ToolRegistry, AgentError> {
 /// Build the builtin tool registry, running `bash` under `limits` when set.
 ///
 /// Governance wraps the command in a systemd user scope so the CPU and memory
-/// caps apply to the whole process tree. Whether a missing `systemd-run` is a
-/// hard failure or a fallback to a bare spawn is `ResourceLimits::enforce_scope`.
+/// caps apply to the whole process tree. A missing `systemd-run` fails the
+/// command; there is no bare-spawn fallback.
 pub fn builtin_tools_with_limits(
     cwd: &Path,
     limits: Option<ResourceLimits>,
@@ -3160,7 +3172,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tool = BashTool {
             cwd: dir.path().to_path_buf(),
-            limits: Some(ResourceLimits::default().with_enforce_scope(false)),
+            limits: Some(ResourceLimits::default()),
         };
         // A scoped command runs in its own cgroup, so its cgroup path names a
         // scope rather than the test process's.

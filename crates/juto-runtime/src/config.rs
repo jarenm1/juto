@@ -16,6 +16,8 @@ use std::{
 use juto_catalog::Model;
 use serde::{Deserialize, Serialize};
 
+use crate::tier::ExecutionTier;
+
 const DEFAULT_MODEL: &str = "";
 const VALID_EFFORTS: &[&str] = &[
     "off", "minimal", "low", "medium", "high", "xhigh", "max", "auto", "inherit",
@@ -124,9 +126,12 @@ pub struct RuntimeConfig {
     pub tools: Vec<String>,
     /// User-defined models merged over the bundled registry.
     pub custom_models: Vec<Model>,
-    /// Run the `bash` tool under the workspace's resource governance: a systemd
-    /// user scope with the CPU and memory caps from `AGENT_*`. Off by default,
-    /// because it changes how a command is supervised and needs `systemd-run`.
+    /// Tier of the top-level run: how confined its shell commands are. Children
+    /// get at most this tier. See `ExecutionTier`.
+    pub execution_tier: ExecutionTier,
+    /// Run attended `bash` commands under resource governance (a systemd scope
+    /// with CPU and memory caps). Sandboxed tiers are always governed. Off by
+    /// default because it needs `systemd-run` on the host.
     pub bash_scoped: bool,
     /// Internal threads of a main session the router may choose among. Past
     /// this many, the least recently routed thread goes dormant; dormant
@@ -152,6 +157,7 @@ impl Default for RuntimeConfig {
             keep_recent_messages: default_keep_recent(),
             tools: Vec::new(),
             custom_models: Vec::new(),
+            execution_tier: ExecutionTier::Attended,
             bash_scoped: false,
             max_active_threads: default_max_active_threads(),
         }
