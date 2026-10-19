@@ -101,6 +101,8 @@ fn meminfo_bytes(meminfo: &str, field: &str) -> io::Result<u64> {
 
 /// Memory of the user's cgroup subtree minus the agent slice, or `None` when
 /// the process is not under a `user-<uid>.slice` (for example on a non-systemd host).
+/// Both sides are measured as working set (see [`working_set`]), so page cache
+/// the kernel can reclaim never reserves memory for the session.
 fn session_memory_outside(agents_slice: &str) -> Option<u64> {
     let cgroup = fs::read_to_string("/proc/self/cgroup").ok()?;
     let relative = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
@@ -111,10 +113,9 @@ fn session_memory_outside(agents_slice: &str) -> Option<u64> {
             .strip_prefix("user-")
             .and_then(|rest| rest.strip_suffix(".slice"))
         {
-            let total = read_u64(&dir.join("memory.current"))?;
+            let total = working_set(&dir)?;
             let agents =
-                read_u64(&dir.join(format!("user@{uid}.service/{agents_slice}/memory.current")))
-                    .unwrap_or(0);
+                working_set(&dir.join(format!("user@{uid}.service/{agents_slice}"))).unwrap_or(0);
             return Some(total.saturating_sub(agents));
         }
         if !dir.pop() {
@@ -123,10 +124,30 @@ fn session_memory_outside(agents_slice: &str) -> Option<u64> {
     }
 }
 
-fn read_u64(path: &Path) -> Option<u64> {
-    fs::read_to_string(path).ok()?.trim().parse().ok()
+/// Working set of one cgroup: memory the kernel cannot drop without swapping or
+/// killing (anonymous memory, kernel stacks, page tables). Page cache (`file`)
+/// and shared memory are excluded because the kernel reclaims or re-reads them.
+fn working_set(dir: &Path) -> Option<u64> {
+    working_set_from_stat(&fs::read_to_string(dir.join("memory.stat")).ok()?)
 }
 
+/// Sum the working-set fields of a `memory.stat` file. `anon`, `kernel_stack`
+/// and `pagetables` are required; `sec_pagetables` is absent on older kernels
+/// and counts as zero.
+fn working_set_from_stat(stat: &str) -> Option<u64> {
+    let field = |name: &str| {
+        stat.lines().find_map(|line| {
+            let mut words = line.split_whitespace();
+            (words.next()? == name).then(|| words.next()?.parse::<u64>().ok())?
+        })
+    };
+    Some(
+        field("anon")?
+            + field("kernel_stack")?
+            + field("pagetables")?
+            + field("sec_pagetables").unwrap_or(0),
+    )
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +179,26 @@ mod tests {
         let text = "MemTotal:       2048 kB\nMemAvailable:   1024 kB\n";
         assert_eq!(meminfo_bytes(text, "MemTotal").unwrap(), 2048 * 1024);
         assert!(meminfo_bytes(text, "SwapTotal").is_err());
+    }
+
+    #[test]
+    fn session_reserve_ignores_page_cache() {
+        // Shaped like the host's user slice: 6.8 GB of page cache must not count.
+        let stat = "anon 20385832960\nfile 6847127552\nkernel_stack 37634048\npagetables 196128768\nshmem 515252224\n";
+        assert_eq!(
+            working_set_from_stat(stat),
+            Some(20385832960 + 37634048 + 196128768)
+        );
+    }
+
+    #[test]
+    fn working_set_counts_secondary_page_tables_and_needs_anon() {
+        let stat = "anon 100\nkernel_stack 10\npagetables 20\nsec_pagetables 5\n";
+        assert_eq!(working_set_from_stat(stat), Some(135));
+        assert_eq!(
+            working_set_from_stat("kernel_stack 10\npagetables 20\n"),
+            None
+        );
     }
 
     #[test]

@@ -93,7 +93,7 @@ memory peak, CPU time, and wall time. Missing values print as `-`.
 | --- | --- |
 | `mem_total_bytes` | `MemTotal` from `/proc/meminfo` |
 | `cores` | `available_parallelism()` |
-| `reserved_bytes` | memory of the user's session outside `agents.slice` (its cgroup `memory.current`, minus the slice's), plus one tenth of total memory as host headroom. Without a `user-<uid>.slice`, this is `MemTotal - MemAvailable` |
+| `reserved_bytes` | working set of the user's session outside `agents.slice`: anonymous memory, kernel stacks and page tables from each cgroup's `memory.stat`, with the slice's working set subtracted. Page cache is excluded because the kernel reclaims it, so cached files never reserve memory. Plus one tenth of total memory as host headroom. Without a `user-<uid>.slice`, this is `MemTotal - MemAvailable` |
 | `budget_bytes` | `mem_total_bytes - reserved_bytes`; measurement fails when this is not positive |
 | `slice_memory_high_bytes` | `budget_bytes` × 9/10 |
 | `tasks_max` | `cores` × 128 |
