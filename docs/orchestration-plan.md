@@ -356,6 +356,11 @@ an `agent_send` to a completed child) push a notice on every terminal publicatio
 turn the user types in a focus thread pushes none; its result reaches the user through
 the focus view.
 
+Run ownership: the registry, concurrency limit, and inbox are shared by the process, but
+`Runtime::subagent_manager(&control)` returns a handle that owns only the children it spawns, scoped
+to that run's control. Cancelling the run cancels its children; ending the run cancels the children
+it still has open (`ChildCancellation`). Other runs' children are left alone.
+
 PR5 adds focus chat mode. Clicking a focus card opens the thread's view: its
 transcript, a follow-up composer, the VCS panel rooted at its workspace, and a
 `← Main` button that returns to the main transcript and sidebar. The transcript

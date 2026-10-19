@@ -487,7 +487,6 @@ impl Child {
 struct Inner {
     factory: Arc<dyn SubagentFactory>,
     semaphore: Arc<Semaphore>,
-    parent_cancel: CancellationToken,
     main_inbox: MainInbox,
     events: broadcast::Sender<SubagentEvent>,
     children: Mutex<HashMap<String, Arc<Child>>>,
@@ -499,24 +498,26 @@ struct Inner {
 /// child task so permits are held only by running children.
 pub struct SubagentManager {
     inner: Arc<Inner>,
+    /// Owns the children this handle spawns: cancelling it stops them.
+    owner: CancellationToken,
 }
 
 impl SubagentManager {
     pub fn new(
         factory: Arc<dyn SubagentFactory>,
         max_concurrency: usize,
-        parent_cancel: CancellationToken,
+        owner: CancellationToken,
         main_inbox: MainInbox,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 factory,
                 semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
-                parent_cancel,
                 main_inbox,
                 children: Mutex::new(HashMap::new()),
                 events: broadcast::channel(EVENT_CAPACITY).0,
             }),
+            owner,
         }
     }
 
@@ -524,6 +525,21 @@ impl SubagentManager {
     /// managers so the whole run tree reports to one main thread.
     pub fn main_inbox(&self) -> MainInbox {
         self.inner.main_inbox.clone()
+    }
+
+    /// Token that owns the children this handle spawns; cancelling it stops
+    /// them. The registry, semaphore, and inbox are shared by every handle.
+    pub(crate) fn owner(&self) -> CancellationToken {
+        self.owner.clone()
+    }
+
+    /// A handle over the same registry, semaphore, and inbox whose children
+    /// are owned by `owner`.
+    pub(crate) fn scoped(&self, owner: CancellationToken) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            owner,
+        }
     }
 
     /// Subscribe to lifecycle events for every child this manager owns. A
@@ -592,7 +608,14 @@ impl SubagentManager {
 
         let inner = Arc::clone(&self.inner);
         let task_id = id.clone();
-        tokio::spawn(run_child(inner, child, task_id, control, validator));
+        tokio::spawn(run_child(
+            inner,
+            child,
+            task_id,
+            control,
+            self.owner.clone(),
+            validator,
+        ));
         Ok(id)
     }
 
@@ -735,12 +758,10 @@ impl SubagentManager {
 
         child.set_status(SubagentStatus::Running);
 
-        let inner = Arc::clone(&self.inner);
-        let task_id = id.to_string();
         tokio::spawn(run_follow_up(
-            inner,
+            Arc::clone(&self.inner),
             child,
-            task_id,
+            self.owner.clone(),
             session_path,
             prompt,
             control,
@@ -861,21 +882,6 @@ impl SubagentManager {
         }
     }
 
-    /// Cancel every child that has not reached a terminal state.
-    pub fn cancel_all(&self) {
-        for child in self
-            .inner
-            .children
-            .lock()
-            .expect("subagent registry poisoned")
-            .values()
-        {
-            if !child.state.borrow().status.is_terminal() {
-                child.control.lock().expect("mutex poisoned").cancel();
-            }
-        }
-    }
-
     /// Status of one child, `None` for unknown ids.
     pub fn status(&self, id: &str) -> Option<SubagentStatus> {
         self.child(id)
@@ -955,16 +961,16 @@ impl SubagentManager {
             .take()
             .ok_or_else(|| SubagentError::NotBlocked(id.to_string()))?;
         let token = child.control.lock().expect("mutex poisoned").token();
-        let parent_token = self.inner.parent_cancel.clone();
+        let owner = self.owner.clone();
 
         tokio::select! {
             biased;
             _ = token.cancelled() => Err(SubagentError::Cancelled),
-            _ = parent_token.cancelled() => Err(SubagentError::Cancelled),
+            _ = owner.cancelled() => Err(SubagentError::Cancelled),
             res = rx => match res {
                 Ok(resolution) => Ok(resolution),
                 Err(_) => {
-                    if token.is_cancelled() || parent_token.is_cancelled() {
+                    if token.is_cancelled() || owner.is_cancelled() {
                         Err(SubagentError::Cancelled)
                     } else {
                         Err(SubagentError::Failed("resolution channel dropped".into()))
@@ -1136,6 +1142,7 @@ async fn acquire_permit(
     inner: &Inner,
     child: &Child,
     control: &RunControl,
+    owner: &CancellationToken,
     origin: TurnOrigin,
 ) -> Option<tokio::sync::OwnedSemaphorePermit> {
     let cancel = control.token();
@@ -1145,7 +1152,7 @@ async fn acquire_permit(
             finish(inner, child, SubagentStatus::Cancelled, Err("cancelled while queued".into()), origin);
             return None;
         }
-        _ = inner.parent_cancel.cancelled() => {
+        _ = owner.cancelled() => {
             finish(inner, child, SubagentStatus::Cancelled, Err("cancelled with parent while queued".into()), origin);
             return None;
         }
@@ -1167,9 +1174,11 @@ async fn run_child(
     child: Arc<Child>,
     id: String,
     control: RunControl,
+    owner: CancellationToken,
     validator: Option<jsonschema::Validator>,
 ) {
-    let Some(_permit) = acquire_permit(&inner, &child, &control, TurnOrigin::Main).await else {
+    let Some(_permit) = acquire_permit(&inner, &child, &control, &owner, TurnOrigin::Main).await
+    else {
         return;
     };
 
@@ -1186,6 +1195,7 @@ async fn run_child(
         &inner,
         &child,
         &control,
+        &owner,
         validator,
         TurnOrigin::Main,
         move |events| async move { factory.run(&task_id, spec, task_control, events).await },
@@ -1200,13 +1210,13 @@ async fn run_child(
 async fn run_follow_up(
     inner: Arc<Inner>,
     child: Arc<Child>,
-    id: String,
+    owner: CancellationToken,
     session_path: Option<PathBuf>,
     prompt: String,
     control: RunControl,
     origin: TurnOrigin,
 ) {
-    let Some(_permit) = acquire_permit(&inner, &child, &control, origin).await else {
+    let Some(_permit) = acquire_permit(&inner, &child, &control, &owner, origin).await else {
         return;
     };
 
@@ -1215,6 +1225,7 @@ async fn run_follow_up(
         .output_schema
         .as_ref()
         .and_then(|schema| jsonschema::validator_for(schema).ok());
+    let id = child.id.clone();
     let factory = inner.factory.clone();
     let spec = child.spec.clone();
     let task_control = control.clone();
@@ -1222,6 +1233,7 @@ async fn run_follow_up(
         &inner,
         &child,
         &control,
+        &owner,
         validator,
         origin,
         move |events| async move {
@@ -1245,6 +1257,7 @@ async fn run_turn<F, Fut>(
     inner: &Inner,
     child: &Child,
     control: &RunControl,
+    owner: &CancellationToken,
     validator: Option<jsonschema::Validator>,
     origin: TurnOrigin,
     turn: F,
@@ -1256,12 +1269,12 @@ async fn run_turn<F, Fut>(
     // turn, then release the propagation task when the turn finishes.
     let propagation_done = CancellationToken::new();
     tokio::spawn({
-        let parent = inner.parent_cancel.clone();
+        let owner = owner.clone();
         let control = control.clone();
         let done = propagation_done.clone();
         async move {
             tokio::select! {
-                _ = parent.cancelled() => control.cancel(),
+                _ = owner.cancelled() => control.cancel(),
                 _ = done.cancelled() => {}
             }
         }
@@ -1307,7 +1320,7 @@ async fn run_turn<F, Fut>(
         (Some(_), SchemaMode::Strict, Err(err)) => Err(err),
     };
 
-    let cancelled = control.token().is_cancelled() || inner.parent_cancel.is_cancelled();
+    let cancelled = control.token().is_cancelled() || owner.is_cancelled();
     let status = match &outcome {
         Ok(result) if result.stop_reason == StopReason::Aborted || cancelled => {
             SubagentStatus::Cancelled
@@ -1516,9 +1529,9 @@ mod tests {
     fn manager(
         factory: Arc<dyn SubagentFactory>,
         max_concurrency: usize,
-        parent: CancellationToken,
+        owner: CancellationToken,
     ) -> SubagentManager {
-        SubagentManager::new(factory, max_concurrency, parent, MainInbox::default())
+        SubagentManager::new(factory, max_concurrency, owner, MainInbox::default())
     }
 
     /// Poll until `running` reaches `n`. Sleeps between checks so blocking
@@ -1936,10 +1949,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parent_cancel_cancels_queued_and_running() {
+    async fn owner_cancel_cancels_queued_and_running() {
         let (_gate, gate_rx) = gate();
         let running = Arc::new(AtomicUsize::new(0));
-        let parent = CancellationToken::new();
+        let owner = CancellationToken::new();
         let manager = manager(
             gate_factory(
                 gate_rx,
@@ -1949,12 +1962,12 @@ mod tests {
                 None,
             ),
             1,
-            parent.clone(),
+            owner.clone(),
         );
         let first = manager.spawn(spec("running")).unwrap();
         let second = manager.spawn(spec("queued")).unwrap();
         until_running(&running, 1).await;
-        parent.cancel();
+        owner.cancel();
         assert!(matches!(
             timeout(WAIT_TIMEOUT, manager.wait(&first))
                 .await
@@ -1970,9 +1983,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_all_marks_every_open_child() {
+    async fn owner_cancel_marks_every_open_child() {
         let (_gate, gate_rx) = gate();
         let running = Arc::new(AtomicUsize::new(0));
+        let owner = CancellationToken::new();
         let manager = manager(
             gate_factory(
                 gate_rx,
@@ -1982,13 +1996,13 @@ mod tests {
                 None,
             ),
             1,
-            CancellationToken::new(),
+            owner.clone(),
         );
         let ids: Vec<String> = (0..3)
             .map(|n| manager.spawn(spec(&format!("c{n}"))).unwrap())
             .collect();
         until_running(&running, 1).await;
-        manager.cancel_all();
+        owner.cancel();
         for id in ids {
             assert!(matches!(
                 manager.wait(&id).await,

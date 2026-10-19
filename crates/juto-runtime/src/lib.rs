@@ -410,24 +410,28 @@ impl Runtime {
         handle
     }
 
+    /// Subagent handle for the run `control` drives. The registry, semaphore,
+    /// and inbox are shared process-wide, but each handle owns only the
+    /// children it spawns: cancelling this run stops them, while ending another
+    /// run leaves its children alone.
     pub fn subagent_manager(&self, control: &RunControl) -> Arc<SubagentManager> {
         let mut guard = self.inner.subagent_manager.lock();
-        if let Some(mgr) = &*guard {
-            return mgr.clone();
-        }
-        let inbox = subagents::MainInbox::default();
-        let mgr = Arc::new(SubagentManager::new(
-            Arc::new(ChildFactory {
-                runtime: self.clone(),
-                depth: 1,
-                inbox: inbox.clone(),
-            }),
-            self.config().max_concurrency,
-            control.token(),
-            inbox,
-        ));
-        *guard = Some(mgr.clone());
-        mgr
+        let template = guard.get_or_insert_with(|| {
+            let inbox = subagents::MainInbox::default();
+            // The template's owner is never cancelled: every handle handed out
+            // below is scoped to a run's own token.
+            Arc::new(SubagentManager::new(
+                Arc::new(ChildFactory {
+                    runtime: self.clone(),
+                    depth: 1,
+                    inbox: inbox.clone(),
+                }),
+                self.config().max_concurrency,
+                CancellationToken::new(),
+                inbox,
+            ))
+        });
+        Arc::new(template.scoped(control.token().child_token()))
     }
 
     pub async fn run(
@@ -500,7 +504,7 @@ impl Runtime {
                 compaction_usage = self.compact(session, &control).await?;
             }
         }
-        let _children = ChildCancellation(manager.clone());
+        let _children = ChildCancellation(manager.owner());
         // Governance is opt-in and degrades to a bare spawn when `systemd-run`
         // is unavailable, so enabling it can never fail the tool outright.
         let limits = self
@@ -753,10 +757,12 @@ impl AgentHooks for RuntimeHooks {
     }
 }
 
-struct ChildCancellation(Arc<SubagentManager>);
+/// Cancels the subagents a run started when the run ends. Only this run's
+/// owner token is cancelled, so children of other runs keep running.
+struct ChildCancellation(CancellationToken);
 impl Drop for ChildCancellation {
     fn drop(&mut self) {
-        self.0.cancel_all();
+        self.0.cancel();
     }
 }
 
@@ -789,6 +795,7 @@ impl ChildFactory {
     /// Manager for the children a run at this factory's depth spawns. Every
     /// nested manager shares the run tree's main inbox, so child messages and
     /// completion notices all land in one depth-0 queue.
+    /// Children it spawns belong to `control`'s run, so ending that run stops them.
     fn nested_manager(&self, runtime: &Runtime, control: &RunControl) -> Arc<SubagentManager> {
         Arc::new(SubagentManager::new(
             Arc::new(ChildFactory {
@@ -797,7 +804,7 @@ impl ChildFactory {
                 inbox: self.inbox.clone(),
             }),
             runtime.config().max_concurrency,
-            control.token(),
+            control.token().child_token(),
             self.inbox.clone(),
         ))
     }
@@ -1477,6 +1484,8 @@ mod tests {
     use juto_catalog::ModelCost;
     use std::collections::BTreeSet;
     use tempfile::tempdir;
+    use tokio::sync::watch;
+    use tokio::time::{Duration, timeout};
     use tokio_util::sync::CancellationToken;
 
     /// Streams one text response and stops, so an isolated child run completes
@@ -2395,5 +2404,237 @@ mod tests {
             panic!("inbox drain returns text");
         };
         assert_eq!(text.as_str(), "[]");
+    }
+
+    /// Delegates through the real `task` tool and scripts every reply, so
+    /// concurrent runs can be driven independently. A run is recognized by its
+    /// first user message: `delegate` spawns one child and then holds its final
+    /// reply on `parent_gate`; the child's task text (`child work`) holds its
+    /// reply on `child_gate`; anything else answers at once.
+    struct DelegatingProvider {
+        child_gate: watch::Receiver<bool>,
+        parent_gate: watch::Receiver<bool>,
+    }
+
+    impl DelegatingProvider {
+        /// Waits for the gate to open. `false` when the run was cancelled first.
+        async fn hold(mut gate: watch::Receiver<bool>, cancel: &CancellationToken) -> bool {
+            tokio::select! {
+                _ = cancel.cancelled() => false,
+                _ = gate.wait_for(|open| *open) => true,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for DelegatingProvider {
+        async fn stream(
+            &self,
+            _model: &Model,
+            context: &Context,
+            _options: &StreamOptions,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let prompt = context
+                .messages
+                .iter()
+                .find_map(|message| match message {
+                    Message::User { content, .. } => content.iter().find_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let answered_by_tool = context
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::ToolResult { .. }));
+            let stopped = || ProviderError::Transport("run stopped while waiting".into());
+            let message = match prompt {
+                "child work" => {
+                    if !Self::hold(self.child_gate.clone(), &cancel).await {
+                        return Err(stopped());
+                    }
+                    assistant_turn(
+                        vec![ContentBlock::Text {
+                            text: "child done".into(),
+                        }],
+                        StopReason::Stop,
+                    )
+                }
+                "delegate" if !answered_by_tool => assistant_turn(
+                    vec![ContentBlock::ToolCall(juto_ai::ToolCall {
+                        id: "task-1".into(),
+                        name: "task".into(),
+                        arguments: json!({"tasks": [{"task": "child work"}]}),
+                        thought_signature: None,
+                    })],
+                    StopReason::ToolUse,
+                ),
+                "delegate" => {
+                    if !Self::hold(self.parent_gate.clone(), &cancel).await {
+                        return Err(stopped());
+                    }
+                    assistant_turn(
+                        vec![ContentBlock::Text {
+                            text: "parent done".into(),
+                        }],
+                        StopReason::Stop,
+                    )
+                }
+                _ => assistant_turn(
+                    vec![ContentBlock::Text {
+                        text: "quick done".into(),
+                    }],
+                    StopReason::Stop,
+                ),
+            };
+            let events: Vec<Result<ProviderEvent, ProviderError>> = vec![
+                Ok(ProviderEvent::Start),
+                Ok(ProviderEvent::Done { message }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    fn delegating_runtime(
+        root: &Path,
+        child_gate: watch::Receiver<bool>,
+        parent_gate: watch::Receiver<bool>,
+    ) -> Runtime {
+        let repo = root.join("repo");
+        native_repo(&repo);
+        runtime_with(
+            &repo,
+            &root.join("data"),
+            mock_config(),
+            Arc::new(DelegatingProvider {
+                child_gate,
+                parent_gate,
+            }),
+        )
+    }
+
+    /// Starts a run on a fresh session in its own task. The task keeps the
+    /// event receiver alive for the whole run so sends never fail.
+    fn spawn_run(
+        runtime: &Runtime,
+        prompt: &'static str,
+        control: RunControl,
+    ) -> tokio::task::JoinHandle<Result<RunOutcome>> {
+        let mut session = runtime.new_session().expect("session");
+        let runtime = runtime.clone();
+        let (events, events_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let _events_rx = events_rx;
+            runtime.run(&mut session, prompt, events, control).await
+        })
+    }
+
+    /// Id of the first child the shared registry reports, as the UI sees it.
+    async fn first_child(probe: &SubagentManager) -> String {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(summary) = probe.list().first() {
+                    return summary.id.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("delegated child appears in the registry")
+    }
+
+    /// A run stopped before it starts must not leave later runs' subagents
+    /// cancelled: each run's children belong to that run, not to whichever
+    /// run first created the process's subagent registry.
+    #[tokio::test]
+    async fn run_started_after_a_stopped_run_keeps_its_subagents() {
+        let root = tempdir().expect("tempdir");
+        let (_child_open, child_gate) = watch::channel(true);
+        let (parent_open, parent_gate) = watch::channel(false);
+        let runtime = delegating_runtime(root.path(), child_gate, parent_gate);
+
+        let stopped = RunControl::new();
+        stopped.cancel();
+        let mut session = runtime.new_session().expect("session");
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        runtime
+            .run(&mut session, "quick", events, stopped)
+            .await
+            .expect("stopped run returns");
+
+        let delegating = spawn_run(&runtime, "delegate", RunControl::new());
+        let probe = runtime.subagent_manager(&RunControl::new());
+        let child = first_child(&probe).await;
+        let result = timeout(Duration::from_secs(5), probe.wait(&child))
+            .await
+            .expect("child settles")
+            .expect("child completes after an earlier run was stopped");
+        assert_eq!(result.output, "child done");
+
+        parent_open.send(true).expect("parent is still waiting");
+        delegating
+            .await
+            .expect("delegating run joins")
+            .expect("delegating run");
+    }
+
+    /// Ending one run must not cancel the subagents another run is still
+    /// waiting on.
+    #[tokio::test]
+    async fn ending_one_run_leaves_another_runs_subagents_running() {
+        let root = tempdir().expect("tempdir");
+        let (child_open, child_gate) = watch::channel(false);
+        let (parent_open, parent_gate) = watch::channel(false);
+        let runtime = delegating_runtime(root.path(), child_gate, parent_gate);
+
+        let delegating = spawn_run(&runtime, "delegate", RunControl::new());
+        let probe = runtime.subagent_manager(&RunControl::new());
+        let child = first_child(&probe).await;
+
+        let mut session = runtime.new_session().expect("session");
+        let (events, _events_rx) = mpsc::unbounded_channel();
+        runtime
+            .run(&mut session, "quick", events, RunControl::new())
+            .await
+            .expect("quick run");
+
+        child_open.send(true).expect("child is still waiting");
+        let result = timeout(Duration::from_secs(5), probe.wait(&child))
+            .await
+            .expect("child settles")
+            .expect("child outlives the run that ended");
+        assert_eq!(result.output, "child done");
+
+        parent_open.send(true).expect("parent is still waiting");
+        delegating
+            .await
+            .expect("delegating run joins")
+            .expect("delegating run");
+    }
+
+    /// Stopping a run still cancels the subagents it started.
+    #[tokio::test]
+    async fn stopping_a_run_cancels_the_subagents_it_started() {
+        let root = tempdir().expect("tempdir");
+        let (_child_open, child_gate) = watch::channel(false);
+        let (_parent_open, parent_gate) = watch::channel(false);
+        let runtime = delegating_runtime(root.path(), child_gate, parent_gate);
+
+        let stop = RunControl::new();
+        let delegating = spawn_run(&runtime, "delegate", stop.clone());
+        let probe = runtime.subagent_manager(&RunControl::new());
+        let child = first_child(&probe).await;
+
+        stop.cancel();
+        let err = timeout(Duration::from_secs(5), probe.wait(&child))
+            .await
+            .expect("child settles")
+            .expect_err("stopped run's child is cancelled");
+        assert!(matches!(err, subagents::SubagentError::Cancelled));
+        // How the stopped run itself ends is not under test.
+        let _ = delegating.await.expect("delegating run joins");
     }
 }
