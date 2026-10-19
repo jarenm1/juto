@@ -12,7 +12,8 @@ use juto_desktop::WindowInfo;
 use juto_desktop::protocol::*;
 use juto_desktop::shm::{FrameWait, ShmFramePool, ShmReader};
 use juto_desktop::supervisor::{
-    DesktopSupervisor, EnvironmentConfig, HostPolicy, OutputConfig, RenderProfile, SystemLimits,
+    DesktopSupervisor, EnvironmentConfig, HostPolicy, IdlePolicy, OutputConfig, RenderProfile,
+    SystemLimits,
 };
 
 /// The worker binary is the daemon; point the supervisor at it.
@@ -38,6 +39,7 @@ fn test_config(env_id: &str) -> EnvironmentConfig {
         lease_ttl_secs: 6,
         compositor_mode: juto_desktop::CompositorMode::Worker,
         owner_heartbeat_timeout_secs: 60,
+        idle: juto_desktop::IdlePolicy::default(),
     }
 }
 
@@ -1846,6 +1848,135 @@ fn heartbeat_renews_and_retention_keeps_an_environment_alive() {
         .unwrap()
         .as_secs();
     assert!(bounded.expires_at <= now + 1801, "{}", bounded.expires_at);
+
+    env.destroy();
+}
+
+/// Polls `condition` every 100ms until it holds or `secs` elapse.
+fn wait_until(secs: u64, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    condition()
+}
+
+#[test]
+fn an_idle_environment_is_suspended_and_resumes_on_activity() {
+    let supervisor = DesktopSupervisor::new();
+    let mut config = test_config(&unique_env_id("idle"));
+    config.idle = IdlePolicy {
+        suspend_after_secs: 2,
+        destroy_after_secs: 0,
+    };
+    let env = supervisor
+        .create_environment(config, &unique_env_id("req"))
+        .expect("create environment");
+    let slice = env.slice().expect("environment slice").to_string();
+    let mut events = env.subscribe();
+
+    // An open viewer keeps the environment awake past the idle threshold.
+    let hold = env.hold_awake().expect("hold awake");
+    std::thread::sleep(Duration::from_millis(3500));
+    assert!(
+        !env.get_status().suspended,
+        "a held environment was suspended"
+    );
+
+    // Once nobody is present, the slice is frozen.
+    drop(hold);
+    assert!(
+        wait_until(10, || env.get_status().suspended),
+        "an idle environment was not suspended"
+    );
+    let state = systemctl_show(&slice, &["FreezerState"]);
+    assert!(state.contains("FreezerState=frozen"), "{state}");
+
+    // Observation resumes it, and the compositor worker answers again.
+    let info = env
+        .observe(Duration::from_secs(5))
+        .expect("observe resumes the environment");
+    assert_eq!(info.width, 640);
+    assert!(!env.get_status().suspended);
+    let state = systemctl_show(&slice, &["FreezerState"]);
+    assert!(state.contains("FreezerState=running"), "{state}");
+
+    let mut seen = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        match event {
+            DesktopEvent::Suspended { .. } => seen.push("suspended"),
+            DesktopEvent::Resumed { .. } => seen.push("resumed"),
+            _ => {}
+        }
+    }
+    assert_eq!(seen, ["suspended", "resumed"]);
+
+    env.destroy();
+}
+
+#[test]
+fn a_suspended_environment_is_reclaimed_after_the_idle_limit() {
+    let supervisor = DesktopSupervisor::new();
+    let mut config = test_config(&unique_env_id("reclaim"));
+    config.idle = IdlePolicy {
+        suspend_after_secs: 1,
+        destroy_after_secs: 4,
+    };
+    let env = supervisor
+        .create_environment(config, &unique_env_id("req"))
+        .expect("create environment");
+    let slice = env.slice().expect("environment slice").to_string();
+    let runtime_dir = env.runtime_dir().to_path_buf();
+
+    assert!(
+        wait_until(10, || env.get_status().suspended),
+        "the environment was not suspended first"
+    );
+    // Destruction must thaw the frozen slice; systemd refuses to stop it otherwise.
+    assert!(
+        wait_until(15, || env.is_destroyed() && !unit_is_active(&slice)),
+        "the idle environment was not reclaimed"
+    );
+    assert!(
+        wait_until(10, || !runtime_dir.exists()),
+        "runtime directory must be removed"
+    );
+}
+
+#[test]
+fn grant_renewal_keeps_the_id_and_never_revives_an_expired_grant() {
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("renew")), &unique_env_id("req"))
+        .expect("create environment");
+    let grant = env.issue_grant(
+        "human:test".to_string(),
+        vec![juto_desktop::protocol::GrantRole::View],
+        "viewer".to_string(),
+        60,
+    );
+    let renewed = env
+        .renew_grant(&grant.grant_id, 10 * 365 * 24 * 3600)
+        .expect("renew");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(renewed.grant_id, grant.grant_id);
+    assert!(renewed.expires_at > grant.expires_at);
+    assert!(renewed.expires_at <= now + juto_desktop::supervisor::MAX_GRANT_SECS + 1);
+
+    let expired = env.issue_grant(
+        "human:test".to_string(),
+        vec![juto_desktop::protocol::GrantRole::View],
+        "viewer".to_string(),
+        0,
+    );
+    assert!(env.renew_grant(&expired.grant_id, 60).is_err());
+    assert!(env.renew_grant("grant-unknown", 60).is_err());
 
     env.destroy();
 }

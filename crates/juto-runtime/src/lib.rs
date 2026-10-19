@@ -47,8 +47,8 @@ use juto_catalog::{Model, Registry};
 pub use juto_desktop::protocol;
 pub use juto_desktop::signaling::{SignalingServer, ViewerReport};
 pub use juto_desktop::supervisor::{
-    AppHandle, CompositorMode, EnvironmentConfig, EnvironmentStatus, OutputConfig, RenderProfile,
-    SystemLimits,
+    AppHandle, AwakeHold, CompositorMode, EnvironmentConfig, EnvironmentStatus, IdlePolicy,
+    OutputConfig, RenderProfile, SystemLimits,
 };
 pub use juto_desktop::{DesktopEnvironment, DesktopError, DesktopSupervisor};
 
@@ -84,7 +84,9 @@ use tokio_util::sync::CancellationToken;
 
 pub use approval::{ApprovalRequest, ChannelApprovalHandler};
 pub use config::{ApprovalMode, RuntimeConfig};
-pub use desktop_artifact::{DesktopArtifactResolver, ResolveError, ViewerRoute};
+pub use desktop_artifact::{
+    DesktopArtifactResolver, ResolveError, SESSION_VIEWER_PRINCIPAL, ViewerRoute,
+};
 pub use peers::{
     PeerAgentSnapshot, PeerBus, PeerError, PeerResource, PeerSendFailure, PeerSendReport,
 };
@@ -404,6 +406,7 @@ impl Runtime {
         let supervisor = Arc::new(DesktopSupervisor::new());
         // Kill orphan scopes and stale directories from a previous process.
         let _report = supervisor.reconcile();
+        desktop_artifact::spawn_session_grant_keepalive(Arc::downgrade(&supervisor));
         *guard = Some(supervisor.clone());
         supervisor
     }
