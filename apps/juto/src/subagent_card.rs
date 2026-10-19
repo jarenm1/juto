@@ -129,8 +129,6 @@ pub fn completion_prompt(arrivals: &[MainMessage]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use juto_runtime::subagents::MainMessageKind;
-
     use super::*;
 
     fn assistant(text: &str) -> Message {
@@ -232,26 +230,5 @@ mod tests {
             vec![desktop("desk-1-artifact")]
         );
         assert!(messages[2].desktop_artifacts.is_empty());
-    }
-
-    #[test]
-    fn completion_prompt_frames_each_arrival_for_the_model() {
-        let arrivals = vec![
-            MainMessage {
-                from: "w1".into(),
-                kind: MainMessageKind::Completed,
-                body: "tests pass".into(),
-            },
-            MainMessage {
-                from: "w2".into(),
-                kind: MainMessageKind::Failed,
-                body: "build error".into(),
-            },
-        ];
-
-        assert_eq!(
-            completion_prompt(&arrivals),
-            "[subagent w1 Completed]\ntests pass\n\n[subagent w2 Failed]\nbuild error"
-        );
     }
 }

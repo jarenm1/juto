@@ -869,6 +869,7 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         match &event {
+            SubagentEvent::MainInboxReady => {}
             SubagentEvent::Spawned {
                 id, name, status, ..
             } => {
@@ -897,7 +898,10 @@ impl ChatView {
             }
         }
         self.sync_subagents(cx);
-        if matches!(event, SubagentEvent::Finished { .. }) {
+        if matches!(
+            event,
+            SubagentEvent::Finished { .. } | SubagentEvent::MainInboxReady
+        ) {
             self.wake_if_idle(window, cx);
         }
         cx.notify();

@@ -14,11 +14,11 @@ use thiserror::Error;
 
 use crate::{
     session::{Session, SessionEntry, SessionError},
-    subagents::{
-        MainMessage, MainMessageKind, SubagentError, SubagentManager, SubagentResult,
-        SubagentStatus, SubagentSummary,
-    },
+    subagents::{SubagentError, SubagentManager, SubagentResult, SubagentStatus, SubagentSummary},
 };
+
+#[cfg(test)]
+use crate::subagents::MainMessage;
 
 /// Errors returned while resolving a peer URI or reading a transcript.
 #[derive(Debug, Error)]
@@ -116,16 +116,11 @@ impl PeerBus {
         let message = message.into();
         let ids = match target {
             PeerTarget::Main => {
-                self.subagents.main_inbox().push_from(
-                    self.subagents.origin().map(str::to_owned),
-                    MainMessage {
-                        from: self
-                            .sender
-                            .clone()
-                            .unwrap_or_else(|| UNKNOWN_SENDER.to_string()),
-                        kind: MainMessageKind::Message,
-                        body: message,
-                    },
+                self.subagents.report_to_main(
+                    self.sender
+                        .clone()
+                        .unwrap_or_else(|| UNKNOWN_SENDER.to_string()),
+                    message,
                 );
                 return Ok(PeerSendReport {
                     sent: vec![MAIN_RECIPIENT.to_string()],
@@ -255,6 +250,7 @@ fn parse_id(id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::subagents::MainMessageKind;
     use async_trait::async_trait;
     use juto_agent::{AgentEvent, RunControl};
     use juto_ai::{Message, StopReason, Usage};
@@ -513,6 +509,8 @@ mod tests {
             vec![MainMessage {
                 from: id.clone(),
                 kind: MainMessageKind::Message,
+                name: None,
+                digest_of: None,
                 body: "need a decision".into(),
             }]
         );
@@ -537,6 +535,8 @@ mod tests {
             vec![MainMessage {
                 from: UNKNOWN_SENDER.into(),
                 kind: MainMessageKind::Message,
+                name: None,
+                digest_of: None,
                 body: "queued".into(),
             }]
         );
