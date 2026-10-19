@@ -166,7 +166,7 @@ async fn agent_slice_limits_are_not_persisted_to_user_config() {
     let workspace = workspace_at(dir.path());
     let limits = ResourceLimits {
         slice: Some(slice.clone()),
-        ..Default::default()
+        ..ResourceLimits::default()
     };
     let mut command = Command::new("sh");
     command.args(["-c", "exit 0"]);

@@ -15,6 +15,7 @@ clap = { workspace = true }
 flate2 = { workspace = true }
 glib = { workspace = true }
 gstreamer = { workspace = true }
+juto-capacity.workspace = true
 gstreamer-app = { workspace = true }
 gstreamer-sdp = { workspace = true }
 gstreamer-video = { workspace = true }

@@ -1,4 +1,5 @@
-//! `juto-cli resources`: measured resource use per command class, and `run`,
+//! `juto-cli resources`: the measured machine capacity, the limits a command
+//! would receive (`grant`), measured resource use per command class, and `run`,
 //! which executes a command under the agent resource governance so that its
 //! usage is recorded.
 
@@ -7,7 +8,7 @@ use std::{ffi::OsString, io::Write as _, path::Path, process::ExitStatus};
 use anyhow::{Context as _, Result};
 use clap::Subcommand;
 use juto_runtime::{
-    ResourceLimits, ScopedStdio, SubagentWorkspace,
+    ResolvedLimits, ResourceLimits, ScopedStdio, SubagentWorkspace,
     resources::{ClassSummary, UsageRecord, UsageStore, summarize},
 };
 use tokio::process::Command;
@@ -18,6 +19,39 @@ pub enum ResourcesCommand {
     ///
     /// Everything after `run` is passed through unchanged, including flags.
     Run {
+        #[arg(
+            required = true,
+            num_args = 1..,
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        argv: Vec<OsString>,
+    },
+    /// Show the machine capacity every agent budget is derived from.
+    Capacity,
+    /// Show the limits a command would receive, without running it.
+    ///
+    /// `--shell` prints assignments for `eval`, which `scripts/agent-scope.sh`
+    /// uses to build its `systemd-run` scope.
+    Grant {
+        /// Emit shell assignments instead of a table.
+        #[arg(long, conflicts_with = "json")]
+        shell: bool,
+        /// Override the scope's `CPUQuota` (default: none, or `AGENT_CPU_QUOTA`).
+        #[arg(long)]
+        cpu_quota: Option<String>,
+        /// Override the scope's `MemoryMax` (default: derived, or `AGENT_MEMORY_MAX`).
+        #[arg(long)]
+        memory_max: Option<String>,
+        /// Join this slice instead of the default.
+        #[arg(long, conflicts_with = "no_slice")]
+        slice: Option<String>,
+        /// Run without joining any shared slice.
+        #[arg(long)]
+        no_slice: bool,
+        /// Apply the slice's transient limits (`systemctl set-property --runtime`).
+        #[arg(long)]
+        apply_slice: bool,
         #[arg(
             required = true,
             num_args = 1..,
@@ -46,6 +80,28 @@ pub async fn run(
             list(&store, repo, json)?;
             Ok(0)
         }
+        Some(ResourcesCommand::Capacity) => {
+            print_capacity(&limits_for(&store), json)?;
+            Ok(0)
+        }
+        Some(ResourcesCommand::Grant {
+            shell,
+            cpu_quota,
+            memory_max,
+            slice,
+            no_slice,
+            apply_slice,
+            argv,
+        }) => {
+            let overrides = GrantOverrides {
+                cpu_quota: cpu_quota.as_deref(),
+                memory_max: memory_max.as_deref(),
+                slice: slice.as_deref(),
+                no_slice: *no_slice,
+            };
+            grant(cwd, &store, &overrides, *apply_slice, *shell, json, argv)?;
+            Ok(0)
+        }
         Some(ResourcesCommand::Run { argv }) => run_command(cwd, &store, argv).await,
     }
 }
@@ -69,6 +125,119 @@ async fn run_command(cwd: &Path, store: &UsageStore, argv: &[OsString]) -> Resul
         .await?;
     let status = child.wait().await.context("waiting for the command")?;
     Ok(exit_code(status))
+}
+
+/// Limits as configured by the environment; shared by `capacity` and `grant`.
+fn limits_for(store: &UsageStore) -> ResourceLimits {
+    ResourceLimits::default().with_usage_store(store.clone())
+}
+
+struct GrantOverrides<'a> {
+    cpu_quota: Option<&'a str>,
+    memory_max: Option<&'a str>,
+    slice: Option<&'a str>,
+    no_slice: bool,
+}
+
+fn grant(
+    cwd: &Path,
+    store: &UsageStore,
+    overrides: &GrantOverrides<'_>,
+    apply_slice: bool,
+    shell: bool,
+    json: bool,
+    argv: &[OsString],
+) -> Result<()> {
+    let (program, args) = argv.split_first().context("no command given")?;
+    let mut limits = limits_for(store);
+    if let Some(quota) = overrides.cpu_quota {
+        limits = limits.with_cpu_quota(quota);
+    }
+    if let Some(max) = overrides.memory_max {
+        limits = limits.with_memory_max(max);
+    }
+    if overrides.no_slice {
+        limits.slice = None;
+    } else if let Some(slice) = overrides.slice {
+        limits.slice = Some(slice.to_string());
+    }
+    let repo = cwd.to_string_lossy();
+    let resolved = limits.resolve(program, args, &repo)?;
+    if apply_slice {
+        resolved.apply_slice()?;
+    }
+    let mut out = std::io::stdout().lock();
+    if shell {
+        write!(out, "{}", shell_assignments(&resolved))?;
+    } else if json {
+        serde_json::to_writer_pretty(&mut out, &resolved)?;
+        writeln!(out)?;
+    } else {
+        write!(out, "{}", grant_table(&resolved))?;
+    }
+    Ok(())
+}
+
+/// Shell assignments consumed by `scripts/agent-scope.sh`. Every value is
+/// single-quoted so no value can inject shell syntax.
+fn shell_assignments(resolved: &ResolvedLimits) -> String {
+    let quoted = |value: &str| format!("'{}'", value.replace('\'', "'\\''"));
+    let mut text = format!(
+        "GRANT_CARGO_JOBS={}\n",
+        quoted(&resolved.cargo_jobs.to_string())
+    );
+    text.push_str(&format!(
+        "GRANT_SLICE={}\n",
+        quoted(resolved.slice.as_deref().unwrap_or(""))
+    ));
+    let properties: Vec<String> = resolved
+        .scope_properties()
+        .iter()
+        .map(|property| quoted(property))
+        .collect();
+    text.push_str(&format!("GRANT_PROPERTIES=({})\n", properties.join(" ")));
+    text
+}
+
+fn grant_table(resolved: &ResolvedLimits) -> String {
+    let mut text = format!("cargo jobs:        {}\n", resolved.cargo_jobs);
+    text.push_str(&format!(
+        "slice:             {}\n",
+        resolved.slice.as_deref().unwrap_or("(none)")
+    ));
+    text.push_str(&format!("memory from history: {}\n", resolved.from_history));
+    for property in resolved.scope_properties() {
+        text.push_str(&format!("  {property}\n"));
+    }
+    text
+}
+
+fn print_capacity(limits: &ResourceLimits, json: bool) -> Result<()> {
+    let capacity = limits.capacity()?;
+    let mut out = std::io::stdout().lock();
+    if json {
+        serde_json::to_writer_pretty(&mut out, &capacity)?;
+        writeln!(out)?;
+    } else {
+        writeln!(out, "cores:            {}", capacity.cores)?;
+        writeln!(
+            out,
+            "memory total:     {}",
+            mebibytes(Some(capacity.mem_total_bytes))
+        )?;
+        writeln!(
+            out,
+            "session reserve:  {}",
+            mebibytes(Some(capacity.reserved_bytes))
+        )?;
+        writeln!(
+            out,
+            "agent budget:     {}",
+            mebibytes(Some(capacity.budget_bytes))
+        )?;
+        writeln!(out, "tasks max:        {}", capacity.tasks_max)?;
+    }
+    Ok(())
 }
 
 /// The shell convention: the code, or `128 + signal` for a signalled child.

@@ -3617,6 +3617,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "juto-capacity"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "juto-catalog"
 version = "0.1.0"
 dependencies = [
@@ -3660,6 +3667,7 @@ dependencies = [
  "gstreamer-sdp",
  "gstreamer-video",
  "gstreamer-webrtc",
+ "juto-capacity",
  "libc",
  "parking_lot",
  "rand 0.9.5",
@@ -3695,6 +3703,7 @@ dependencies = [
  "jsonschema",
  "juto-agent",
  "juto-ai",
+ "juto-capacity",
  "juto-catalog",
  "juto-desktop",
  "libc",

@@ -1,0 +1,9 @@
+[package]
+name = "juto-capacity"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Measured machine capacity and the agent memory budget derived from it"
+
+[dependencies]
+serde.workspace = true

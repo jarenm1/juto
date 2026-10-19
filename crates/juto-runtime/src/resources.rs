@@ -26,6 +26,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use juto_capacity::MachineCapacity;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -437,6 +438,69 @@ fn exit_code(status: ExitStatus) -> Option<i32> {
     status.code()
 }
 
+/// Memory and CPU grant for one command, derived from measured capacity and the
+/// usage history of its repository and class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandGrant {
+    /// Kill line for the scope (`MemoryMax`).
+    pub memory_max_bytes: u64,
+    /// Throttle line for the scope (`MemoryHigh`): nine tenths of `memory_max_bytes`.
+    pub memory_high_bytes: u64,
+    /// `TasksMax` for the scope.
+    pub tasks_max: u32,
+    /// Parallel jobs `cargo` may use under this grant.
+    pub cargo_jobs: usize,
+    /// False when no sample exists and the first-run rule applied.
+    pub from_history: bool,
+}
+
+/// Percentile of observed peaks that a learned estimate is based on.
+const ESTIMATE_PERCENTILE: u64 = 95;
+
+/// A command with no history may use this fraction of the agent budget.
+const FIRST_RUN_BUDGET_DIVISOR: u64 = 2;
+
+/// Derive the grant for a command in `repo` of `class`.
+///
+/// The learned estimate is the p95 of recorded peaks plus a quarter. A sample
+/// killed by the OOM killer reports a lower bound, so its peak is doubled. The
+/// result never exceeds the agent budget.
+pub fn command_grant(
+    capacity: &MachineCapacity,
+    store: Option<&UsageStore>,
+    repo: &str,
+    class: &str,
+) -> io::Result<CommandGrant> {
+    let records = match store {
+        Some(store) => store.read()?,
+        None => Vec::new(),
+    };
+    let samples: Vec<&UsageRecord> = records
+        .iter()
+        .filter(|record| record.repo == repo && record.class == class)
+        .collect();
+    let mut peaks: Vec<u64> = samples.iter().filter_map(|r| r.memory_peak_bytes).collect();
+    peaks.sort_unstable();
+    let learned = nearest_rank(&peaks, ESTIMATE_PERCENTILE);
+    let mut bytes = match learned {
+        Some(peak) => peak.saturating_add(peak / 4),
+        None => capacity.budget_bytes / FIRST_RUN_BUDGET_DIVISOR,
+    };
+    for sample in &samples {
+        if sample.oom_kills.unwrap_or(0) > 0 {
+            bytes = bytes.max(sample.memory_peak_bytes.unwrap_or(bytes).saturating_mul(2));
+        }
+    }
+    let memory = bytes.clamp(1, capacity.budget_bytes);
+    Ok(CommandGrant {
+        memory_max_bytes: memory,
+        memory_high_bytes: memory / 10 * 9,
+        tasks_max: capacity.tasks_max,
+        cargo_jobs: capacity.cargo_jobs(memory),
+        from_history: learned.is_some(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,5 +609,116 @@ mod tests {
         assert_eq!(build.memory_peak_bytes.p50, Some(1000));
         assert_eq!(build.memory_peak_bytes.p95, Some(1900));
         assert_eq!(build.wall_ms.p50, Some(100));
+    }
+
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    fn capacity() -> MachineCapacity {
+        MachineCapacity::from_measurements(64 * GIB, 16, 2 * GIB).expect("capacity")
+    }
+
+    fn peak_report(peak: u64, oom_kills: u64) -> Option<WrapperReport> {
+        Some(WrapperReport {
+            exit_code: 0,
+            memory_peak_bytes: Some(peak),
+            cpu_usec: None,
+            oom_kills: Some(oom_kills),
+            io_read_bytes: None,
+            io_write_bytes: None,
+        })
+    }
+
+    fn store_with(records: &[UsageRecord]) -> (tempfile::TempDir, UsageStore) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = UsageStore::new(dir.path().join("resources"));
+        for record in records {
+            store.append(record).expect("append");
+        }
+        (dir, store)
+    }
+
+    #[test]
+    fn first_run_grants_half_the_budget_without_history() {
+        let capacity = capacity();
+        let grant = command_grant(&capacity, None, "/repo", "cargo build").expect("grant");
+        assert!(!grant.from_history);
+        assert_eq!(grant.memory_max_bytes, capacity.budget_bytes / 2);
+        assert_eq!(grant.memory_high_bytes, grant.memory_max_bytes / 10 * 9);
+        assert_eq!(grant.tasks_max, capacity.tasks_max);
+        assert_eq!(
+            grant.cargo_jobs,
+            capacity.cargo_jobs(grant.memory_max_bytes)
+        );
+    }
+
+    #[test]
+    fn learned_grant_is_p95_of_peaks_plus_a_quarter() {
+        // Twenty runs peaking at 100, 200, …, 2000 MiB: nearest-rank p95 is 1900 MiB.
+        let records: Vec<UsageRecord> = (1..=20)
+            .map(|i| {
+                record_for(
+                    "/repo",
+                    "cargo build",
+                    10,
+                    Some(0),
+                    peak_report(i * 100 * MIB, 0),
+                )
+            })
+            .collect();
+        let (_dir, store) = store_with(&records);
+        let grant =
+            command_grant(&capacity(), Some(&store), "/repo", "cargo build").expect("grant");
+        assert!(grant.from_history);
+        assert_eq!(grant.memory_max_bytes, 1900 * MIB + 1900 * MIB / 4);
+    }
+
+    #[test]
+    fn oom_kill_doubles_the_observed_peak() {
+        let records = [record_for(
+            "/repo",
+            "cargo build",
+            10,
+            Some(137),
+            peak_report(GIB, 1),
+        )];
+        let (_dir, store) = store_with(&records);
+        let grant =
+            command_grant(&capacity(), Some(&store), "/repo", "cargo build").expect("grant");
+        assert_eq!(grant.memory_max_bytes, 2 * GIB);
+    }
+
+    #[test]
+    fn grant_never_exceeds_the_agent_budget() {
+        let capacity = capacity();
+        let records = [record_for(
+            "/repo",
+            "cargo build",
+            10,
+            Some(0),
+            peak_report(capacity.budget_bytes * 2, 0),
+        )];
+        let (_dir, store) = store_with(&records);
+        let grant = command_grant(&capacity, Some(&store), "/repo", "cargo build").expect("grant");
+        assert_eq!(grant.memory_max_bytes, capacity.budget_bytes);
+    }
+
+    #[test]
+    fn history_of_other_repos_and_classes_is_ignored() {
+        let capacity = capacity();
+        let records = [
+            record_for(
+                "/other",
+                "cargo build",
+                10,
+                Some(0),
+                peak_report(10 * GIB, 0),
+            ),
+            record_for("/repo", "cargo test", 10, Some(0), peak_report(10 * GIB, 0)),
+        ];
+        let (_dir, store) = store_with(&records);
+        let grant = command_grant(&capacity, Some(&store), "/repo", "cargo build").expect("grant");
+        assert!(!grant.from_history);
+        assert_eq!(grant.memory_max_bytes, capacity.budget_bytes / 2);
     }
 }

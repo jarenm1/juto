@@ -1822,7 +1822,8 @@ fn run_desktop_action(
                     fps,
                 },
                 render_profile: RenderProfile::Software,
-                limits: SystemLimits::default(),
+                limits: SystemLimits::measured()
+                    .map_err(|e| format!("cannot measure host capacity: {e}"))?,
                 workspace_dir: workspace.to_path_buf(),
                 lease_ttl_secs: 6,
                 // Run the compositor in its own process inside the environment

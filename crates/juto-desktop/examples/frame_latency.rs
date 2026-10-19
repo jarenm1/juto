@@ -147,7 +147,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             fps,
         },
         render_profile: RenderProfile::Software,
-        limits: SystemLimits::default(),
+        limits: SystemLimits::measured()
+            .map_err(|e| format!("cannot measure host capacity: {e}"))?,
         workspace_dir: std::env::temp_dir(),
         lease_ttl_secs: 60,
         compositor_mode: CompositorMode::Worker,

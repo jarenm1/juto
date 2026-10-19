@@ -103,7 +103,9 @@ pub use tools::{
     DESKTOP_SESSION_ARTIFACT_VERSION, DesktopArtifactTool, DesktopSessionArtifact, DesktopTool,
     register_desktop_tools,
 };
-pub use workspace::{GpuLockGuard, ResourceLimits, ScopedStdio, SubagentWorkspace, WorkspaceError};
+pub use workspace::{
+    GpuLockGuard, ResolvedLimits, ResourceLimits, ScopedStdio, SubagentWorkspace, WorkspaceError,
+};
 
 use crate::change_graph::{ChangeGraph, EditProvenance, JoinOutcome};
 use crate::roles::{AgentRole, ToolScope};
