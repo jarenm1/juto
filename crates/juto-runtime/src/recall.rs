@@ -22,7 +22,7 @@ const LINE_CHARS: usize = 160;
 /// Character budget of a tool call's arguments on one list line.
 const ARGS_CHARS: usize = 80;
 
-const DESCRIPTION: &str = "Read the main thread's original messages, including those a compaction hid from the model. Without `index`, lists messages one line each, from `from` (default 0); `count` caps the lines. A page holds about 16 KB and ends with a `more:` line giving the next `from`. With `index`, returns that message in full; `at` (a byte offset) continues a long message, and a `more:` line gives the next `at`. Numbers do not change when the thread is compacted.";
+const DESCRIPTION: &str = "Read the main thread's original messages, including those hidden by compaction. Without `id`, lists messages from `from` (default 0), limited by `count` and about 16 KB; follow the `more:` hint. With `id`, returns that message in full; `at` continues a long message by byte offset. Numbers stay stable across compaction, but refer to the current branch.";
 
 /// Arguments of one `recall` call. Every field is optional.
 #[derive(Debug, Default, Deserialize)]
@@ -30,6 +30,7 @@ const DESCRIPTION: &str = "Read the main thread's original messages, including t
 struct Args {
     from: Option<usize>,
     count: Option<usize>,
+    #[serde(rename = "id")]
     index: Option<usize>,
     at: Option<usize>,
 }
@@ -56,8 +57,8 @@ impl Tool for RecallTool {
                 "properties": {
                     "from": {"type": "integer", "minimum": 0, "description": "First index to list. Defaults to 0."},
                     "count": {"type": "integer", "minimum": 1, "description": "Most lines to list."},
-                    "index": {"type": "integer", "minimum": 0, "description": "Return this message in full."},
-                    "at": {"type": "integer", "minimum": 0, "description": "Byte offset into the message body; needs index."}
+                    "id": {"type": "integer", "minimum": 0, "description": "Return this message index in full."},
+                    "at": {"type": "integer", "minimum": 0, "description": "Byte offset into the message body; needs id."}
                 },
                 "additionalProperties": false
             }),
@@ -85,12 +86,12 @@ impl Tool for RecallTool {
 fn read(path: &Path, args: Args) -> Result<ToolOutput, String> {
     if args.at.is_some() && args.index.is_none() {
         return Ok(ToolOutput::error(
-            "`at` pages one message, so it needs `index`",
+            "`at` pages one message, so it needs `id`",
         ));
     }
     if args.index.is_some() && (args.from.is_some() || args.count.is_some()) {
         return Ok(ToolOutput::error(
-            "`index` returns one message; `from` and `count` only page the list",
+            "`id` returns one message; `from` and `count` only page the list",
         ));
     }
     if args.count == Some(0) {
@@ -169,9 +170,7 @@ fn detail(view: &PathView<'_>, index: usize, at: usize) -> ToolOutput {
     if start > 0 || end < body.len() {
         out.push_str(&format!("\n[bytes {start}..{end} of {}]", body.len()));
         if end < body.len() {
-            out.push_str(&format!(
-                " more: recall {{\"index\": {index}, \"at\": {end}}}"
-            ));
+            out.push_str(&format!(" more: recall {{\"id\": {index}, \"at\": {end}}}"));
         }
     }
     ToolOutput::text(out)
@@ -293,6 +292,45 @@ fn clip_chars(text: &str, max: usize) -> String {
     let mut clipped: String = text.chars().take(max - 1).collect();
     clipped.push('…');
     clipped
+}
+
+/// Capture once per task call, not once per child: siblings share exact bytes.
+pub(crate) fn snapshot(path: &Path) -> anyhow::Result<String> {
+    const BUDGET: usize = 12 * 1024;
+    let session = Session::open(path)?;
+    let view = session.path_view()?;
+    let mut out = String::from(
+        "Main thread snapshot (context only — do your task, not the user's last message)\nOriginal messages: recall {\"id\": N}; indices refer to the current main branch.\n",
+    );
+    if let Some(mark) = view.compaction {
+        out.push_str("[Earlier conversation summary]\n");
+        let end = floor_boundary(mark.summary, BUDGET / 2);
+        out.push_str(&mark.summary[..end]);
+        if end < mark.summary.len() {
+            out.push_str("\n[summary clipped]");
+        }
+        out.push('\n');
+    }
+    // Reserve a small omission notice, then select a contiguous newest suffix.
+    let budget = BUDGET - out.len() - 80;
+    let mut lines = Vec::new();
+    let mut bytes = 0;
+    for entry in view.visible().iter().rev() {
+        let line = index_line(entry);
+        if bytes + line.len() + 1 > budget {
+            break;
+        }
+        bytes += line.len() + 1;
+        lines.push(line);
+    }
+    if lines.len() < view.visible().len() {
+        out.push_str("[Older visible messages omitted; use recall]\n");
+    }
+    for line in lines.iter().rev() {
+        out.push_str(line);
+        out.push('\n');
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

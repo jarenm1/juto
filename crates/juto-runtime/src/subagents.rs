@@ -68,6 +68,9 @@ pub struct TaskSpec {
     /// it when a `task` call spawns children; the model never does.
     #[serde(skip)]
     pub main_session: Option<PathBuf>,
+    /// Immutable main view captured once for all siblings in a task call.
+    #[serde(skip)]
+    pub main_snapshot: Option<Arc<str>>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -100,6 +103,7 @@ impl TaskSpec {
             focus: false,
             origin: None,
             main_session: None,
+            main_snapshot: None,
         }
     }
 }
@@ -1553,6 +1557,7 @@ mod tests {
             focus: false,
             origin: None,
             main_session: None,
+            main_snapshot: None,
         }
     }
 

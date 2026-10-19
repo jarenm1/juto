@@ -237,3 +237,43 @@ fn misuse_is_a_tool_error_not_an_empty_page() {
         .is_error
     );
 }
+
+#[test]
+fn snapshot_caps_summary_and_keeps_newest_visible_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::create(dir.path(), Path::new("/work")).unwrap();
+    session.append(user("hidden-original")).unwrap();
+    session.compact("summary ".repeat(2000), 0).unwrap();
+    for i in 0..200 {
+        session
+            .append(user(&format!("visible-{i} {}", "é".repeat(200))))
+            .unwrap();
+    }
+    let text = snapshot(session.path()).unwrap();
+    assert!(text.len() <= 12 * 1024);
+    assert!(text.contains("[Earlier conversation summary]\nsummary"));
+    assert!(!text.contains("hidden-original"));
+    assert!(!text.contains("|user: visible-0 "));
+    assert!(text.contains("200|user: visible-199 "));
+}
+
+#[test]
+fn detail_continuation_hints_round_trip_through_public_arguments() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::create(dir.path(), Path::new("/work")).unwrap();
+    let body = "é".repeat(PAGE_BYTES);
+    session.append(user(&body)).unwrap();
+    let mut args = json!({"id": 0});
+    let mut rebuilt = String::new();
+    loop {
+        let text = text_of(&read(session.path(), serde_json::from_value(args).unwrap()).unwrap());
+        let (_, body_page) = text.split_once('\n').unwrap();
+        let (page, footer) = body_page.rsplit_once("\n[bytes ").unwrap();
+        rebuilt.push_str(page);
+        let Some((_, hint)) = footer.split_once("more: recall ") else {
+            break;
+        };
+        args = serde_json::from_str(hint).unwrap();
+    }
+    assert_eq!(rebuilt, body);
+}

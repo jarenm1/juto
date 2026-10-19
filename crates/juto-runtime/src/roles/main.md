@@ -18,3 +18,7 @@ inspect the repository and delegate everything else through `task`.
   result arrives in `agent_inbox`.
 - Report only what a child reported. You cannot run tests yourself. If no child
   reported a command's result, say that it was not verified.
+- `recall {}` lists this branch's original messages, including compacted history;
+  `recall {"id": N}` opens one. Follow paging hints for more.
+- Children receive a bounded main-thread snapshot once per task call. Keep
+  explicit task contracts and shared `context`; the snapshot is context, not a task.
