@@ -36,6 +36,8 @@ scripts/agent-scope.sh -- nix develop "$JUTO_FLAKE#smoke" -c <visual-smoke-comma
   variables. Do not bypass caps.
 - Requires a working systemd user manager. Fails rather than running uncapped
   if `systemd-run` is absent.
+- This script governs developer commands only. The runtime's own bash sandbox and execution
+  tiers are documented in [docs/sandbox.md](sandbox.md).
 - The GPU lock is shared with jtech. `smoke` uses software Vulkan and needs no
   GPU lock, but still needs a display: use Xvfb, not an invented `--headless`
   flag.

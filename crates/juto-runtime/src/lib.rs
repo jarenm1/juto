@@ -16,6 +16,7 @@ mod roles;
 pub mod session;
 pub mod subagents;
 pub mod threads;
+pub mod tier;
 pub mod tools;
 mod vcs;
 pub mod workspace;
@@ -76,6 +77,7 @@ impl SignalingHandle {
     }
 }
 use serde_json::{Value, json};
+use tier::ExecutionTier;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -461,6 +463,7 @@ impl Runtime {
             depth: 0,
             role: roles::MAIN_ROLE,
             read_only: false,
+            tier: self.config().execution_tier,
             sender: None,
             main_session: Some(&main_session),
         };
@@ -491,6 +494,7 @@ impl Runtime {
             depth,
             role: role_name,
             read_only,
+            tier,
             sender,
             main_session,
         } = placement;
@@ -504,6 +508,7 @@ impl Runtime {
             .get(role_name)
             .with_context(|| format!("unknown agent role `{role_name}`"))?
             .clone();
+        let tier = role.tier.map_or(tier, |ceiling| tier.min(ceiling));
         let scope = if read_only {
             role.tools.intersect(&ToolScope::read_only())
         } else {
@@ -525,14 +530,12 @@ impl Runtime {
             }
         }
         let _children = ChildCancellation(manager.owner());
-        // Governance is opt-in and degrades to a bare spawn when `systemd-run`
-        // is unavailable, so enabling it can never fail the tool outright.
-        let limits = self
-            .inner
-            .config
-            .read()
-            .bash_scoped
-            .then(|| ResourceLimits::default().with_enforce_scope(false));
+        // The run's tier decides how `bash` is confined; see `ExecutionTier::bash_limits`.
+        let mut limits = tier.bash_limits(settings.bash_scoped);
+        if let Some(sandbox) = limits.as_mut().and_then(|limits| limits.sandbox.as_mut()) {
+            sandbox.denied_paths =
+                workspace::credential_paths(std::slice::from_ref(&self.inner.data_dir));
+        }
         let mut registry = tools::builtin_tools_with_limits(&self.inner.cwd, limits)?;
         if let Some(main_session) = main_session {
             registry.register(Arc::new(recall::RecallTool::new(
@@ -551,9 +554,18 @@ impl Runtime {
                 catalog.clone(),
                 depth == 0,
                 main_session.map(Path::to_path_buf),
+                tier,
             )?;
         }
-        browser::register_browser_tool(&mut registry, self.inner.browser.clone(), &self.inner.cwd)?;
+        // The browser launches host processes and reads and writes host files
+        // outside the bash sandbox, so sandboxed tiers do not get it.
+        if !tier.sandboxed() {
+            browser::register_browser_tool(
+                &mut registry,
+                self.inner.browser.clone(),
+                &self.inner.cwd,
+            )?;
+        }
         if scope.allows("desktop") {
             tools::register_desktop_tools(
                 &mut registry,
@@ -821,6 +833,8 @@ struct RunPlacement<'a> {
     depth: usize,
     role: &'a str,
     read_only: bool,
+    /// Execution tier that governs this run's commands and tools.
+    tier: ExecutionTier,
     /// Id of the child running here, if any. Its messages to `agent://main`
     /// carry this id as `from`; `None` for the main thread.
     sender: Option<&'a str>,
@@ -1190,6 +1204,9 @@ impl subagents::SubagentFactory for ChildFactory {
                         depth: self.depth,
                         role,
                         read_only: spec.read_only,
+                        // Specs from the `task` tool always carry a tier; a missing one
+                        // falls back to the sandboxed default.
+                        tier: spec.tier.unwrap_or(ExecutionTier::Workspace),
                         sender: Some(id),
                         main_session: spec.main_session.as_deref(),
                     },
@@ -1247,6 +1264,9 @@ impl subagents::SubagentFactory for ChildFactory {
                         depth: self.depth,
                         role,
                         read_only: spec.read_only,
+                        // Specs from the `task` tool always carry a tier; a missing one
+                        // falls back to the sandboxed default.
+                        tier: spec.tier.unwrap_or(ExecutionTier::Workspace),
                         sender: Some(id),
                         main_session: spec.main_session.as_deref(),
                     },
@@ -1327,6 +1347,7 @@ fn register_agent_tools(
     catalog: Arc<BTreeMap<String, AgentRole>>,
     main: bool,
     main_session: Option<PathBuf>,
+    run_tier: ExecutionTier,
 ) -> Result<()> {
     registry.register(Arc::new(TaskTool {
         manager: manager.clone(),
@@ -1334,6 +1355,7 @@ fn register_agent_tools(
         allow_focus: main,
         async_results: main,
         main_session,
+        run_tier,
     }))?;
     registry.register(Arc::new(WaitTool {
         manager: manager.clone(),
@@ -1365,6 +1387,8 @@ struct TaskTool {
     async_results: bool,
     /// The session `recall` reads: the main thread's, which children inherit.
     main_session: Option<PathBuf>,
+    /// Tier of the run that calls `task`. Children get at most this tier.
+    run_tier: ExecutionTier,
 }
 #[async_trait]
 impl Tool for TaskTool {
@@ -1372,14 +1396,14 @@ impl Tool for TaskTool {
         ToolDefinition {
             name: "task".into(),
             description: format!(
-                "Run child agents concurrently. Each child gets an independent durable transcript; optional output_schema validates its JSON result. Set schema_mode to strict (default) to fail on missing or invalid data, or permissive to preserve the result. {} Set agent to a role from the available agents list; omit it for the default task role. A role's tools bound what its child may use, and read_only further restricts a child to read, glob, and grep.",
+                "Run child agents concurrently. Each child gets an independent durable transcript; optional output_schema validates its JSON result. Set schema_mode to strict (default) to fail on missing or invalid data, or permissive to preserve the result. {} Set agent to a role from the available agents list; omit it for the default task role. A role's tools bound what its child may use, and read_only further restricts a child to read, glob, and grep. Set tier to untrusted, workspace, or attended to confine a child's shell commands; omit it for the default (isolated children get workspace, others attended). A child never gets a tier above this run's.",
                 if self.async_results {
                     "This call returns once the children are queued, with their ids. Each child's terminal result arrives later as a message in the main thread; use `wait` to read one now."
                 } else {
                     "This call waits for all children."
                 }
             ),
-            parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"agent":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"schema_mode":{"type":"string","enum":["strict","permissive"]},"read_only":{"type":"boolean"},"isolated_workspace":{"type":"boolean"},"focus":{"type":"boolean"},"solution_space":{"type":"string"}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false}),
+            parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"agent":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"schema_mode":{"type":"string","enum":["strict","permissive"]},"read_only":{"type":"boolean"},"isolated_workspace":{"type":"boolean"},"focus":{"type":"boolean"},"solution_space":{"type":"string"},"tier":{"type":"string","enum":["untrusted","workspace","attended"]}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false}),
         }
     }
     fn tier(&self) -> ToolTier {
@@ -1472,6 +1496,22 @@ impl TaskTool {
         if focus && !self.allow_focus {
             return Err("focus threads may only be spawned by the main thread".into());
         }
+        let isolated_workspace = value
+            .get("isolated_workspace")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let requested_tier = value
+            .get("tier")
+            .cloned()
+            .map(serde_json::from_value::<ExecutionTier>)
+            .transpose()
+            .map_err(|error| format!("invalid tier: {error}"))?;
+        // A focus thread is always isolated, so it defaults the same way.
+        let tier = ExecutionTier::resolve_child(
+            self.run_tier,
+            requested_tier,
+            isolated_workspace || focus,
+        )?;
         Ok(TaskSpec {
             name: value.get("name").and_then(Value::as_str).map(str::to_owned),
             main_session: self.main_session.clone(),
@@ -1498,15 +1538,13 @@ impl TaskTool {
                 .get("read_only")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-            isolated_workspace: value
-                .get("isolated_workspace")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            isolated_workspace,
             solution_space: value
                 .get("solution_space")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             focus,
+            tier: Some(tier),
             origin: None,
         })
     }
@@ -1866,6 +1904,7 @@ mod tests {
             allow_focus: true,
             async_results: false,
             main_session: Some(main.path().to_path_buf()),
+            run_tier: ExecutionTier::Attended,
         };
         let ctx = ToolContext {
             cwd: repo.clone(),
@@ -2992,6 +3031,7 @@ mod tests {
                     depth: 2,
                     role: "builder",
                     read_only: false,
+                    tier: ExecutionTier::Attended,
                     sender: None,
                     main_session: None,
                 },
@@ -3015,6 +3055,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandboxed_tiers_do_not_get_the_browser() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(AdvertisedTools::default());
+        let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
+
+        let tiers = [
+            ExecutionTier::Untrusted,
+            ExecutionTier::Workspace,
+            ExecutionTier::Attended,
+        ];
+        for tier in tiers {
+            let mut session = runtime.new_session().expect("session");
+            let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+            runtime
+                .run_depth(
+                    &mut session,
+                    "make the change".to_string(),
+                    events,
+                    RunControl::new(),
+                    RunPlacement {
+                        depth: 1,
+                        role: "builder",
+                        read_only: false,
+                        tier,
+                        sender: None,
+                        main_session: None,
+                    },
+                    runtime.subagent_manager(&RunControl::new()),
+                )
+                .await
+                .expect("builder run");
+        }
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), tiers.len(), "one request per run");
+        for (tier, tools) in tiers.iter().zip(&requests) {
+            assert_eq!(
+                tools.contains("browser"),
+                !tier.sandboxed(),
+                "{tier:?} advertised {tools:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn task_rejects_unknown_and_top_level_agents_before_spawning() {
         let root = tempdir().expect("tempdir");
         let repo = root.path().join("repo");
@@ -3028,6 +3116,7 @@ mod tests {
             catalog: Arc::new(roles::load(&repo, &data_dir).expect("roles")),
             allow_focus: false,
             async_results: false,
+            run_tier: ExecutionTier::Attended,
             main_session: None,
         };
         let context = ToolContext {
@@ -3111,6 +3200,7 @@ mod tests {
             catalog: Arc::new(BTreeMap::new()),
             allow_focus: false,
             async_results: false,
+            run_tier: ExecutionTier::Attended,
             main_session: None,
         };
         let error = tool
@@ -3129,6 +3219,7 @@ mod tests {
             catalog: Arc::new(BTreeMap::new()),
             allow_focus: true,
             async_results: false,
+            run_tier: ExecutionTier::Attended,
             main_session: None,
         };
         tool.execute(arguments, context)

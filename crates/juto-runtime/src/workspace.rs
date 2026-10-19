@@ -9,8 +9,8 @@
 //! Architectural reference: `docs/orchestration-plan.md` §4 and `scripts/agent-scope.sh`.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    ffi::OsString,
+    collections::BTreeMap,
+    ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
     sync::Arc,
@@ -45,8 +45,8 @@ fn vcs_error(error: anyhow::Error) -> WorkspaceError {
 ///
 /// `scripts/agent-scope.sh` uses `${VAR:-default}`, so an exported-but-empty
 /// variable means "unset". Reading it verbatim would forward an empty value to
-/// `systemd-run` (e.g. `-p CPUQuota=` applies `infinity`, silently uncapping a
-/// scope that claims `enforce_scope`).
+/// `systemd-run` (e.g. `-p CPUQuota=` applies `infinity`, silently uncapping
+/// the scope).
 fn env_var_nonempty(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -83,7 +83,9 @@ pub enum WorkspaceError {
     #[error("command working directory `{cwd}` is outside assigned workspace `{workspace}`")]
     CwdEscapedWorkspace { cwd: PathBuf, workspace: PathBuf },
 
-    #[error("systemd-run is unavailable; refusing uncapped execution")]
+    #[error(
+        "systemd-run is unavailable; refusing to run the command without its resource governance"
+    )]
     SystemdUnavailable,
 
     #[error("failed to spawn scoped command `{command}`: {source}")]
@@ -114,107 +116,197 @@ pub enum WorkspaceError {
     Other(String),
 }
 
-/// How `$HOME` (and `/root`, `/run/user`) is exposed inside a sandboxed command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ProtectHome {
-    /// Leave `$HOME` untouched (no `ProtectHome` property is emitted).
-    Off,
-    /// Mount `$HOME` read-only (`ProtectHome=read-only`).
-    #[default]
-    ReadOnly,
-    /// Make `$HOME` inaccessible (`ProtectHome=yes`).
-    Yes,
-}
-
-/// Filesystem sandbox applied to a resource-scoped command.
+/// Filesystem sandbox applied to a governed command.
 ///
-/// The sandbox is opt-in: [`ResourceLimits::sandbox`] defaults to `None`, so
-/// existing callers keep the advisory-only boundary. When enabled, the command
-/// runs in a systemd unit whose filesystem view is restricted:
+/// The command runs in a transient systemd *service* whose filesystem view is
+/// restricted:
 ///
-/// * `protect_system` mounts the system hierarchy (`/usr`, `/boot`, `/etc`, ...)
+/// * `protect_system` mounts the system hierarchy (`/usr`, `/etc`, ...)
 ///   read-only (`ProtectSystem=strict`).
-/// * `protect_home` controls how `$HOME` is exposed (`ProtectHome`).
-/// * `private_tmp` gives the command a private `/tmp` and `/var/tmp`
-///   (`PrivateTmp=yes`).
-/// * the workspace itself is always granted write access, and each
-///   [`Sandbox::write_paths`] entry adds another writable directory
-///   (`ReadWritePaths`).
+/// * `hide_home` replaces `$HOME` with an empty tmpfs (`ProtectHome=tmpfs`).
+///   Credentials under it (`~/.ssh`, `~/.config/gh`, juto's data directory) are
+///   absent; only the grants below reappear.
+/// * `private_tmp` gives the command a private `/tmp` and `/var/tmp`.
+/// * the workspace is bind-mounted writable. [`Sandbox::write_paths`] adds more
+///   writable directories and [`Sandbox::read_paths`] read-only ones. Grants that
+///   do not exist on the host are skipped.
+///
+/// The command's environment is an allowlist, applied with `env -i`: the user
+/// manager's environment is not inherited.
+///
+/// Grants are bind mounts (`BindPaths`, `BindReadOnlyPaths`), not
+/// `ReadWritePaths`: a `ReadWritePaths` entry fails with status 226 when its
+/// mount point lies under the hidden home or the private `/tmp`.
 ///
 /// # Running `cargo` inside a sandbox
 ///
-/// With `ProtectSystem=strict` the whole hierarchy is read-only except the API
-/// filesystems and the granted `ReadWritePaths`. When `protect_home` is
-/// [`ProtectHome::ReadOnly`] or [`ProtectHome::Yes`], `$HOME` is read-only or
-/// hidden, so a build tool that keeps state there fails unless those
-/// directories are granted explicitly. Callers that run `cargo` (or `rustup`)
-/// inside a sandbox must therefore add `CARGO_HOME` (usually `~/.cargo`),
-/// `RUSTUP_HOME` (usually `~/.rustup`), and `XDG_CACHE_HOME` (usually
-/// `~/.cache`) to [`Sandbox::write_paths`].
+/// `ProtectSystem=strict` makes the system read-only and `hide_home` hides
+/// `$HOME`, so a build tool that keeps state there needs its directories granted.
+/// [`Sandbox::for_agent_workspace`] grants `CARGO_HOME`, `RUSTUP_HOME`, and
+/// `XDG_CACHE_HOME`, plus the flake checkout named by `JUTO_FLAKE` so that
+/// `nix develop` can read it.
+///
+/// # Not a boundary against hostile code
+///
+/// The sandbox limits ordinary tool use: accidental writes and credential
+/// exposure through files and the environment. It does not stop deliberately
+/// malicious code. The nix daemon socket stays reachable, so builds and
+/// substitutes the daemon runs are outside this sandbox. See `docs/sandbox.md`.
 ///
 /// # Implementation note
 ///
-/// Namespace properties are not supported by transient *scopes*: `systemd-run
-/// --user --scope -p ProtectSystem=strict` fails with `Unknown assignment`.
-/// A sandboxed command is therefore run as a transient *service* (see
-/// [`SubagentWorkspace::build_scoped_std_command`]), which supports both the
-/// resource caps and the namespace properties.
+/// Namespace properties are not supported by transient *scopes*:
+/// `systemd-run --user --scope -p ProtectSystem=strict` fails with `Unknown
+/// assignment`. A sandboxed command therefore runs as a transient *service* (see
+/// [`SubagentWorkspace::build_scoped_std_command`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sandbox {
     /// Mount the system hierarchy read-only (`ProtectSystem=strict`).
     pub protect_system: bool,
-    /// How `$HOME` is exposed inside the sandbox.
-    pub protect_home: ProtectHome,
+    /// Replace `$HOME` with an empty tmpfs (`ProtectHome=tmpfs`).
+    pub hide_home: bool,
     /// Give the command a private `/tmp` and `/var/tmp` (`PrivateTmp=yes`).
     pub private_tmp: bool,
-    /// Extra directories granted write access inside the sandbox.
+    /// Extra directories granted write access (`BindPaths`).
     ///
     /// Relative entries are resolved against the workspace root. The workspace
     /// itself is always writable and does not need to be listed here.
     pub write_paths: Vec<PathBuf>,
+    /// Extra directories granted read-only access (`BindReadOnlyPaths`).
+    ///
+    /// Relative entries are resolved against the workspace root.
+    pub read_paths: Vec<PathBuf>,
+    /// Credential locations hidden even when an enclosing directory is granted.
+    pub denied_paths: Vec<PathBuf>,
 }
 
 impl Default for Sandbox {
     fn default() -> Self {
         Self {
             protect_system: true,
-            protect_home: ProtectHome::ReadOnly,
+            hide_home: true,
             private_tmp: true,
             write_paths: Vec::new(),
+            read_paths: Vec::new(),
+            denied_paths: credential_paths(&[]),
         }
     }
 }
 
 impl Sandbox {
-    /// The default sandbox plus the toolchain directories a build must write.
+    /// The default sandbox plus the toolchain and flake grants an agent build needs.
     ///
-    /// `ProtectSystem=strict` makes the whole hierarchy read-only and
-    /// `ProtectHome=read-only` makes `$HOME` read-only, so a build tool that
-    /// keeps state there fails unless those directories are granted. Cargo
-    /// writes to `CARGO_HOME` even for a read-only metadata query, so it is
-    /// always granted (defaulting to `$HOME/.cargo`); `RUSTUP_HOME` and
-    /// `XDG_CACHE_HOME` are granted when set. Without this, enabling the
-    /// sandbox breaks every build.
+    /// `CARGO_HOME`, `RUSTUP_HOME`, and `XDG_CACHE_HOME` become write grants, taken
+    /// from the environment or defaulting to `$HOME/.cargo`, `$HOME/.rustup`, and
+    /// `$HOME/.cache`. The checkout named by `JUTO_FLAKE` becomes a read grant.
+    /// Without these, cargo and `nix develop` fail inside the sandbox.
     pub fn for_agent_workspace() -> Self {
         let mut sandbox = Self::default();
-        for key in ["CARGO_HOME", "RUSTUP_HOME", "XDG_CACHE_HOME"] {
-            let path = match std::env::var_os(key) {
-                Some(value) => PathBuf::from(value),
-                None if key == "CARGO_HOME" => match std::env::var_os("HOME") {
-                    Some(home) => PathBuf::from(home).join(".cargo"),
-                    None => continue,
-                },
-                None => continue,
-            };
-            if path.is_absolute() && !sandbox.write_paths.contains(&path) {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let toolchain = [
+            ("CARGO_HOME", home.as_ref().map(|home| home.join(".cargo"))),
+            (
+                "RUSTUP_HOME",
+                home.as_ref().map(|home| home.join(".rustup")),
+            ),
+            (
+                "XDG_CACHE_HOME",
+                home.as_ref().map(|home| home.join(".cache")),
+            ),
+        ];
+        for (key, fallback) in toolchain {
+            let path = std::env::var_os(key).map(PathBuf::from).or(fallback);
+            if let Some(path) = path
+                && path.is_absolute()
+                && !sandbox.write_paths.contains(&path)
+            {
                 sandbox.write_paths.push(path);
             }
+        }
+        if let Some(flake) = flake_source_path() {
+            sandbox.read_paths.push(flake);
         }
         sandbox
     }
 }
 
-/// Resource constraints and governance parameters for subagent execution.
+/// The local checkout that `JUTO_FLAKE` (`git+file://<path>?rev=...`) names.
+///
+/// `nix develop "$JUTO_FLAKE"` inside a sandbox must read this checkout.
+fn flake_source_path() -> Option<PathBuf> {
+    let flake = std::env::var("JUTO_FLAKE").ok()?;
+    let path = PathBuf::from(flake.strip_prefix("git+file://")?.split('?').next()?);
+    path.is_absolute().then_some(path)
+}
+
+/// Known credential locations, including custom runtime-owned paths. Keep lexical
+/// names as well as symlink targets: hiding only one would leave the other visible.
+pub(crate) fn credential_paths(extra: &[PathBuf]) -> Vec<PathBuf> {
+    let mut paths = extra.to_vec();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        for name in [
+            ".ssh",
+            ".gnupg",
+            ".config/gh",
+            ".netrc",
+            ".aws",
+            ".docker",
+            ".local/share/juto",
+            ".config/juto",
+            ".git-credentials",
+            ".npmrc",
+            ".pypirc",
+        ] {
+            paths.push(home.join(name));
+        }
+        let cargo = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".cargo"));
+        paths.push(cargo.join("credentials"));
+        paths.push(cargo.join("credentials.toml"));
+    }
+    for variable in [
+        "JUTO_DATA_DIR",
+        "GNUPGHOME",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_CONFIG_FILE",
+        "DOCKER_CONFIG",
+    ] {
+        if let Some(path) = std::env::var_os(variable) {
+            paths.push(PathBuf::from(path));
+        }
+    }
+    if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
+        paths.push(PathBuf::from(config).join("gh"));
+    }
+    if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
+        paths.push(PathBuf::from(data).join("juto"));
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let mut resolved = Vec::new();
+    for path in paths {
+        let path = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        if let Ok(canonical) = path.canonicalize()
+            && !resolved.contains(&canonical)
+        {
+            resolved.push(canonical);
+        }
+        if !resolved.contains(&path) {
+            resolved.push(path);
+        }
+    }
+    resolved
+}
+
+/// Resource caps, and an optional sandbox, for one governed command.
+///
+/// Governance always runs the command under `systemd-run`. When `systemd-run` is
+/// missing the command fails with [`WorkspaceError::SystemdUnavailable`]: there
+/// is no uncapped fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLimits {
     /// Per-scope CPU quota (e.g. "400%", "200%").
@@ -233,11 +325,7 @@ pub struct ResourceLimits {
     pub gpu: bool,
     /// Path to the shared GPU file lock.
     pub gpu_lock: Option<PathBuf>,
-    /// When true, fails if `systemd-run` is not available rather than running uncapped.
-    pub enforce_scope: bool,
-    /// Optional filesystem sandbox applied to the scoped command.
-    ///
-    /// `None` (the default) keeps the advisory-only boundary; see [`Sandbox`].
+    /// Filesystem sandbox for the command. `None` runs it under caps only; see [`Sandbox`].
     pub sandbox: Option<Sandbox>,
 }
 
@@ -255,9 +343,6 @@ impl Default for ResourceLimits {
         let gpu_lock = env_var_nonempty("AGENT_GPU_LOCK")
             .map(PathBuf::from)
             .or_else(|| Some(default_gpu_lock_path()));
-        let sandbox = env_var_nonempty("AGENT_SANDBOX")
-            .filter(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .map(|_| Sandbox::for_agent_workspace());
 
         Self {
             cpu_quota,
@@ -268,8 +353,7 @@ impl Default for ResourceLimits {
             slice_memory_max,
             gpu: false,
             gpu_lock,
-            enforce_scope: true,
-            sandbox,
+            sandbox: None,
         }
     }
 }
@@ -290,12 +374,6 @@ impl ResourceLimits {
     /// Set explicit per-scope memory ceiling.
     pub fn with_memory_max(mut self, mem: impl Into<String>) -> Self {
         self.memory_max = mem.into();
-        self
-    }
-
-    /// Configure whether systemd scope enforcement is mandatory.
-    pub fn with_enforce_scope(mut self, enforce: bool) -> Self {
-        self.enforce_scope = enforce;
         self
     }
 
@@ -392,6 +470,38 @@ impl ScopedChild {
     /// The transient unit name, when this child is sandboxed.
     pub fn unit(&self) -> Option<&str> {
         self.unit.as_deref()
+    }
+
+    /// Terminate the service payload before awaiting its output pipes.
+    ///
+    /// Killing `systemd-run` only kills the client: the service may retain the
+    /// pipe descriptors. Waiting for those descriptors before dropping this
+    /// guard would postpone cleanup until the payload exits on its own.
+    pub async fn kill_unit(&mut self) -> std::io::Result<()> {
+        let Some(unit) = &self.unit else {
+            return Ok(());
+        };
+        // A collected unit may already be absent; that is a successful cleanup.
+        // Keep the unit on the guard so cancellation during this await still
+        // schedules the normal stop operation.
+        // Kill the whole unit, then stop it. A kill alone can land before systemd has
+        // forked the service's process, and then the process starts afterwards;
+        // `stop` cancels a pending start job and waits until the unit is inactive.
+        for args in [
+            &["kill", "--signal=SIGKILL", "--kill-whom=all"][..],
+            &["stop"][..],
+        ] {
+            let _ = tokio::process::Command::new("systemctl")
+                .arg("--user")
+                .args(args)
+                .arg(unit)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await?;
+        }
+        Ok(())
     }
 
     /// Wait for the child to exit.
@@ -740,13 +850,13 @@ impl SubagentWorkspace {
         let orig_args: Vec<OsString> = original.get_args().map(|s| s.to_os_string()).collect();
         let work_dir = validate_scoped_cwd(&self.path, original.get_current_dir())?;
 
-        let systemd_available = is_systemd_run_available();
-        if !systemd_available && limits.enforce_scope {
+        // Governance always runs under systemd: a missing `systemd-run` is an
+        // error, never a silent run without the caps or the sandbox.
+        if !is_systemd_run_available() {
             return Err(WorkspaceError::SystemdUnavailable);
         }
 
-        // Configure shared slice properties if needed
-        if systemd_available && let Some(slice) = &limits.slice {
+        if let Some(slice) = &limits.slice {
             let cpu_quota = limits
                 .slice_cpu_quota
                 .as_deref()
@@ -761,9 +871,7 @@ impl SubagentWorkspace {
         // Derive CARGO_BUILD_JOBS from cpu_quota if not already present
         let jobs = calculate_cargo_build_jobs(&limits.cpu_quota);
 
-        let mut cmd: std::process::Command;
-
-        if limits.gpu {
+        let mut cmd = if limits.gpu {
             let gpu_lock = limits
                 .gpu_lock
                 .clone()
@@ -784,91 +892,44 @@ impl SubagentWorkspace {
             if let Some(parent) = gpu_lock.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-
-            cmd = std::process::Command::new("flock");
-            cmd.arg(&gpu_lock);
-
-            if systemd_available {
-                cmd.arg("systemd-run");
-                cmd.arg("--user");
-                append_systemd_unit_mode(&mut cmd, limits.sandbox.is_some());
-                if let Some(unit) = unit {
-                    cmd.arg(format!("--unit={unit}"));
-                }
-                cmd.arg("--quiet");
-                cmd.arg("-p").arg(format!("CPUQuota={}", limits.cpu_quota));
-                cmd.arg("-p")
-                    .arg(format!("MemoryMax={}", limits.memory_max));
-                cmd.arg("-p")
-                    .arg(format!("MemorySwapMax={}", limits.memory_swap_max));
-
-                if let Some(slice) = &limits.slice {
-                    cmd.arg(format!("--slice={}", slice));
-                }
-
-                if let Some(sandbox) = &limits.sandbox {
-                    emit_sandbox_properties(&mut cmd, sandbox, &self.path);
-                }
-                let unsets = emit_service_environment(&mut cmd, original, limits.sandbox.is_some());
-
-                cmd.arg("--");
-                // A variable the original command explicitly removes is applied
-                // with `env -u` in front of the program: `--setenv` can only set
-                // (or set-to-empty), never unset, and the forwarded process
-                // environment would otherwise resurrect it.
-                if !unsets.is_empty() {
-                    cmd.arg("env");
-                    for key in &unsets {
-                        cmd.arg("-u").arg(key);
-                    }
-                }
-                cmd.arg(&program);
-                cmd.args(&orig_args);
-            } else {
-                cmd.arg(&program);
-                cmd.args(&orig_args);
-            }
-        } else if systemd_available {
-            cmd = std::process::Command::new("systemd-run");
-            cmd.arg("--user");
-            append_systemd_unit_mode(&mut cmd, limits.sandbox.is_some());
-            if let Some(unit) = unit {
-                cmd.arg(format!("--unit={unit}"));
-            }
-            cmd.arg("--quiet");
-            cmd.arg("-p").arg(format!("CPUQuota={}", limits.cpu_quota));
-            cmd.arg("-p")
-                .arg(format!("MemoryMax={}", limits.memory_max));
-            cmd.arg("-p")
-                .arg(format!("MemorySwapMax={}", limits.memory_swap_max));
-
-            if let Some(slice) = &limits.slice {
-                cmd.arg(format!("--slice={}", slice));
-            }
-
-            if let Some(sandbox) = &limits.sandbox {
-                emit_sandbox_properties(&mut cmd, sandbox, &self.path);
-            }
-            let unsets = emit_service_environment(&mut cmd, original, limits.sandbox.is_some());
-
-            cmd.arg("--");
-            if !unsets.is_empty() {
-                cmd.arg("env");
-                for key in &unsets {
-                    cmd.arg("-u").arg(key);
-                }
-            }
-            cmd.arg(&program);
-            cmd.args(&orig_args);
+            let mut flock = std::process::Command::new("flock");
+            flock.arg(&gpu_lock).arg("systemd-run");
+            flock
         } else {
-            cmd = std::process::Command::new(&program);
-            cmd.args(&orig_args);
+            std::process::Command::new("systemd-run")
+        };
+        cmd.arg("--user");
+        append_systemd_unit_mode(&mut cmd, limits.sandbox.is_some());
+        if let Some(unit) = unit {
+            cmd.arg(format!("--unit={unit}"));
+        }
+        cmd.arg("--quiet");
+        cmd.arg("-p").arg(format!("CPUQuota={}", limits.cpu_quota));
+        cmd.arg("-p")
+            .arg(format!("MemoryMax={}", limits.memory_max));
+        cmd.arg("-p")
+            .arg(format!("MemorySwapMax={}", limits.memory_swap_max));
+        if let Some(slice) = &limits.slice {
+            cmd.arg(format!("--slice={}", slice));
+        }
+
+        match &limits.sandbox {
+            Some(sandbox) => {
+                emit_sandbox_properties(&mut cmd, sandbox, &self.path);
+                let env = sandbox_environment(original, jobs);
+                append_sandbox_command(&mut cmd, &env, &program, &orig_args);
+            }
+            None => {
+                cmd.arg("--");
+                cmd.arg(&program).args(&orig_args);
+            }
         }
 
         // Set working directory
         cmd.current_dir(work_dir);
 
-        // Forward and inherit all original environment variables
+        // Forward and inherit all original environment variables. A sandboxed
+        // command ignores these: its environment travels as `env -i` arguments.
         for (key, val) in original.get_envs() {
             if let Some(val) = val {
                 cmd.env(key, val);
@@ -914,7 +975,7 @@ pub fn is_systemd_run_available() -> bool {
 /// Select the transient unit type for a `systemd-run` invocation.
 ///
 /// Resource caps work on both scopes and services, but namespace properties
-/// (`ProtectSystem`, `ProtectHome`, `PrivateTmp`, `ReadWritePaths`) are only
+/// (`ProtectSystem`, `ProtectHome`, `PrivateTmp`, `BindPaths`) are only
 /// supported by services: `systemd-run --user --scope -p ProtectSystem=strict`
 /// is rejected with `Unknown assignment`. A sandboxed command therefore runs as
 /// a transient service, which additionally needs `--pipe` (forward stdio and
@@ -930,103 +991,183 @@ fn append_systemd_unit_mode(cmd: &mut std::process::Command, sandboxed: bool) {
     }
 }
 
-/// Forward the caller's *effective* environment to a transient *service*.
+/// Program that applies a sandboxed command's environment before it runs.
+const SANDBOX_ENV_PROGRAM: &str = "/usr/bin/env";
+
+/// Variables a sandboxed command inherits by exact name.
 ///
-/// A scope wraps the calling process and inherits its environment, but a
-/// service runs in the user manager's environment: without this a sandboxed
-/// command loses `PATH` and every build fails with ``linker `clang` not found``.
-/// `--setenv` is the only way to reach a service's environment; setting the
-/// variables on the `systemd-run` process itself does not propagate.
-///
-/// The effective environment is what the unsandboxed command would see: this
-/// process's environment with `original`'s explicit entries applied. A
-/// `None` entry is an unset; `--setenv` cannot unset, so those keys are
-/// returned for the caller to apply with `env -u` after `--` (returned keys
-/// are not emitted as `--setenv`, and inherited copies of them are skipped).
-/// Forwarding the whole environment to a service matches the same command
-/// running as a scope or unsandboxed — it inherits this process's
-/// environment either way — so nothing extra reaches the sandboxed command.
-fn emit_service_environment(
-    cmd: &mut std::process::Command,
-    original: &std::process::Command,
-    sandboxed: bool,
-) -> Vec<OsString> {
-    if !sandboxed {
-        return Vec::new();
+/// A sandboxed command starts from the user manager's environment, which can
+/// carry the desktop session's credentials (`SSH_AUTH_SOCK`,
+/// `DBUS_SESSION_BUS_ADDRESS`, `GPG_TTY`, API tokens). Only these names, and the
+/// prefixes in [`SANDBOX_ENV_PREFIXES`], are forwarded from this process.
+const SANDBOX_ENV_NAMES: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "LANG",
+    "LANGUAGE",
+    "TERM",
+    "TZ",
+    "JUTO_FLAKE",
+    "IN_NIX_SHELL",
+    "NIX_PATH",
+    "NIX_PROFILES",
+    "NIX_USER_PROFILE_DIR",
+    "NIX_SSL_CERT_FILE",
+    "SSL_CERT_FILE",
+    "LOCALE_ARCHIVE",
+    "PKG_CONFIG_PATH",
+    "LD_LIBRARY_PATH",
+    "LIBCLANG_PATH",
+    "CC",
+    "CXX",
+    "AR",
+    "CFLAGS",
+    "CXXFLAGS",
+    "CPPFLAGS",
+    "LDFLAGS",
+    "XDG_CACHE_HOME",
+];
+
+/// Name prefixes a sandboxed command inherits from this process.
+const SANDBOX_ENV_PREFIXES: &[&str] = &["LC_", "CARGO_", "RUST_", "RUSTUP_", "CMAKE_"];
+
+/// Words that mark a variable as a credential, even under an allowed prefix
+/// (`CARGO_REGISTRIES_<name>_TOKEN`, for example).
+const SANDBOX_ENV_SECRET_WORDS: &[&str] = &[
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "CREDENTIAL",
+    "AUTH",
+    "COOKIE",
+    "API_KEY",
+];
+
+/// Whether the variable `name` is forwarded into a sandboxed command.
+fn sandbox_env_allowed(name: &str) -> bool {
+    if SANDBOX_ENV_SECRET_WORDS
+        .iter()
+        .any(|word| name.contains(word))
+    {
+        return false;
     }
-    // The last word wins: an explicit entry overrides the inherited value, an
-    // explicit unset suppresses it.
-    let mut unsets: HashSet<OsString> = HashSet::new();
-    let mut overrides: HashMap<OsString, OsString> = HashMap::new();
+    SANDBOX_ENV_NAMES.contains(&name)
+        || SANDBOX_ENV_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+/// The environment a sandboxed command runs with.
+///
+/// This process's allowlisted variables, with `original`'s explicit entries
+/// applied (an explicit `None` unsets), and `CARGO_BUILD_JOBS` derived from the
+/// cpu quota when no value is set.
+fn sandbox_environment(
+    original: &std::process::Command,
+    jobs: usize,
+) -> BTreeMap<OsString, OsString> {
+    let mut env: BTreeMap<OsString, OsString> = std::env::vars_os()
+        .filter(|(key, _)| key.to_str().is_some_and(sandbox_env_allowed))
+        .collect();
     for (key, value) in original.get_envs() {
         match value {
             Some(value) => {
-                unsets.remove(key);
-                overrides.insert(key.to_os_string(), value.to_os_string());
+                env.insert(key.to_os_string(), value.to_os_string());
             }
             None => {
-                overrides.remove(key);
-                unsets.insert(key.to_os_string());
+                env.remove(key);
             }
         }
     }
-    let mut unset_keys: Vec<OsString> = unsets.iter().cloned().collect();
-    unset_keys.sort();
-    let mut forwarded: BTreeMap<OsString, OsString> = std::env::vars_os()
-        .filter(|(key, _)| !unsets.contains(key))
-        .collect();
-    forwarded.extend(overrides);
-    for (key, value) in forwarded {
-        let mut arg = OsString::from("--setenv=");
-        arg.push(&key);
-        arg.push("=");
-        arg.push(&value);
-        cmd.arg(arg);
+    env.entry(OsString::from("CARGO_BUILD_JOBS"))
+        .or_insert_with(|| OsString::from(jobs.to_string()));
+    env
+}
+
+/// Append the sandboxed program: `-- /usr/bin/env -i KEY=VALUE... program args`.
+///
+/// `env -i` clears the service's inherited environment, so the program sees
+/// exactly `env`. The assignments travel as arguments, which is what makes an
+/// unset possible: `--setenv` can only set variables, never remove them.
+fn append_sandbox_command(
+    cmd: &mut std::process::Command,
+    env: &BTreeMap<OsString, OsString>,
+    program: &OsStr,
+    args: &[OsString],
+) {
+    cmd.arg("--").arg(SANDBOX_ENV_PROGRAM).arg("-i");
+    for (key, value) in env {
+        let mut assignment = key.clone();
+        assignment.push("=");
+        assignment.push(value);
+        cmd.arg(assignment);
     }
-    unset_keys
+    cmd.arg(program).args(args);
 }
 
 /// Emit the `systemd-run` properties that implement `sandbox`.
 ///
-/// The workspace itself is always granted write access; relative
-/// [`Sandbox::write_paths`] entries are resolved against the workspace. Paths
-/// are canonicalized when possible so symlinked workspaces grant the real
-/// directory.
+/// Grants are bind mounts (`BindPaths`, `BindReadOnlyPaths`), not
+/// `ReadWritePaths`: a bind creates its mount point inside the hidden home or
+/// the private `/tmp`, where `ReadWritePaths` fails with status 226. Grants that
+/// do not exist on the host are skipped. The workspace is always writable.
 fn emit_sandbox_properties(cmd: &mut std::process::Command, sandbox: &Sandbox, workspace: &Path) {
     if sandbox.protect_system {
         cmd.arg("-p").arg("ProtectSystem=strict");
     }
-
-    match sandbox.protect_home {
-        ProtectHome::Off => {}
-        ProtectHome::ReadOnly => {
-            cmd.arg("-p").arg("ProtectHome=read-only");
-        }
-        ProtectHome::Yes => {
-            cmd.arg("-p").arg("ProtectHome=yes");
-        }
+    if sandbox.hide_home {
+        cmd.arg("-p").arg("ProtectHome=tmpfs");
     }
-
     if sandbox.private_tmp {
         cmd.arg("-p").arg("PrivateTmp=yes");
+    }
+    for path in &sandbox.denied_paths {
+        // A missing credential path is harmless. Existing paths remain
+        // inaccessible even when a cache or explicit grant contains them.
+        cmd.arg("-p")
+            .arg(format!("InaccessiblePaths=-{}", path.display()));
     }
 
     let workspace = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
-    cmd.arg("-p")
-        .arg(format!("ReadWritePaths={}", workspace.display()));
-
+    let mut writable = vec![workspace.clone()];
     for path in &sandbox.write_paths {
-        let resolved = if path.is_absolute() {
-            path.clone()
-        } else {
-            workspace.join(path)
-        };
-        let resolved = resolved.canonicalize().unwrap_or(resolved);
-        cmd.arg("-p")
-            .arg(format!("ReadWritePaths={}", resolved.display()));
+        if let Some(resolved) = resolve_grant(path, &workspace)
+            && !writable.contains(&resolved)
+        {
+            writable.push(resolved);
+        }
     }
+    for path in &writable {
+        cmd.arg("-p").arg(format!("BindPaths={}", path.display()));
+    }
+
+    for path in &sandbox.read_paths {
+        let Some(resolved) = resolve_grant(path, &workspace) else {
+            continue;
+        };
+        // A read-only bind over a writable directory would hide its writes, so a
+        // grant that contains a writable path is skipped: it is already writable.
+        if writable.iter().any(|w| w.starts_with(&resolved)) {
+            continue;
+        }
+        cmd.arg("-p")
+            .arg(format!("BindReadOnlyPaths={}", resolved.display()));
+    }
+}
+
+/// Resolve a grant against the workspace and canonicalize it; `None` when the
+/// path does not exist on the host.
+fn resolve_grant(path: &Path, workspace: &Path) -> Option<PathBuf> {
+    let resolved = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    };
+    resolved.canonicalize().ok()
 }
 
 /// Locate the nearest ancestor that is a native Juto workspace root.
@@ -1265,7 +1406,6 @@ mod tests {
             "AGENT_SLICE_CPU_QUOTA",
             "AGENT_SLICE_MEMORY_MAX",
             "AGENT_GPU_LOCK",
-            "AGENT_SANDBOX",
         ]);
         let limits = ResourceLimits::default();
         assert_eq!(limits.cpu_quota, DEFAULT_CPU_QUOTA);
@@ -1273,18 +1413,18 @@ mod tests {
         assert_eq!(limits.memory_swap_max, DEFAULT_MEMORY_SWAP_MAX);
         assert_eq!(limits.slice.as_deref(), Some(DEFAULT_SLICE));
         assert!(!limits.gpu);
-        assert!(limits.enforce_scope);
+        assert!(limits.sandbox.is_none());
 
         let customized = limits
             .with_cpu_quota("200%")
             .with_memory_max("4G")
             .with_gpu(true)
-            .with_enforce_scope(false);
+            .with_sandbox(Sandbox::default());
 
         assert_eq!(customized.cpu_quota, "200%");
         assert_eq!(customized.memory_max, "4G");
         assert!(customized.gpu);
-        assert!(!customized.enforce_scope);
+        assert_eq!(customized.sandbox, Some(Sandbox::default()));
     }
 
     #[test]
@@ -1395,77 +1535,6 @@ mod tests {
             assert!(args.contains(&"cargo".to_string()));
             assert!(args.contains(&"build".to_string()));
             assert!(args.contains(&"--release".to_string()));
-        }
-    }
-
-    #[test]
-    fn sandboxed_service_forwards_the_effective_environment() {
-        if !is_systemd_run_available() {
-            eprintln!("skipping: systemd-run unavailable");
-            return;
-        }
-        let _guard = env_lock();
-        // SAFETY: serialized by ENV_LOCK.
-        unsafe {
-            std::env::set_var("JUTO_SVCENV_INHERITED", "inherited-value");
-            std::env::set_var("JUTO_SVCENV_REMOVED", "present");
-        }
-
-        let ws = workspace_at(&PathBuf::from("/tmp/test-ws"));
-        let mut orig = std::process::Command::new("cargo");
-        orig.arg("build");
-        // An explicit override beats the inherited copy; an explicit unset
-        // must reach the service as a removal, not a resurrection.
-        orig.env("JUTO_SVCENV_INHERITED", "overridden-value");
-        orig.env("JUTO_SVCENV_EXPLICIT", "explicit-value");
-        orig.env_remove("JUTO_SVCENV_REMOVED");
-
-        let limits = ResourceLimits::default().with_sandbox(Sandbox::default());
-        let scoped = ws
-            .build_scoped_std_command(&orig, &limits)
-            .expect("build scoped");
-        let args: Vec<String> = scoped
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-
-        // The effective environment is forwarded through --setenv: inherited
-        // variables are preserved with their overrides applied.
-        assert!(
-            args.contains(&"--setenv=JUTO_SVCENV_INHERITED=overridden-value".to_string()),
-            "the override must win over the inherited value: {args:?}"
-        );
-        assert!(
-            !args.contains(&"--setenv=JUTO_SVCENV_INHERITED=inherited-value".to_string()),
-            "the shadowed inherited value must not be forwarded: {args:?}"
-        );
-        assert!(
-            args.contains(&"--setenv=JUTO_SVCENV_EXPLICIT=explicit-value".to_string()),
-            "an explicit entry must be forwarded: {args:?}"
-        );
-        assert!(
-            !args
-                .iter()
-                .any(|a| a.starts_with("--setenv=JUTO_SVCENV_REMOVED")),
-            "an explicitly removed variable must not be set: {args:?}"
-        );
-
-        // The unset is applied in the service by `env -u` before the program.
-        let dashdash = args.iter().position(|a| a == "--").unwrap();
-        assert_eq!(args[dashdash + 1], "env", "{args:?}");
-        let u = args[dashdash + 1..]
-            .iter()
-            .position(|a| a == "-u")
-            .map(|i| dashdash + 1 + i)
-            .expect("`env -u` must precede the program");
-        assert_eq!(args[u + 1], "JUTO_SVCENV_REMOVED", "{args:?}");
-        let program = args.iter().rposition(|a| a == "cargo").unwrap();
-        assert!(program > u, "the program must follow `env -u`: {args:?}");
-
-        // SAFETY: serialized by ENV_LOCK.
-        unsafe {
-            std::env::remove_var("JUTO_SVCENV_INHERITED");
-            std::env::remove_var("JUTO_SVCENV_REMOVED");
         }
     }
 
@@ -1900,7 +1969,6 @@ mod tests {
             "AGENT_SLICE_CPU_QUOTA",
             "AGENT_SLICE_MEMORY_MAX",
             "AGENT_GPU_LOCK",
-            "AGENT_SANDBOX",
         ];
         let _env = EnvGuard::clear(&vars);
         for var in vars {

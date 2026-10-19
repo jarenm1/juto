@@ -91,6 +91,8 @@ pub(crate) struct AgentRole {
     /// Model selectors a child run of this role tries in order when its
     /// `task` entry names no model (oh-my-pi agent `model:` frontmatter).
     pub(crate) models: Vec<String>,
+    /// Optional execution-tier ceiling; a role can tighten, never loosen a run.
+    pub(crate) tier: Option<crate::tier::ExecutionTier>,
     /// Markdown body, appended to the run's system prompt.
     pub(crate) instructions: String,
 }
@@ -103,6 +105,8 @@ struct RoleFrontmatter {
     tools: Option<ToolsField>,
     /// A selector or an ordered fallback list.
     model: Option<ModelField>,
+    #[serde(default)]
+    tier: Option<crate::tier::ExecutionTier>,
 }
 
 #[derive(Deserialize)]
@@ -158,6 +162,7 @@ fn parse_role(path: &Path, name: &str, text: &str) -> Result<AgentRole> {
         name: name.to_owned(),
         description: fm.description,
         tools,
+        tier: fm.tier,
         models,
         instructions: body.trim().to_owned(),
     })
@@ -275,6 +280,17 @@ mod tests {
         assert_eq!(auditor.instructions, "Look closely.");
         assert!(auditor.tools.allows("read"));
         assert!(!auditor.tools.allows("write"));
+    }
+
+    #[test]
+    fn role_parses_execution_tier_ceiling() {
+        let role = parse_role(
+            Path::new("auditor.md"),
+            "auditor",
+            "---\ndescription: audits\ntier: untrusted\n---\n",
+        )
+        .unwrap();
+        assert_eq!(role.tier, Some(crate::tier::ExecutionTier::Untrusted));
     }
 
     #[test]
