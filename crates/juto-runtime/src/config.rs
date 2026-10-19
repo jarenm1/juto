@@ -129,6 +129,9 @@ pub struct RuntimeConfig {
     /// Tier of the top-level run: how confined its shell commands are. Children
     /// get at most this tier. See `ExecutionTier`.
     pub execution_tier: ExecutionTier,
+    /// HTTP/HTTPS destinations for workspace-tier shells. Untrusted shells use
+    /// only the built-in package mirrors, regardless of project configuration.
+    pub network: crate::network::NetworkConfig,
     /// Run attended `bash` commands under resource governance (a systemd scope
     /// with CPU and memory caps). Sandboxed tiers are always governed. Off by
     /// default because it needs `systemd-run` on the host.
@@ -158,6 +161,7 @@ impl Default for RuntimeConfig {
             tools: Vec::new(),
             custom_models: Vec::new(),
             execution_tier: ExecutionTier::Attended,
+            network: crate::network::NetworkConfig::default(),
             bash_scoped: false,
             max_active_threads: default_max_active_threads(),
         }
@@ -210,6 +214,7 @@ impl RuntimeConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        self.network.validate().map_err(ConfigError::Validation)?;
         if self.max_concurrency == 0 {
             return Err(ConfigError::Validation(
                 "maxConcurrency must be positive".into(),

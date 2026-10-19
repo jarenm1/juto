@@ -104,6 +104,15 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let mut raw = std::env::args_os().skip(1);
+    if raw
+        .next()
+        .is_some_and(|arg| arg == juto_runtime::network::FORWARDER_ARGUMENT)
+    {
+        let code = juto_runtime::network::run_forwarder(raw)
+            .context("sandbox network forwarder failed")?;
+        std::process::exit(code);
+    }
     let arguments = Arguments::parse();
     let cwd = arguments.cwd.canonicalize().context("invalid --cwd")?;
     if let Command::Changes { command } = &arguments.command {
