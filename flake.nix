@@ -147,6 +147,17 @@
               };
             }
           );
+          # Shared compile cache for agent workspaces. Each workspace keeps its
+          # own target/; sccache serves identical registry-crate compiles across
+          # workspaces from one cache, capped by SCCACHE_CACHE_SIZE. sccache
+          # refuses to run while CARGO_INCREMENTAL is set (inherited from an
+          # older shell), so the hook unsets it. See docs/agent-workflow.md
+          # "Build profile".
+          compileCacheHook = ''
+            unset CARGO_INCREMENTAL
+            export SCCACHE_DIR="''${SCCACHE_DIR:-''${XDG_CACHE_HOME:-$HOME/.cache}/sccache}"
+            export SCCACHE_CACHE_SIZE="''${SCCACHE_CACHE_SIZE:-10G}"
+          '';
         in
         {
           packages.default = juto;
@@ -170,6 +181,7 @@
                 ninja
                 jujutsu
                 git
+                sccache
               ]
               ++ xwaylandTools
               ++ audioTools;
@@ -177,11 +189,12 @@
 
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
 
-            # Keep Cargo's incremental cache usable; do not wrap rustc with sccache.
-            CARGO_INCREMENTAL = "1";
+            # Shared compile cache: sccache serves registry crates across agent
+            # workspaces. Workspace members stay incremental and pass through.
+            RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
 
             # GPUI loads graphics libraries at runtime. Use the host GPU driver.
-            shellHook = ''
+            shellHook = compileCacheHook + ''
               export LD_LIBRARY_PATH="/run/opengl-driver/lib:${pkgs.lib.makeLibraryPath nativeLibraries}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               export GST_PLUGIN_SYSTEM_PATH_1_0="${gstPluginPath}"
             '';
@@ -201,6 +214,8 @@
               ++ xwaylandTools
               ++ audioTools;
             LIBGL_ALWAYS_SOFTWARE = "1";
+            RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+            shellHook = compileCacheHook;
             VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.x86_64.json";
             FONTCONFIG_FILE = pkgs.makeFontsConf {
               fontDirectories = [ pkgs.dejavu_fonts ];

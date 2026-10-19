@@ -54,6 +54,49 @@ scripts/agent-scope.sh -- nix develop "$JUTO_FLAKE#smoke" -c <visual-smoke-comma
 - Track `Cargo.lock` and `flake.lock`. Regenerate Cargo locks with Cargo, not by
   hand.
 
+### Shared compile cache
+
+- Dev shells (`default` and `smoke`) set `RUSTC_WRAPPER` to the flake's pinned
+  sccache, export `SCCACHE_DIR` (default `${XDG_CACHE_HOME:-~/.cache}/sccache`)
+  and `SCCACHE_CACHE_SIZE` (default `10G`, LRU eviction), and unset
+  `CARGO_INCREMENTAL`. Override the two directories in the environment.
+- Identical rustc invocations (same toolchain, flags and registry source) hit
+  one entry from any workspace's `target/`. Workspace members are compiled
+  incrementally; sccache passes those through and reports them as
+  "incremental". Cargo already builds registry dependencies non-incremental,
+  so no dependency-only profile override is needed.
+- `CARGO_INCREMENTAL=1` in the environment forces incremental compilation for
+  every crate, dependencies included. sccache then refuses to run
+  (`incremental compilation is prohibited: Unset CARGO_INCREMENTAL`). Shells
+  inherit it from older sessions, so the dev shell unsets it; keep it unset
+  elsewhere.
+- sccache runs one server per user on `127.0.0.1:4226`, shared by every shell
+  on the host. `SCCACHE_DIR` and `SCCACHE_CACHE_SIZE` are read when the server
+  starts; the first shell to start it wins. Run `sccache --stop-server` after
+  changing either.
+- Check hits with `sccache --show-stats` inside a dev shell. Build scripts,
+  proc-macros and binaries are not Rust cache hits. The `cc` crate also detects
+  `RUSTC_WRAPPER=sccache` and caches supported C/C++/assembler invocations;
+  other native build systems are not automatically wrapped.
+- Trust boundary: every agent on the host shares this cache. Content-triggered
+  (untrusted) work MUST NOT read or write it. Run its cargo commands with
+  `env RUSTC_WRAPPER= cargo ...`, which bypasses sccache entirely. Clearing
+  `RUSTC_WRAPPER` in the parent shell is insufficient: the dev shell sets it.
+- Measured (one serial run per row, `cargo build -p juto`, host loadavg 12-14
+  on 24 cores, isolated `SCCACHE_DIR`):
+  - Cold, empty cache, workspace A: 2m44s wall; 0 Rust hits, 635 misses; cache
+    520 MiB after.
+  - Cold, workspace B at the same `main` commit, cache populated by A:
+    2m02s wall; 478 hits / 635 requests (75.3%), Rust 436/593 (73.5%), 0
+    cache errors.
+  - Cold, workspace B, `RUSTC_WRAPPER=` (no cache): 2m24s wall.
+  - Edit loop (touch `crates/juto-ai/src/lib.rs`, rebuild): 4.9 s with the
+    wrapper, 4.0 s without.
+  Caveats: one run per row under shared load, so the 15% cold-build gain is
+  close to load noise; cargo's `user` time excludes the sccache server, so
+  wall time is the comparable figure. The benefit grows with each workspace
+  that builds the same dependency set; a fully cold cache gains nothing.
+
 ## Known build gap
 
 `flake.nix`'s `nativeLibraries` is incomplete for the desktop crates, so a clean

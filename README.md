@@ -519,7 +519,8 @@ outside the project source; a remote `/tmp` path does not render for reviewers.
 - Unoptimized dev/test builds, line-table debug information, incremental
   compilation. Dependencies remain unoptimized too: no `opt-level = 3` override.
 - Clang + mold on `x86_64-unknown-linux-gnu`. No dev LTO, single-codegen-unit
-  override, compiler-cache wrapper, or forced host-specific CPU flags.
+  override, or forced host-specific CPU flags. Dev shells wrap rustc with a
+  shared sccache compile cache; see `docs/agent-workflow.md` "Build profile".
 - Cargo retains its per-workspace `target/` cache. Agent builds use jtech's
   adapted resource wrapper: four jobs by default, with CPU/memory caps and a
   shared hardware GPU lock. See AGENTS.md for overrides and concurrency rules.
