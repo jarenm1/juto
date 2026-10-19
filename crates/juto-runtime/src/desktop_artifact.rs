@@ -12,12 +12,13 @@ use std::sync::Arc;
 
 use juto_desktop::DesktopSupervisor;
 use juto_desktop::protocol::GrantRole;
+use serde::{Deserialize, Serialize};
 
 use crate::SignalingHandle;
 use crate::tools::DesktopSessionArtifact;
 
 /// How a human should view an agent's desktop.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ViewerRoute {
     /// Same-host embedded viewer for an environment owned by this process.
     Local {

@@ -237,3 +237,47 @@ fn open_rejects_non_session_file() {
     ));
     assert_eq!(std::fs::read(&path).unwrap(), b"{\"hello\":1}\n");
 }
+
+#[test]
+fn append_interrupted_pairs_open_calls_and_marks_the_run_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/work")).unwrap();
+    s.append(user("fix it")).unwrap();
+    s.append(tool_assistant("call-1")).unwrap();
+    let path = s.path().to_path_buf();
+
+    s.append_interrupted("run-1", "daemon restarted").unwrap();
+    s.append_interrupted("run-1", "daemon restarted").unwrap();
+
+    let s = Session::open(&path).unwrap();
+    let entries = s.active_entries().unwrap();
+    let results: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Message {
+                message:
+                    Message::ToolResult {
+                        tool_call_id,
+                        is_error,
+                        ..
+                    },
+            } => Some((tool_call_id.clone(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results, vec![("call-1".to_string(), true)]);
+
+    let markers: Vec<_> = entries
+        .iter()
+        .filter_map(|entry| match &entry.kind {
+            EntryKind::Custom { custom_type, data } if custom_type == "run_interrupted" => {
+                Some(data.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        markers,
+        vec![serde_json::json!({ "run_id": "run-1", "reason": "daemon restarted" })]
+    );
+}

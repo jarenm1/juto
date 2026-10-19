@@ -85,10 +85,10 @@ pub use desktop_artifact::{DesktopArtifactResolver, ResolveError, ViewerRoute};
 pub use peers::{
     PeerAgentSnapshot, PeerBus, PeerError, PeerResource, PeerSendFailure, PeerSendReport,
 };
-pub use session::{EntryKind, Session};
+pub use session::{EntryKind, Session, SessionEntry};
 pub use subagents::{
-    BlockerReason, ChildState, SchemaMode, SubagentError, SubagentManager, SubagentResult,
-    SubagentStatus, SubagentSummary, TaskSpec,
+    BlockerReason, ChildState, SchemaMode, SubagentError, SubagentEvent, SubagentManager,
+    SubagentResult, SubagentStatus, SubagentSummary, TaskSpec,
 };
 pub use tools::{
     DESKTOP_SESSION_ARTIFACT_VERSION, DesktopArtifactTool, DesktopSessionArtifact, DesktopTool,
@@ -123,6 +123,7 @@ struct RuntimeInner {
     provider: Arc<dyn Provider>,
     approval: Option<Arc<dyn ApprovalHandler>>,
     subagent_manager: Mutex<Option<Arc<SubagentManager>>>,
+    subagent_root: CancellationToken,
     desktop_supervisor: Mutex<Option<Arc<DesktopSupervisor>>>,
     signaling: Mutex<Option<Arc<SignalingHandle>>>,
 }
@@ -205,6 +206,7 @@ impl Runtime {
                 provider,
                 approval,
                 subagent_manager: Mutex::new(None),
+                subagent_root: CancellationToken::new(),
                 desktop_supervisor: Mutex::new(None),
                 signaling: Mutex::new(None),
             }),
@@ -413,7 +415,10 @@ impl Runtime {
         handle
     }
 
-    pub fn subagent_manager(&self, control: &RunControl) -> Arc<SubagentManager> {
+    /// The runtime's subagent manager, created once. Its children are parented
+    /// to a runtime-owned token that no run cancels, so one run's `RunControl`
+    /// never cancels the manager. Children still stop when their parent run ends.
+    pub fn subagent_manager(&self) -> Arc<SubagentManager> {
         let mut guard = self.inner.subagent_manager.lock();
         if let Some(mgr) = &*guard {
             return mgr.clone();
@@ -426,7 +431,7 @@ impl Runtime {
                 inbox: inbox.clone(),
             }),
             self.config().max_concurrency,
-            control.token(),
+            self.inner.subagent_root.clone(),
             inbox,
         ));
         *guard = Some(mgr.clone());
@@ -447,7 +452,7 @@ impl Runtime {
             tier: self.config().execution_tier,
             sender: None,
         };
-        let manager = self.subagent_manager(&control);
+        let manager = self.subagent_manager();
         let inbox = manager.main_inbox();
         // Completions that landed while no main run was active enter this run first.
         deliver_main_inbox(&inbox, &control);
@@ -1374,10 +1379,7 @@ fn queued_output(children: Vec<(String, Option<String>, bool)>) -> ToolOutput {
 fn deliver_main_inbox(inbox: &subagents::MainInbox, control: &RunControl) -> bool {
     let mut pending = inbox.drain().into_iter();
     while let Some(message) = pending.next() {
-        let text = format!(
-            "[subagent {} {:?}]\n{}",
-            message.from, message.kind, message.body
-        );
+        let text = subagents::main_message_text(&message);
         if !control.steer(Message::user(text)) {
             inbox.requeue_front(std::iter::once(message).chain(pending).collect());
             return false;
@@ -1654,8 +1656,7 @@ mod tests {
         let data_dir = root.path().join("data");
 
         let runtime = mock_runtime(&repo, &data_dir);
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
 
         let mut spec = TaskSpec::new("say hello");
         spec.isolated_workspace = true;
@@ -1671,6 +1672,25 @@ mod tests {
             "isolated child workspace must survive a completed run: {}",
             workspace_dir.display()
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_subagent_manager_survives_run_control_cancellation() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+
+        let runtime = mock_runtime(&repo, &data_dir);
+        let control = RunControl::new();
+        let manager = runtime.subagent_manager();
+        control.cancel();
+
+        let id = manager
+            .spawn(TaskSpec::new("say hello"))
+            .expect("spawn child");
+        let result = manager.wait(&id).await.expect("child run");
+        assert_eq!(result.output, "child output");
     }
 
     #[tokio::test]
@@ -1848,8 +1868,7 @@ mod tests {
         });
         let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
 
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new("begin the thread");
         spec.focus = true;
         let id = manager.spawn(spec).expect("spawn focus child");
@@ -1896,8 +1915,7 @@ mod tests {
         });
         let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
 
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new("begin the thread");
         spec.focus = true;
         let id = manager.spawn(spec).expect("spawn focus child");
@@ -1950,8 +1968,7 @@ mod tests {
         let provider = Arc::new(AdvertisedTools::default());
         let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
 
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new("work");
         spec.focus = true;
         let id = manager.spawn(spec).expect("spawn focus child");
@@ -2003,8 +2020,7 @@ mod tests {
     /// Runs one child through the manager a `task` call uses, so its role is
     /// resolved exactly as delegated work is.
     async fn run_child(runtime: &Runtime, role: &str, task: &str) {
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new(task);
         spec.agent = Some(role.to_string());
         let id = manager.spawn(spec).expect("spawn child");
@@ -2180,8 +2196,7 @@ mod tests {
         };
         let runtime = runtime_with(&repo, &data_dir, config, provider.clone());
 
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new("write built.txt");
         spec.agent = Some("builder".to_string());
         spec.isolated_workspace = true;
@@ -2259,7 +2274,7 @@ mod tests {
                     tier: ExecutionTier::Attended,
                     sender: None,
                 },
-                runtime.subagent_manager(&RunControl::new()),
+                runtime.subagent_manager(),
             )
             .await
             .expect("depth-2 run");
@@ -2285,8 +2300,7 @@ mod tests {
         native_repo(&repo);
         let data_dir = root.path().join("data");
         let runtime = runtime_with(&repo, &data_dir, mock_config(), Arc::new(MockProvider));
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let tool = TaskTool {
             manager: manager.clone(),
             catalog: Arc::new(roles::load(&repo, &data_dir).expect("roles")),
