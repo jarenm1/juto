@@ -448,10 +448,12 @@ pub struct MainMessage {
 /// main session with several internal threads delivers a report to the thread
 /// that asked for it.
 ///
-/// Once [`MainInbox::bind`] attaches a file, every change to the queue or to
-/// the digest archive is written to it. Reports still waiting in a sender's
+/// Once [`MainInbox::bind`] attaches a file, every change to the queue, to the
+/// user's notices, or to the digest archive is written to it. Reports still waiting in a sender's
 /// lane for their digest are not persisted: the digest needs the live model,
 /// so a restart before it finishes drops them.
+///
+/// The user's copy of each notice is separate: dismissing it never acknowledges the message for the model.
 #[derive(Clone, Default)]
 pub struct MainInbox {
     messages: Arc<Mutex<Vec<Queued>>>,
@@ -465,6 +467,10 @@ pub struct MainInbox {
     event_senders: Arc<Mutex<Vec<broadcast::WeakSender<SubagentEvent>>>>,
     /// Backing file, set once by `bind`.
     store: Arc<OnceLock<PathBuf>>,
+    /// Notices the user sees, in arrival order. Reading never drains; dismissing removes only this copy.
+    user: Arc<Mutex<Vec<MainMessage>>>,
+    /// Woken when a notice is pushed to `user`.
+    user_changed: Arc<Notify>,
 }
 
 /// One queued message and the top-level session it is addressed to.
@@ -491,14 +497,17 @@ impl MainInbox {
             return Ok(());
         }
         let loaded = main_inbox_store::load(&path)?;
-        let restored = !loaded.queued.is_empty();
+        let restored = !loaded.queued.is_empty() || !loaded.user.is_empty();
+        let mut user = self.user.lock().expect("main inbox poisoned");
         let mut archive = self.archive.lock().expect("main inbox poisoned");
         archive.extend(loaded.archive);
+        user.splice(0..0, loaded.user);
         messages.splice(0..0, loaded.queued);
         // Checked above under the `messages` lock, so no other bind can have set it.
         let _ = self.store.set(path);
-        self.persist_with(&messages, &archive);
+        self.persist_with(&messages, &user, &archive);
         drop(archive);
+        drop(user);
         drop(messages);
         if restored {
             self.announce();
@@ -511,12 +520,16 @@ impl MainInbox {
         self.push_from(None, message);
     }
 
-    /// Queue a message addressed to the top-level session `origin`.
+    /// Queue a message addressed to the top-level session `origin`. The user's
+    /// copy is queued with it.
     pub fn push_from(&self, origin: Option<String>, message: MainMessage) {
         {
             let mut messages = self.messages.lock().expect("main inbox poisoned");
+            let mut user = self.user.lock().expect("main inbox poisoned");
+            user.push(message.clone());
             messages.push(Queued { origin, message });
-            self.persist(&messages);
+            let archive = self.archive.lock().expect("main inbox poisoned");
+            self.persist_with(&messages, &user, &archive);
         }
         self.announce();
     }
@@ -537,22 +550,30 @@ impl MainInbox {
         // Stores a permit when no waiter is parked, so a push racing a drain
         // is not missed by the next `arrived` wait.
         self.arrived.notify_one();
+        self.user_changed.notify_one();
     }
 
-    /// Write the queue and archive to the bound file, if any. Callers hold the
-    /// `messages` lock, so writes are ordered with the change they record. A
-    /// failed write is reported on stderr and the state stays in memory; the
-    /// next successful write stores all of it again.
+    /// Write the queue, the user's notices and the archive to the bound file,
+    /// if any. Lock order is `messages`, then `user`, then `archive`. A failed
+    /// write is reported on stderr and the state stays in memory; the next
+    /// successful write stores all of it again.
     fn persist(&self, messages: &[Queued]) {
+        let user = self.user.lock().expect("main inbox poisoned");
         let archive = self.archive.lock().expect("main inbox poisoned");
-        self.persist_with(messages, &archive);
+        self.persist_with(messages, &user, &archive);
     }
 
-    fn persist_with(&self, messages: &[Queued], archive: &HashMap<String, ArchivedReport>) {
+    /// As [`Self::persist`], for callers that already hold `messages` and `user`.
+    fn persist_with(
+        &self,
+        messages: &[Queued],
+        user: &[MainMessage],
+        archive: &HashMap<String, ArchivedReport>,
+    ) {
         let Some(path) = self.store.get() else {
             return;
         };
-        if let Err(error) = main_inbox_store::save(path, messages, archive) {
+        if let Err(error) = main_inbox_store::save(path, messages, archive, user) {
             eprintln!("juto: {error:#}");
         }
     }
@@ -560,6 +581,35 @@ impl MainInbox {
     /// Resolves once a message is pushed. Pending messages are read with `drain`.
     pub async fn arrived(&self) {
         self.arrived.notified().await;
+    }
+
+    /// Resolves once a notice is pushed for the user. Read them with `user_messages`.
+    pub async fn user_changed(&self) {
+        self.user_changed.notified().await;
+    }
+
+    /// The notices the user has not dismissed, oldest first. Reading never drains.
+    pub fn user_messages(&self) -> Vec<MainMessage> {
+        self.user.lock().expect("main inbox poisoned").clone()
+    }
+
+    /// Dismiss one notice for the user, leaving the model's copy queued. A
+    /// failed write keeps the notice visible so the dismissal can be retried.
+    pub fn dismiss_user_message(&self, message: &MainMessage) -> anyhow::Result<()> {
+        let messages = self.messages.lock().expect("main inbox poisoned");
+        let mut user = self.user.lock().expect("main inbox poisoned");
+        let Some(index) = user.iter().position(|entry| entry == message) else {
+            return Ok(());
+        };
+        let removed = user.remove(index);
+        if let Some(path) = self.store.get() {
+            let archive = self.archive.lock().expect("main inbox poisoned");
+            if let Err(error) = main_inbox_store::save(path, &messages, &archive, &user) {
+                user.insert(index, removed);
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     /// Put undelivered messages for `origin` back at the front, preserving
@@ -776,9 +826,10 @@ async fn bound_pending(inbox: &MainInbox, pending: PendingReport) -> MainMessage
             };
             {
                 let messages = inbox.messages.lock().expect("main inbox poisoned");
+                let user = inbox.user.lock().expect("main inbox poisoned");
                 let mut archive = inbox.archive.lock().expect("main inbox poisoned");
                 archive.insert(key, archived);
-                inbox.persist_with(&messages, &archive);
+                inbox.persist_with(&messages, &user, &archive);
             }
             MainMessage {
                 from,
@@ -4384,5 +4435,55 @@ mod tests {
                 .unwrap()
                 .starts_with("first report ")
         );
+    }
+
+    fn inbox_note(from: &str, body: &str) -> MainMessage {
+        MainMessage {
+            from: from.into(),
+            name: None,
+            kind: MainMessageKind::Message,
+            digest_of: None,
+            body: body.into(),
+        }
+    }
+
+    /// The user's copy of a notice is independent of the model's: dismissing it
+    /// leaves the message queued for `drain`, and both outcomes survive a restart.
+    #[test]
+    fn user_dismiss_and_model_drain_are_independent_across_restart() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let path = root.path().join("session.json");
+        let inbox = MainInbox::default();
+        inbox.bind(path.clone()).expect("bind");
+        let first = inbox_note("child", "completed");
+        let second = inbox_note("child", "failed");
+        inbox.push(first.clone());
+        inbox.push(second.clone());
+        inbox.dismiss_user_message(&first).expect("dismiss first");
+        assert_eq!(inbox.drain(), vec![first.clone(), second.clone()]);
+        drop(inbox);
+
+        let inbox = MainInbox::default();
+        inbox.bind(path.clone()).expect("rebind");
+        assert!(inbox.drain().is_empty());
+        assert_eq!(inbox.user_messages(), vec![second.clone()]);
+        inbox.dismiss_user_message(&second).expect("dismiss second");
+        drop(inbox);
+
+        let inbox = MainInbox::default();
+        inbox.bind(path).expect("third bind");
+        assert!(inbox.user_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_wakes_user_watchers() {
+        let inbox = MainInbox::default();
+        let watcher = inbox.clone();
+        let waiting = tokio::spawn(async move { watcher.user_changed().await });
+        inbox.push(inbox_note("child-1", "blocked on a decision"));
+        timeout(WAIT_TIMEOUT, waiting)
+            .await
+            .expect("watcher woke after push")
+            .expect("watcher task");
     }
 }

@@ -1,5 +1,5 @@
 //! On-disk form of the main inbox: the undrained messages, each with the
-//! origin it is addressed to, and the archive its digests point into. The
+//! origin it is addressed to, the notices the user has not dismissed, and the archive its digests point into. The
 //! file is replaced atomically, so a crash leaves either the old or the new
 //! state, never a torn one.
 
@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::subagents::{ArchivedReport, Queued};
+use crate::subagents::{ArchivedReport, MainMessage, Queued};
 
 /// On-disk format version. A file with any other version is refused, so no
 /// message is discarded by a reader that does not understand it.
@@ -23,6 +23,7 @@ const FORMAT_VERSION: u32 = 1;
 pub(crate) struct Loaded {
     pub(crate) queued: Vec<Queued>,
     pub(crate) archive: HashMap<String, ArchivedReport>,
+    pub(crate) user: Vec<MainMessage>,
 }
 
 #[derive(Serialize)]
@@ -30,6 +31,7 @@ struct StoredRef<'a> {
     version: u32,
     queued: &'a [Queued],
     archive: &'a HashMap<String, ArchivedReport>,
+    user: &'a [MainMessage],
 }
 
 #[derive(Deserialize)]
@@ -37,6 +39,7 @@ struct Stored {
     version: u32,
     queued: Vec<Queued>,
     archive: HashMap<String, ArchivedReport>,
+    user: Vec<MainMessage>,
 }
 
 /// Read the inbox at `path`. A missing file is an empty inbox. A file that
@@ -49,6 +52,7 @@ pub(crate) fn load(path: &Path) -> Result<Loaded> {
             return Ok(Loaded {
                 queued: Vec::new(),
                 archive: HashMap::new(),
+                user: Vec::new(),
             });
         }
         Err(source) => {
@@ -67,6 +71,7 @@ pub(crate) fn load(path: &Path) -> Result<Loaded> {
     Ok(Loaded {
         queued: stored.queued,
         archive: stored.archive,
+        user: stored.user,
     })
 }
 
@@ -77,11 +82,13 @@ pub(crate) fn save(
     path: &Path,
     queued: &[Queued],
     archive: &HashMap<String, ArchivedReport>,
+    user: &[MainMessage],
 ) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(&StoredRef {
         version: FORMAT_VERSION,
         queued,
         archive,
+        user,
     })
     .context("encoding main inbox")?;
     let directory = path.parent().unwrap_or_else(|| Path::new("."));
@@ -142,19 +149,25 @@ mod tests {
         let root = tempdir().expect("tempdir");
         let path = root.path().join("inbox").join("main.json");
         let queue = vec![queued(Some("thread-a"), "one"), queued(None, "two")];
-        save(&path, &queue, &HashMap::new()).expect("save");
+        let user = vec![queue[1].message.clone()];
+        save(&path, &queue, &HashMap::new(), &user).expect("save");
         let loaded = load(&path).expect("load");
         assert_eq!(loaded.queued.len(), 2);
         assert_eq!(loaded.queued[0].origin.as_deref(), Some("thread-a"));
         assert_eq!(loaded.queued[0].message, queue[0].message);
         assert_eq!(loaded.queued[1].origin, None);
+        assert_eq!(loaded.user, user);
     }
 
     #[test]
     fn unknown_format_version_is_refused() {
         let root = tempdir().expect("tempdir");
         let path = root.path().join("main.json");
-        fs::write(&path, br#"{"version":99,"queued":[],"archive":{}}"#).expect("write");
+        fs::write(
+            &path,
+            br#"{"version":99,"queued":[],"archive":{},"user":[]}"#,
+        )
+        .expect("write");
         let error = load(&path).err().expect("refused");
         assert!(error.to_string().contains("unsupported format version 99"));
     }
