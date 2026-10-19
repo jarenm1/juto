@@ -187,6 +187,7 @@ async fn main() -> Result<()> {
                 Some(path) => MainSession::open(&path)?,
                 None => runtime.new_main_session()?,
             };
+            runtime.open_main_inbox(&session)?;
             if model_override && resumed {
                 runtime.switch_main_model(&mut session, &runtime.config().model)?;
             }
