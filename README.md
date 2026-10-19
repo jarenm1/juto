@@ -292,10 +292,9 @@ previous process; the daemon and the runtime call it at startup.
 **Not yet shipped: audio and the remaining profiles.** Audio (private PipeWire
 sink plus Opus), Xwayland, the hardware render-node profile, DMA-BUF
 export/import, and TURN relay configuration are not implemented.
-The embedded GPUI viewer still reads the pool in-process; wiring it to the
-daemon's `SCM_RIGHTS` attach path is a follow-up. A compile pass is not evidence of
-streaming; the shipped behavior is verified by the integration tests and the
-smokes described below.
+The embedded GPUI viewer attaches to the runtime daemon's desktop control socket
+and maps the sealed frame pool read-only through `SCM_RIGHTS`; no compositor or
+agent runtime lives in the GUI process.
 
 **Remote sharing desktop artifacts in chat.** Agents mount remote desktop sharing
 sessions in chat conversations via the `desktop_artifact` tool. Artifact descriptors persist
@@ -327,9 +326,21 @@ nix develop
 # Alternatively, when using direnv:
 direnv allow
 
-scripts/agent-scope.sh -- nix develop . -c cargo build --workspace --locked
+scripts/agent-scope.sh -- nix develop . -c cargo build -p juto -p juto-daemon --locked
 scripts/agent-scope.sh --gpu -- nix develop . -c cargo run -p juto --locked
 ```
+
+The GUI requires the `juto-daemon` executable next to it or on `PATH`. Build both
+packages above before launching. It connects to a private per-workspace Unix
+socket under `$XDG_RUNTIME_DIR/juto/` and starts the daemon as a detached
+`systemd --user` service if absent. Closing the window leaves sessions, running
+agents, approvals, and desktop environments alive. Reopening a session with
+`juto --session <journal-path>` reattaches to its committed transcript and current
+run. The daemon owns credentials; the GUI sends login/model commands over RPC.
+After a daemon restart, unfinished runs are reported as interrupted, not resumed.
+Use `systemctl --user list-units 'juto-daemon-*'` to find workspace services,
+`journalctl --user -u <unit>` for logs, and `systemctl --user stop <unit>` to stop
+one explicitly. The installed Nix package includes both executables.
 
 The flake also packages the GUI app for `x86_64-linux`. Install the latest
 published GitHub revision into your user profile:

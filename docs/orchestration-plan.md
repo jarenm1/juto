@@ -396,13 +396,31 @@ again until a release succeeds, even if the directory was partly removed.
 
 ## 6. Future Extensibility: Headless Daemon, Mobile & Automations
 
-### 6.1 Headless Runtime vs. Presentation Layer
-* **`juto-runtime` as a Background Daemon**:
-  Manages credentials, sessions, subagent pools, jj workspaces, and tool execution.
-  Exposes an asynchronous RPC API (Unix socket or TLS).
-* **GPUI Desktop as Client**:
-  GPUI connects as an RPC client. Closing the UI window does not kill background builds
-  or running subagents.
+### 6.1 Headless Runtime vs. Presentation Layer *(shipped)*
+
+`juto-daemon` hosts the runtime, credential store, sessions, subagents, workspace
+operations, approvals, and desktop supervisor. There is one daemon per canonical
+workspace directory and one foreground run at a time per daemon. The GPUI app is
+an RPC client only: closing its last window disconnects it, not the running agent.
+
+The GUI connects to `$XDG_RUNTIME_DIR/juto/<workspace-key>/daemon.sock`, starting
+`juto-daemon --workspace <directory>` in a detached systemd user service when
+necessary. The socket directory is private to the user; clients negotiate the
+versioned newline-delimited JSON protocol in `juto-daemon::protocol`. Desktop
+frames use the adjacent desktop control socket and read-only shared-memory
+descriptor transfer, not an in-process runtime reference. Credentials remain in
+the daemon and are never returned in RPC responses.
+
+Opening a session returns its committed journal, active run, and pending
+approvals. The client subscribes before opening and deduplicates committed
+messages by journal index. On connection loss it reconnects and reloads that
+snapshot. Partial in-progress stream deltas are not replayed; the committed
+message arrives when it finishes. A daemon restart marks previously in-flight
+runs interrupted; it never pretends to resume their model/tool execution.
+
+Stop a workspace daemon explicitly with
+`systemctl --user stop juto-daemon-<workspace-key>`. This terminates its running
+work; merely closing the GUI does not. Remote/TLS runtime access is not provided.
 
 ### 6.2 Mobile Companion
 * Lightweight companion app (or web interface) connects to the desktop daemon over
