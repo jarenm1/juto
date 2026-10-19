@@ -237,3 +237,66 @@ fn open_rejects_non_session_file() {
     ));
     assert_eq!(std::fs::read(&path).unwrap(), b"{\"hello\":1}\n");
 }
+
+#[test]
+fn path_view_indices_survive_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    for text in ["m0", "m1", "m2", "m3", "m4"] {
+        s.append(user(text)).unwrap();
+    }
+    let before: Vec<(usize, String)> = s
+        .path_view()
+        .unwrap()
+        .messages
+        .iter()
+        .map(|m| (m.index, m.id.to_owned()))
+        .collect();
+    s.compact("summary".into(), 2).unwrap();
+    s.append(user("m5")).unwrap();
+    let view = s.path_view().unwrap();
+    let after: Vec<(usize, String)> = view.messages[..5]
+        .iter()
+        .map(|m| (m.index, m.id.to_owned()))
+        .collect();
+    assert_eq!(after, before);
+    let mark = view.compaction.unwrap();
+    assert_eq!((mark.at, mark.first_visible), (5, 3));
+    let visible: Vec<String> = view.visible().iter().map(|m| m.message.text()).collect();
+    assert_eq!(visible, ["m3", "m4", "m5"]);
+    assert_eq!(s.messages().unwrap().len(), 4);
+}
+
+#[test]
+fn compaction_that_keeps_nothing_hides_the_whole_prefix_but_keeps_it_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    s.append(user("a")).unwrap();
+    s.append(user("b")).unwrap();
+    s.compact("summary".into(), 0).unwrap();
+    let view = s.path_view().unwrap();
+    let mark = view.compaction.unwrap();
+    assert_eq!((mark.at, mark.first_visible), (2, 2));
+    assert!(view.visible().is_empty());
+    assert_eq!(view.messages.len(), 2);
+    assert_eq!(s.messages().unwrap().len(), 1);
+}
+
+#[test]
+fn branch_renumbers_the_active_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    for text in ["a", "b", "c"] {
+        s.append(user(text)).unwrap();
+    }
+    let a = s.path_view().unwrap().messages[0].id.to_owned();
+    s.branch(Some(&a)).unwrap();
+    s.append(user("d")).unwrap();
+    let view = s.path_view().unwrap();
+    let texts: Vec<(usize, String)> = view
+        .messages
+        .iter()
+        .map(|m| (m.index, m.message.text()))
+        .collect();
+    assert_eq!(texts, [(0, "a".to_owned()), (1, "d".to_owned())]);
+}
