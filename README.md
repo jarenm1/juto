@@ -317,12 +317,29 @@ stream — only received frames establish that.
 **Owner lifetime and retention.** An environment records an owner heartbeat;
 `Heartbeat` renews either the owner deadline or the control lease (matching the
 current epoch), and input traffic never renews either implicitly. A reaper retires
-an environment whose heartbeat has lapsed, so an abandoned desktop does not
-outlive its task. `Retain` transfers lifetime responsibility to an authenticated
-human session with a host-bounded deadline (default maximum 30 minutes).
-The runtime's `desktop` tool heartbeats on every action. The embedded canvas renews the
-owner heartbeat every 2 seconds for as long as it is mounted, paused or live, and renews
-the human control lease only while the human holds control.
+an environment whose heartbeat has lapsed, so a daemon client that disappears
+does not leave its desktop behind. `Retain` transfers lifetime responsibility to
+an authenticated human session with a host-bounded deadline (default maximum 30
+minutes). Environments created by the harness (the runtime's `desktop` tool and
+`juto --desktop`) are owned by the harness process itself: they set no owner
+timeout and live until destroyed, reclaimed as idle, or the harness exits (the
+next harness start reconciles what an exit left behind), so an agent can leave
+a desktop waiting for a human to verify it. The runtime renews the session
+viewer's grant before it lapses, so the chat card still opens hours later. The
+embedded canvas sends no owner heartbeat; it renews the human control lease only
+while the human holds control.
+
+**Idle suspension.** Activity is any launch, observation, input, control
+acquisition, resize, or viewer attach, plus the continuous presence of an
+attached viewer, a live embedded canvas, or a live control lease. A paused
+canvas does not count, so a chat full of paused desktops still lets them idle.
+After `idle.suspendAfterSecs` (default 5 minutes) without activity the
+environment slice is frozen with `systemctl --user freeze`: applications, the
+compositor worker, and the audio server stop running and keep their memory. The
+next activity, including resuming a paused canvas, thaws it before the operation
+proceeds, and `Describe` reports `suspended`. After `idle.destroyAfterSecs`
+(default 24 hours) without activity the environment is destroyed. Either limit
+is disabled by setting it to 0.
 
 **Compositor worker process.** The compositor runs in its own process inside the
 environment slice (`juto-desktop-<env>-compositor.scope`), so its CPU and memory
@@ -748,8 +765,7 @@ to the virtual seat per live move (four), none for the two moves made while paus
 and xeyes' pupils pointed at the last live position. Keyboard forwarding is confirmed
 headless under Xvfb: `xdotool type aZ1` into the viewer delivered `aZ1` to an `xterm`
 client (captured with `head -c 3`), and Shift for `Z` reached the seat as a modifier.
-The `desktop` tool's owner heartbeat and the
-mounted-canvas heartbeat keep the environment alive while the canvas is mounted.
+A live canvas holds the environment awake; a paused one lets it go idle.
 
 The remote path is covered by an end-to-end WebRTC test and a browser smoke:
 

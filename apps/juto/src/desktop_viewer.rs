@@ -17,8 +17,8 @@ use gpui::{
     Pixels, Point, Render, RenderImage, ScrollWheelEvent, Subscription, Task, Window, canvas, div,
     img, prelude::*, px, rgb, rgba,
 };
-use juto_runtime::DesktopEnvironment;
 use juto_runtime::protocol::{DesktopEvent, GrantRole, InputBatch, InputEvent};
+use juto_runtime::{AwakeHold, DesktopEnvironment};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::desktop_stream;
@@ -76,7 +76,7 @@ fn cursor_style_for_shape(shape: &str) -> CursorStyle {
 
 /// The authenticated principal this interactive session acts as: the local
 /// human viewing the desktop. Grants and artifact resolution are bound to it.
-pub(crate) const SESSION_PRINCIPAL: &str = "human:viewer";
+pub(crate) const SESSION_PRINCIPAL: &str = juto_runtime::SESSION_VIEWER_PRINCIPAL;
 
 /// How a viewer may act on its environment, derived from its resolved grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,12 +163,16 @@ pub struct DesktopViewer {
     cursor_overlay: Option<CursorOverlay>,
     /// Pointer position in window coordinates while over the image.
     cursor_pointer: Option<Point<Pixels>>,
+    /// Resumes a suspended desktop and keeps it awake while the canvas is live.
+    /// Live frames are read from shared memory, which is not activity on its
+    /// own, so without this a watched desktop would freeze at the idle limit. A
+    /// paused canvas holds nothing, so the desktop can still go idle.
+    awake: Option<AwakeHold>,
 }
 
 impl DesktopViewer {
     /// Creates a paused viewer for `env`. It captures one still of the newest
-    /// frame and runs no frame loop until resumed. The owner heartbeat starts
-    /// now so the environment is not retired as abandoned.
+    /// frame and runs no frame loop until resumed.
     pub fn new(
         env: DesktopEnvironment,
         access: ControlAccess,
@@ -207,6 +211,7 @@ impl DesktopViewer {
             cursor_task: None,
             cursor_overlay: None,
             cursor_pointer: None,
+            awake: None,
         };
         viewer._input_guards = vec![
             cx.on_focus_out(&viewer.focus_handle, window, |this, _event, _window, cx| {
@@ -378,6 +383,8 @@ impl DesktopViewer {
         self.release_held_input(cx);
         self.paused = true;
         self.frame_task = None;
+        // A paused canvas no longer keeps the desktop awake; the idle clock starts.
+        self.awake = None;
         if self.has_control {
             self.release_control(cx);
         }
@@ -394,6 +401,16 @@ impl DesktopViewer {
         if !self.env.is_alive() {
             self.mark_stopped(cx);
             return;
+        }
+        // Resume a suspended desktop before the first live frame, and keep it
+        // awake for as long as the canvas stays live.
+        match self.env.hold_awake() {
+            Ok(hold) => self.awake = Some(hold),
+            Err(err) => {
+                self.error = Some(format!("desktop did not resume: {err}"));
+                cx.notify();
+                return;
+            }
         }
         self.paused = false;
         self.status = "connecting".to_string();
@@ -447,15 +464,18 @@ impl DesktopViewer {
     /// viewer. The last frame stays on screen; input is no longer forwarded.
     fn mark_stopped(&mut self, cx: &mut Context<Self>) {
         self.frame_task = None;
+        self.awake = None;
         self.has_control = false;
         self.status = "stopped".to_string();
         self.error = Some("desktop stopped".to_string());
         cx.notify();
     }
 
-    /// Runs for the viewer's whole lifetime. Each tick it renews the owner
-    /// heartbeat, so an open viewer keeps its environment alive whether paused
-    /// or live. While control is held it also renews the control lease.
+    /// Runs for the viewer's whole lifetime. Each tick it notices a destroyed
+    /// environment, keeps a local owner's grant fresh, and renews the control
+    /// lease while control is held. It sends no owner heartbeat: desktops the
+    /// harness creates set no owner timeout, and a viewer alone must never keep
+    /// an abandoned desktop alive.
     fn start_heartbeat(&mut self, cx: &mut Context<Self>) {
         let env = self.env.clone();
         let access = self.access;
@@ -466,12 +486,6 @@ impl DesktopViewer {
                 if !env.is_alive() {
                     let _ = this.update(cx, |this, cx| this.mark_stopped(cx));
                     break;
-                }
-                if let Err(err) = env.heartbeat("owner", None) {
-                    let _ = this.update(cx, |this, cx| {
-                        this.error = Some(format!("heartbeat failed: {err}"));
-                        cx.notify();
-                    });
                 }
                 // A local owner session keeps its own grant alive before the host
                 // cap expires it; otherwise control could not be renewed.

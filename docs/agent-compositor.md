@@ -123,6 +123,19 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
 - Owner lifetime: `Heartbeat` renews the owner deadline or the control lease, a
   reaper retires an environment whose heartbeat lapsed, and `Retain` transfers
   lifetime responsibility to a human session with a host-bounded deadline.
+  Environments created in the harness process are owned by that process: they
+  set no owner timeout, live until destroyed, reclaimed as idle, or the process
+  exits (startup reconciliation removes what an exit left behind), and the
+  runtime renews the session viewer's grant (same id, host-bounded) while the
+  environment lives.
+- Idle suspension: activity (launch, observe, input, control acquisition,
+  resize, viewer attach, and the presence of a viewer, awake hold, or live
+  lease) resets an idle clock. After `IdlePolicy::suspend_after_secs` (default
+  5 minutes) the environment slice is frozen through the cgroup freezer and
+  `Suspended` is emitted; the next activity thaws it before proceeding and
+  emits `Resumed`. After `IdlePolicy::destroy_after_secs` (default 24 hours)
+  the environment is destroyed. Teardown and orphan reconciliation thaw a
+  frozen slice first, because systemd refuses to stop a frozen unit.
 - Artifact resolution: the runtime validates host, environment, grant, principal,
   and expiry before returning a same-host route or a one-time remote token, and
   otherwise reports `Unsupported`, `Unauthorized`, `Expired`, `Stopped`, or
@@ -300,12 +313,17 @@ Creating -> Ready -> Stopping -> Stopped
   spawn errors separate from exit status. `WindowMapped` and `FrameAvailable`
   are observations, not inferred from successful process launch. Launchers may
   spawn several processes/windows; an application handle tracks its subtree.
-- Owner heartbeat interval is 10 seconds for the runtime's `desktop` tool; the
-  embedded canvas heartbeats every 2 seconds while it is mounted. Expiry after
-  60 seconds destroys the environment unless the runtime has explicitly
-  transferred retention ownership to a human session. Task cancellation stops
-  the desktop by default. A mounted viewer keeps the desktop alive; once the
-  canvas unmounts, heartbeats stop and ordinary expiry applies.
+- Owner heartbeat interval is 10 seconds; expiry after 60 seconds destroys the
+  environment unless the runtime has explicitly transferred retention ownership
+  to a human session. An owner that shares the supervisor's process (the
+  harness) needs no heartbeat; startup reconciliation reclaims what its exit
+  left behind. Task cancellation stops the desktop by default. A viewer alone
+  never keeps an abandoned desktop alive: the embedded canvas sends no owner
+  heartbeat.
+- Idle environments are suspended (cgroup freeze, memory kept) and resumed by
+  the next activity, then destroyed after a host idle limit, so a desktop can
+  wait for human verification without consuming CPU or living forever. A live
+  embedded canvas holds the environment awake; a paused one does not.
 - `Destroy` first revokes grants/leases, releases held input, closes viewers,
   requests application termination, then stops the entire environment cgroup.
   Default grace period: 5 seconds, followed by forced termination. Destroy is

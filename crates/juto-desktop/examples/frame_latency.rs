@@ -152,6 +152,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         lease_ttl_secs: 60,
         compositor_mode: CompositorMode::Worker,
         owner_heartbeat_timeout_secs: 60,
+        idle: juto_desktop::IdlePolicy::default(),
     };
     let env = supervisor
         .create_environment(config, &format!("req-{env_id}"))

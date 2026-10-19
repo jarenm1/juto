@@ -43,6 +43,7 @@ fn test_config(env_id: &str) -> EnvironmentConfig {
         lease_ttl_secs: 6,
         compositor_mode: juto_desktop::CompositorMode::Worker,
         owner_heartbeat_timeout_secs: 60,
+        idle: juto_desktop::IdlePolicy::default(),
     }
 }
 

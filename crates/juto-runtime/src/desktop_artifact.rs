@@ -8,13 +8,63 @@
 //! Artifact creation is not environment creation, and a resolved route is not
 //! proof that a stream is live: only received frames establish that.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use juto_desktop::DesktopSupervisor;
 use juto_desktop::protocol::GrantRole;
+use juto_desktop::supervisor::MAX_GRANT_SECS;
 
 use crate::SignalingHandle;
 use crate::tools::DesktopSessionArtifact;
+
+/// The authenticated principal of the interactive harness session: the local
+/// human who opens desktop artifacts. Agent-created desktops grant it access.
+pub const SESSION_VIEWER_PRINCIPAL: &str = "human:viewer";
+
+/// How often the session grant keepalive runs.
+const GRANT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+/// Session grants closer than this to expiry are renewed.
+const GRANT_RENEW_MARGIN_SECS: u64 = 600;
+
+/// Renews this process's session viewer grants while their environments live.
+///
+/// A desktop can wait hours for a human to verify it; its chat artifact must
+/// still open then. Each renewal is host-bounded and keeps the grant id; an
+/// expired or revoked grant is never revived, and a destroyed environment's
+/// grants lapse. The thread ends with the supervisor.
+pub(crate) fn spawn_session_grant_keepalive(supervisor: Weak<DesktopSupervisor>) {
+    let _ = std::thread::Builder::new()
+        .name("juto-desktop-grant-keepalive".to_string())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(GRANT_KEEPALIVE_INTERVAL);
+                let Some(supervisor) = supervisor.upgrade() else {
+                    return;
+                };
+                renew_session_grants(&supervisor);
+            }
+        });
+}
+
+fn renew_session_grants(supervisor: &DesktopSupervisor) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    for env in supervisor.environments() {
+        if env.is_destroyed() {
+            continue;
+        }
+        for grant in env.get_status().active_grants {
+            if grant.principal == SESSION_VIEWER_PRINCIPAL
+                && grant.expires_at <= now + GRANT_RENEW_MARGIN_SECS
+            {
+                let _ = env.renew_grant(&grant.grant_id, MAX_GRANT_SECS);
+            }
+        }
+    }
+}
 
 /// How a human should view an agent's desktop.
 #[derive(Debug, Clone, PartialEq, Eq)]
