@@ -1500,7 +1500,10 @@ fn configure_slice_properties(slice: &str, cpu_quota: &str, mem_max: &str) {
 
     if !props.is_empty() {
         let mut cmd = std::process::Command::new("systemctl");
-        cmd.arg("--user").arg("set-property").arg(slice);
+        cmd.arg("--user")
+            .arg("--runtime")
+            .arg("set-property")
+            .arg(slice);
         for prop in props {
             cmd.arg(prop);
         }

@@ -2,7 +2,7 @@
 
 use std::{
     ffi::{OsStr, OsString},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use juto_runtime::{
@@ -139,4 +139,52 @@ async fn sandboxed_run_records_a_completed_usage() {
         .map(|entries| entries.count())
         .unwrap_or(0);
     assert_eq!(leftovers, 0);
+}
+
+/// Agent slice limits are applied to the live slice and never written into the
+/// user's persistent systemd configuration.
+#[tokio::test]
+async fn agent_slice_limits_are_not_persisted_to_user_config() {
+    if !is_systemd_run_available() {
+        eprintln!("skipping: systemd-run unavailable");
+        return;
+    }
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .expect("HOME or XDG_CONFIG_HOME");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let slice = format!("juto-test-{}-{nanos}.slice", std::process::id());
+    let persisted = config_home
+        .join("systemd/user.control")
+        .join(format!("{slice}.d"));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let workspace = workspace_at(dir.path());
+    let limits = ResourceLimits {
+        slice: Some(slice.clone()),
+        ..Default::default()
+    };
+    let mut command = Command::new("sh");
+    command.args(["-c", "exit 0"]);
+    let status = workspace
+        .run_scoped(&mut command, limits)
+        .await
+        .expect("scoped run");
+
+    let written = persisted.exists();
+    // Undo this test's slice state whether or not the bug leaked it.
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "revert", &slice])
+        .output();
+    let _ = std::fs::remove_dir_all(&persisted);
+    assert!(status.success());
+    assert!(
+        !written,
+        "slice limits persisted to {}",
+        persisted.display()
+    );
 }

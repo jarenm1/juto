@@ -85,7 +85,7 @@ if [[ -n "$slice" ]]; then
             props+=("MemoryMax=$slice_memory_max")
         fi
         if ((${#props[@]} > 0)); then
-            systemctl --user set-property "$slice" "${props[@]}" >/dev/null 2>&1 || true
+            systemctl --user set-property --runtime "$slice" "${props[@]}" >/dev/null 2>&1 || true
         fi
     fi
     scope+=("--slice=$slice")
