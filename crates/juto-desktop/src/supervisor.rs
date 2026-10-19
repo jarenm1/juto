@@ -2464,6 +2464,7 @@ fn create_environment_slice(env_id: &str, limits: &SystemLimits) -> Result<Strin
     let applied = Command::new("systemctl")
         .args([
             "--user",
+            "--runtime",
             "set-property",
             &slice,
             &format!("CPUQuota={}", limits.cpu_quota),
