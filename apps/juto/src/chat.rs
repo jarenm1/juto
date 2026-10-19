@@ -452,8 +452,7 @@ impl ChatView {
             picker
         });
         let auth_modal = cx.new(|cx| AuthModal::new(runtime.clone(), tokio_handle.clone(), cx));
-        let subagent_control = RunControl::new();
-        let subagents = runtime.subagent_manager(&subagent_control);
+        let subagents = runtime.subagent_manager();
         let sidebar = cx.new(Sidebar::new);
         let initial_summaries = subagents.list();
         let initial_threads = session.threads().to_vec();

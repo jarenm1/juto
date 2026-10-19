@@ -98,10 +98,10 @@ pub use desktop_artifact::{
 pub use peers::{
     PeerAgentSnapshot, PeerBus, PeerError, PeerResource, PeerSendFailure, PeerSendReport,
 };
-pub use session::{EntryKind, Session};
+pub use session::{EntryKind, Session, SessionEntry};
 pub use subagents::{
-    BlockerReason, ChildState, SchemaMode, SubagentError, SubagentManager, SubagentResult,
-    SubagentStatus, SubagentSummary, TaskSpec,
+    BlockerReason, ChildState, SchemaMode, SubagentError, SubagentEvent, SubagentManager,
+    SubagentResult, SubagentStatus, SubagentSummary, TaskSpec,
 };
 pub use threads::{
     MainEvent, MainSession, Route, RouteKind, ThreadEvent, ThreadInfo, ThreadStatus, TimelineItem,
@@ -474,12 +474,12 @@ impl Runtime {
         handle
     }
 
-    /// Subagent handle for the run `control` drives. The registry, admission,
-    /// and inbox are shared process-wide, but each handle owns only the
-    /// children it spawns: cancelling this run stops them, while ending another
-    /// run leaves its children alone.
-    pub fn subagent_manager(&self, control: &RunControl) -> Arc<SubagentManager> {
-        Arc::new(self.main_template().scoped(control.token().child_token()))
+    /// The runtime's subagent manager, shared by every run. Its owner token is
+    /// never cancelled, so cancelling a run leaves children it spawned running.
+    /// `run` gives each top-level run its own scope, which only a stop cancels.
+    /// Nested runs scope their own children to their run (see `nested_manager`).
+    pub fn subagent_manager(&self) -> Arc<SubagentManager> {
+        self.main_template()
     }
 
     /// Make the main inbox durable under `main`'s session file, so undrained
@@ -500,14 +500,13 @@ impl Runtime {
         self.main_template().main_inbox().bind(path)
     }
 
-    /// The process-wide handle every run scopes from, created on first use.
+    /// The process-wide manager every run shares, created on first use.
     fn main_template(&self) -> Arc<SubagentManager> {
         let mut guard = self.inner.subagent_manager.lock();
         guard
             .get_or_insert_with(|| {
                 let inbox = subagents::MainInbox::default();
-                // The template's owner is never cancelled: every handle handed out
-                // scopes from it with its run's own token.
+                // The owner is never cancelled, so children outlive any single run.
                 Arc::new(SubagentManager::new(
                     Arc::new(ChildFactory {
                         runtime: self.clone(),
@@ -538,17 +537,31 @@ impl Runtime {
             sender: None,
             main_session: Some(&main_session),
         };
-        let manager = self.subagent_manager(&control);
+        // Children this run starts are owned by a token of their own. Stopping
+        // the run cancels them; ending it normally leaves them running.
+        let run_children = CancellationToken::new();
+        let stopped = control.token();
+        let manager = Arc::new(self.subagent_manager().scoped(run_children.clone()));
         let inbox = manager.main_inbox();
         let session_id = session.header().id.clone();
         // Reports that landed while this session had no active run enter this
         // run first. Reports addressed to other sessions stay queued.
         deliver_main_inbox(&inbox, &control, &session_id);
         let forwarder = tokio::spawn(forward_main_inbox(inbox, control.clone(), session_id));
+        let stop_children = tokio::spawn(cancel_children_on_stop(
+            control.clone(),
+            run_children.clone(),
+        ));
         let outcome = self
             .run_depth(session, prompt.into(), events, control, placement, manager)
             .await;
         forwarder.abort();
+        stop_children.abort();
+        // The watcher can be aborted before it runs when the run returns at once on
+        // stop, so a stop is also applied here.
+        if stopped.is_cancelled() {
+            run_children.cancel();
+        }
         outcome
     }
 
@@ -600,7 +613,9 @@ impl Runtime {
                 compaction_usage = self.compact(session, &control).await?;
             }
         }
-        let _children = ChildCancellation(manager.owner());
+        // Depth 0's children belong to the run's scope, which only a stop cancels (see `run`).
+        // Nested runs own the children they spawn and stop them when they end.
+        let _children = (depth > 0).then(|| ChildCancellation(manager.owner()));
         // The run's tier decides how `bash` is confined; see `ExecutionTier::bash_limits`.
         // Depth 0 is the user's own session; delegated runs queue as background work.
         let priority = if depth == 0 {
@@ -1030,6 +1045,13 @@ impl Drop for ChildCancellation {
     fn drop(&mut self) {
         self.0.cancel();
     }
+}
+
+/// Cancels a run's children when the run is stopped. Ending the run without a
+/// stop leaves them running, so `run` aborts this watcher when the run ends.
+async fn cancel_children_on_stop(control: RunControl, children: CancellationToken) {
+    control.token().cancelled().await;
+    children.cancel();
 }
 
 /// Where a run sits in the delegation tree: its depth, the role it runs as,
@@ -1874,19 +1896,7 @@ fn deliver_main_inbox(
 ) -> bool {
     let mut pending = inbox.drain_for(session_id).into_iter();
     while let Some(message) = pending.next() {
-        let name = message
-            .name
-            .as_deref()
-            .map(|name| format!(" name={name:?}"))
-            .unwrap_or_default();
-        let digest = message
-            .digest_of
-            .map(|bytes| format!(" (digest of {bytes} bytes)"))
-            .unwrap_or_default();
-        let text = format!(
-            "[subagent {}{name} {:?}{digest}]\n{}",
-            message.from, message.kind, message.body
-        );
+        let text = subagents::main_message_text(&message);
         if !control.steer(Message::user(text)) {
             inbox.requeue_front(
                 Some(session_id),
@@ -2155,8 +2165,7 @@ mod tests {
             message: Message::user("current main request"),
         })
         .unwrap();
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let tool = TaskTool {
             manager: manager.clone(),
             catalog: Arc::new(roles::load(&repo, &data).unwrap()),
@@ -2391,7 +2400,7 @@ mod tests {
             let runtime = mock_runtime(&repo, &data);
             let main = runtime.new_main_session().expect("main session");
             runtime.open_main_inbox(&main).expect("bind");
-            let inbox = runtime.subagent_manager(&RunControl::new()).main_inbox();
+            let inbox = runtime.subagent_manager().main_inbox();
             inbox.push_from(Some("thread-a".into()), main_note("child-a", "first"));
             inbox.push_from(Some("thread-b".into()), main_note("child-b", "second"));
             main.path().to_path_buf()
@@ -2400,7 +2409,7 @@ mod tests {
         let runtime = mock_runtime(&repo, &data);
         let main = MainSession::open(&session_path).expect("reopen main session");
         runtime.open_main_inbox(&main).expect("rebind");
-        let inbox = runtime.subagent_manager(&RunControl::new()).main_inbox();
+        let inbox = runtime.subagent_manager().main_inbox();
         assert_eq!(
             inbox.drain_for("thread-b"),
             vec![main_note("child-b", "second")]
@@ -2586,8 +2595,7 @@ mod tests {
         let data_dir = root.path().join("data");
 
         let runtime = mock_runtime(&repo, &data_dir);
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
 
         let mut spec = TaskSpec::new("say hello");
         spec.isolated_workspace = true;
@@ -2652,6 +2660,25 @@ mod tests {
         let mut unset = settings.clone();
         unset.model_roles.clear();
         assert_eq!(unset.resolve_selector("@smol").unwrap().0, "mock/test");
+    }
+
+    #[tokio::test]
+    async fn runtime_subagent_manager_survives_run_control_cancellation() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+
+        let runtime = mock_runtime(&repo, &data_dir);
+        let control = RunControl::new();
+        let manager = runtime.subagent_manager();
+        control.cancel();
+
+        let id = manager
+            .spawn(TaskSpec::new("say hello"))
+            .expect("spawn child");
+        let result = manager.wait(&id).await.expect("child run");
+        assert_eq!(result.output, "child output");
     }
 
     #[tokio::test]
@@ -2850,8 +2877,7 @@ mod tests {
         };
         let runtime = runtime_with(&repo, &data_dir, config, provider.clone());
 
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new("write built.txt");
         spec.agent = Some("builder".to_string());
         spec.isolated_workspace = true;
@@ -3120,7 +3146,7 @@ mod tests {
             }),
         );
         let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let mut notifications = manager.subscribe_events();
         let mut session = runtime.new_session().unwrap();
         let mut other_session = runtime.new_session().unwrap();
@@ -3228,8 +3254,7 @@ mod tests {
         });
         let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
 
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new("begin the thread");
         spec.focus = true;
         let id = manager.spawn(spec).expect("spawn focus child");
@@ -3276,8 +3301,7 @@ mod tests {
         });
         let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
 
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new("begin the thread");
         spec.focus = true;
         let id = manager.spawn(spec).expect("spawn focus child");
@@ -3330,8 +3354,7 @@ mod tests {
         let provider = Arc::new(AdvertisedTools::default());
         let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
 
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new("work");
         spec.focus = true;
         let id = manager.spawn(spec).expect("spawn focus child");
@@ -3383,8 +3406,7 @@ mod tests {
     /// Runs one child through the manager a `task` call uses, so its role is
     /// resolved exactly as delegated work is.
     async fn run_child(runtime: &Runtime, role: &str, task: &str) {
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new(task);
         spec.agent = Some(role.to_string());
         let id = manager.spawn(spec).expect("spawn child");
@@ -3564,8 +3586,7 @@ mod tests {
         };
         let runtime = runtime_with(&repo, &data_dir, config, provider.clone());
 
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new("write built.txt");
         spec.agent = Some("builder".to_string());
         spec.isolated_workspace = true;
@@ -3644,7 +3665,7 @@ mod tests {
                     sender: None,
                     main_session: None,
                 },
-                runtime.subagent_manager(&RunControl::new()),
+                runtime.subagent_manager(),
             )
             .await
             .expect("depth-2 run");
@@ -3694,7 +3715,7 @@ mod tests {
                         sender: None,
                         main_session: None,
                     },
-                    runtime.subagent_manager(&RunControl::new()),
+                    runtime.subagent_manager(),
                 )
                 .await
                 .expect("builder run");
@@ -3718,8 +3739,7 @@ mod tests {
         native_repo(&repo);
         let data_dir = root.path().join("data");
         let runtime = runtime_with(&repo, &data_dir, mock_config(), Arc::new(MockProvider));
-        let control = RunControl::new();
-        let manager = runtime.subagent_manager(&control);
+        let manager = runtime.subagent_manager();
         let tool = TaskTool {
             manager: manager.clone(),
             catalog: Arc::new(roles::load(&repo, &data_dir).expect("roles")),
@@ -4179,7 +4199,7 @@ mod tests {
             .expect("stopped run returns");
 
         let delegating = spawn_run(&runtime, "delegate", RunControl::new());
-        let probe = runtime.subagent_manager(&RunControl::new());
+        let probe = runtime.subagent_manager();
         let child = first_child(&probe).await;
         let result = timeout(Duration::from_secs(5), probe.wait(&child))
             .await
@@ -4204,7 +4224,7 @@ mod tests {
         let runtime = delegating_runtime(root.path(), child_gate, parent_gate);
 
         let delegating = spawn_run(&runtime, "delegate", RunControl::new());
-        let probe = runtime.subagent_manager(&RunControl::new());
+        let probe = runtime.subagent_manager();
         let child = first_child(&probe).await;
 
         let mut session = runtime.new_session().expect("session");
@@ -4238,7 +4258,7 @@ mod tests {
 
         let stop = RunControl::new();
         let delegating = spawn_run(&runtime, "delegate", stop.clone());
-        let probe = runtime.subagent_manager(&RunControl::new());
+        let probe = runtime.subagent_manager();
         let child = first_child(&probe).await;
 
         stop.cancel();
@@ -4249,5 +4269,32 @@ mod tests {
         assert!(matches!(err, subagents::SubagentError::Cancelled));
         // How the stopped run itself ends is not under test.
         let _ = delegating.await.expect("delegating run joins");
+    }
+
+    /// A child outlives the top-level run that spawned it: ending that run does
+    /// not cancel the subagents it started.
+    #[tokio::test]
+    async fn child_outlives_the_run_that_spawned_it() {
+        let root = tempdir().expect("tempdir");
+        let (child_open, child_gate) = watch::channel(false);
+        let (parent_open, parent_gate) = watch::channel(false);
+        let runtime = delegating_runtime(root.path(), child_gate, parent_gate);
+
+        let delegating = spawn_run(&runtime, "delegate", RunControl::new());
+        let probe = runtime.subagent_manager();
+        let child = first_child(&probe).await;
+
+        parent_open.send(true).expect("parent is still waiting");
+        delegating
+            .await
+            .expect("delegating run joins")
+            .expect("delegating run");
+
+        child_open.send(true).expect("child is still waiting");
+        let result = timeout(Duration::from_secs(5), probe.wait(&child))
+            .await
+            .expect("child settles")
+            .expect("child outlives the run that spawned it");
+        assert_eq!(result.output, "child done");
     }
 }

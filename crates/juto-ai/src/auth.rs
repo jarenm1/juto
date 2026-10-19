@@ -124,7 +124,7 @@ impl fmt::Debug for Credential {
 }
 
 /// Redacted, listable view of one stored credential — identity metadata only.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CredentialSummary {
     pub provider: String,

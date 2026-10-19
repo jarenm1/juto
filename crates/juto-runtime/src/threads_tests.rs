@@ -445,9 +445,9 @@ async fn a_subagent_report_returns_to_the_thread_that_spawned_it() {
     let mut main = runtime.new_main_session().expect("main session");
     let (spawner, _, _) = send(&runtime, &mut main, SPAWN_REQUEST).await;
 
-    // Let the child settle: it completes, or is cancelled when the spawning
-    // run ends. Either way its report is addressed to the spawning thread.
-    let manager = runtime.subagent_manager(&RunControl::new());
+    // Let the child settle: it completes; the spawning run ending does not cancel
+    // it. Its report is addressed to the spawning thread either way.
+    let manager = runtime.subagent_manager();
     let children = manager.list();
     assert_eq!(children.len(), 1, "one child was queued");
     let _ = manager.wait(&children[0].id).await;
