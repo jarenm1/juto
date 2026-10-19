@@ -10,7 +10,7 @@ mod tool;
 mod view;
 
 pub use agent::Agent;
-pub use control::RunControl;
+pub use control::{BackgroundJob, RunControl};
 pub use error::AgentError;
 pub use events::{AgentConfig, AgentEvent, AgentHooks, RunOutcome};
 pub use tool::{Tool, ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier};

@@ -690,6 +690,71 @@ async fn follow_up_keeps_run_alive() {
 }
 
 #[tokio::test]
+async fn run_waits_for_a_background_job_and_takes_its_result() {
+    let model = test_model();
+    let control = RunControl::new();
+    let job = control.begin_background_job();
+    let job_control = control.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The result is steered before the job releases the run, as in production.
+        assert!(job_control.steer(Message::user("job result")));
+        drop(job);
+    });
+    let provider = ScriptedProvider::new(vec![
+        text_done_script(&model, "first"),
+        text_done_script(&model, "second"),
+    ]);
+    let provider_ref = provider.clone();
+    let (outcome, _events, context) = run_with_context(
+        provider,
+        ToolRegistry::new(),
+        None,
+        &control,
+        vec![Message::user("go")],
+    )
+    .await;
+    outcome.unwrap();
+    assert_eq!(provider_ref.stream_calls().await, 2);
+    assert!(context.messages.iter().any(|m| matches!(
+        m,
+        Message::User { content, .. }
+            if matches!(&content[..], [ContentBlock::Text { text }] if text == "job result")
+    )));
+    assert_eq!(control.background_jobs(), 0);
+}
+
+#[tokio::test]
+async fn a_run_that_fails_cancels_its_open_background_jobs() {
+    // A queued command must not start once its run has failed: the job's
+    // cancellation fires when the run ends, on the error path too.
+    let control = RunControl::new();
+    let _job = control.begin_background_job();
+    let job_cancel = control.background_token();
+    let provider = ScriptedProvider::new(vec![Script::Events(vec![
+        Ok(ProviderEvent::Start),
+        Ok(ProviderEvent::TextDelta {
+            index: 0,
+            delta: "partial".into(),
+        }),
+        Err(ProviderError::Transport("connection dropped".into())),
+    ])]);
+    let (outcome, _events, _context) = run_with_context(
+        provider,
+        ToolRegistry::new(),
+        None,
+        &control,
+        vec![Message::user("go")],
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        Err(AgentError::Provider(ProviderError::Transport(_)))
+    ));
+    assert!(job_cancel.is_cancelled());
+}
+
+#[tokio::test]
 async fn pause_gates_before_model_call() {
     let model = test_model();
     let control = RunControl::new();

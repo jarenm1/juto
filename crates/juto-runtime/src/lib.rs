@@ -2,6 +2,7 @@
 //! Behavioral reference: oh-my-pi 579da1d6; upstream attribution is in licenses/OMP-MIT.txt.
 
 pub mod approval;
+pub mod broker;
 pub mod browser;
 pub mod change_graph;
 pub mod config;
@@ -112,6 +113,7 @@ pub use workspace::{
     GpuLockGuard, ResolvedLimits, ResourceLimits, ScopedStdio, SubagentWorkspace, WorkspaceError,
 };
 
+use crate::broker::{Broker, Priority};
 use crate::change_graph::{ChangeGraph, EditProvenance, JoinOutcome};
 use crate::roles::{AgentRole, ToolScope};
 
@@ -567,17 +569,25 @@ impl Runtime {
         }
         let _children = ChildCancellation(manager.owner());
         // The run's tier decides how `bash` is confined; see `ExecutionTier::bash_limits`.
+        // Depth 0 is the user's own session; delegated runs queue as background work.
+        let priority = if depth == 0 {
+            Priority::Attended
+        } else {
+            Priority::Background
+        };
+        let resources_dir = self.inner.data_dir.join("resources");
         let mut limits = tier.bash_limits(settings.bash_scoped).map(|limits| {
-            limits.with_usage_store(resources::UsageStore::new(
-                self.inner.data_dir.join("resources"),
-            ))
+            limits
+                .with_usage_store(resources::UsageStore::new(resources_dir.clone()))
+                .with_admission(Broker::new(resources_dir.join("broker")))
+                .with_priority(priority)
         });
         if let Some(sandbox) = limits.as_mut().and_then(|limits| limits.sandbox.as_mut()) {
             sandbox.denied_paths =
                 workspace::credential_paths(std::slice::from_ref(&self.inner.data_dir));
             sandbox.network = settings.network.policy(tier);
         }
-        let mut registry = tools::builtin_tools_with_limits(&self.inner.cwd, limits)?;
+        let mut registry = tools::builtin_tools_with_limits(&self.inner.cwd, limits, &control)?;
         if let Some(main_session) = main_session {
             registry.register(Arc::new(recall::RecallTool::new(
                 main_session.to_path_buf(),

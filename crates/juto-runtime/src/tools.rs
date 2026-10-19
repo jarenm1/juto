@@ -12,7 +12,7 @@
 //! on Unix; see `kill_process_group`.
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::{self, BufRead, Read as _},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -22,15 +22,18 @@ use std::{
 use async_trait::async_trait;
 use globset::{Candidate, GlobBuilder};
 use juto_agent::{
-    AgentError, Tool, ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier, VIEW_TAGS,
-    ViewNode, validate_view, view_details,
+    AgentError, RunControl, Tool, ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier,
+    VIEW_TAGS, ViewNode, validate_view, view_details,
 };
-use juto_ai::ContentBlock;
+use juto_ai::{ContentBlock, Message};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
+use crate::broker::{Lease, Submission, Ticket};
 use crate::change_graph::{ChangeGraph, EditProvenance, JoinOutcome, ReconcileOutcome};
 use crate::workspace::{ResourceLimits, ScopedChild, ScopedStdio, SubagentWorkspace};
 
@@ -1169,6 +1172,10 @@ struct BashTool {
     /// scope with CPU/memory caps). A sandboxed tier also confines its filesystem
     /// and environment. A missing `systemd-run` fails the command.
     limits: Option<ResourceLimits>,
+    /// The run this tool belongs to; queued commands report through it.
+    run: RunControl,
+    /// Background jobs of this run, read back by `bash_job`.
+    jobs: BashJobs,
 }
 
 #[async_trait]
@@ -1178,7 +1185,9 @@ impl Tool for BashTool {
             name: "bash".to_string(),
             description: "Run a shell command (sh -c) in the session working directory. Merged \
 				stdout/stderr is bounded to a rolling tail; the process runs in its own process \
-				group and is killed on timeout or cancellation."
+				group and is killed on timeout or cancellation. When the resource budget cannot \
+				admit the command yet, the call returns a job id at once and the result is \
+				delivered when the job finishes (see bash_job)."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -1220,155 +1229,324 @@ impl Tool for BashTool {
             )),
             None => Some(Duration::from_secs_f64(BASH_DEFAULT_TIMEOUT)),
         };
-
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg(&params.command)
-            .current_dir(&cwd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
-        // Governed commands run under `spawn_scoped`, so the caps apply to the whole
-        // process tree. Its guard stops the transient unit on drop: a sandboxed
-        // command outlives its client, so killing the child alone would leave it
-        // running. A sandboxed command writes only under the run's workspace, so it
-        // is rooted there and its cwd must stay inside. An unsandboxed governed
-        // command is rooted at its own cwd, as before.
-        let mut child = match &self.limits {
-            Some(limits) => {
-                let root = if limits.sandbox.is_some() {
-                    base_cwd.to_path_buf()
-                } else {
-                    cwd.clone()
-                };
-                let workspace = SubagentWorkspace {
-                    path: root.clone(),
-                    node_id: String::new(),
-                    thread: String::new(),
-                    repo_root: root,
-                    subagent_id: String::new(),
-                };
-                workspace
-                    .spawn_scoped(
-                        &mut command,
-                        limits.clone(),
-                        ScopedStdio {
-                            stdin: std::process::Stdio::null(),
-                            stdout: std::process::Stdio::piped(),
-                            stderr: std::process::Stdio::piped(),
-                        },
-                    )
-                    .await
-                    .map_err(|e| format!("failed to spawn `sh`: {e}"))?
+        let spec = BashCommand {
+            command: params.command,
+            cwd,
+            base_cwd: base_cwd.to_path_buf(),
+            timeout,
+        };
+        let command = bash_command(&spec);
+        let Some(limits) = &self.limits else {
+            return run_bash_command(&spec, command, None, None, &ctx.cancel).await;
+        };
+        // Admission comes before the spawn: a queued command holds no process
+        // and no transient unit while it waits.
+        let admission = bash_workspace(&spec, limits)
+            .admission(&command, limits)
+            .map_err(|e| format!("failed to spawn `sh`: {e}"))?;
+        let Some(admission) = admission else {
+            return run_bash_command(&spec, command, Some(limits), None, &ctx.cancel).await;
+        };
+        let reserved_bytes = admission.bytes();
+        match admission
+            .submit()
+            .map_err(|e| format!("failed to spawn `sh`: {e}"))?
+        {
+            Submission::Admitted(lease) => {
+                run_bash_command(&spec, command, Some(limits), Some(lease), &ctx.cancel).await
             }
-            None => ScopedChild::unscoped(
-                command
-                    .spawn()
-                    .map_err(|e| format!("failed to spawn `sh`: {e}"))?,
-            ),
-        };
-        let pid = child.id();
-        let mut guard = ProcessGroupGuard::new(pid);
-
-        // Drain both pipes concurrently into a shared rolling tail so slow
-        // readers can never deadlock the child on a full pipe.
-        let sink = Arc::new(Mutex::new(TailBuffer::new(BASH_OUTPUT_MAX_BYTES)));
-        let stdout = child.child_mut().stdout.take().expect("stdout piped");
-        let stderr = child.child_mut().stderr.take().expect("stderr piped");
-        let out_task = spawn_drain(stdout, Arc::clone(&sink));
-        let err_task = spawn_drain(stderr, Arc::clone(&sink));
-
-        let start = Instant::now();
-        let (finished, timed_out, cancelled) = {
-            let wait = child.wait();
-            tokio::pin!(wait);
-            match timeout {
-                Some(deadline) => {
-                    tokio::select! {
-                        result = &mut wait => (Some(result.map_err(|e| e.to_string())?), false, false),
-                        () = tokio::time::sleep(deadline) => (None, true, false),
-                        () = ctx.cancel.cancelled() => (None, false, true),
-                    }
-                }
-                None => {
-                    tokio::select! {
-                        result = &mut wait => (Some(result.map_err(|e| e.to_string())?), false, false),
-                        () = ctx.cancel.cancelled() => (None, false, true),
-                    }
-                }
-            }
-        };
-
-        let exit_status = if timed_out || cancelled {
-            // Kill the `systemd-run` client first: the unit exists only once systemd
-            // has taken the client's start request, so stopping the unit before that
-            // would find nothing and leave the service running.
-            if let Some(pid) = pid {
-                kill_process_group(pid);
-            }
-            child
-                .kill_unit()
-                .await
-                .map_err(|e| format!("failed to terminate sandbox unit: {e}"))?;
-            guard.disarm();
-            // Reap the leader; the group has been signalled.
-            child.wait().await.map_err(|e| e.to_string())?
-        } else {
-            guard.disarm();
-            finished.expect("status present when not timed out or cancelled")
-        };
-
-        // Readers finish once the pipes close (exited or killed).
-        let _ = out_task.await;
-        let _ = err_task.await;
-        let (text_output, total_bytes, dropped_bytes) = {
-            let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
-            guard.finish()
-        };
-        let truncated = dropped_bytes > 0;
-
-        let exit_code = exit_status.code();
-        let mut summary = String::new();
-        if truncated {
-            summary.push_str(&format!("[output truncated: {dropped_bytes} of {total_bytes} bytes dropped; showing last {} bytes]\n", BASH_OUTPUT_MAX_BYTES.min(total_bytes)));
+            Submission::Queued(ticket) => Ok(self.queue(
+                spec,
+                command,
+                limits.clone(),
+                ticket,
+                reserved_bytes,
+                // The run's job token: cancelled when the run is cancelled or ends.
+                self.run.background_token(),
+            )),
         }
-        summary.push_str(&text_output);
-        if !text_output.is_empty() && !text_output.ends_with('\n') {
-            summary.push('\n');
-        }
-        if cancelled {
-            summary.push_str("[cancelled; process group killed]");
-        } else if timed_out {
-            summary.push_str(&format!(
-                "[timed out after {}s; process group killed]",
-                timeout.map_or(0.0, |d| d.as_secs_f64())
-            ));
-        } else if let Some(code) = exit_code {
-            summary.push_str(&format!("[exit code {code}]"));
-        } else {
-            summary.push_str(&format!("[{exit_status}]"));
-        }
-        let is_error = cancelled || timed_out || exit_code.is_none_or(|c| c != 0);
-        let details = json!({
-            "command": params.command,
-            "cwd": display_path(base_cwd, &cwd),
-            "exitCode": exit_code,
-            "timedOut": timed_out,
-            "cancelled": cancelled,
-            "truncated": truncated,
-            "outputBytes": total_bytes,
-            "durationMs": start.elapsed().as_millis() as u64,
-        });
-        Ok(if is_error {
-            error_output(summary, details)
-        } else {
-            output(summary, details)
-        })
     }
+}
+
+/// A bash command resolved against the session: what runs, where, and how long.
+struct BashCommand {
+    command: String,
+    cwd: PathBuf,
+    /// The session working directory; `cwd` is displayed relative to it.
+    base_cwd: PathBuf,
+    timeout: Option<Duration>,
+}
+
+/// State of a background `bash` job, published so `bash_job` can report or wait.
+#[derive(Debug, Clone)]
+enum JobState {
+    Queued { position: usize },
+    Running,
+    Finished(ToolOutput),
+}
+
+/// Background `bash` jobs of one run, keyed by job id.
+#[derive(Clone, Default)]
+struct BashJobs(Arc<Mutex<BTreeMap<String, watch::Sender<JobState>>>>);
+
+impl BashJobs {
+    fn register(&self, id: &str, state: JobState) -> watch::Sender<JobState> {
+        let (tx, _) = watch::channel(state);
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), tx.clone());
+        tx
+    }
+
+    fn get(&self, id: &str) -> Option<watch::Sender<JobState>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+    }
+}
+
+impl BashTool {
+    /// Hand a command the broker queued to a background task. The model gets a
+    /// job id at once; the task waits for admission, runs the command, and
+    /// steers the result into the run. Cancelling the wait drops the queued
+    /// ticket, so nothing stays reserved.
+    fn queue(
+        &self,
+        spec: BashCommand,
+        command: tokio::process::Command,
+        limits: ResourceLimits,
+        ticket: Ticket,
+        reserved_bytes: u64,
+        cancel: CancellationToken,
+    ) -> ToolOutput {
+        let position = ticket.position();
+        let id = format!("bash-{}", Uuid::now_v7().simple());
+        let state = self.jobs.register(&id, JobState::Queued { position });
+        let job = self.run.begin_background_job();
+        let run = self.run.clone();
+        let task_id = id.clone();
+        tokio::spawn(async move {
+            // Held until the result is steered, so the run cannot stop first.
+            let _job = job;
+            let result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    Err("cancelled while queued for admission".to_string())
+                }
+                admitted = ticket.admitted() => match admitted {
+                    Ok(lease) => {
+                        state.send_replace(JobState::Running);
+                        run_bash_command(&spec, command, Some(&limits), Some(lease), &cancel).await
+                    }
+                    Err(error) => Err(format!("admission failed: {error}")),
+                },
+            };
+            let result = result.unwrap_or_else(ToolOutput::error);
+            state.send_replace(JobState::Finished(result.clone()));
+            let _ = run.steer(Message::user(job_report(&task_id, &result)));
+        });
+        output(
+            format!(
+                "Queued {id} at position {position}: the resource budget cannot admit it yet, \
+                 and it reserves {} MiB. Its result will be delivered when it finishes; \
+                 `bash_job` reports its status.",
+                reserved_bytes / (1024 * 1024)
+            ),
+            json!({
+                "job": id,
+                "status": "queued",
+                "queuePosition": position,
+                "reservedBytes": reserved_bytes,
+            }),
+        )
+    }
+}
+
+/// The text a finished background job steers into its run.
+fn job_report(id: &str, result: &ToolOutput) -> String {
+    let body: String = result
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    format!("Background bash job {id} finished:\n{body}")
+}
+
+/// The `sh -c` command for `spec`, in its own process group and killed if dropped.
+fn bash_command(spec: &BashCommand) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(&spec.command)
+        .current_dir(&spec.cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+}
+
+/// The workspace a command run in `cwd` is governed as.
+fn bash_workspace(spec: &BashCommand, limits: &ResourceLimits) -> SubagentWorkspace {
+    // A sandboxed command writes only under the run's workspace, so it is rooted
+    // there and its cwd must stay inside. An unsandboxed governed command is
+    // rooted at its own cwd.
+    let root = if limits.sandbox.is_some() {
+        spec.base_cwd.clone()
+    } else {
+        spec.cwd.clone()
+    };
+    SubagentWorkspace {
+        path: root.clone(),
+        node_id: String::new(),
+        thread: String::new(),
+        repo_root: root,
+        subagent_id: String::new(),
+    }
+}
+
+/// Run `spec` to completion, timeout, or cancellation and capture its bounded
+/// output. `limits` governs the command when set; `admission` is the broker
+/// lease it runs under, when the broker admitted it.
+async fn run_bash_command(
+    spec: &BashCommand,
+    mut command: tokio::process::Command,
+    limits: Option<&ResourceLimits>,
+    admission: Option<Lease>,
+    cancel: &CancellationToken,
+) -> Result<ToolOutput, String> {
+    // Under governance the command runs inside a systemd user scope, so the
+    // caps apply to the whole tree. `enforce_scope` is the caller's choice:
+    // with it off, a host without `systemd-run` degrades to a bare spawn
+    // rather than failing the tool.
+    // The governed path goes through `spawn_admitted`, whose guard stops the
+    // transient unit on drop: a sandboxed command runs as a service that
+    // outlives its client, so killing the child alone would leave it running.
+    let mut child = match limits {
+        Some(limits) => bash_workspace(spec, limits)
+            .spawn_admitted(
+                &mut command,
+                limits,
+                ScopedStdio {
+                    stdin: std::process::Stdio::null(),
+                    stdout: std::process::Stdio::piped(),
+                    stderr: std::process::Stdio::piped(),
+                },
+                admission,
+            )
+            .map_err(|e| format!("failed to spawn `sh`: {e}"))?,
+        None => ScopedChild::unscoped(
+            command
+                .spawn()
+                .map_err(|e| format!("failed to spawn `sh`: {e}"))?,
+        ),
+    };
+    let pid = child.id();
+    let mut guard = ProcessGroupGuard::new(pid);
+
+    // Drain both pipes concurrently into a shared rolling tail so slow
+    // readers can never deadlock the child on a full pipe.
+    let sink = Arc::new(Mutex::new(TailBuffer::new(BASH_OUTPUT_MAX_BYTES)));
+    let stdout = child.child_mut().stdout.take().expect("stdout piped");
+    let stderr = child.child_mut().stderr.take().expect("stderr piped");
+    let out_task = spawn_drain(stdout, Arc::clone(&sink));
+    let err_task = spawn_drain(stderr, Arc::clone(&sink));
+
+    let start = Instant::now();
+    let timeout = spec.timeout;
+    let (finished, timed_out, cancelled) = {
+        let wait = child.wait();
+        tokio::pin!(wait);
+        match timeout {
+            Some(deadline) => {
+                tokio::select! {
+                    result = &mut wait => (Some(result.map_err(|e| e.to_string())?), false, false),
+                    () = tokio::time::sleep(deadline) => (None, true, false),
+                    () = cancel.cancelled() => (None, false, true),
+                }
+            }
+            None => {
+                tokio::select! {
+                    result = &mut wait => (Some(result.map_err(|e| e.to_string())?), false, false),
+                    () = cancel.cancelled() => (None, false, true),
+                }
+            }
+        }
+    };
+
+    let exit_status = if timed_out || cancelled {
+        if let Some(pid) = pid {
+            kill_process_group(pid);
+        }
+        // Kill the `systemd-run` client first: the unit exists only once systemd
+        // has taken the client's start request, so stopping the unit before that
+        // would find nothing and leave the service running.
+        child
+            .kill_unit()
+            .await
+            .map_err(|e| format!("failed to terminate sandbox unit: {e}"))?;
+        guard.disarm();
+        // Reap the leader; the group has been signalled.
+        child.wait().await.map_err(|e| e.to_string())?
+    } else {
+        guard.disarm();
+        finished.expect("status present when not timed out or cancelled")
+    };
+
+    // Readers finish once the pipes close (exited or killed).
+    let _ = out_task.await;
+    let _ = err_task.await;
+    let (text_output, total_bytes, dropped_bytes) = {
+        let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+        guard.finish()
+    };
+    let truncated = dropped_bytes > 0;
+
+    let exit_code = exit_status.code();
+    let mut summary = String::new();
+    if truncated {
+        summary.push_str(&format!("[output truncated: {dropped_bytes} of {total_bytes} bytes dropped; showing last {} bytes]\n", BASH_OUTPUT_MAX_BYTES.min(total_bytes)));
+    }
+    summary.push_str(&text_output);
+    if !text_output.is_empty() && !text_output.ends_with('\n') {
+        summary.push('\n');
+    }
+    if cancelled {
+        summary.push_str("[cancelled; process group killed]");
+    } else if timed_out {
+        summary.push_str(&format!(
+            "[timed out after {}s; process group killed]",
+            timeout.map_or(0.0, |d| d.as_secs_f64())
+        ));
+    } else if let Some(code) = exit_code {
+        summary.push_str(&format!("[exit code {code}]"));
+    } else {
+        summary.push_str(&format!("[{exit_status}]"));
+    }
+    let is_error = cancelled || timed_out || exit_code.is_none_or(|c| c != 0);
+    let details = json!({
+        "command": spec.command,
+        "cwd": display_path(&spec.base_cwd, &spec.cwd),
+        "exitCode": exit_code,
+        "timedOut": timed_out,
+        "cancelled": cancelled,
+        "truncated": truncated,
+        "outputBytes": total_bytes,
+        "durationMs": start.elapsed().as_millis() as u64,
+    });
+    Ok(if is_error {
+        error_output(summary, details)
+    } else {
+        output(summary, details)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2531,7 +2709,7 @@ fn action_label(action: &VcsAction) -> &'static str {
 /// Approval policy is enforced by agent hooks via each tool's [`Tool::tier`];
 /// these tools perform real filesystem/process work and return true errors.
 pub fn builtin_tools(cwd: &Path) -> Result<ToolRegistry, AgentError> {
-    builtin_tools_with_limits(cwd, None)
+    builtin_tools_with_limits(cwd, None, &RunControl::new())
 }
 
 /// Build the builtin tool registry, running `bash` under `limits` when set.
@@ -2542,8 +2720,9 @@ pub fn builtin_tools(cwd: &Path) -> Result<ToolRegistry, AgentError> {
 pub fn builtin_tools_with_limits(
     cwd: &Path,
     limits: Option<ResourceLimits>,
+    run: &RunControl,
 ) -> Result<ToolRegistry, AgentError> {
-    builtin_tools_with_file_policy(cwd, limits, Vec::new())
+    builtin_tools_with_file_policy(cwd, limits, Vec::new(), run)
 }
 
 /// Build tools with sandboxed native reads and explicit runtime credential denials.
@@ -2552,6 +2731,7 @@ pub fn builtin_tools_with_file_policy(
     cwd: &Path,
     limits: Option<ResourceLimits>,
     credential_paths: Vec<PathBuf>,
+    run: &RunControl,
 ) -> Result<ToolRegistry, AgentError> {
     let policy = FileReadPolicy::new(cwd, limits.as_ref(), credential_paths);
     let mut registry = ToolRegistry::new();
@@ -2573,9 +2753,15 @@ pub fn builtin_tools_with_file_policy(
         cwd: cwd.to_path_buf(),
         policy,
     }))?;
+    let jobs = BashJobs::default();
+    if limits.is_some() {
+        registry.register(Arc::new(BashJobTool { jobs: jobs.clone() }))?;
+    }
     registry.register(Arc::new(BashTool {
         cwd: cwd.to_path_buf(),
         limits,
+        run: run.clone(),
+        jobs,
     }))?;
     registry.register(Arc::new(VcsTool {
         cwd: cwd.to_path_buf(),
@@ -2583,6 +2769,75 @@ pub fn builtin_tools_with_file_policy(
     registry.register(Arc::new(DesktopArtifactTool))?;
     registry.register(Arc::new(ViewTool))?;
     Ok(registry)
+}
+
+/// `bash_job` reports a background `bash` job queued for admission. With
+/// `wait` it blocks until the job finishes and returns the command's output.
+struct BashJobTool {
+    jobs: BashJobs,
+}
+
+#[derive(Deserialize)]
+struct BashJobArgs {
+    job: String,
+    #[serde(default)]
+    wait: bool,
+}
+
+#[async_trait]
+impl Tool for BashJobTool {
+    fn definition(&self) -> juto_ai::ToolDefinition {
+        juto_ai::ToolDefinition {
+            name: "bash_job".to_string(),
+            description: "Reports the status of a background bash job. A `bash` call returns a job id when its command was queued for admission under the resource budget; the job's result is also delivered to you when it finishes. With `wait` true, blocks until the job finishes and returns its output.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "job": { "type": "string", "description": "Job id returned by bash." },
+                    "wait": { "type": "boolean", "description": "Block until the job finishes." }
+                },
+                "required": ["job"]
+            }),
+        }
+    }
+
+    fn tier(&self) -> ToolTier {
+        ToolTier::Read
+    }
+
+    fn concurrency(&self) -> ToolConcurrency {
+        ToolConcurrency::Shared
+    }
+
+    async fn execute(&self, arguments: Value, ctx: ToolContext) -> Result<ToolOutput, String> {
+        let args: BashJobArgs = serde_json::from_value(arguments)
+            .map_err(|e| format!("invalid bash_job arguments: {e}"))?;
+        let Some(job) = self.jobs.get(&args.job) else {
+            return Err(format!("unknown bash job `{}`", args.job));
+        };
+        let mut rx = job.subscribe();
+        if args.wait {
+            tokio::select! {
+                biased;
+                () = ctx.cancel.cancelled() => return Err("cancelled".to_string()),
+                waited = rx.wait_for(|state| matches!(state, JobState::Finished(_))) => {
+                    waited.map(|_| ()).map_err(|_| "bash job state unavailable".to_string())?;
+                }
+            }
+        }
+        let state = rx.borrow().clone();
+        Ok(match state {
+            JobState::Queued { position } => output(
+                format!("bash job {} is queued at position {position}", args.job),
+                json!({ "job": args.job, "status": "queued", "queuePosition": position }),
+            ),
+            JobState::Running => output(
+                format!("bash job {} is running", args.job),
+                json!({ "job": args.job, "status": "running" }),
+            ),
+            JobState::Finished(result) => result,
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -2909,6 +3164,8 @@ mod tests {
             BashTool {
                 cwd: PathBuf::new(),
                 limits: None,
+                run: RunControl::new(),
+                jobs: BashJobs::default(),
             }
             .tier(),
             ToolTier::Exec
@@ -2931,6 +3188,8 @@ mod tests {
             BashTool {
                 cwd: PathBuf::new(),
                 limits: None,
+                run: RunControl::new(),
+                jobs: BashJobs::default(),
             }
             .concurrency(),
             ToolConcurrency::Shared
@@ -3539,6 +3798,8 @@ mod tests {
         let tool = BashTool {
             cwd: dir.path().to_path_buf(),
             limits: None,
+            run: RunControl::new(),
+            jobs: BashJobs::default(),
         };
         let out = tool
             .execute(json!({"command": "echo hi; echo err >&2"}), ctx(dir.path()))
@@ -3569,6 +3830,8 @@ mod tests {
         let tool = BashTool {
             cwd: dir.path().to_path_buf(),
             limits: Some(ResourceLimits::default()),
+            run: RunControl::new(),
+            jobs: BashJobs::default(),
         };
         // A scoped command runs in its own cgroup, so its cgroup path names a
         // scope rather than the test process's.
@@ -3620,6 +3883,8 @@ mod tests {
             limits: Some(
                 ResourceLimits::default().with_sandbox(crate::workspace::Sandbox::default()),
             ),
+            run: RunControl::new(),
+            jobs: BashJobs::default(),
         };
         let out = tool
             .execute(
@@ -3925,6 +4190,8 @@ mod tests {
         let tool = BashTool {
             cwd: dir.path().to_path_buf(),
             limits: None,
+            run: RunControl::new(),
+            jobs: BashJobs::default(),
         };
         let out = tool
             .execute(json!({"command": "pwd", "cwd": "sub"}), ctx(dir.path()))
@@ -3948,6 +4215,8 @@ mod tests {
         let tool = BashTool {
             cwd: dir.path().to_path_buf(),
             limits: None,
+            run: RunControl::new(),
+            jobs: BashJobs::default(),
         };
         // Grandchild survives the shell if only the leader is killed.
         let command = format!("(sleep 2; touch {}) & wait", sentinel.display());
@@ -3974,6 +4243,8 @@ mod tests {
         let tool = BashTool {
             cwd: dir.path().to_path_buf(),
             limits: None,
+            run: RunControl::new(),
+            jobs: BashJobs::default(),
         };
         let mut context = ctx(dir.path());
         context.cancel = cancel.clone();
@@ -3994,6 +4265,8 @@ mod tests {
         let tool = BashTool {
             cwd: dir.path().to_path_buf(),
             limits: None,
+            run: RunControl::new(),
+            jobs: BashJobs::default(),
         };
         let out = tool
             .execute(
@@ -4360,5 +4633,117 @@ mod tests {
             .decode(data)
             .unwrap();
         assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    use crate::broker::{Broker, Priority, Request};
+
+    /// A broker whose ledger is held by reservations the test controls.
+    fn held_broker(dir: &Path) -> Broker {
+        let pressure = dir.join("pressure");
+        std::fs::write(&pressure, "full avg10=0.00\n").unwrap();
+        Broker::new(dir.join("broker")).with_pressure_file(pressure)
+    }
+
+    fn bash_request(bytes: u64) -> Request {
+        Request {
+            bytes,
+            gpu: false,
+            priority: Priority::Background,
+            label: "bash".to_string(),
+        }
+    }
+
+    fn joined_text(output: &ToolOutput) -> String {
+        output
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn queued_spec(dir: &Path, command: &str) -> BashCommand {
+        BashCommand {
+            command: command.to_string(),
+            cwd: dir.to_path_buf(),
+            base_cwd: dir.to_path_buf(),
+            timeout: Some(Duration::from_secs(30)),
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_bash_command_runs_once_its_reservation_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = held_broker(dir.path());
+        let Submission::Admitted(held) = broker.submit(bash_request(60), 100).unwrap() else {
+            panic!("an empty ledger admits the first request");
+        };
+        let Submission::Queued(ticket) = broker.submit(bash_request(60), 100).unwrap() else {
+            panic!("60 + 60 bytes exceed a 100-byte budget");
+        };
+        let run = RunControl::new();
+        let tool = BashTool {
+            cwd: dir.path().to_path_buf(),
+            limits: None,
+            run: run.clone(),
+            jobs: BashJobs::default(),
+        };
+        let spec = queued_spec(dir.path(), "echo queued-ran");
+        let command = bash_command(&spec);
+        let limits = ResourceLimits::default();
+        let queued = tool.queue(spec, command, limits, ticket, 60, CancellationToken::new());
+        assert_eq!(queued.details["status"], "queued");
+        assert_eq!(queued.details["queuePosition"], 1);
+        assert_eq!(run.background_jobs(), 1);
+        let job = queued.details["job"].as_str().unwrap().to_string();
+
+        drop(held);
+        let finished = BashJobTool {
+            jobs: tool.jobs.clone(),
+        }
+        .execute(json!({ "job": job, "wait": true }), ctx(dir.path()))
+        .await
+        .unwrap();
+        assert!(!finished.is_error);
+        assert_eq!(finished.details["exitCode"], 0);
+        assert!(joined_text(&finished).contains("queued-ran"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_bash_command_never_runs_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = held_broker(dir.path());
+        let Submission::Admitted(held) = broker.submit(bash_request(60), 100).unwrap() else {
+            panic!("an empty ledger admits the first request");
+        };
+        let Submission::Queued(ticket) = broker.submit(bash_request(60), 100).unwrap() else {
+            panic!("60 + 60 bytes exceed a 100-byte budget");
+        };
+        let tool = BashTool {
+            cwd: dir.path().to_path_buf(),
+            limits: None,
+            run: RunControl::new(),
+            jobs: BashJobs::default(),
+        };
+        let spec = queued_spec(dir.path(), "touch ran-marker");
+        let command = bash_command(&spec);
+        let limits = ResourceLimits::default();
+        let cancel = CancellationToken::new();
+        let queued = tool.queue(spec, command, limits, ticket, 60, cancel.clone());
+        let job = queued.details["job"].as_str().unwrap().to_string();
+
+        cancel.cancel();
+        let finished = BashJobTool {
+            jobs: tool.jobs.clone(),
+        }
+        .execute(json!({ "job": job, "wait": true }), ctx(dir.path()))
+        .await
+        .unwrap();
+        assert!(finished.is_error);
+        assert!(joined_text(&finished).contains("cancelled while queued"));
+        assert!(!dir.path().join("ran-marker").exists());
+        drop(held);
     }
 }

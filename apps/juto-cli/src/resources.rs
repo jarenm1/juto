@@ -9,7 +9,9 @@ use anyhow::{Context as _, Result};
 use clap::Subcommand;
 use juto_runtime::{
     ResolvedLimits, ResourceLimits, ScopedStdio, SubagentWorkspace,
+    broker::{Broker, Priority},
     resources::{ClassSummary, UsageRecord, UsageStore, summarize},
+    workspace::QueueObserver,
 };
 use tokio::process::Command;
 
@@ -19,6 +21,10 @@ pub enum ResourcesCommand {
     ///
     /// Everything after `run` is passed through unchanged, including flags.
     Run {
+        /// Admission class when the resource budget is short: `attended` (default),
+        /// `verification`, `background`, or `scheduled`.
+        #[arg(long)]
+        priority: Option<Priority>,
         #[arg(
             required = true,
             num_args = 1..,
@@ -102,11 +108,18 @@ pub async fn run(
             grant(cwd, &store, &overrides, *apply_slice, *shell, json, argv)?;
             Ok(0)
         }
-        Some(ResourcesCommand::Run { argv }) => run_command(cwd, &store, argv).await,
+        Some(ResourcesCommand::Run { priority, argv }) => {
+            run_command(cwd, &store, priority.unwrap_or(Priority::Attended), argv).await
+        }
     }
 }
 
-async fn run_command(cwd: &Path, store: &UsageStore, argv: &[OsString]) -> Result<i32> {
+async fn run_command(
+    cwd: &Path,
+    store: &UsageStore,
+    priority: Priority,
+    argv: &[OsString],
+) -> Result<i32> {
     let (program, args) = argv.split_first().context("no command given")?;
     let workspace = SubagentWorkspace {
         path: cwd.to_path_buf(),
@@ -116,8 +129,15 @@ async fn run_command(cwd: &Path, store: &UsageStore, argv: &[OsString]) -> Resul
         subagent_id: String::new(),
     };
     // Default limits enforce the scope: if systemd cannot apply it, the command
-    // fails instead of running unbounded.
-    let limits = ResourceLimits::default().with_usage_store(store.clone());
+    // fails instead of running unbounded. Admission goes through the same
+    // ledger the agents use, so a short budget queues this command too.
+    let limits = ResourceLimits::default()
+        .with_usage_store(store.clone())
+        .with_admission(Broker::new(store.dir().join("broker")))
+        .with_priority(priority)
+        .with_queue_observer(QueueObserver::new(|position| {
+            eprintln!("queued at position {position}: waiting for the resource budget");
+        }));
     let mut command = Command::new(program);
     command.args(args);
     let mut child = workspace

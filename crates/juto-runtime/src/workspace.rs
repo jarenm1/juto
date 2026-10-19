@@ -23,6 +23,7 @@ use thiserror::Error;
 pub use tokio::process::Command;
 use uuid::Uuid;
 
+use crate::broker::{Broker, BrokerError, Lease, Priority, Request, Submission};
 use crate::change_graph::ChangeGraph;
 use crate::git_transfer::GitRepository;
 use crate::resources::{USAGE_WRAPPER, UsageStore, UsageTicket, command_class, command_grant};
@@ -117,6 +118,9 @@ pub enum WorkspaceError {
 
     #[error("workspace error: {0}")]
     Other(String),
+
+    #[error(transparent)]
+    Admission(#[from] BrokerError),
 }
 
 /// Filesystem sandbox applied to a governed command.
@@ -308,11 +312,76 @@ pub(crate) fn credential_paths(extra: &[PathBuf]) -> Vec<PathBuf> {
     resolved
 }
 
+/// Receives the queue position when a scoped command waits for admission.
+///
+/// Equality is identity: two observers are equal only when they share one
+/// callback, which keeps [`ResourceLimits`] comparable.
+#[derive(Clone)]
+pub struct QueueObserver(Arc<dyn Fn(usize) + Send + Sync>);
+
+impl QueueObserver {
+    /// Wrap `callback` as an observer.
+    pub fn new(callback: impl Fn(usize) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    fn notify(&self, position: usize) {
+        (self.0)(position);
+    }
+}
+
+impl std::fmt::Debug for QueueObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("QueueObserver")
+    }
+}
+
+impl PartialEq for QueueObserver {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for QueueObserver {}
+
+/// Parse a systemd byte size (`4G`, `512M`, `1048576`) into bytes.
+///
+/// Suffixes are powers of 1024, as systemd reads them. An unbounded or
+/// unparsable limit cannot be reserved, so it is an error.
+fn memory_reservation_bytes(size: &str) -> Result<u64, WorkspaceError> {
+    let trimmed = size.trim();
+    let (digits, multiplier) = match trimmed.chars().last() {
+        Some(suffix) if suffix.is_ascii_alphabetic() => {
+            let multiplier: u64 = match suffix.to_ascii_uppercase() {
+                'K' => 1 << 10,
+                'M' => 1 << 20,
+                'G' => 1 << 30,
+                'T' => 1 << 40,
+                _ => return Err(unreservable(size)),
+            };
+            (&trimmed[..trimmed.len() - 1], multiplier)
+        }
+        _ => (trimmed, 1),
+    };
+    digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|value| value.checked_mul(multiplier))
+        .ok_or_else(|| unreservable(size))
+}
+
+fn unreservable(size: &str) -> WorkspaceError {
+    WorkspaceError::Capacity(format!(
+        "memory limit `{size}` cannot be reserved; set a finite size"
+    ))
+}
+
 /// Resource caps, and an optional sandbox, for one governed command.
 ///
 /// Governance always runs the command under `systemd-run`. When `systemd-run` is
 /// missing the command fails with [`WorkspaceError::SystemdUnavailable`]: there
 /// is no uncapped fallback.
+/// Resource constraints and governance parameters for subagent execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLimits {
     /// Explicit per-scope CPU cap (e.g. "200%"); unset leaves CPU shared by weight.
@@ -335,6 +404,12 @@ pub struct ResourceLimits {
     pub sandbox: Option<Sandbox>,
     /// Store that records each scoped command's resource usage; `None` records nothing.
     pub usage_store: Option<UsageStore>,
+    /// Admission ledger; `None` starts commands without waiting for capacity.
+    pub broker: Option<Broker>,
+    /// Admission class; attended commands are served before background ones.
+    pub priority: Priority,
+    /// Notified with the queue position when this command has to wait.
+    pub queue_observer: Option<QueueObserver>,
 }
 
 impl Default for ResourceLimits {
@@ -359,6 +434,9 @@ impl Default for ResourceLimits {
             gpu_lock,
             sandbox: None,
             usage_store: None,
+            broker: None,
+            priority: Priority::default(),
+            queue_observer: None,
         }
     }
 }
@@ -394,6 +472,28 @@ impl ResourceLimits {
     /// command. The default records nothing.
     pub fn with_usage_store(mut self, store: UsageStore) -> Self {
         self.usage_store = Some(store);
+        self
+    }
+
+    /// Admit scoped commands through `broker` before they start, so the memory
+    /// reserved by all running commands fits the agent budget.
+    ///
+    /// Admission applies where systemd measures the command. Without a broker,
+    /// commands start without waiting for capacity.
+    pub fn with_admission(mut self, broker: Broker) -> Self {
+        self.broker = Some(broker);
+        self
+    }
+
+    /// Set this command's class in the admission queue.
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    /// Call `observer` with the queue position when this command has to wait.
+    pub fn with_queue_observer(mut self, observer: QueueObserver) -> Self {
+        self.queue_observer = Some(observer);
         self
     }
 }
@@ -445,6 +545,25 @@ impl Drop for GpuLockGuard {
     }
 }
 
+/// A command's admission before it joins the broker's queue.
+pub struct Admission {
+    broker: Broker,
+    request: Request,
+    budget: u64,
+}
+
+impl Admission {
+    /// Join the broker's queue; see [`Broker::submit`].
+    pub fn submit(self) -> Result<Submission, BrokerError> {
+        self.broker.submit(self.request, self.budget)
+    }
+
+    /// Memory the command reserves while it is queued or running, in bytes.
+    pub fn bytes(&self) -> u64 {
+        self.request.bytes
+    }
+}
+
 /// A scoped child whose transient systemd unit is stopped when it is dropped.
 ///
 /// A sandboxed command runs as a transient *service*, which outlives its
@@ -458,6 +577,8 @@ pub struct ScopedChild {
     unit: Option<String>,
     /// Usage ticket finished when the child is reaped; `None` when not recording.
     usage: Option<UsageTicket>,
+    /// Admission reservation, released when the child is dropped.
+    _lease: Option<Lease>,
 }
 
 impl ScopedChild {
@@ -471,6 +592,7 @@ impl ScopedChild {
             child: Some(child),
             unit: None,
             usage: None,
+            _lease: None,
         }
     }
 
@@ -764,6 +886,63 @@ impl SubagentWorkspace {
         limits: ResourceLimits,
         stdio: ScopedStdio,
     ) -> Result<ScopedChild, WorkspaceError> {
+        // Admission comes before the command is built, so a queued command holds
+        // no process and no transient unit while it waits.
+        let lease = match self.admission(cmd, &limits)? {
+            Some(admission) => match admission.submit()? {
+                Submission::Admitted(lease) => Some(lease),
+                Submission::Queued(ticket) => {
+                    if let Some(observer) = &limits.queue_observer {
+                        observer.notify(ticket.position());
+                    }
+                    Some(ticket.admitted().await?)
+                }
+            },
+            None => None,
+        };
+        self.spawn_admitted(cmd, &limits, stdio, lease)
+    }
+
+    /// The broker admission `cmd` needs, or `None` when no broker is configured.
+    /// A host without `systemd-run` fails closed: the broker cannot measure or
+    /// enforce the command's memory, so the command is refused, not run bare.
+    pub fn admission(
+        &self,
+        cmd: &Command,
+        limits: &ResourceLimits,
+    ) -> Result<Option<Admission>, WorkspaceError> {
+        let Some(broker) = &limits.broker else {
+            return Ok(None);
+        };
+        if !is_systemd_run_available() {
+            return Err(WorkspaceError::SystemdUnavailable);
+        }
+        let program = cmd.as_std().get_program().to_os_string();
+        let args: Vec<OsString> = cmd.as_std().get_args().map(OsStr::to_os_string).collect();
+        let repo = self.repo_root.display().to_string();
+        let resolved = limits.resolve(&program, &args, &repo)?;
+        let bytes = memory_reservation_bytes(&resolved.memory_max)?;
+        Ok(Some(Admission {
+            broker: broker.clone(),
+            request: Request {
+                bytes,
+                gpu: limits.gpu,
+                priority: limits.priority,
+                label: command_class(&program, &args),
+            },
+            budget: limits.capacity()?.budget_bytes,
+        }))
+    }
+
+    /// Spawn a command whose admission is already decided (see [`Self::admission`]).
+    /// `lease` lives in the returned child, so the reservation ends with it.
+    pub fn spawn_admitted(
+        &self,
+        cmd: &mut Command,
+        limits: &ResourceLimits,
+        stdio: ScopedStdio,
+        lease: Option<Lease>,
+    ) -> Result<ScopedChild, WorkspaceError> {
         // A sandboxed command runs as a transient *service*, which outlives its
         // `systemd-run` client. Naming the unit is what lets the guard stop it.
         let unit = limits
@@ -771,7 +950,7 @@ impl SubagentWorkspace {
             .is_some()
             .then(|| format!("juto-{}", Uuid::now_v7()));
         let (built, usage) =
-            self.build_scoped_with_usage(cmd.as_std(), &limits, unit.as_deref(), true)?;
+            self.build_scoped_with_usage(cmd.as_std(), limits, unit.as_deref(), true)?;
         let mut scoped = Command::from(built);
         scoped
             .stdin(stdio.stdin)
@@ -793,6 +972,7 @@ impl SubagentWorkspace {
             child: Some(child),
             unit,
             usage,
+            _lease: lease,
         })
     }
 

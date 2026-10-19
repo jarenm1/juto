@@ -214,6 +214,13 @@ impl Agent {
                 // then do follow-ups keep the run alive.
                 let mut pending = control::drain(&mut steering);
                 pending.extend(control::drain(&mut follow_ups));
+                // A background job delivers its result by steering, so the run
+                // stays open while one is outstanding.
+                while pending.is_empty() && control.background_jobs() > 0 && !token.is_cancelled() {
+                    control.wait_background_job(&token).await;
+                    pending = control::drain(&mut steering);
+                    pending.extend(control::drain(&mut follow_ups));
+                }
                 if pending.is_empty() {
                     let reason = if assistant_stop == StopReason::ToolUse {
                         StopReason::Stop
@@ -234,6 +241,9 @@ impl Agent {
             }
         };
 
+        // Every exit path ends the run's background jobs: a job still queued or
+        // running must not deliver into a run that has already finished.
+        control.abandon_background_jobs();
         outcome
     }
 
