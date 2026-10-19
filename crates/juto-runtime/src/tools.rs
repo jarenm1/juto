@@ -4,9 +4,9 @@
 //! (read.ts, write.ts, edit/, glob.ts, grep.ts, bash.ts) at
 //! 579da1d661c5cb8d43bc2ddd429ab72e67165ad8; see licenses/OMP-MIT.txt.
 //!
-//! Approvals are enforced by agent hooks via [`Tool::tier`]; these tools
-//! perform the real operation and return true errors. Approval is not a
-//! sandbox: absolute paths are allowed, matching source behavior.
+//! Approvals are enforced by agent hooks via [`Tool::tier`]. Sandboxed runs
+//! additionally confine native reads/searches to workspace and granted roots.
+//! Writes retain the native change-graph workspace and metadata checks.
 //!
 //! Requires the `libc` crate (workspace dependency) for process-group kill
 //! on Unix; see `kill_process_group`.
@@ -117,6 +117,89 @@ fn effective_cwd<'a>(tool_cwd: &'a Path, ctx: &'a ToolContext) -> &'a Path {
     }
 }
 
+/// Native read policy uses the same grants as the shell sandbox. Denials take
+/// precedence over grants, including a grant containing the credential store.
+#[derive(Clone, Default)]
+struct FileReadPolicy {
+    roots: Option<Vec<PathBuf>>,
+    denied: Vec<PathBuf>,
+}
+
+impl FileReadPolicy {
+    fn new(cwd: &Path, limits: Option<&ResourceLimits>, credentials: Vec<PathBuf>) -> Self {
+        let Some(sandbox) = limits.and_then(|limits| limits.sandbox.as_ref()) else {
+            return Self::default();
+        };
+        let roots = std::iter::once(cwd.to_path_buf())
+            .chain(
+                sandbox
+                    .read_paths
+                    .iter()
+                    .chain(&sandbox.write_paths)
+                    .map(|path| {
+                        if path.is_absolute() {
+                            path.clone()
+                        } else {
+                            cwd.join(path)
+                        }
+                    }),
+            )
+            .filter_map(|path| path.canonicalize().ok())
+            .collect();
+        let denied = crate::workspace::credential_paths(&credentials)
+            .into_iter()
+            .chain(sandbox.denied_paths.iter().map(|path| {
+                if path.is_absolute() {
+                    path.clone()
+                } else {
+                    cwd.join(path)
+                }
+            }))
+            .filter_map(|path| Self::canonical_denial(&path))
+            .collect();
+        Self {
+            roots: Some(roots),
+            denied,
+        }
+    }
+
+    // Preserve denials for files created after this run starts, resolving any
+    // symlinked existing parent of the future credential file.
+    fn canonical_denial(path: &Path) -> Option<PathBuf> {
+        if let Ok(path) = path.canonicalize() {
+            return Some(path);
+        }
+        let parent = Self::canonical_denial(path.parent()?)?;
+        Some(parent.join(path.file_name()?))
+    }
+
+    fn resolve(&self, path: &Path) -> Result<PathBuf, String> {
+        if self.roots.is_none() {
+            return Ok(path.to_path_buf());
+        }
+        let canonical = path
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
+        if self
+            .denied
+            .iter()
+            .any(|denied| canonical.starts_with(denied))
+        {
+            return Err("file access denied: credential path".to_string());
+        }
+        if !self
+            .roots
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|root| canonical.starts_with(root))
+        {
+            return Err("file access denied: outside workspace and granted roots".to_string());
+        }
+        Ok(canonical)
+    }
+}
+
 /// Best-effort relative display path: relative to `cwd` when possible.
 fn display_path(cwd: &Path, path: &Path) -> String {
     match path.strip_prefix(cwd) {
@@ -172,16 +255,25 @@ fn one() -> usize {
 
 struct ReadTool {
     cwd: PathBuf,
+    policy: FileReadPolicy,
 }
 
 impl ReadTool {
     /// List a directory: sorted entries, directories suffixed with `/`.
-    fn read_dir(path: &Path, cwd: &Path, cancel: &CancellationToken) -> Result<ToolOutput, String> {
+    fn read_dir(
+        policy: &FileReadPolicy,
+        path: &Path,
+        cwd: &Path,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, String> {
         let mut entries: Vec<String> = Vec::new();
         let read_dir =
             std::fs::read_dir(path).map_err(|e| format!("{}: {e}", display_path(cwd, path)))?;
         for entry in read_dir {
             let entry = entry.map_err(|e| e.to_string())?;
+            if policy.resolve(&entry.path()).is_err() {
+                continue;
+            }
             let file_type = entry.file_type().map_err(|e| e.to_string())?;
             let mut name = entry.file_name().to_string_lossy().into_owned();
             if file_type.is_dir() {
@@ -307,7 +399,7 @@ impl Tool for ReadTool {
             name: "read".to_string(),
             description: "Read a file as numbered lines (offset/limit windowed, bounded output) \
 				or list a directory. Relative paths resolve against the session cwd; absolute \
-				paths are allowed."
+				paths are subject to the run's workspace/granted-root policy."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -330,13 +422,14 @@ impl Tool for ReadTool {
             .map_err(|e| format!("invalid read arguments: {e}"))?;
         check_cancel(&ctx.cancel)?;
         let cwd = effective_cwd(&self.cwd, &ctx).to_path_buf();
-        let path = resolve_path(&cwd, &params.path);
+        let path = self.policy.resolve(&resolve_path(&cwd, &params.path))?;
         let cancel = ctx.cancel.clone();
+        let policy = self.policy.clone();
         tokio::task::spawn_blocking(move || {
             let meta = std::fs::metadata(&path)
                 .map_err(|e| format!("{}: {e}", display_path(&cwd, &path)))?;
             if meta.is_dir() {
-                Self::read_dir(&path, &cwd, &cancel)
+                Self::read_dir(&policy, &path, &cwd, &cancel)
             } else if meta.is_file() {
                 Self::read_file(&path, &cwd, &params, &cancel)
             } else {
@@ -555,6 +648,7 @@ fn yes() -> bool {
 
 struct GlobTool {
     cwd: PathBuf,
+    policy: FileReadPolicy,
 }
 
 #[async_trait]
@@ -605,6 +699,8 @@ impl Tool for GlobTool {
             .path
             .as_deref()
             .map_or_else(|| cwd.clone(), |p| resolve_path(&cwd, p));
+        let root = self.policy.resolve(&root)?;
+        let policy = self.policy.clone();
         let cancel = ctx.cancel.clone();
         tokio::task::spawn_blocking(move || {
             if !root.is_dir() {
@@ -621,6 +717,7 @@ impl Tool for GlobTool {
                 .require_git(false)
                 .follow_links(false)
                 .sort_by_file_name(|a, b| a.cmp(b));
+            walker.filter_entry(move |entry| policy.resolve(entry.path()).is_ok());
             let mut seen: u64 = 0;
             for entry in walker.build() {
                 seen += 1;
@@ -710,6 +807,7 @@ struct GrepParams {
 
 struct GrepTool {
     cwd: PathBuf,
+    policy: FileReadPolicy,
 }
 
 struct FileMatches {
@@ -809,6 +907,8 @@ impl Tool for GrepTool {
             .path
             .as_deref()
             .map_or_else(|| cwd.clone(), |p| resolve_path(&cwd, p));
+        let root = self.policy.resolve(&root)?;
+        let policy = self.policy.clone();
         let skip = params.skip.unwrap_or(0);
         let cancel = ctx.cancel.clone();
         tokio::task::spawn_blocking(move || {
@@ -816,6 +916,7 @@ impl Tool for GrepTool {
                 .map_err(|e| format!("{}: {e}", display_path(&cwd, &root)))?;
             if meta.is_file() {
                 // Single explicit file: wider per-file cap, ignore rules bypassed.
+                let root = policy.resolve(&root)?;
                 let result = Self::search_file(&regex, &root, &cwd, GREP_SINGLE_FILE_MATCHES)?;
                 if result.binary {
                     return Err(format!(
@@ -849,6 +950,9 @@ impl Tool for GrepTool {
                     }),
                 ));
             }
+            if !meta.is_dir() {
+                return Err("grep path is not a regular file or directory".to_string());
+            }
 
             // Collect candidate files deterministically, then paginate.
             let mut files = Vec::new();
@@ -862,6 +966,8 @@ impl Tool for GrepTool {
                 .require_git(false)
                 .follow_links(false)
                 .sort_by_file_name(|a, b| a.cmp(b));
+            let walk_policy = policy.clone();
+            walker.filter_entry(move |entry| walk_policy.resolve(entry.path()).is_ok());
             for entry in walker.build() {
                 let entry = match entry {
                     Ok(entry) => entry,
@@ -883,7 +989,11 @@ impl Tool for GrepTool {
                 if cancel.is_cancelled() {
                     return Err("cancelled".to_string());
                 }
-                let result = match Self::search_file(&regex, file, &cwd, GREP_PER_FILE_MATCHES) {
+                let file = match policy.resolve(file) {
+                    Ok(file) => file,
+                    Err(_) => continue,
+                };
+                let result = match Self::search_file(&regex, &file, &cwd, GREP_PER_FILE_MATCHES) {
                     Ok(result) => result,
                     Err(_) => continue, // unreadable mid-walk: skip, don't fail the search
                 };
@@ -900,7 +1010,7 @@ impl Tool for GrepTool {
                     truncated = true;
                     text.push_str(&format!(
                         "  ... (more matches in {})\n",
-                        display_path(&cwd, file)
+                        display_path(&cwd, &file)
                     ));
                 }
                 if result.size_limited {
@@ -2309,9 +2419,21 @@ pub fn builtin_tools_with_limits(
     cwd: &Path,
     limits: Option<ResourceLimits>,
 ) -> Result<ToolRegistry, AgentError> {
+    builtin_tools_with_file_policy(cwd, limits, Vec::new())
+}
+
+/// Build tools with sandboxed native reads and explicit runtime credential denials.
+/// The graph-backed write/edit path is deliberately unchanged.
+pub fn builtin_tools_with_file_policy(
+    cwd: &Path,
+    limits: Option<ResourceLimits>,
+    credential_paths: Vec<PathBuf>,
+) -> Result<ToolRegistry, AgentError> {
+    let policy = FileReadPolicy::new(cwd, limits.as_ref(), credential_paths);
     let mut registry = ToolRegistry::new();
     registry.register(Arc::new(ReadTool {
         cwd: cwd.to_path_buf(),
+        policy: policy.clone(),
     }))?;
     registry.register(Arc::new(WriteTool {
         cwd: cwd.to_path_buf(),
@@ -2321,9 +2443,11 @@ pub fn builtin_tools_with_limits(
     }))?;
     registry.register(Arc::new(GlobTool {
         cwd: cwd.to_path_buf(),
+        policy: policy.clone(),
     }))?;
     registry.register(Arc::new(GrepTool {
         cwd: cwd.to_path_buf(),
+        policy,
     }))?;
     registry.register(Arc::new(BashTool {
         cwd: cwd.to_path_buf(),
@@ -2412,6 +2536,145 @@ mod tests {
         }
     }
 
+    fn file_read_tools(cwd: &Path, policy: FileReadPolicy) -> Vec<(&'static str, Box<dyn Tool>)> {
+        vec![
+            (
+                "read",
+                Box::new(ReadTool {
+                    cwd: cwd.to_path_buf(),
+                    policy: policy.clone(),
+                }),
+            ),
+            (
+                "glob",
+                Box::new(GlobTool {
+                    cwd: cwd.to_path_buf(),
+                    policy: policy.clone(),
+                }),
+            ),
+            (
+                "grep",
+                Box::new(GrepTool {
+                    cwd: cwd.to_path_buf(),
+                    policy,
+                }),
+            ),
+        ]
+    }
+
+    fn file_read_arguments(name: &str, path: &Path) -> Value {
+        match name {
+            "read" => json!({"path": path}),
+            "glob" => json!({"path": path, "pattern": "*", "hidden": true, "gitignore": false}),
+            "grep" => json!({"path": path, "pattern": "visible|secret", "gitignore": false}),
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn confined_file_tools_reject_absolute_parent_and_symlink_escapes() {
+        use crate::tier::ExecutionTier;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(workspace.join("nested")).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+        std::fs::write(workspace.join("visible.txt"), "visible\n").unwrap();
+        symlink(&outside, workspace.join("escape")).unwrap();
+        for tier in [ExecutionTier::Workspace, ExecutionTier::Untrusted] {
+            let limits = tier.bash_limits(false);
+            let policy = FileReadPolicy::new(&workspace, limits.as_ref(), vec![]);
+            for (name, tool) in file_read_tools(&workspace, policy) {
+                for path in [
+                    outside.clone(),
+                    workspace.join("../outside"),
+                    workspace.join("escape"),
+                ] {
+                    let error = tool
+                        .execute(file_read_arguments(name, &path), ctx(&workspace))
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        error.contains("outside workspace and granted roots"),
+                        "{name}: {error}"
+                    );
+                }
+                let out = tool
+                    .execute(
+                        file_read_arguments(name, &workspace.join("nested/..")),
+                        ctx(&workspace),
+                    )
+                    .await
+                    .unwrap();
+                assert!(text(&out).contains("visible"), "{name}: {}", text(&out));
+                assert!(!text(&out).contains("secret"), "{name}: {}", text(&out));
+                assert!(!text(&out).contains("escape"), "{name}: {}", text(&out));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn confined_file_tools_allow_grants_but_never_credentials() {
+        use crate::workspace::Sandbox;
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        let granted = dir.path().join("granted");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&granted).unwrap();
+        std::fs::write(granted.join("visible.txt"), "visible\n").unwrap();
+        let credentials = granted.join("credentials.json");
+        let limits = ResourceLimits::default().with_sandbox(Sandbox {
+            read_paths: vec![PathBuf::from("../granted")],
+            write_paths: vec![granted.clone()],
+            ..Sandbox::default()
+        });
+        let policy = FileReadPolicy::new(&workspace, Some(&limits), vec![credentials.clone()]);
+        std::fs::write(&credentials, "secret\n").unwrap();
+        let alias = granted.join("alias");
+        symlink(&credentials, &alias).unwrap();
+        for (name, tool) in file_read_tools(&workspace, policy) {
+            for path in [&credentials, &alias] {
+                let error = tool
+                    .execute(file_read_arguments(name, path), ctx(&workspace))
+                    .await
+                    .unwrap_err();
+                assert!(error.contains("credential path"), "{name}: {error}");
+            }
+            let out = tool
+                .execute(file_read_arguments(name, &granted), ctx(&workspace))
+                .await
+                .unwrap();
+            assert!(text(&out).contains("visible"), "{name}: {}", text(&out));
+            assert!(!text(&out).contains("secret"), "{name}: {}", text(&out));
+            assert!(
+                !text(&out).contains("credentials.json"),
+                "{name}: {}",
+                text(&out)
+            );
+            assert!(!text(&out).contains("alias"), "{name}: {}", text(&out));
+        }
+    }
+
+    #[tokio::test]
+    async fn attended_file_tools_keep_existing_outside_read_convention() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("visible.txt"), "visible\n").unwrap();
+        for (name, tool) in file_read_tools(workspace.path(), FileReadPolicy::default()) {
+            let out = tool
+                .execute(
+                    file_read_arguments(name, outside.path()),
+                    ctx(workspace.path()),
+                )
+                .await
+                .unwrap();
+            assert!(text(&out).contains("visible"), "{name}: {}", text(&out));
+        }
+    }
+
     fn text(out: &ToolOutput) -> String {
         out.content
             .iter()
@@ -2482,21 +2745,24 @@ mod tests {
     fn tiers_and_concurrency() {
         assert!(matches!(
             ReadTool {
-                cwd: PathBuf::new()
+                cwd: PathBuf::new(),
+                policy: FileReadPolicy::default(),
             }
             .tier(),
             ToolTier::Read
         ));
         assert!(matches!(
             GlobTool {
-                cwd: PathBuf::new()
+                cwd: PathBuf::new(),
+                policy: FileReadPolicy::default(),
             }
             .tier(),
             ToolTier::Read
         ));
         assert!(matches!(
             GrepTool {
-                cwd: PathBuf::new()
+                cwd: PathBuf::new(),
+                policy: FileReadPolicy::default(),
             }
             .tier(),
             ToolTier::Read
@@ -2562,6 +2828,7 @@ mod tests {
         .unwrap();
         let tool = ReadTool {
             cwd: dir.path().to_path_buf(),
+            policy: FileReadPolicy::default(),
         };
         let out = tool
             .execute(
@@ -2592,6 +2859,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "y").unwrap();
         let tool = ReadTool {
             cwd: dir.path().to_path_buf(),
+            policy: FileReadPolicy::default(),
         };
         let out = tool
             .execute(json!({"path": "."}), ctx(dir.path()))
@@ -2999,6 +3267,7 @@ mod tests {
         std::fs::write(dir.path().join(".hidden.rs"), "").unwrap();
         let tool = GlobTool {
             cwd: dir.path().to_path_buf(),
+            policy: FileReadPolicy::default(),
         };
 
         let out = tool
@@ -3063,6 +3332,7 @@ mod tests {
         }
         let tool = GlobTool {
             cwd: dir.path().to_path_buf(),
+            policy: FileReadPolicy::default(),
         };
         let out = tool
             .execute(json!({"pattern": "*.txt", "limit": 2}), ctx(dir.path()))
@@ -3081,6 +3351,7 @@ mod tests {
         std::fs::write(dir.path().join("sub/b.txt"), "say hello again\n").unwrap();
         let tool = GrepTool {
             cwd: dir.path().to_path_buf(),
+            policy: FileReadPolicy::default(),
         };
 
         // Case-sensitive by default: only sub/b.txt matches.
@@ -3125,6 +3396,7 @@ mod tests {
         std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
         let tool = GrepTool {
             cwd: dir.path().to_path_buf(),
+            policy: FileReadPolicy::default(),
         };
         let out = tool
             .execute(json!({"pattern": "hit"}), ctx(dir.path()))
@@ -3617,6 +3889,7 @@ mod tests {
         std::fs::write(other.path().join("x.txt"), "other\n").unwrap();
         let tool = ReadTool {
             cwd: dir.path().to_path_buf(),
+            policy: FileReadPolicy::default(),
         };
         // ctx.cwd overrides the tool's baked cwd.
         let out = tool
