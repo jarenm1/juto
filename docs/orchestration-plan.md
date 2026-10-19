@@ -241,6 +241,10 @@ To prevent parallel agents from exhausting host memory, CPU, or lock contention:
    * Hardware GPU access is serialized via a shared file lock (`flock`).
    * Automated visual tests use headless software Vulkan (Mesa / Xvfb) to avoid blocking
      the host GPU.
+3. **Measured usage** (implemented): every scoped command run through the runtime records peak
+   memory, CPU, OOM kills, and IO per command class in `<data-dir>/resources/usage.jsonl`, read
+   from inside the unit's cgroup. Admission and capacity derivation build on these records and
+   are not implemented yet. See `docs/resources.md`.
 
 ### 4.3 Repository Setup Skill
 The harness installs the `juto-repo-setup` skill in its global skill directory.

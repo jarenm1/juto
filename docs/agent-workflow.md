@@ -43,6 +43,8 @@ scripts/agent-scope.sh -- nix develop "$JUTO_FLAKE#smoke" -c <visual-smoke-comma
   flag.
 - Light commands (`cargo fmt`, `cargo metadata`, jj, source search) need no
   scope.
+- Runs through `juto-cli resources run` are recorded (see `docs/resources.md`);
+  `scripts/agent-scope.sh` runs are not, because they bypass the runtime.
 
 ## Build profile
 

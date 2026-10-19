@@ -13,6 +13,7 @@ pub mod network;
 pub mod peers;
 mod recall;
 pub mod replication;
+pub mod resources;
 mod roles;
 pub mod session;
 pub mod subagents;
@@ -535,7 +536,11 @@ impl Runtime {
         }
         let _children = ChildCancellation(manager.owner());
         // The run's tier decides how `bash` is confined; see `ExecutionTier::bash_limits`.
-        let mut limits = tier.bash_limits(settings.bash_scoped);
+        let mut limits = tier.bash_limits(settings.bash_scoped).map(|limits| {
+            limits.with_usage_store(resources::UsageStore::new(
+                self.inner.data_dir.join("resources"),
+            ))
+        });
         if let Some(sandbox) = limits.as_mut().and_then(|limits| limits.sandbox.as_mut()) {
             sandbox.denied_paths =
                 workspace::credential_paths(std::slice::from_ref(&self.inner.data_dir));

@@ -39,6 +39,11 @@ writes limited to the workspace and toolchain caches, no raw sockets, HTTP(S) on
 missing. Tiers, grants, the network allowlist, and known limits are in
 [docs/sandbox.md](docs/sandbox.md).
 
+**Resource usage.** Every scoped command run through the runtime (`juto-cli resources run`, and
+scoped bash commands when `bash_scoped` is on) is recorded in `<data-dir>/resources/usage.jsonl`
+with its exit status, wall time, and cgroup peak memory, CPU, OOM kills, and IO. `juto-cli
+resources` summarizes measured use per command class. See [docs/resources.md](docs/resources.md).
+
 **Delegating role model.** The top-level `main` role has `read`, `glob`, `grep`, `task`, `wait`,
 `agent_send`, `agent_cancel`, `agent_inbox`, `subagent_release`, `subagent_join`, `subagent_drop`, and `view`; it cannot edit files. Work runs in child agents defined as
 markdown roles in `crates/juto-runtime/src/roles/`: `builder` (all tools), `scout` and `reviewer`
