@@ -196,7 +196,7 @@ impl SubagentStatus {
 
 /// Status snapshot returned by [`SubagentManager::list`]. Never carries
 /// credential material.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentSummary {
     pub id: String,
@@ -364,7 +364,7 @@ pub struct ChildState {
 /// Lifecycle notification for every child a manager owns. Observers subscribe
 /// with [`SubagentManager::subscribe_events`]. A receiver that reports `Lagged`
 /// should resynchronize from [`SubagentManager::list`].
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SubagentEvent {
     /// A bounded report is now readable in the shared main inbox.
@@ -840,6 +840,34 @@ async fn bound_pending(inbox: &MainInbox, pending: PendingReport) -> MainMessage
             }
         }
     }
+}
+
+/// The text a main thread receives for one inbox message. Steering into an active
+/// run and waking an idle run both use this framing, so the model reads them alike.
+pub fn main_message_text(message: &MainMessage) -> String {
+    let name = message
+        .name
+        .as_deref()
+        .map(|name| format!(" name={name:?}"))
+        .unwrap_or_default();
+    let digest = message
+        .digest_of
+        .map(|bytes| format!(" (digest of {bytes} bytes)"))
+        .unwrap_or_default();
+    format!(
+        "[subagent {}{name} {:?}{digest}]\n{}",
+        message.from, message.kind, message.body
+    )
+}
+
+/// The prompt that wakes an idle main thread with messages that arrived while no
+/// run was active.
+pub fn completion_prompt(messages: &[MainMessage]) -> String {
+    messages
+        .iter()
+        .map(main_message_text)
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// Where a child's isolated workspace stands. `Releasing` covers the cleanup
@@ -3455,6 +3483,31 @@ mod tests {
                 digest_of: None,
                 body: "again:report".into(),
             }]
+        );
+    }
+
+    #[test]
+    fn completion_prompt_frames_each_arrival_for_the_model() {
+        let arrivals = vec![
+            MainMessage {
+                from: "w1".into(),
+                kind: MainMessageKind::Completed,
+                name: None,
+                digest_of: None,
+                body: "tests pass".into(),
+            },
+            MainMessage {
+                from: "w2".into(),
+                kind: MainMessageKind::Failed,
+                name: None,
+                digest_of: None,
+                body: "build error".into(),
+            },
+        ];
+
+        assert_eq!(
+            completion_prompt(&arrivals),
+            "[subagent w1 Completed]\ntests pass\n\n[subagent w2 Failed]\nbuild error"
         );
     }
 
