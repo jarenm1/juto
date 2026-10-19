@@ -55,6 +55,7 @@ smithay = { version = "0.7.0", default-features = false, features = [
     "xwayland",
 ] }
 juto-catalog = { path = "crates/juto-catalog" }
+juto-daemon = { path = "crates/juto-daemon" }
 juto-desktop = { path = "crates/juto-desktop" }
 juto-ai = { path = "crates/juto-ai" }
 juto-agent = { path = "crates/juto-agent" }
