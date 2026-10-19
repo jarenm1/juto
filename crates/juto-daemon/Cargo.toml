@@ -1,0 +1,28 @@
+[package]
+name = "juto-daemon"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Headless per-workspace host for the Juto agent runtime, serving a local Unix-socket protocol"
+
+[dependencies]
+anyhow = { workspace = true }
+fs2 = { workspace = true }
+libc = { workspace = true }
+juto-agent = { workspace = true }
+juto-ai = { workspace = true }
+juto-catalog = { workspace = true }
+juto-desktop = { workspace = true }
+juto-runtime = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+futures = { workspace = true }
+tempfile = { workspace = true }
