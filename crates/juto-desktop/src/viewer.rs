@@ -9,15 +9,20 @@
 //! `F_SEAL_FUTURE_WRITE`, so a viewer cannot alter desktop content.
 
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
 use crate::error::DesktopError;
-use crate::protocol::{DesktopCommand, DesktopRequest, DesktopResponse, InputBatch, InputEvent};
+use crate::protocol::{
+    DesktopCommand, DesktopEvent, DesktopRequest, DesktopResponse, Grant, GrantRole, InputBatch,
+    InputEvent,
+};
 use crate::scm;
-use crate::shm::{ShmReader, ShmSlotHeader};
+use crate::shm::{FrameWait, ShmReader, ShmSlotHeader};
+use crate::supervisor::EnvironmentStatus;
 
 /// Negotiated attachment metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,10 +137,15 @@ impl ViewerClient {
         let Some(frame) = self.reader.latest_frame()? else {
             return Ok(None);
         };
-        let (header, pixels) = self
+        // The slot stays reserved until its pixels are copied out, so the
+        // compositor cannot overwrite them mid-read.
+        self.reader.acquire_slot(frame.slot);
+        let copied = self
             .reader
-            .read_slot(frame.slot, self.info.slot_size as usize)?;
-        Ok(Some((header, pixels.to_vec())))
+            .read_slot(frame.slot, self.info.slot_size as usize)
+            .map(|(header, pixels)| (header, pixels.to_vec()));
+        self.reader.release_slot(frame.slot);
+        Ok(Some(copied?))
     }
 
     /// Requests a fresh composition and returns the resulting frame.
@@ -267,6 +277,105 @@ impl ViewerClient {
         }
     }
 
+    /// Renews the human control lease this viewer holds. Acquiring while another
+    /// holder has control would take it over, so only the current epoch renews.
+    pub fn heartbeat_lease(&mut self) -> Result<(), DesktopError> {
+        let epoch = self.epoch.ok_or_else(|| DesktopError::Unauthorized {
+            caller: self.info.viewer_id.clone(),
+            role: "Control".to_string(),
+            environment: self.env_id.clone(),
+        })?;
+        let env_id = self.env_id.clone();
+        let command = DesktopCommand::Heartbeat {
+            env_id,
+            target: "lease".to_string(),
+            epoch: Some(epoch),
+        };
+        match self.call(command)? {
+            DesktopResponse::HeartbeatExtended { .. } => Ok(()),
+            other => Err(unexpected("heartbeat", other)),
+        }
+    }
+
+    /// Keeps the environment awake for `deadline_seconds` on behalf of
+    /// `human_owner`, so the idle policy does not freeze a desktop being watched.
+    /// Returns the retention expiry (unix seconds). Unlike main's in-process
+    /// `AwakeHold`, the hold is a deadline: it lapses unless renewed.
+    pub fn retain(
+        &mut self,
+        human_owner: &str,
+        deadline_seconds: u64,
+    ) -> Result<u64, DesktopError> {
+        let command = DesktopCommand::Retain {
+            env_id: self.env_id.clone(),
+            human_owner: human_owner.to_string(),
+            deadline_seconds,
+        };
+        match self.call(command)? {
+            DesktopResponse::Retained { expires_at, .. } => Ok(expires_at),
+            other => Err(unexpected("retain", other)),
+        }
+    }
+
+    /// The control epoch this viewer holds, or `None` without control.
+    pub fn control_epoch(&self) -> Option<u64> {
+        self.epoch
+    }
+
+    /// The environment's current status: control lease, readiness, and grants.
+    pub fn describe(&mut self) -> Result<EnvironmentStatus, DesktopError> {
+        let env_id = self.env_id.clone();
+        let command = DesktopCommand::Describe {
+            env_id,
+            after_event_seq: None,
+        };
+        match self.call(command)? {
+            DesktopResponse::Description(status) => Ok(*status),
+            other => Err(unexpected("describe", other)),
+        }
+    }
+
+    /// Issues a capability grant on this environment.
+    pub fn grant(
+        &mut self,
+        principal: &str,
+        roles: Vec<GrantRole>,
+        audience: &str,
+        expiry_seconds: u64,
+    ) -> Result<Grant, DesktopError> {
+        let env_id = self.env_id.clone();
+        let command = DesktopCommand::Grant {
+            env_id,
+            principal: principal.to_string(),
+            roles,
+            audience: audience.to_string(),
+            expiry_seconds,
+        };
+        match self.call(command)? {
+            DesktopResponse::GrantIssued(grant) => Ok(grant),
+            other => Err(unexpected("grant", other)),
+        }
+    }
+
+    /// Blocks until a frame newer than publish sequence `after` is written, or
+    /// until `timeout` passes.
+    pub fn wait_for_frame(&self, after: u32, timeout: Duration) -> Result<FrameWait, DesktopError> {
+        self.reader.wait_for_frame(after, timeout)
+    }
+
+    /// Sends one command and reads its response, mapping daemon errors to `Err`.
+    fn call(&mut self, command: DesktopCommand) -> Result<DesktopResponse, DesktopError> {
+        let payload = serde_json::to_vec(&DesktopRequest::new(command))
+            .map_err(|e| DesktopError::Protocol(format!("encode request: {e}")))?;
+        write_frame(&self.stream, &payload)?;
+        match self.read_response()? {
+            DesktopResponse::Error { code, message } => {
+                Err(DesktopError::Protocol(format!("{code}: {message}")))
+            }
+            response => Ok(response),
+        }
+    }
+
     /// Sends input for the held lease.
     pub fn send_input(
         &mut self,
@@ -324,16 +433,27 @@ fn write_frame(stream: &UnixStream, payload: &[u8]) -> Result<(), DesktopError> 
     Ok(())
 }
 
+/// Largest control response the viewer accepts.
+const CONTROL_FRAME_LIMIT: usize = 64 * 1024;
+
+/// Largest event the viewer accepts. Cursor bitmaps travel as JSON, so the
+/// control limit is too small for them.
+const EVENT_FRAME_LIMIT: usize = 16 * 1024 * 1024;
+
 fn read_frame(stream: &UnixStream) -> Result<Vec<u8>, DesktopError> {
+    read_frame_limited(stream, CONTROL_FRAME_LIMIT)
+}
+
+fn read_frame_limited(stream: &UnixStream, limit: usize) -> Result<Vec<u8>, DesktopError> {
     let mut stream = stream;
     let mut length = [0u8; 4];
     stream
         .read_exact(&mut length)
         .map_err(|e| DesktopError::Protocol(format!("read length: {e}")))?;
     let size = u32::from_be_bytes(length) as usize;
-    if size > 64 * 1024 {
+    if size > limit {
         return Err(DesktopError::Protocol(format!(
-            "control frame of {size} bytes exceeds 64 KiB"
+            "frame of {size} bytes exceeds {limit} bytes"
         )));
     }
     let mut payload = vec![0u8; size];
@@ -341,6 +461,56 @@ fn read_frame(stream: &UnixStream) -> Result<Vec<u8>, DesktopError> {
         .read_exact(&mut payload)
         .map_err(|e| DesktopError::Protocol(format!("read payload: {e}")))?;
     Ok(payload)
+}
+
+fn unexpected(what: &str, response: DesktopResponse) -> DesktopError {
+    DesktopError::Protocol(format!("unexpected {what} response: {response:?}"))
+}
+
+/// A dedicated connection that streams one environment's events. It carries no
+/// commands, so it never affects the environment's awake state.
+pub struct EventStream {
+    stream: UnixStream,
+}
+
+impl EventStream {
+    /// Subscribes to `env_id` events on the daemon listening at `socket`.
+    pub fn subscribe(socket: &Path, env_id: &str) -> Result<Self, DesktopError> {
+        let stream = UnixStream::connect(socket).map_err(|e| DesktopError::Io {
+            path: socket.to_path_buf(),
+            source: e,
+        })?;
+        let command = DesktopCommand::Subscribe {
+            env_id: env_id.to_string(),
+        };
+        let payload = serde_json::to_vec(&DesktopRequest::new(command))
+            .map_err(|e| DesktopError::Protocol(format!("encode subscribe: {e}")))?;
+        write_frame(&stream, &payload)?;
+        let frame = read_frame(&stream)?;
+        let response: DesktopResponse = serde_json::from_slice(&frame)
+            .map_err(|e| DesktopError::Protocol(format!("decode subscribe response: {e}")))?;
+        match response {
+            DesktopResponse::Subscribed { .. } => Ok(Self { stream }),
+            DesktopResponse::Error { code, message } => {
+                Err(DesktopError::Protocol(format!("{code}: {message}")))
+            }
+            other => Err(unexpected("subscribe", other)),
+        }
+    }
+
+    /// Blocks for the next event. `ResyncRequired` marks events the daemon dropped.
+    pub fn next_event(&self) -> Result<DesktopEvent, DesktopError> {
+        let frame = read_frame_limited(&self.stream, EVENT_FRAME_LIMIT)?;
+        serde_json::from_slice(&frame)
+            .map_err(|e| DesktopError::Protocol(format!("decode event: {e}")))
+    }
+
+    /// Ends the stream, unblocking a pending `next_event` on another thread.
+    pub fn close(&self) -> Result<(), DesktopError> {
+        self.stream
+            .shutdown(Shutdown::Both)
+            .map_err(|e| DesktopError::Protocol(format!("shutdown event stream: {e}")))
+    }
 }
 
 fn read_frame_with_fd(

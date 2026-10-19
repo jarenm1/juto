@@ -3563,6 +3563,7 @@ dependencies = [
  "juto-agent",
  "juto-ai",
  "juto-catalog",
+ "juto-daemon",
  "juto-desktop",
  "juto-runtime",
  "serde_json",

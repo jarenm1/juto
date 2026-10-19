@@ -9,9 +9,13 @@ use gpui::{
     px, rgb, uniform_list,
 };
 use juto_ai::judge_role_accepts;
-use juto_catalog::{Model, Registry};
-use juto_runtime::{Runtime, RuntimeConfig};
+use juto_catalog::Model;
+use juto_daemon::client::{Client, Notification};
+use juto_daemon::protocol::{Reply, Request, ServerEvent};
+use juto_runtime::RuntimeConfig;
+use tokio::sync::broadcast::error::RecvError;
 
+use crate::chat_request::call;
 use crate::text_input::{SubmitText, TextInput};
 
 actions!(
@@ -100,7 +104,10 @@ struct RoleEntry {
     resolved: Option<String>,
 }
 
+#[derive(Default)]
 struct PickerData {
+    config: RuntimeConfig,
+    catalog: Vec<Model>,
     models: Vec<ModelEntry>,
     roles: Vec<RoleEntry>,
     connected: BTreeSet<String>,
@@ -110,49 +117,80 @@ struct PickerData {
     judge_role: bool,
 }
 
-impl PickerData {
-    fn new(config: &RuntimeConfig, registry: &Registry) -> Self {
-        let mut role_names = BTreeSet::from([
-            "default".to_string(),
-            "task".to_string(),
-            "judge".to_string(),
-            "advisor".to_string(),
-            "review".to_string(),
-        ]);
-        role_names.extend(config.model_roles.keys().cloned());
-        let mut roles = role_names
-            .into_iter()
-            .map(|name| {
-                let resolution = config.resolve_selector(&format!("@{name}")).ok();
-                let (_target, resolved) = resolution
-                    .and_then(|(target, _)| {
-                        let model = registry.resolve(&target).ok()?;
-                        Some((
-                            Some(target),
-                            Some(format!("{}/{}", model.provider, model.id)),
-                        ))
-                    })
-                    .unwrap_or((None, None));
-                RoleEntry {
-                    role: name,
-                    resolved,
-                }
-            })
-            .collect::<Vec<_>>();
-        let role_order = ["default", "task", "judge", "advisor", "review"];
-        roles.sort_by_key(|role| {
-            role_order
-                .iter()
-                .position(|name| *name == role.role)
-                .unwrap_or(role_order.len())
-        });
-        let mut models = registry
+/// Role rows and the selector each resolves to. Resolution uses the full
+/// catalog, so a role may target a model the picker does not offer.
+fn role_entries(config: &RuntimeConfig, catalog: &[Model]) -> Vec<RoleEntry> {
+    let mut role_names = BTreeSet::from([
+        "default".to_string(),
+        "task".to_string(),
+        "judge".to_string(),
+        "advisor".to_string(),
+        "review".to_string(),
+    ]);
+    role_names.extend(config.model_roles.keys().cloned());
+    let mut roles = role_names
+        .into_iter()
+        .map(|name| {
+            let resolved = config
+                .resolve_selector(&format!("@{name}"))
+                .ok()
+                .and_then(|(target, _)| resolve_model(catalog, &target))
+                .map(|model| format!("{}/{}", model.provider, model.id));
+            RoleEntry {
+                role: name,
+                resolved,
+            }
+        })
+        .collect::<Vec<_>>();
+    let role_order = ["default", "task", "judge", "advisor", "review"];
+    roles.sort_by_key(|role| {
+        role_order
             .iter()
-            .filter(|model| {
-                // Judge-kind rows served by the TypeSafe transport, plus chat and tiny
-                // models. Judge-kind rows are offered only in the judge scope.
-                judge_role_accepts(model)
-            })
+            .position(|name| *name == role.role)
+            .unwrap_or(role_order.len())
+    });
+    roles
+}
+
+/// Selector lookup with `juto_catalog::Registry::resolve` semantics: a
+/// `provider/id` selector naming a known provider is locked to it, and a bare
+/// id must match exactly one row.
+fn resolve_model<'a>(catalog: &'a [Model], selector: &str) -> Option<&'a Model> {
+    if let Some((provider, id)) = selector.split_once('/')
+        && catalog
+            .iter()
+            .any(|model| model.provider.eq_ignore_ascii_case(provider))
+    {
+        return catalog.iter().find(|model| {
+            model.provider.eq_ignore_ascii_case(provider) && model.id.eq_ignore_ascii_case(id)
+        });
+    }
+    let mut found = catalog
+        .iter()
+        .filter(|model| model.id.eq_ignore_ascii_case(selector));
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
+}
+
+impl PickerData {
+    /// Replaces the catalog and config, then rebuilds rows and roles against `query`.
+    fn load(&mut self, config: RuntimeConfig, catalog: Vec<Model>, query: &str) {
+        self.config = config;
+        self.catalog = catalog;
+        self.rebuild(query);
+    }
+
+    /// Applies a role-binding change reported by the daemon.
+    fn set_config(&mut self, config: RuntimeConfig, query: &str) {
+        self.config = config;
+        self.rebuild(query);
+    }
+
+    fn rebuild(&mut self, query: &str) {
+        let mut models = self
+            .catalog
+            .iter()
+            .filter(|model| judge_role_accepts(model))
             .map(ModelEntry::from_catalog)
             .collect::<Vec<_>>();
         models.sort_by(|left, right| {
@@ -160,41 +198,18 @@ impl PickerData {
                 .cmp(&right.provider)
                 .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
         });
-        for model in &mut models {
-            model.roles = roles
+        self.models = models;
+        self.roles = role_entries(&self.config, &self.catalog);
+        for model in &mut self.models {
+            model.roles = self
+                .roles
                 .iter()
                 .filter(|role| role.resolved.as_deref() == Some(model.selector.as_str()))
                 .map(|role| role.role.clone())
                 .collect();
         }
-        Self {
-            models,
-            roles,
-            connected: BTreeSet::new(),
-            available: BTreeSet::new(),
-            filtered: Vec::new(),
-            query: None,
-            judge_role: false,
-        }
-    }
-
-    /// Reflect a persisted `role -> selector` binding: updates the role row
-    /// and the role badges shown on each model row.
-    fn record_assignment(&mut self, role: &str, selector: &str) {
-        if let Some(entry) = self.roles.iter_mut().find(|entry| entry.role == role) {
-            entry.resolved = Some(selector.to_string());
-        } else {
-            self.roles.push(RoleEntry {
-                role: role.to_string(),
-                resolved: Some(selector.to_string()),
-            });
-        }
-        for model in &mut self.models {
-            model.roles.retain(|name| name != role);
-            if model.selector == selector {
-                model.roles.push(role.to_string());
-            }
-        }
+        let connected = std::mem::take(&mut self.connected);
+        self.connect(connected, query);
     }
 
     fn connect(&mut self, providers: BTreeSet<String>, query: &str) {
@@ -244,7 +259,54 @@ pub enum ModelPickerEvent {
     ManageProviders,
 }
 
+/// Picker state fetched from the daemon in one pass.
+struct PickerLoad {
+    config: RuntimeConfig,
+    catalog: Vec<Model>,
+    available: BTreeSet<String>,
+}
+
+async fn load_picker(
+    client: Client,
+    tokio_handle: tokio::runtime::Handle,
+) -> Result<PickerLoad, String> {
+    let config = match call(client.clone(), tokio_handle.clone(), Request::GetConfig).await {
+        Ok(Reply::Config(config)) => config,
+        Ok(_) => return Err("Unexpected daemon reply to config request".into()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let catalog = match call(client.clone(), tokio_handle.clone(), Request::ListModels).await {
+        Ok(Reply::Models(catalog)) => catalog,
+        Ok(_) => return Err("Unexpected daemon reply to model list".into()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let providers: Vec<String> = catalog
+        .iter()
+        .map(|model| model.provider.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let available: BTreeSet<String> = match call(
+        client,
+        tokio_handle,
+        Request::CredentialStatus { providers },
+    )
+    .await
+    {
+        Ok(Reply::Credentials(status)) => status.available.into_iter().collect(),
+        Ok(_) => return Err("Unexpected daemon reply to credential status".into()),
+        Err(error) => return Err(error.to_string()),
+    };
+    Ok(PickerLoad {
+        config,
+        catalog,
+        available,
+    })
+}
+
 pub struct ModelPicker {
+    client: Client,
+    tokio_handle: tokio::runtime::Handle,
     focus_handle: FocusHandle,
     search_input: Entity<TextInput>,
     active_model: String,
@@ -255,6 +317,8 @@ pub struct ModelPicker {
     loading: bool,
     error: Option<String>,
     refresh_task: Option<Task<()>>,
+    assign_task: Option<Task<()>>,
+    _notifications_task: Task<()>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -262,9 +326,9 @@ impl gpui::EventEmitter<ModelPickerEvent> for ModelPicker {}
 
 impl ModelPicker {
     pub fn new(
+        client: Client,
+        tokio_handle: tokio::runtime::Handle,
         active_model: impl Into<String>,
-        config: &RuntimeConfig,
-        registry: &Registry,
         cx: &mut Context<Self>,
     ) -> Self {
         let active_model = active_model.into();
@@ -280,55 +344,74 @@ impl ModelPicker {
         let submitted = cx.subscribe(&search_input, |this, _, _: &SubmitText, cx| {
             this.select_current(cx);
         });
+        let mut notifications = client.subscribe();
+        let notifications_task = cx.spawn(async move |this, cx| {
+            loop {
+                let update = match notifications.recv().await {
+                    Ok(Notification::Event(ServerEvent::Config { config })) => {
+                        this.update(cx, |this, cx| {
+                            this.data
+                                .set_config(config, this.search_input.read(cx).text());
+                            cx.notify();
+                        })
+                    }
+                    Ok(Notification::Connected(_)) | Err(RecvError::Lagged(_)) => {
+                        this.update(cx, |this, cx| this.refresh_credentials(cx))
+                    }
+                    Ok(Notification::Disconnected) => this.update(cx, |this, cx| {
+                        this.data
+                            .connect(BTreeSet::new(), this.search_input.read(cx).text());
+                        this.error = Some("Daemon disconnected".into());
+                        cx.notify();
+                    }),
+                    Ok(_) => continue,
+                    Err(RecvError::Closed) => break,
+                };
+                if update.is_err() {
+                    break;
+                }
+            }
+        });
         Self {
+            client,
+            tokio_handle,
             focus_handle: cx.focus_handle(),
             search_input,
             active_model,
             assign_role: "default".into(),
-            data: PickerData::new(config, registry),
+            data: PickerData::default(),
             selected: 0,
             scroll_handle: UniformListScrollHandle::new(),
             loading: true,
             error: None,
             refresh_task: None,
+            assign_task: None,
+            _notifications_task: notifications_task,
             _subscriptions: vec![subscription, submitted],
         }
     }
 
-    pub fn refresh_credentials(
-        &mut self,
-        runtime: Runtime,
-        handle: tokio::runtime::Handle,
-        cx: &mut Context<Self>,
-    ) {
+    /// Reloads config, the model catalog, and which providers hold usable
+    /// credentials. Models stay hidden until the daemon confirms them.
+    pub fn refresh_credentials(&mut self, cx: &mut Context<Self>) {
         self.loading = true;
         self.error = None;
         // Fail closed while a refresh is pending; removed providers cannot remain selectable.
         self.data
             .connect(BTreeSet::new(), self.search_input.read(cx).text());
-        let providers: BTreeSet<String> = self
-            .data
-            .models
-            .iter()
-            .map(|model| model.provider.clone())
-            .collect();
-        let task = handle.spawn_blocking(move || {
-            runtime
-                .credentials()
-                .available_providers(providers.iter().map(String::as_str))
-        });
+        let client = self.client.clone();
+        let tokio_handle = self.tokio_handle.clone();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let result = load_picker(client, tokio_handle).await;
             let _ = this.update(cx, |this, cx| {
                 this.loading = false;
                 match result {
-                    Ok(Ok(providers)) => this
-                        .data
-                        .connect(providers, this.search_input.read(cx).text()),
-                    Ok(Err(error)) => {
-                        this.error = Some(format!("Could not read provider credentials: {error}"))
+                    Ok(loaded) => {
+                        let query = this.search_input.read(cx).text();
+                        this.data.load(loaded.config, loaded.catalog, query);
+                        this.data.connect(loaded.available, query);
                     }
-                    Err(error) => this.error = Some(format!("Credential lookup failed: {error}")),
+                    Err(error) => this.error = Some(format!("Could not load models: {error}")),
                 }
                 this.selected = 0;
                 this.scroll_handle.scroll_to_item(0, ScrollStrategy::Top);
@@ -343,27 +426,41 @@ impl ModelPicker {
         self.search_input.read(cx).focus_handle(cx).focus(window);
     }
 
-    /// Persisted bindings arrive through this after `Runtime::set_model_role`
-    /// succeeds; the picker never mutates role state on its own so a failed
-    /// write can't desync the display from config.yml.
-    pub fn apply_assignment(&mut self, role: &str, selector: &str, cx: &mut Context<Self>) {
-        if role == "default" {
-            self.active_model = selector.to_string();
-        }
-        self.data.record_assignment(role, selector);
-        cx.notify();
-    }
-
-    pub fn set_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
-        self.error = error;
-        cx.notify();
-    }
-
     fn select_model(&mut self, selector: String, cx: &mut Context<Self>) {
-        cx.emit(ModelPickerEvent::AssignRole {
-            role: self.assign_role.clone(),
-            selector,
-        });
+        if self.assign_task.is_some() {
+            return;
+        }
+        let role = self.assign_role.clone();
+        let request = Request::SetModelRole {
+            role: role.clone(),
+            selector: selector.clone(),
+        };
+        let client = self.client.clone();
+        let tokio_handle = self.tokio_handle.clone();
+        self.error = None;
+        self.assign_task = Some(cx.spawn(async move |this, cx| {
+            let result = call(client, tokio_handle, request).await;
+            let _ = this.update(cx, |this, cx| {
+                this.assign_task = None;
+                match result {
+                    Ok(Reply::Config(config)) => {
+                        this.data
+                            .set_config(config, this.search_input.read(cx).text());
+                        if role == "default" {
+                            this.active_model = selector.clone();
+                        }
+                        cx.emit(ModelPickerEvent::AssignRole { role, selector });
+                    }
+                    Ok(_) => {
+                        this.error = Some("Unexpected daemon reply to role assignment".into());
+                    }
+                    Err(error) => {
+                        this.error = Some(format!("Could not assign @{role}: {error}"));
+                    }
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn close(&mut self, _: &CloseModelPicker, _: &mut Window, cx: &mut Context<Self>) {
@@ -860,15 +957,61 @@ impl Render for ModelPicker {
 mod tests {
     use super::*;
 
+    fn model(provider: &str, id: &str, api: &str, kind: &str) -> Model {
+        Model {
+            id: id.into(),
+            name: id.into(),
+            api: api.into(),
+            provider: provider.into(),
+            base_url: String::new(),
+            reasoning: false,
+            input: vec!["text".into()],
+            cost: Default::default(),
+            context_window: None,
+            max_tokens: None,
+            kind: kind.into(),
+            supports_tools: true,
+            compat: Default::default(),
+        }
+    }
+
+    #[test]
+    fn daemon_catalog_selectors_preserve_ambiguity_and_provider_locking() {
+        let catalog = vec![
+            model("openai", "shared", "openai-responses", "chat"),
+            model("anthropic", "shared", "anthropic-messages", "chat"),
+            model("openrouter", "vendor/model", "openai-responses", "chat"),
+        ];
+        assert!(resolve_model(&catalog, "shared").is_none());
+        assert_eq!(
+            resolve_model(&catalog, "OPENAI/SHARED").map(|model| model.provider.as_str()),
+            Some("openai")
+        );
+        assert!(resolve_model(&catalog, "openai/vendor/model").is_none());
+        assert_eq!(
+            resolve_model(&catalog, "vendor/model").map(|model| model.provider.as_str()),
+            Some("openrouter")
+        );
+    }
+
     #[test]
     fn disconnected_models_and_role_targets_are_unavailable_after_revocation() {
-        let registry = Registry::bundled().unwrap();
+        let catalog = vec![
+            model(
+                "anthropic",
+                "claude-sonnet-4-5",
+                "anthropic-messages",
+                "chat",
+            ),
+            model("openai", "gpt-4o", "openai-responses", "chat"),
+        ];
         let config = RuntimeConfig {
             model: "anthropic/claude-sonnet-4-5".into(),
             model_roles: [("fast".into(), "openai/gpt-4o:high".into())].into(),
             ..Default::default()
         };
-        let mut data = PickerData::new(&config, &registry);
+        let mut data = PickerData::default();
+        data.load(config, catalog, "");
         assert!(data.filtered.is_empty());
         assert_eq!(
             data.roles
@@ -918,36 +1061,22 @@ mod tests {
 
     #[test]
     fn unsupported_transports_and_non_chat_models_are_not_offered() {
-        let mut registry = Registry::empty();
-        let mut model = Registry::bundled()
-            .unwrap()
-            .get("openai", "gpt-4o")
-            .unwrap()
-            .clone();
-        model.id = "chat".into();
-        registry.upsert(model.clone());
-        model.id = "embedding".into();
-        model.kind = "embedding".into();
-        registry.upsert(model.clone());
-        model.id = "unsupported".into();
-        model.kind = "chat".into();
-        model.api = "future-transport".into();
-        registry.upsert(model);
-        let mut data = PickerData::new(&RuntimeConfig::default(), &registry);
+        let catalog = vec![
+            model("openai", "chat", "openai-responses", "chat"),
+            model("openai", "embedding", "openai-responses", "embedding"),
+            model("openai", "unsupported", "future-transport", "chat"),
+        ];
+        let mut data = PickerData::default();
+        data.load(RuntimeConfig::default(), catalog, "");
         data.connect(BTreeSet::from(["openai".into()]), "");
         assert_eq!(data.available, BTreeSet::from(["openai/chat".into()]));
     }
 
     #[test]
     fn devin_models_are_offered_once_connected() {
-        let mut registry = Registry::empty();
-        let model = Registry::bundled()
-            .unwrap()
-            .get("devin", "swe-1-6")
-            .unwrap()
-            .clone();
-        registry.upsert(model);
-        let mut data = PickerData::new(&RuntimeConfig::default(), &registry);
+        let catalog = vec![model("devin", "swe-1-6", "devin-agent", "chat")];
+        let mut data = PickerData::default();
+        data.load(RuntimeConfig::default(), catalog, "");
         data.connect(BTreeSet::new(), "");
         assert!(data.available.is_empty());
         data.connect(BTreeSet::from(["devin".into()]), "");
@@ -956,14 +1085,9 @@ mod tests {
 
     #[test]
     fn typesafe_judge_models_are_offered_only_for_the_judge_role() {
-        let mut registry = Registry::empty();
-        let judge = Registry::bundled()
-            .unwrap()
-            .get("typesafe", "jev-preview")
-            .unwrap()
-            .clone();
-        registry.upsert(judge);
-        let mut data = PickerData::new(&RuntimeConfig::default(), &registry);
+        let catalog = vec![model("typesafe", "jev-preview", "typesafe", "judge")];
+        let mut data = PickerData::default();
+        data.load(RuntimeConfig::default(), catalog, "");
         data.connect(BTreeSet::from(["typesafe".into()]), "");
         assert!(data.filtered.is_empty());
         data.set_judge_role(true, "");
@@ -976,11 +1100,12 @@ mod tests {
 
     #[test]
     fn judge_scope_offers_chat_models_and_chat_scope_hides_judge_models() {
-        let bundled = Registry::bundled().unwrap();
-        let mut registry = Registry::empty();
-        registry.upsert(bundled.get("typesafe", "jev-preview").unwrap().clone());
-        registry.upsert(bundled.get("openai", "gpt-4o").unwrap().clone());
-        let mut data = PickerData::new(&RuntimeConfig::default(), &registry);
+        let catalog = vec![
+            model("typesafe", "jev-preview", "typesafe", "judge"),
+            model("openai", "gpt-4o", "openai-responses", "chat"),
+        ];
+        let mut data = PickerData::default();
+        data.load(RuntimeConfig::default(), catalog, "");
         data.connect(BTreeSet::from(["typesafe".into(), "openai".into()]), "");
         let selectors = |data: &PickerData| -> Vec<String> {
             data.filtered
