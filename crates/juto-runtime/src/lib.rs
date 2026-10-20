@@ -5,6 +5,7 @@ pub mod approval;
 pub mod broker;
 pub mod browser;
 pub mod change_graph;
+mod compaction;
 pub mod config;
 pub mod context;
 mod contextual;
@@ -144,6 +145,9 @@ struct RuntimeInner {
     admission: pools::Admission,
     approval: Option<Arc<dyn ApprovalHandler>>,
     subagent_manager: Mutex<Option<Arc<SubagentManager>>>,
+    /// Background summaries keyed by session id; at most one per session.
+    compactions:
+        Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<Result<session::NewNode>>>>,
     desktop_supervisor: Mutex<Option<Arc<DesktopSupervisor>>>,
     signaling: Mutex<Option<Arc<SignalingHandle>>>,
     /// Browser processes and named tabs shared across runs.
@@ -260,6 +264,7 @@ impl Runtime {
                 admission,
                 approval,
                 subagent_manager: Mutex::new(None),
+                compactions: Mutex::new(std::collections::HashMap::new()),
                 desktop_supervisor: Mutex::new(None),
                 signaling: Mutex::new(None),
             }),
@@ -711,6 +716,8 @@ impl Runtime {
             }
             system_prompt.push(descriptions);
         }
+        // A finished background summary joins the view at the run start only.
+        self.apply_background_compaction(session).await;
         // The estimate covers the first request: system prompt, advertised tools,
         // and the history plus the new prompt.
         if settings.auto_compact {
@@ -718,7 +725,10 @@ impl Runtime {
             let estimated =
                 estimate_request_tokens(&system_prompt, &registry.definitions(), &history)
                     + (prompt.len() as u64).div_ceil(3);
-            if history.len() > settings.keep_recent_messages && estimated > window_budget {
+            if history.len() > settings.keep_recent_messages
+                && estimated > window_budget
+                && !self.has_background_compaction(&session.header().id)
+            {
                 compaction_usage = self.compact(session, &control).await?;
             }
         }
@@ -813,6 +823,15 @@ impl Runtime {
         if let Some(error) = persistence_error {
             return Err(error.context("session persistence failed; run cancelled"));
         }
+        if settings.auto_compact
+            && let Err(error) = self.schedule_background_compaction(
+                session,
+                window_budget,
+                settings.keep_recent_messages,
+            )
+        {
+            eprintln!("juto: could not schedule background compaction: {error:#}");
+        }
         let mut result = result?;
         result.usage.add(&compaction_usage);
         Ok(result)
@@ -826,13 +845,16 @@ impl Runtime {
         if session.messages()?.is_empty() {
             bail!("cannot compact an empty session");
         }
+        // A synchronous compaction replaces the view now, so a pending background
+        // summary of the old view is dropped.
+        self.abort_background_compaction(&session.header().id);
         let selector = match self.config().compactor {
             Some(compactor) => compactor,
             None => session
                 .current_model()
                 .unwrap_or_else(|| self.config().model),
         };
-        let (model, mut options) = self.resolve_model(&selector)?;
+        let (model, options) = self.resolve_model(&selector)?;
         let method = self.config().compaction_method;
         let accepts_images = model.input.iter().any(|input| input == "image");
         if method == CompactionMethod::Snapcompact && !accepts_images {
@@ -845,21 +867,25 @@ impl Runtime {
         }
         if method.archives_frames(accepts_images) {
             let mut history = Vec::new();
-            let previous_archive = match plan.previous.first().cloned() {
-                Some(PriorCompaction {
-                    archive: Some(archive),
-                    ..
-                }) => Some(archive),
-                Some(PriorCompaction {
-                    summary,
-                    archive: None,
-                }) => {
-                    history.push(Message::developer(format!(
-                        "[Earlier conversation summary]\n{summary}"
-                    )));
+            let previous_archive = match plan.previous.as_slice() {
+                [
+                    PriorCompaction {
+                        archive: Some(archive),
+                        ..
+                    },
+                ] => Some(archive.clone()),
+                previous => {
+                    for prior in previous {
+                        let text = prior
+                            .archive
+                            .as_ref()
+                            .map_or_else(|| prior.summary.clone(), |archive| archive.text());
+                        history.push(Message::developer(format!(
+                            "[Earlier conversation summary]\n{text}"
+                        )));
+                    }
                     None
                 }
-                None => None,
             };
             history.extend(plan.discarded.iter().cloned());
             let transcript = serialize_conversation(&history);
@@ -887,33 +913,8 @@ impl Runtime {
                 );
             }
         }
-        let mut input = Vec::new();
-        if let Some(prior) = plan.previous.into_iter().next() {
-            let text = match prior.archive {
-                Some(archive) => archive.text(),
-                None => prior.summary,
-            };
-            input.push(Message::developer(format!(
-                "[Earlier conversation summary]\n{text}"
-            )));
-        }
-        input.extend(plan.discarded);
-        options.max_tokens = Some(options.max_tokens.unwrap_or(4096).min(4096));
-        let context = Context {
-            system_prompt: vec![COMPACTION_PROMPT.into()],
-            messages: input,
-            tools: Vec::new(),
-        };
-        let completed = self
-            .complete_once(&model, &options, &context, &control.token())
+        self.compact_nodes(session, &model, &options, &cancel, keep)
             .await
-            .context("compaction failed")?;
-        let summary = completed.text();
-        if summary.trim().is_empty() {
-            bail!("compaction returned an empty summary");
-        }
-        session.compact(summary, None, keep)?;
-        Ok(completed.usage)
     }
 
     /// One tool-free completion: streams `context` to `model` and returns the
