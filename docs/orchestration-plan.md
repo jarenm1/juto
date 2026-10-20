@@ -257,6 +257,7 @@ and mid-run compaction share this budget.
   window can overflow it. This predates the guard: run-start compaction has the same gap.
 * With `auto_compact` off there is no guard, and requests are sent without a size check.
 * Cancelling during mid-run compaction ends the run as `Aborted` with no `Error` event.
+* If the context window is smaller than the system prompt plus tool schemas, the first request fails with `ContextOverflow` and no request is sent.
 
 ---
 
