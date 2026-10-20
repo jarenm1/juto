@@ -435,7 +435,7 @@ impl Daemon {
                     .await
                     .map(|outcome| match outcome {
                         UnattendedOutcome::Finished(run) => (Some(run.stop_reason), None),
-                        UnattendedOutcome::Blocked(decision) => (None, Some(decision)),
+                        UnattendedOutcome::Blocked(decision) => (None, Some(*decision)),
                     })
             } else {
                 daemon
