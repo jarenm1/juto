@@ -26,7 +26,10 @@ use juto_agent::{AgentEvent, ToolTier};
 use juto_ai::{Message, StopReason, ToolCall};
 use juto_catalog::Model;
 use juto_runtime::subagents::MainMessage;
-use juto_runtime::{RuntimeConfig, SessionEntry, SubagentEvent, SubagentSummary, ViewerRoute};
+use juto_runtime::{
+    RuntimeConfig, SessionEntry, SubagentEvent, SubagentSummary, ThreadEvent, TimelineItem,
+    ViewerRoute,
+};
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change to this module.
@@ -103,6 +106,10 @@ pub enum Request {
     CreateSession,
     /// Opens a session by id and returns its committed transcript plus live state.
     OpenSession {
+        session_id: String,
+    },
+    /// Returns the routed history of a main session, oldest first.
+    Timeline {
         session_id: String,
     },
     /// Opens a session journal by path (for `--session <path>`).
@@ -240,6 +247,10 @@ pub enum Reply {
     Models(Vec<Model>),
     Subagents(Vec<SubagentSummary>),
     Transcript(Vec<Message>),
+    /// Answers [`Request::Timeline`].
+    Timeline {
+        items: Vec<TimelineItem>,
+    },
     Credentials(CredentialStatus),
     LoginStarted {
         login_id: u64,
@@ -330,6 +341,11 @@ pub enum ServerEvent {
     Session {
         session_id: String,
         event: SessionEvent,
+    },
+    /// A thread of session `session_id` was routed, created, relabeled, or went dormant.
+    Thread {
+        session_id: String,
+        event: ThreadEvent,
     },
     Subagent {
         event: SubagentEvent,
@@ -425,5 +441,71 @@ pub mod paths {
     /// systemd `--user` unit name for the daemon serving `canonical_cwd`.
     pub fn unit_name(canonical_cwd: &Path) -> String {
         format!("juto-daemon-{}", workspace_key(canonical_cwd))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use juto_runtime::{Route, RouteKind, ThreadInfo, ThreadStatus};
+    use serde::de::DeserializeOwned;
+    use std::path::PathBuf;
+
+    fn route() -> Route {
+        Route {
+            thread: "thread-1".into(),
+            label: "Protocol surface".into(),
+            kind: RouteKind::Continue,
+            confidence: Some(0.9),
+            rationale: Some("same topic".into()),
+            query: None,
+            note: None,
+        }
+    }
+
+    fn thread() -> ThreadInfo {
+        ThreadInfo {
+            id: "thread-1".into(),
+            label: "Protocol surface".into(),
+            status: ThreadStatus::Active,
+            session_path: PathBuf::from("/tmp/thread-1.jsonl"),
+            created: 1,
+            last_routed: 2,
+        }
+    }
+
+    /// Serializes `value`, parses it back, and checks the JSON survives unchanged.
+    fn assert_round_trips<T: Serialize + DeserializeOwned>(value: &T) {
+        let json = serde_json::to_value(value).unwrap();
+        let parsed: T = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn route_thread_event_and_timeline_item_round_trip() {
+        assert_round_trips(&route());
+        assert_round_trips(&ThreadEvent::ThreadRouted { route: route() });
+        assert_round_trips(&ThreadEvent::ThreadUpdated { thread: thread() });
+        assert_round_trips(&ThreadEvent::ThreadLabelFailed {
+            thread: "thread-1".into(),
+            error: "tiny model unavailable".into(),
+        });
+        assert_round_trips(&TimelineItem::Routed { route: route() });
+        assert_round_trips(&TimelineItem::Message {
+            thread: Some("thread-1".into()),
+            message: Message::user("hello"),
+        });
+    }
+
+    #[test]
+    fn thread_event_crosses_the_wire_as_a_server_event() {
+        let event = ServerEvent::Thread {
+            session_id: "session-1".into(),
+            event: ThreadEvent::ThreadRouted { route: route() },
+        };
+        assert_round_trips(&event);
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["thread"]["session_id"], "session-1");
+        assert_eq!(json["thread"]["event"]["type"], "thread_routed");
     }
 }

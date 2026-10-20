@@ -10,10 +10,10 @@ use juto_ai::{
     ProviderEvent, ProviderStream, StopReason, StreamOptions, Usage, timestamp_ms,
 };
 use juto_catalog::{Model, ModelCost};
-use juto_runtime::ViewerRoute;
 use juto_runtime::subagents::{MainMessage, MainMessageKind};
 use juto_runtime::tools::{DESKTOP_SESSION_ARTIFACT_VERSION, DesktopSessionArtifact};
 use juto_runtime::{EntryKind, SessionEntry, TaskSpec};
+use juto_runtime::{Route, RouteKind, ThreadEvent, ViewerRoute};
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -612,4 +612,60 @@ async fn child_completion_wakes_the_session_that_spawned_it() {
     .await
     .expect("wake run started within 10s");
     assert_eq!(woken, spawning.info.id);
+}
+
+#[tokio::test]
+async fn thread_events_reach_subscribed_clients() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon(root.path(), ScriptedProvider::new(false));
+    let view = create_session(&daemon).await;
+    let mut rx = attach(&daemon);
+    let route = Route {
+        thread: "thread-1".into(),
+        label: "Protocol surface".into(),
+        kind: RouteKind::New,
+        confidence: None,
+        rationale: None,
+        query: None,
+        note: None,
+    };
+
+    daemon.emit(ServerEvent::Thread {
+        session_id: view.info.id.clone(),
+        event: ThreadEvent::ThreadRouted {
+            route: route.clone(),
+        },
+    });
+
+    let delivered = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("thread event within 10s");
+    match delivered {
+        Some(ServerEvent::Thread {
+            session_id,
+            event: ThreadEvent::ThreadRouted { route: got },
+        }) => {
+            assert_eq!(session_id, view.info.id);
+            assert_eq!(got, route);
+        }
+        other => panic!("expected a routed thread event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn timeline_request_answers_for_a_session() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon(root.path(), ScriptedProvider::new(false));
+    let view = create_session(&daemon).await;
+
+    let Reply::Timeline { items } = daemon
+        .request(Request::Timeline {
+            session_id: view.info.id.clone(),
+        })
+        .await
+        .expect("timeline")
+    else {
+        panic!("expected a timeline reply");
+    };
+    assert!(items.is_empty(), "a fresh session has no routed history");
 }
