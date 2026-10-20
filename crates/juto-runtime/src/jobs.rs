@@ -398,6 +398,27 @@ impl JobRegistry {
             .remove(id);
     }
 
+    /// Applies a terminal transition and drops the job's run control under the
+    /// live-run lock. A retry registers its control under that same lock, so the
+    /// removal can never reach a control registered after the transition.
+    fn settle(
+        &self,
+        id: &str,
+        edit: impl FnOnce(&mut Job) -> Result<(), JobError>,
+    ) -> Result<(), JobError> {
+        let mut live = self
+            .live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.mutate(id, edit)?;
+        live.remove(id);
+        self.cancel_requested
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(id);
+        Ok(())
+    }
+
     /// Records an operator cancel and stops the live run of `id`, if it has one.
     fn request_cancel(&self, id: &str) {
         let control = self
@@ -1058,7 +1079,7 @@ impl Runtime {
             Settled::Blocked(decision_id) => (JobStatus::Blocked, None, None, Some(decision_id)),
         };
         let blocked = status == JobStatus::Blocked;
-        self.inner.jobs.mutate(id, |job| {
+        self.inner.jobs.settle(id, |job| {
             job.status = status;
             job.error = error;
             job.result = result;
@@ -1071,7 +1092,6 @@ impl Runtime {
             job.drained = false;
             Ok(())
         })?;
-        self.inner.jobs.unregister(id);
         Ok(())
     }
 }
