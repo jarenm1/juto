@@ -487,9 +487,17 @@ impl Daemon {
                 });
                 let outcome = daemon
                     .runtime
-                    .run_unattended(&mut session, text, agent_tx, control, None)
+                    .run_unattended(
+                        &mut session,
+                        text,
+                        agent_tx,
+                        control,
+                        None,
+                        juto_runtime::JobLimits::default(),
+                    )
                     .await
-                    .map(|unattended| match unattended.outcome {
+                    .outcome
+                    .map(|outcome| match outcome {
                         UnattendedOutcome::Finished(run) => (Some(run.stop_reason), None),
                         UnattendedOutcome::Blocked(decision) => (None, Some(decision)),
                     });
