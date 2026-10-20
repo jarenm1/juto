@@ -187,7 +187,7 @@ fn page_bounds(body: &str, at: usize) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-fn floor_boundary(text: &str, mut at: usize) -> usize {
+pub(crate) fn floor_boundary(text: &str, mut at: usize) -> usize {
     at = at.min(text.len());
     while !text.is_char_boundary(at) {
         at -= 1;
@@ -224,7 +224,7 @@ fn index_line(entry: &PathMessage<'_>) -> String {
 }
 
 /// Everything in a message, for the detail view.
-fn full_body(message: &Message) -> String {
+pub(crate) fn full_body(message: &Message) -> String {
     match message {
         Message::ToolResult {
             tool_name,
@@ -270,7 +270,7 @@ fn render_call(call: &ToolCall, full: bool) -> String {
     }
 }
 
-fn role(message: &Message) -> &'static str {
+pub(crate) fn role(message: &Message) -> &'static str {
     match message {
         Message::User { .. } => "user",
         Message::Developer { .. } => "developer",

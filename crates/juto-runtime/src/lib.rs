@@ -27,6 +27,7 @@ pub mod tier;
 pub mod tools;
 mod vcs;
 pub mod workspace;
+mod zoom;
 
 use std::{
     collections::BTreeMap,
@@ -619,6 +620,10 @@ impl Runtime {
             registry.register(Arc::new(recall::RecallTool::new(
                 main_session.to_path_buf(),
             )))?;
+            // Only the main thread zooms: `all`-scoped child roles would inherit it.
+            if depth == 0 {
+                registry.register(Arc::new(zoom::ZoomTool::new(main_session.to_path_buf())))?;
+            }
         }
         if can_delegate {
             let peers = match sender {
@@ -3893,6 +3898,7 @@ mod tests {
                 "glob",
                 "grep",
                 "recall",
+                "zoom",
                 "task",
                 "wait",
                 "agent_send",
@@ -3928,7 +3934,7 @@ mod tests {
 
         assert_eq!(
             provider.requests(),
-            vec![tool_set(&["read", "glob", "grep", "recall"])]
+            vec![tool_set(&["read", "glob", "grep", "recall", "zoom"])]
         );
     }
 

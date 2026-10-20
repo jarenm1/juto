@@ -25,7 +25,7 @@ pub(crate) const DEFAULT_ROLE: &str = "task";
 pub(crate) const MAIN_ROLE: &str = "main";
 
 /// Read-only builtin tools, by registry name.
-const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", "recall"];
+const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", "recall", "zoom"];
 
 const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("main", include_str!("roles/main.md")),
