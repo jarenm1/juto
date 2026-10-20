@@ -744,6 +744,24 @@ impl Daemon {
             }
             Request::GetConfig => services::get_config(self),
             Request::ListModels => services::list_models(self),
+            Request::CreateAutomation { spec } => services::automations::create(self, spec),
+            Request::ListAutomations => services::automations::list(self),
+            Request::GetAutomation { automation_id } => {
+                services::automations::get(self, &automation_id)
+            }
+            Request::AutomationHistory { automation_id } => {
+                services::automations::history(self, &automation_id)
+            }
+            Request::RunAutomationNow { automation_id } => {
+                services::automations::run_now(self, &automation_id)
+            }
+            Request::SetAutomationEnabled {
+                automation_id,
+                enabled,
+            } => services::automations::set_enabled(self, &automation_id, enabled),
+            Request::DeleteAutomation { automation_id } => {
+                services::automations::delete(self, &automation_id)
+            }
             Request::SetModelRole { role, selector } => {
                 services::set_model_role(self, role, selector)
             }
@@ -1034,6 +1052,7 @@ pub async fn serve(workspace: PathBuf) -> Result<()> {
         }
     }
     tokio::spawn(wake_loop(daemon.clone()));
+    tokio::spawn(services::automations::tick_loop(daemon.clone()));
     tokio::spawn(inbox_loop(daemon.clone()));
     forward_job_events(&daemon);
     let approval_daemon = daemon.clone();
