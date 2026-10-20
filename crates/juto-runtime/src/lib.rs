@@ -1877,7 +1877,9 @@ async fn collect_agents(
 }
 
 /// Output of a non-blocking `task` call: the children are queued and their
-/// terminal results arrive later in the main inbox.
+/// terminal results arrive later in the main inbox. They belong to the run that
+/// started them: they keep running when that run's turn ends, and only stopping
+/// the run cancels them.
 fn queued_output(children: Vec<(String, Option<String>, bool)>) -> ToolOutput {
     let count = children.len();
     let entries: Vec<Value> = children
@@ -1890,7 +1892,7 @@ fn queued_output(children: Vec<(String, Option<String>, bool)>) -> ToolOutput {
     ToolOutput {
         content: vec![ContentBlock::Text {
             text: format!(
-                "Queued {count} child agent(s): {listing}. Their results arrive in the main thread as they finish; call `wait` with these ids to read them now. Children still running when your turn ends are cancelled."
+                "Queued {count} child agent(s): {listing}. Their results arrive in the main thread as they finish; call `wait` with these ids to read them now. Children keep running after your turn ends; stopping the run cancels them."
             ),
         }],
         details: Value::Array(entries),
