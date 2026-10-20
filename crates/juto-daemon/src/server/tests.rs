@@ -10,6 +10,7 @@ use juto_ai::{
     ProviderEvent, ProviderStream, StopReason, StreamOptions, Usage, timestamp_ms,
 };
 use juto_catalog::{Model, ModelCost};
+use juto_runtime::jobs::{Job, JobBudget, JobContract, JobStatus};
 use juto_runtime::{Decision, DecisionStatus, EntryKind, SessionEntry, TaskSpec};
 use serde_json::Value;
 use tokio::{
@@ -707,4 +708,198 @@ async fn pending_decision_survives_a_daemon_restart_and_is_still_approvable() {
     assert!(run_id.is_some());
     until(|| restarted.state.lock().unwrap().active.is_none()).await;
     assert_eq!(publish_results(&view.info.path), 1);
+}
+
+fn init_repo(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Daemon Test"]);
+    git(&["config", "user.email", "daemon@example.test"]);
+    std::fs::write(dir.join("README.md"), "# Initial\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "initial"]);
+}
+
+/// Like [`daemon`], with the workspace a Git repository, as background jobs require.
+fn daemon_in_repo(root: &Path, provider: Arc<dyn Provider>) -> Arc<Daemon> {
+    init_repo(&root.join("workspace"));
+    daemon(root, provider)
+}
+
+async fn start_job(
+    daemon: &Arc<Daemon>,
+    prompt: &str,
+    contract: JobContract,
+) -> Result<Job, RpcError> {
+    let request = Request::StartJob {
+        prompt: prompt.into(),
+        budget: JobBudget {
+            wall_secs: 60,
+            max_attempts: 1,
+        },
+        contract,
+    };
+    match daemon.request(request).await? {
+        Reply::Job(job) => Ok(job),
+        _ => panic!("expected a job reply"),
+    }
+}
+
+async fn job(daemon: &Arc<Daemon>, job_id: &str) -> Job {
+    let request = Request::GetJob {
+        job_id: job_id.into(),
+    };
+    match daemon.request(request).await.expect("get job") {
+        Reply::Job(job) => job,
+        _ => panic!("expected a job reply"),
+    }
+}
+
+async fn drain(daemon: &Arc<Daemon>) -> Vec<Job> {
+    match daemon
+        .request(Request::DrainJobs)
+        .await
+        .expect("drain jobs")
+    {
+        Reply::Jobs(jobs) => jobs,
+        _ => panic!("expected jobs"),
+    }
+}
+
+/// Polls the job until `check` holds; fails after ten seconds.
+async fn wait_for_job(daemon: &Arc<Daemon>, job_id: &str, check: impl Fn(&Job) -> bool) -> Job {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let current = job(daemon, job_id).await;
+            if check(&current) {
+                return current;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("job condition not reached within 10s")
+}
+
+#[tokio::test]
+async fn a_job_runs_without_a_client_and_its_result_is_drained_once() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon_in_repo(root.path(), ScriptedProvider::new(false));
+    let contract = JobContract {
+        no_change: true,
+        ..Default::default()
+    };
+    let started = start_job(&daemon, "summarize the repo", contract)
+        .await
+        .expect("start job");
+
+    let finished = wait_for_job(&daemon, &started.id, |job| job.status.is_terminal()).await;
+    assert_eq!(finished.status, JobStatus::Succeeded);
+    assert_eq!(finished.result.as_deref(), Some("done"));
+
+    let drained = drain(&daemon).await;
+    let ids: Vec<&str> = drained.iter().map(|job| job.id.as_str()).collect();
+    assert_eq!(ids, vec![started.id.as_str()]);
+    assert!(
+        drain(&daemon).await.is_empty(),
+        "a finished job is drained once"
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_job_resumes_when_its_decision_is_approved_through_resolve_decision() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon_in_repo(root.path(), Arc::new(PublishProvider));
+    let contract = JobContract {
+        no_change: true,
+        ..Default::default()
+    };
+    let started = start_job(&daemon, "publish the branch", contract)
+        .await
+        .expect("start job");
+
+    let blocked = wait_for_job(&daemon, &started.id, |job| job.status == JobStatus::Blocked).await;
+    let decision_id = blocked
+        .decision_id
+        .clone()
+        .expect("a blocked job names its decision");
+    let listed = decisions(&daemon)
+        .await
+        .into_iter()
+        .find(|decision| decision.id == decision_id)
+        .expect("the job's decision is listed");
+    assert_eq!(listed.job_id.as_deref(), Some(started.id.as_str()));
+    assert_eq!(listed.status, DecisionStatus::Pending);
+
+    let Reply::Decision { decision, run_id } =
+        resolve(&daemon, &decision_id, true).await.expect("approve")
+    else {
+        panic!("expected a decision reply");
+    };
+    assert_eq!(decision.status, DecisionStatus::Approved);
+    assert!(
+        run_id.is_none(),
+        "a job decision resumes the job, not a session run"
+    );
+
+    let finished = wait_for_job(&daemon, &started.id, |job| job.status.is_terminal()).await;
+    assert_eq!(finished.status, JobStatus::Succeeded);
+    let session = finished.session_path.expect("the job keeps its session");
+    assert_eq!(
+        publish_results(&session),
+        1,
+        "the approved action runs exactly once"
+    );
+}
+
+#[tokio::test]
+async fn a_job_without_a_completion_contract_is_refused_and_never_recorded() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon_in_repo(root.path(), ScriptedProvider::new(false));
+    let error = start_job(&daemon, "just do it", JobContract::default())
+        .await
+        .expect_err("a job without a contract is refused");
+    assert!(matches!(error.code, ErrorCode::Invalid));
+    assert!(drain(&daemon).await.is_empty());
+}
+
+#[tokio::test]
+async fn job_changes_are_published_to_attached_clients() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon_in_repo(root.path(), ScriptedProvider::new(false));
+    let mut rx = attach(&daemon);
+    forward_job_events(&daemon);
+    let contract = JobContract {
+        no_change: true,
+        ..Default::default()
+    };
+    let started = start_job(&daemon, "summarize the repo", contract)
+        .await
+        .expect("start job");
+
+    let finished_id = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = rx.recv().await {
+            if let ServerEvent::Job { job } = event
+                && job.status.is_terminal()
+            {
+                return job.id;
+            }
+        }
+        panic!("client channel closed before the job finished");
+    })
+    .await
+    .expect("a finished job event within 10s");
+    assert_eq!(finished_id, started.id);
 }

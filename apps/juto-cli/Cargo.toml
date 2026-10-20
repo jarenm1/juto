@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 juto-runtime.workspace = true
+juto-daemon.workspace = true
 juto-ai.workspace = true
 juto-agent.workspace = true
 juto-catalog.workspace = true

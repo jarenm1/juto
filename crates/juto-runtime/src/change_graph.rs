@@ -290,6 +290,18 @@ impl ChangeGraph {
         self.repository.changed_paths(&baseline, &current)
     }
 
+    /// The paths where the workspace differs from the base it was created from,
+    /// including edits already captured as changes. Uncaptured edits are not the
+    /// only kind of change: a job that claims no change must leave this empty.
+    pub fn paths_changed_since_base(&self) -> Result<Vec<String>> {
+        let _lock =
+            crate::vcs::MutationLock::acquire(self.workspace()).map_err(anyhow::Error::msg)?;
+        let state = self.state()?;
+        let baseline = self.capture_baseline()?;
+        let current = self.repository.capture_tree(&baseline)?;
+        self.repository.changed_paths(&state.base_tree, &current)
+    }
+
     /// The tree a workspace capture is layered on: this workspace's head, the
     /// thread head, or the base tree.
     fn capture_baseline(&self) -> Result<String> {

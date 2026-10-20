@@ -7,6 +7,7 @@ mod chat_input;
 mod chat_request;
 mod desktop_viewer;
 mod focus_view;
+mod jobs_panel;
 mod model_picker;
 mod sidebar;
 mod subagent_card;
