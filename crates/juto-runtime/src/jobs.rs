@@ -104,7 +104,7 @@ pub struct JobBudget {
 }
 
 impl JobBudget {
-    fn validate(self) -> Result<(), JobError> {
+    pub(crate) fn validate(self) -> Result<(), JobError> {
         if self.wall_secs == 0 {
             return Err(JobError::Invalid("wall_secs must be at least 1".into()));
         }
@@ -146,7 +146,7 @@ pub struct JobContract {
 }
 
 impl JobContract {
-    fn validate(&self) -> Result<(), JobError> {
+    pub(crate) fn validate(&self) -> Result<(), JobError> {
         if self.artifact.is_none() && self.output_schema.is_none() && !self.no_change {
             return Err(JobError::Invalid(
                 "a job needs a completion contract: an artifact, an output schema, or no_change"
@@ -192,7 +192,7 @@ pub struct JobFork {
 #[serde(rename_all = "camelCase")]
 pub struct JobOrigin {
     pub automation_id: String,
-    /// The scheduled instant, in Unix milliseconds.
+    /// The scheduled instant, or the time of a run started by hand, in Unix milliseconds.
     pub instant_ms: u64,
 }
 
@@ -1420,4 +1420,4 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

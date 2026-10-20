@@ -2,6 +2,7 @@
 //! Behavioral reference: oh-my-pi 579da1d6; upstream attribution is in licenses/OMP-MIT.txt.
 
 pub mod approval;
+pub mod automations;
 pub mod broker;
 pub mod browser;
 pub mod change_graph;
