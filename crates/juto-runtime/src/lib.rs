@@ -819,7 +819,9 @@ impl Runtime {
                 cwd: self.inner.cwd.clone(),
             }))?;
         }
-        if scope.allows("desktop") {
+        // Desktop input and display capture reach outside the bash sandbox, so
+        // sandboxed tiers do not get it, as with the browser.
+        if !tier.sandboxed() && scope.allows("desktop") {
             tools::register_desktop_tools(
                 &mut registry,
                 self.desktop_supervisor(),
@@ -4071,7 +4073,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandboxed_tiers_do_not_get_the_browser() {
+    async fn sandboxed_tiers_do_not_get_browser_or_desktop() {
         let root = tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         native_repo(&repo);
@@ -4113,6 +4115,11 @@ mod tests {
         for (tier, tools) in tiers.iter().zip(&requests) {
             assert_eq!(
                 tools.contains("browser"),
+                !tier.sandboxed(),
+                "{tier:?} advertised {tools:?}"
+            );
+            assert_eq!(
+                tools.contains("desktop"),
                 !tier.sandboxed(),
                 "{tier:?} advertised {tools:?}"
             );
