@@ -488,15 +488,27 @@ impl Runtime {
     /// session again is a no-op; binding a different one fails, because this
     /// process serves one main session.
     pub fn open_main_inbox(&self, main: &MainSession) -> Result<()> {
-        let id = main.id();
+        self.bind_inbox_file(main.id())
+    }
+
+    /// Make the main inbox durable for a host that serves many sessions and has
+    /// no main session of its own, such as the daemon. `key` names the host's
+    /// file, `data_dir/inbox/<key>.json`, in the same place a main session's
+    /// file lives. The daemon passes its workspace key, so one daemon per
+    /// workspace owns one file.
+    pub fn open_host_inbox(&self, key: &str) -> Result<()> {
+        self.bind_inbox_file(key)
+    }
+
+    fn bind_inbox_file(&self, key: &str) -> Result<()> {
         anyhow::ensure!(
-            !id.is_empty()
-                && id
+            !key.is_empty()
+                && key
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
-            "session id `{id}` cannot name an inbox file"
+            "inbox key `{key}` cannot name an inbox file"
         );
-        let path = self.data_dir().join("inbox").join(format!("{id}.json"));
+        let path = self.data_dir().join("inbox").join(format!("{key}.json"));
         self.main_template().main_inbox().bind(path)
     }
 
