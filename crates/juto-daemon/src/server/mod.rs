@@ -6,6 +6,7 @@ use crate::protocol::*;
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use juto_agent::{AgentEvent, RunControl};
+use juto_runtime::jobs::{JobError, JobStatus};
 use juto_runtime::{
     ApprovalRequest, ChannelApprovalHandler, Decision, EntryKind, MainEvent, MainSession, Runtime,
     RuntimeConfig, Session, SubagentEvent, TimelineItem, UnattendedOutcome,
@@ -81,19 +82,45 @@ impl Notifier for SystemNotifier {
     }
 }
 
-/// The message that resumes an approved run: it names the exact action to retry.
-fn continuation_prompt(decision: &Decision) -> String {
-    format!(
-        "The operator approved the blocked action `{}` ({}), decision {}. Continue the task. Retry that exact action once; it is now permitted.",
-        decision.tool, decision.capability, decision.id
-    )
-}
-
 fn failed(error: impl std::fmt::Display) -> RpcError {
     RpcError::new(ErrorCode::Failed, error.to_string())
 }
 fn invalid(error: impl std::fmt::Display) -> RpcError {
     RpcError::new(ErrorCode::Invalid, error.to_string())
+}
+
+fn job_failed(error: JobError) -> RpcError {
+    let code = match error {
+        JobError::NotFound(_) => ErrorCode::NotFound,
+        JobError::Invalid(_) => ErrorCode::Invalid,
+        JobError::Failed(_) => ErrorCode::Failed,
+    };
+    RpcError::new(code, error.to_string())
+}
+
+/// Relays every job change to attached clients for as long as the runtime lives.
+fn forward_job_events(daemon: &Arc<Daemon>) {
+    let job_daemon = daemon.clone();
+    let mut jobs = daemon.runtime.subscribe_jobs();
+    tokio::spawn(async move {
+        loop {
+            match jobs.recv().await {
+                Ok(job) => {
+                    if job.status == JobStatus::Blocked
+                        && let Some(decision) = job.decision_id.as_deref().and_then(|id| {
+                            job_daemon.runtime.decision_store().get(id).ok().flatten()
+                        })
+                    {
+                        job_daemon.notifier.decision_blocked(&decision);
+                    }
+                    job_daemon.emit(ServerEvent::Job { job: Box::new(job) });
+                }
+                // A lagged receiver re-lists jobs; events it missed are not replayed.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 fn publish(state: &mut State, event: ServerEvent) {
     state
@@ -317,6 +344,24 @@ impl Daemon {
             .get(&decision_id)
             .map_err(failed)?
             .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "unknown decision"))?;
+        if pending.job_id.is_some() {
+            let (decision, _job) = self
+                .runtime
+                .decide_job(&decision_id, approve)
+                .map_err(job_failed)?;
+            let mut state = self.state.lock().unwrap();
+            session_event(
+                &mut state,
+                &decision.session_id,
+                SessionEvent::DecisionResolved {
+                    decision: decision.clone(),
+                },
+            );
+            return Ok(Reply::Decision {
+                decision,
+                run_id: None,
+            });
+        }
         let mut state = self.state.lock().unwrap();
         if !approve {
             let decision = store.resolve(&decision_id, false).map_err(invalid)?;
@@ -346,7 +391,7 @@ impl Daemon {
             .start_locked(
                 &mut state,
                 decision.session_id.clone(),
-                continuation_prompt(&decision),
+                juto_runtime::continuation_prompt(&decision),
                 true,
             )
             .map_err(failed)?;
@@ -617,6 +662,46 @@ impl Daemon {
                 decision_id,
                 approve,
             } => self.resolve_decision(decision_id, approve),
+            Request::StartJob {
+                prompt,
+                budget,
+                contract,
+            } => self
+                .runtime
+                .start_job(prompt, budget, contract)
+                .map(Reply::Job)
+                .map_err(job_failed),
+            Request::ListJobs => self
+                .runtime
+                .list_jobs()
+                .map(Reply::Jobs)
+                .map_err(job_failed),
+            Request::GetJob { job_id } => self
+                .runtime
+                .job(&job_id)
+                .map(Reply::Job)
+                .map_err(job_failed),
+            Request::CancelJob { job_id } => self
+                .runtime
+                .cancel_job(&job_id)
+                .map(Reply::Job)
+                .map_err(job_failed),
+            Request::RetryJob { job_id } => self
+                .runtime
+                .retry_job(&job_id)
+                .map(Reply::Job)
+                .map_err(job_failed),
+            Request::SetJobInbox { job_id, state } => self
+                .runtime
+                .set_job_inbox(&job_id, state)
+                .await
+                .map(Reply::Job)
+                .map_err(job_failed),
+            Request::DrainJobs => self
+                .runtime
+                .drain_job_results()
+                .map(Reply::Jobs)
+                .map_err(job_failed),
             Request::Steer { session_id, text } => {
                 let state = self.state.lock().unwrap();
                 let run = state
@@ -947,6 +1032,12 @@ pub async fn serve(workspace: PathBuf) -> Result<()> {
         desktop_socket,
         Arc::new(SystemNotifier),
     )?;
+    let interrupted = daemon.runtime.recover_jobs().map_err(anyhow::Error::new)?;
+    if interrupted > 0 {
+        eprintln!(
+            "juto-daemon: marked {interrupted} unfinished job(s) interrupted; retry them from their checkpoints"
+        );
+    }
     for entry in std::fs::read_dir(data_dir.join("sessions"))? {
         let path = entry?.path();
         if path.extension().is_some_and(|ext| ext == "jsonl")
@@ -961,6 +1052,7 @@ pub async fn serve(workspace: PathBuf) -> Result<()> {
     }
     tokio::spawn(wake_loop(daemon.clone()));
     tokio::spawn(inbox_loop(daemon.clone()));
+    forward_job_events(&daemon);
     let approval_daemon = daemon.clone();
     tokio::spawn(async move {
         while let Some(request) = approvals.recv().await {

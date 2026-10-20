@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use juto_agent::{AgentEvent, ToolTier};
 use juto_ai::{Message, StopReason, ToolCall};
 use juto_catalog::Model;
+use juto_runtime::jobs::{InboxState, Job, JobBudget, JobContract};
 use juto_runtime::subagents::MainMessage;
 use juto_runtime::{
     Decision, RuntimeConfig, SubagentEvent, SubagentSummary, ThreadEvent, TimelineItem, ViewerRoute,
@@ -127,12 +128,43 @@ pub enum Request {
     },
     /// Lists durable decisions (pending and resolved) for this daemon.
     ListDecisions,
-    /// Resolves a pending decision. Approving starts a run that retries the
-    /// blocked action once; rejecting records the refusal and starts nothing.
+    /// Resolves a pending decision. For a session run, approving starts a run that
+    /// retries the blocked action once; for a job, approving resumes the job.
+    /// Rejecting records the refusal and fails or skips the blocked action.
     ResolveDecision {
         decision_id: String,
         approve: bool,
     },
+    /// Starts a background job: the daemon runs `prompt` to completion with no
+    /// client attached. `contract` says what finishing means; the result is checked
+    /// against it.
+    StartJob {
+        prompt: String,
+        budget: JobBudget,
+        contract: JobContract,
+    },
+    /// Lists every job this daemon knows, oldest first.
+    ListJobs,
+    GetJob {
+        job_id: String,
+    },
+    /// Cancels a queued, running, or blocked job.
+    CancelJob {
+        job_id: String,
+    },
+    /// Starts a new attempt for a failed or interrupted job, within its budget.
+    RetryJob {
+        job_id: String,
+    },
+    /// Sets a job's inbox state. Archiving needs a finished job and reclaims its
+    /// isolated workspaces.
+    SetJobInbox {
+        job_id: String,
+        state: InboxState,
+    },
+    /// Returns finished jobs the main agent has not yet been shown. Each job is
+    /// returned once, including across daemon restarts.
+    DrainJobs,
     /// Queues a steering message for the active run of `session_id`. Fails with
     /// [`ErrorCode::Invalid`] if that session has no active run.
     Steer {
@@ -263,6 +295,10 @@ pub enum Reply {
         decision: Decision,
         run_id: Option<String>,
     },
+    /// Jobs, oldest first (list and drain).
+    Jobs(Vec<Job>),
+    /// One job after a request that read or changed it.
+    Job(Job),
     Transcript(Vec<Message>),
     /// Answers [`Request::Timeline`].
     Timeline {
@@ -377,6 +413,11 @@ pub enum ServerEvent {
     },
     /// The user's inbox changed; fetch it with `Request::InboxMessages`.
     Inbox,
+    /// A job changed: queued, running, blocked, finished, or its inbox state moved.
+    Job {
+        /// Boxed: a job is large, and every event is passed by value.
+        job: Box<Job>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

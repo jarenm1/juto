@@ -1,4 +1,5 @@
 mod changes;
+mod jobs;
 mod resources;
 
 use std::{
@@ -59,6 +60,11 @@ enum Command {
         repo: Option<PathBuf>,
         #[command(subcommand)]
         command: Option<resources::ResourcesCommand>,
+    },
+    /// Start, inspect, and manage background jobs in this workspace's daemon.
+    Jobs {
+        #[command(subcommand)]
+        command: jobs::JobsCommand,
     },
     /// Stream a turn in a new or existing main session. The request is routed to one of
     /// the session's internal threads. A prompt of '-' reads stdin.
@@ -145,6 +151,20 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Command::Jobs { command } = &arguments.command {
+        if arguments.model.is_some()
+            || arguments.thinking.is_some()
+            || arguments.max_tokens.is_some()
+            || arguments.yes
+            || arguments.read_only
+        {
+            bail!(
+                "--model, --thinking, --max-tokens, --yes and --read-only do not apply to jobs: \
+                 the daemon runs a job with this workspace's .juto/config.yml and its own approval rules"
+            );
+        }
+        return jobs::run(&cwd, command, arguments.json).await;
+    }
     let data_dir = match arguments.data_dir {
         Some(path) => path,
         None => default_data_dir()?,
@@ -171,6 +191,7 @@ async fn main() -> Result<()> {
     match arguments.command {
         Command::Changes { .. } => unreachable!("handled before runtime initialization"),
         Command::Resources { .. } => unreachable!("handled before runtime initialization"),
+        Command::Jobs { .. } => unreachable!("handled before runtime initialization"),
         Command::Run { prompt, session } => {
             let resumed = session.is_some();
             let prompt = if prompt == "-" {
