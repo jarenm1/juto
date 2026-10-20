@@ -3644,6 +3644,7 @@ dependencies = [
  "juto-agent",
  "juto-ai",
  "juto-catalog",
+ "juto-daemon",
  "juto-runtime",
  "rpassword",
  "serde_json",

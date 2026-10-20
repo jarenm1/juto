@@ -2,11 +2,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use crate::Quit;
 use crate::auth_modal::{AuthModal, AuthModalEvent};
 use crate::chat_input::{ChatInput, SubmitMessage};
 use crate::focus_view::{FocusEvent, FocusView};
+use crate::jobs_panel::{self, JobAction, JobActionHandler};
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::subagent_card;
@@ -23,6 +25,7 @@ use juto_daemon::client::{Client, Notification};
 use juto_daemon::protocol::{
     PendingApproval, Reply, Request, ServerEvent, SessionEvent, SessionView, SubagentCommand,
 };
+use juto_runtime::jobs::Job;
 use juto_runtime::subagents::{MainMessage, SubagentEvent};
 use juto_runtime::{DesktopSessionArtifact, SubagentSummary, TimelineItem};
 use tokio::sync::broadcast::{self, error::RecvError};
@@ -316,6 +319,7 @@ pub struct ChatView {
     focus: Option<Entity<FocusView>>,
     _focus_subscription: Option<Subscription>,
     subagents: Vec<SubagentSummary>,
+    jobs: Vec<Job>,
     show_sidebar: bool,
     active_modal: ActiveModal,
     active_model: SharedString,
@@ -451,6 +455,7 @@ impl ChatView {
                             }
                             this.sync_subagents(cx);
                             this.sync_inbox(cx);
+                            this.sync_jobs(cx);
                         })
                         .is_err()
                     {
@@ -495,6 +500,7 @@ impl ChatView {
             focus: None,
             _focus_subscription: None,
             subagents: Vec::new(),
+            jobs: Vec::new(),
             show_sidebar: true,
             active_modal: ActiveModal::None,
             active_model: initial_model.into(),
@@ -776,6 +782,126 @@ impl ChatView {
         self.send_request(Request::InboxDismiss { message }, cx);
     }
 
+    /// Re-reads every background job from the daemon.
+    fn sync_jobs(&mut self, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let result = crate::chat_request::call(client, handle, Request::ListJobs).await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(Reply::Jobs(jobs)) => {
+                    this.jobs = jobs;
+                    cx.notify();
+                }
+                Ok(_) => this.report_error("Unexpected jobs reply".into(), cx),
+                Err(error) => this.report_error(error.to_string(), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Puts `job` in the strip, replacing any earlier copy of it.
+    fn upsert_job(&mut self, job: Job) {
+        match self.jobs.iter_mut().find(|known| known.id == job.id) {
+            Some(known) => *known = job,
+            None => self.jobs.push(job),
+        }
+    }
+
+    /// Runs a strip action. Follow-up seeds the composer; the rest send one daemon request.
+    fn job_action(
+        &mut self,
+        action: JobAction,
+        job_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(job) = self.jobs.iter().find(|job| job.id == job_id).cloned() else {
+            return;
+        };
+        if action == JobAction::FollowUp {
+            let text = jobs_panel::follow_up_text(&job);
+            self.input.update(cx, |input, cx| input.set_text(&text, cx));
+            self.focus_input(window, cx);
+            return;
+        }
+        if let Some(request) = jobs_panel::action_request(action, &job) {
+            self.job_request(request, cx);
+        }
+    }
+
+    /// Sends a job request. A job reply updates its strip row; any other reply re-lists jobs.
+    fn job_request(&mut self, request: Request, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let result = crate::chat_request::call(client, handle, request).await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(Reply::Job(job)) => {
+                    this.upsert_job(job);
+                    cx.notify();
+                }
+                Ok(_) => this.sync_jobs(cx),
+                Err(error) => this.report_error(error.to_string(), cx),
+            });
+        })
+        .detach();
+    }
+
+    /// Starts a background job for the composer's text. It runs in the daemon whether or not
+    /// this window stays open; its result appears in the strip.
+    fn start_background(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_send(cx) {
+            return;
+        }
+        let text = self.input.update(cx, |input, cx| input.take_text(cx));
+        let attachments = std::mem::take(&mut self.attachments);
+        let prompt = format_prompt(&text, &attachments);
+        self.attachment_error = None;
+        self.artifact_notice = None;
+        self.focus_input(window, cx);
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        let request = jobs_panel::background_request(prompt);
+        cx.spawn(async move |this, cx| {
+            let result = crate::chat_request::call(client, handle, request).await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(Reply::Job(job)) => {
+                    this.artifact_notice = Some(
+                        format!(
+                            "Started background job {}. Its result will appear above the composer.",
+                            job.id
+                        )
+                        .into(),
+                    );
+                    this.upsert_job(job);
+                    cx.notify();
+                }
+                Ok(_) => this.report_error("Unexpected job reply".into(), cx),
+                Err(error) => {
+                    // Give the text back unless the user has already typed something new.
+                    this.input.update(cx, |input, cx| {
+                        if !input.has_text() {
+                            input.set_text(&text, cx);
+                        }
+                    });
+                    this.report_error(error.to_string(), cx)
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Routes strip clicks back to this view.
+    fn job_action_handler(&self, cx: &mut Context<Self>) -> JobActionHandler {
+        let chat = cx.weak_entity();
+        Rc::new(
+            move |action: JobAction, job_id: &str, window: &mut Window, cx: &mut App| {
+                let _ = chat.update(cx, |this, cx| this.job_action(action, job_id, window, cx));
+            },
+        )
+    }
+
     fn subagent_command(&mut self, id: String, command: SubagentCommand, cx: &mut Context<Self>) {
         self.send_request(Request::SubagentCommand { id, command }, cx);
     }
@@ -899,6 +1025,7 @@ impl ChatView {
             }
             ServerEvent::Subagent { event } => self.handle_subagent_event(event, cx),
             ServerEvent::Inbox => self.sync_inbox(cx),
+            ServerEvent::Job { job } => self.upsert_job(*job),
             _ => {}
         }
         self.scroll.scroll_to_bottom();
@@ -1350,6 +1477,10 @@ impl ChatView {
             .min_h_0()
             .w_full()
             .child(self.message_list(cx))
+            .child(jobs_panel::render_strip(
+                &self.jobs,
+                &self.job_action_handler(cx),
+            ))
             .child(self.composer(window, cx))
     }
 
@@ -1620,6 +1751,32 @@ impl ChatView {
             }))
             .child("+");
 
+        let background_button = div()
+            .id("send-background")
+            .flex()
+            .items_center()
+            .justify_center()
+            .h_8()
+            .px_3()
+            .rounded_full()
+            .border_1()
+            .border_color(rgb(0x444444))
+            .text_size(px(12.))
+            .text_color(if can_send {
+                rgb(0xcccccc)
+            } else {
+                rgb(0x707070)
+            })
+            .when(can_send, |button| {
+                button
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgb(0x2e2e2e)))
+            })
+            .on_click(
+                cx.listener(|this, _: &ClickEvent, window, cx| this.start_background(window, cx)),
+            )
+            .child("Background");
+
         let send_button = div()
             .id("send-message")
             .flex()
@@ -1781,7 +1938,14 @@ impl ChatView {
                                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx)))
                                         .child("Stop")
                                 ))
-                                .child(send_button),
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(background_button)
+                                        .child(send_button),
+                                ),
                         ),
                 )
                 .child(
