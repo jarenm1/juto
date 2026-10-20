@@ -5,6 +5,7 @@ use crate::protocol::{ErrorCode, RpcError};
 pub(crate) mod automations;
 pub(crate) mod config;
 pub(crate) mod credentials;
+pub(crate) mod github;
 pub(crate) mod subagents;
 
 pub(crate) use config::{get_config, list_models, set_model_role};
