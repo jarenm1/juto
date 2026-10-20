@@ -297,7 +297,9 @@ impl RuntimeConfig {
                     "compactor must name a model or @role, got {selector:?}"
                 )));
             }
-            // Same role resolution as modelRoles, so a broken binding fails at load.
+            // Same role resolution as modelRoles: cycles and unknown effort fail
+            // here. Unknown provider/model names are a registry lookup and fail at
+            // compaction (`Runtime::resolve_model`), not at load.
             let _ = self.resolve_selector(selector)?;
         }
         // Role selectors must resolve (no cycles) — validate eagerly so a

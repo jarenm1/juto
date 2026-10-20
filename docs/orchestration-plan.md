@@ -208,7 +208,14 @@ claiming complete OMP feature parity.
   accuracy or token savings have been established for this port.
 * `compactor` (optional `provider/model[:effort]` or `@role`, the `modelRoles` grammar)
   names the model that writes compaction summaries. Unset, compaction uses the session's
-  current model. Invalid selectors fail config load.
+  current model. Empty, blank, effort-only, and role-cycle selectors fail config load;
+  unknown provider or model names fail at compaction time (registry lookup), not at load.
+  A configured compactor that fails (missing credentials, unknown model, or a text-only
+  model under `snapcompact`) hard-fails the compaction: there is no fallback to the session
+  model, and no Compaction entry is journaled. Image capability comes from the compactor, so
+  a text-only compactor makes `auto` summarize and makes `snapcompact` error. The `auto`
+  threshold still uses the session model's context window, so a compactor with a smaller
+  window can fail the summary request.
 * The public-domain X.org misc-fixed 8x13 Latin-1 glyph table is embedded in `font.rs`
   with its source and public-domain notice; no unused BDF is vendored. Anthropic uses
   11px advance/16px pitch; OpenAI/default uses 8px advance/22px pitch. Frames are
