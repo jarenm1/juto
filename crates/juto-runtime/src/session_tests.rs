@@ -366,3 +366,162 @@ fn compaction_plan_reports_previous_and_discarded() {
         .collect();
     assert_eq!(discarded, ["q2", "q3"]);
 }
+
+fn message_ids(session: &Session) -> Vec<String> {
+    session
+        .path_view()
+        .unwrap()
+        .messages
+        .iter()
+        .map(|message| message.id.to_owned())
+        .collect()
+}
+
+fn span_texts(session: &Session, start: &str, end: &str) -> Vec<String> {
+    session
+        .entries_in_span(start, end)
+        .unwrap()
+        .iter()
+        .map(|entry| match &entry.kind {
+            EntryKind::Message { message } => message.text(),
+            other => panic!("span returned a non-message entry: {other:?}"),
+        })
+        .collect()
+}
+
+fn latest_span(session: &Session) -> (Option<String>, Option<String>) {
+    session
+        .active_entries()
+        .unwrap()
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            EntryKind::Compaction {
+                span_start_id,
+                span_end_id,
+                ..
+            } => Some((span_start_id.clone(), span_end_id.clone())),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn compaction_span_covers_exactly_the_replaced_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let path;
+    let ids;
+    {
+        let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+        for text in ["q1", "q2", "q3", "q4", "q5", "q6"] {
+            s.append(user(text)).unwrap();
+        }
+        ids = message_ids(&s);
+        s.compact("first".into(), None, 2).unwrap();
+        path = s.path().to_path_buf();
+    }
+    let s = Session::open(&path).unwrap();
+    // keep_recent_messages=2 keeps q5 and q6, so the span is q1 through q4.
+    assert_eq!(
+        latest_span(&s),
+        (Some(ids[0].clone()), Some(ids[3].clone()))
+    );
+    assert_eq!(span_texts(&s, &ids[0], &ids[3]), ["q1", "q2", "q3", "q4"]);
+    assert_eq!(span_texts(&s, &ids[0], &ids[0]), ["q1"]);
+    assert_eq!(span_texts(&s, &ids[3], &ids[3]), ["q4"]);
+    assert_eq!(s.messages().unwrap().len(), 3);
+}
+
+#[test]
+fn second_compaction_span_starts_at_the_previous_first_kept_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    for text in ["q1", "q2", "q3", "q4", "q5", "q6"] {
+        s.append(user(text)).unwrap();
+    }
+    s.compact("first".into(), None, 2).unwrap();
+    s.append(user("q7")).unwrap();
+    s.append(user("q8")).unwrap();
+    let ids = message_ids(&s);
+    // The first compaction kept q5 onward, so the second replaces q5 through q7.
+    // Its own compaction entry sits between q6 and q7 on the path and is skipped.
+    s.compact("second".into(), None, 1).unwrap();
+    assert_eq!(
+        latest_span(&s),
+        (Some(ids[4].clone()), Some(ids[6].clone()))
+    );
+    assert_eq!(span_texts(&s, &ids[4], &ids[6]), ["q5", "q6", "q7"]);
+    assert_eq!(span_texts(&s, &ids[4], &ids[4]), ["q5"]);
+    assert_eq!(span_texts(&s, &ids[0], &ids[3]), ["q1", "q2", "q3", "q4"]);
+    // The second summary plus q8, the only message after its cut.
+    assert_eq!(s.messages().unwrap().len(), 2);
+}
+
+#[test]
+fn entries_in_span_rejects_reversed_unknown_and_off_path_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    for text in ["q1", "q2", "q3"] {
+        s.append(user(text)).unwrap();
+    }
+    let ids = message_ids(&s);
+    assert!(matches!(
+        s.entries_in_span(&ids[2], &ids[0]),
+        Err(SessionError::InvalidSpan { .. })
+    ));
+    assert!(matches!(
+        s.entries_in_span(&ids[0], "missing"),
+        Err(SessionError::InvalidSpan { .. })
+    ));
+    // Branching back to q1 takes q2 off the active path.
+    s.branch(Some(&ids[0])).unwrap();
+    s.append(user("q4")).unwrap();
+    assert!(matches!(
+        s.entries_in_span(&ids[0], &ids[1]),
+        Err(SessionError::InvalidSpan { .. })
+    ));
+}
+
+#[test]
+fn compaction_that_replaces_nothing_records_no_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    s.append(user("q1")).unwrap();
+    s.append(user("q2")).unwrap();
+    s.compact("summary".into(), None, 2).unwrap();
+    assert_eq!(latest_span(&s), (None, None));
+    assert_eq!(s.messages().unwrap().len(), 3);
+}
+
+#[test]
+fn journal_without_span_fields_renders_the_same_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    for text in ["q1", "q2", "q3"] {
+        s.append(user(text)).unwrap();
+    }
+    s.compact("sum".into(), None, 1).unwrap();
+    s.append(user("q4")).unwrap();
+    let expected: Vec<String> = s.messages().unwrap().iter().map(Message::text).collect();
+    let path = s.path().to_path_buf();
+    drop(s);
+    // Rewrite the journal as the previous build wrote it: compaction records carry no span.
+    let legacy: String = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut record: serde_json::Value = serde_json::from_str(line).unwrap();
+            if let Some(fields) = record.as_object_mut() {
+                fields.remove("span_start_id");
+                fields.remove("span_end_id");
+            }
+            format!("{record}\n")
+        })
+        .collect();
+    std::fs::write(&path, &legacy).unwrap();
+    assert!(!legacy.contains("span_"));
+    let s = Session::open(&path).unwrap();
+    let actual: Vec<String> = s.messages().unwrap().iter().map(Message::text).collect();
+    assert_eq!(actual, expected);
+    assert_eq!(latest_span(&s), (None, None));
+}
