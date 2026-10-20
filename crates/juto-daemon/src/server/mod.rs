@@ -692,6 +692,16 @@ impl Drop for SocketGuard {
     }
 }
 
+/// Recovers and registers the session journal at `path` when it belongs to `workspace`.
+fn load_session(daemon: &Daemon, path: &Path, workspace: &Path) -> Result<()> {
+    let mut session = Session::open(path).with_context(|| format!("opening {}", path.display()))?;
+    if session.header().cwd == workspace {
+        recover(&mut session)?;
+        daemon.register(&session).map_err(anyhow::Error::new)?;
+    }
+    Ok(())
+}
+
 /// Runs one foreground daemon for `workspace`. A filesystem lock excludes a second
 /// daemon; the 0700 directory, 0600 sockets and peer UID checks exclude other users.
 pub async fn serve(workspace: PathBuf) -> Result<()> {
@@ -736,13 +746,14 @@ pub async fn serve(workspace: PathBuf) -> Result<()> {
     let daemon = Daemon::new(runtime, &workspace, desktop_socket)?;
     for entry in std::fs::read_dir(data_dir.join("sessions"))? {
         let path = entry?.path();
-        if path.extension().is_some_and(|ext| ext == "jsonl") {
-            let mut session =
-                Session::open(&path).with_context(|| format!("opening {}", path.display()))?;
-            if session.header().cwd == workspace {
-                recover(&mut session)?;
-                daemon.register(&session).map_err(anyhow::Error::new)?;
-            }
+        if path.extension().is_some_and(|ext| ext == "jsonl")
+            && let Err(error) = load_session(&daemon, &path, &workspace)
+        {
+            // One unreadable journal must not keep the daemon down: skip it and serve the rest.
+            eprintln!(
+                "juto-daemon: skipping session journal {}: {error:#}",
+                path.display()
+            );
         }
     }
     tokio::spawn(wake_loop(daemon.clone()));
