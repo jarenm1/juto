@@ -47,7 +47,7 @@ const READ_DEFAULT_LIMIT: usize = 2000;
 /// window is capped lower like the source default).
 const READ_MAX_LINES: usize = 2000;
 /// Inline byte cap for file output (DEFAULT_MAX_BYTES upstream).
-const OUTPUT_MAX_BYTES: usize = 50 * 1024;
+pub(crate) const OUTPUT_MAX_BYTES: usize = 50 * 1024;
 /// Per match-line byte cap (DEFAULT_MAX_COLUMN upstream).
 const MATCH_LINE_MAX_BYTES: usize = 512;
 /// Directory listing cap.
