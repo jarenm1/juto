@@ -77,6 +77,52 @@ An unattended grant pins the commit the bookmark pointed at when the decision wa
 
 Children an unattended run starts belong to that run. When the root run finishes, every child still working is cancelled and settled before the run returns. Their reports reach the session's main inbox.
 
+## Jobs
+
+A job is a durable background run started with `juto-cli jobs run-now` (or
+`JobRegistry` in `juto-runtime::jobs`). It runs in a fresh fork of the
+repository, so it never writes into the user's working copy. Its result lands
+in the inbox: `jobs drain` returns each finished job once.
+
+A job needs a completion contract. Pass at least one flag:
+
+- `--artifact <path>`: a workspace-relative file that must exist and be
+  non-empty.
+- `--output-schema <file>`: the final answer must parse as JSON and satisfy the
+  schema.
+- `--no-change`: the workspace must have no changes when the job stops.
+
+The model stopping is not enough. A job whose contract is not met fails with the
+reason, for example `completion contract not met: artifact out/x.txt was not
+written`.
+
+`--no-change` measures changes from the tree the job's fork started from, not
+from the repository's initial commit. Work committed after the graph was
+created does not count. A no-change job that writes a file fails with
+`the job changed 1 path(s) but its contract requires no change`.
+
+Budgets and states:
+
+- `--wall-secs` bounds total running time across attempts and decision
+  resumptions. When it runs out the job fails with
+  `wall-clock budget of <n>s exhausted`. Turn and token budgets are not
+  enforced per job.
+- `--max-attempts` bounds the attempts the job may start, counting the first.
+  `jobs retry` starts a new attempt within the budget.
+- A runtime that stops while a job is queued or running leaves it
+  `interrupted`. Nothing replays on restart. `jobs retry` continues the saved
+  session. A tool call that was in flight is recorded as interrupted and is not
+  run again.
+- A tool call that needs an operator decision moves the job to `blocked`.
+  `jobs decide <decision-id> --approve` resumes it. The GUI jobs panel offers
+  Approve and Deny for the same decision.
+
+Unattended runs use the `workspace` tier (see Execution tier), so writes happen
+only in the job's fork. The `main` role cannot write. A job that must change
+files therefore delegates the writes: the main agent starts a `task` child and
+calls `wait` for it. If the main agent answers without calling `wait`, the job
+ends and the child is cancelled.
+
 ## Limitations
 
 - `net:<host>` denials and out-of-workspace file access are hard errors. They
@@ -84,9 +130,8 @@ Children an unattended run starts belong to that run. When the root run finishes
 - Redaction in decision summaries is heuristic. Bash command text is not
   redacted.
 - Decision records are never pruned.
-- The GUI shows a notice for a blocked run but has no decision card. Decisions
-  can be resolved through the daemon protocol only; `juto-cli` has no decision
-  commands.
+- Unattended writes need the `task`/`wait` delegation above. Whether unattended
+  runs should get a writable role is an open product question.
 - If the continuation run fails to start after approval, the decision stays
   `approved` with no run. The grant is not lost: a new unattended prompt that
   repeats the exact action consumes it.
