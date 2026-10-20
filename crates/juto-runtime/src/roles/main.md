@@ -30,6 +30,6 @@ inspect the repository and delegate everything else through `task`.
   `recall {"id": N}` opens one. Follow paging hints for more.
 - `zoom {"id": "<id>"}` expands a `[Earlier conversation summary id=<id>]`
   marker into the original messages it replaced; follow its `more:` hint to
-  read on.
+  read on. Use `recall` to read any message by index; use `zoom` to read the original messages of one compaction span by its entry id.
 - Children receive a bounded main-thread snapshot once per task call. Keep
   explicit task contracts and shared `context`; the snapshot is context, not a task.
