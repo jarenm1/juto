@@ -4750,4 +4750,49 @@ mod tests {
         assert!(!dir.path().join("ran-marker").exists());
         drop(held);
     }
+
+    #[tokio::test]
+    async fn a_turn_waiting_on_its_queued_bash_job_gives_its_desk_back() {
+        // A turn whose own desk leaves less than the full budget free waits on a
+        // full-budget command. The wait must release the desk, or the command
+        // never admits and the turn never ends.
+        let dir = tempfile::tempdir().unwrap();
+        let budget = 512;
+        let broker = held_broker(dir.path());
+        let desks = crate::pools::Desks::with_budget(broker.clone(), budget);
+        let parent = desks.seat("parent").await.unwrap();
+        let turn = crate::pools::TurnDesk::new(desks, "parent".into(), parent);
+        let Submission::Queued(ticket) = broker.submit(bash_request(budget), budget).unwrap()
+        else {
+            panic!("the turn's desk leaves no room for a full-budget command");
+        };
+        let tool = BashTool {
+            cwd: dir.path().to_path_buf(),
+            limits: None,
+            run: RunControl::new(),
+            jobs: BashJobs::default(),
+        };
+        let spec = queued_spec(dir.path(), "echo bash-ran");
+        let command = bash_command(&spec);
+        let queued = tool.queue(
+            spec,
+            command,
+            ResourceLimits::default(),
+            ticket,
+            budget,
+            CancellationToken::new(),
+        );
+        let job = queued.details["job"].as_str().unwrap().to_string();
+
+        let bash_job = BashJobTool {
+            jobs: tool.jobs.clone(),
+        };
+        let wait = bash_job.execute(json!({ "job": job, "wait": true }), ctx(dir.path()));
+        let finished = tokio::time::timeout(Duration::from_secs(10), turn.hold(wait))
+            .await
+            .expect("the queued command admits once the turn's desk is released")
+            .unwrap();
+        assert!(!finished.is_error);
+        assert!(joined_text(&finished).contains("bash-ran"));
+    }
 }
