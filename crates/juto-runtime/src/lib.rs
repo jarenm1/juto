@@ -6,10 +6,12 @@ pub mod change_graph;
 pub mod config;
 pub mod context;
 mod contextual;
+pub mod decisions;
 pub mod desktop_artifact;
 pub mod git_transfer;
 pub mod network;
 pub mod peers;
+mod publish;
 pub mod replication;
 mod roles;
 pub mod session;
@@ -81,6 +83,8 @@ use tokio_util::sync::CancellationToken;
 
 pub use approval::{ApprovalRequest, ChannelApprovalHandler};
 pub use config::{ApprovalMode, RuntimeConfig};
+pub use decisions::{Decision, DecisionStatus, DecisionStore};
+use decisions::{SharedScope, UnattendedScope};
 pub use desktop_artifact::{DesktopArtifactResolver, ResolveError, ViewerRoute};
 pub use peers::{
     PeerAgentSnapshot, PeerBus, PeerError, PeerResource, PeerSendFailure, PeerSendReport,
@@ -429,6 +433,7 @@ impl Runtime {
                 runtime: self.clone(),
                 depth: 1,
                 inbox: inbox.clone(),
+                unattended: None,
             }),
             self.config().max_concurrency,
             self.inner.subagent_root.clone(),
@@ -451,6 +456,7 @@ impl Runtime {
             read_only: false,
             tier: self.config().execution_tier,
             sender: None,
+            unattended: None,
         };
         let manager = self.subagent_manager();
         let inbox = manager.main_inbox();
@@ -463,7 +469,86 @@ impl Runtime {
         forwarder.abort();
         outcome
     }
+}
 
+/// How an unattended run ended.
+pub enum UnattendedOutcome {
+    /// The run ran to its own end; see [`RunOutcome::stop_reason`].
+    Finished(RunOutcome),
+    /// A tool call needs an operator decision. The run stopped before that call.
+    Blocked(Decision),
+}
+
+/// The tier an unattended run executes under. Unattended runs are always sandboxed
+/// and never `full`: `untrusted` stays `untrusted`, and every other tier maps to
+/// `workspace`.
+fn unattended_tier(configured: ExecutionTier) -> ExecutionTier {
+    match configured {
+        ExecutionTier::Untrusted => ExecutionTier::Untrusted,
+        ExecutionTier::Workspace | ExecutionTier::Attended | ExecutionTier::Full => {
+            ExecutionTier::Workspace
+        }
+    }
+}
+
+impl Runtime {
+    /// Durable decisions for blocked unattended actions under this data directory.
+    pub fn decision_store(&self) -> DecisionStore {
+        DecisionStore::open(&self.inner.data_dir)
+    }
+
+    /// Runs `prompt` as an unattended run in `session`. The run never prompts. A
+    /// tool call that leaves its profile records a [`Decision`], cancels the run
+    /// tree, and the outcome is [`UnattendedOutcome::Blocked`]. The run uses the
+    /// sandboxed tier from [`unattended_tier`]; its subagents inherit the same scope.
+    pub async fn run_unattended(
+        &self,
+        session: &mut Session,
+        prompt: impl Into<String>,
+        events: mpsc::UnboundedSender<AgentEvent>,
+        control: RunControl,
+        job_id: Option<String>,
+    ) -> Result<UnattendedOutcome> {
+        let scope: SharedScope = Arc::new(UnattendedScope::new(
+            &self.inner.data_dir,
+            session.header().id.clone(),
+            job_id,
+            control.clone(),
+        ));
+        let inbox = subagents::MainInbox::default();
+        let manager = Arc::new(SubagentManager::new(
+            Arc::new(ChildFactory {
+                runtime: self.clone(),
+                depth: 1,
+                inbox: inbox.clone(),
+                unattended: Some(scope.clone()),
+            }),
+            self.config().max_concurrency,
+            control.token(),
+            inbox.clone(),
+        ));
+        let placement = RunPlacement {
+            depth: 0,
+            role: roles::MAIN_ROLE,
+            read_only: false,
+            tier: unattended_tier(self.config().execution_tier),
+            sender: None,
+            unattended: Some(&scope),
+        };
+        deliver_main_inbox(&inbox, &control);
+        let forwarder = tokio::spawn(forward_main_inbox(inbox, control.clone()));
+        let outcome = self
+            .run_depth(session, prompt.into(), events, control, placement, manager)
+            .await;
+        forwarder.abort();
+        match scope.take_blocked() {
+            Some(decision) => Ok(UnattendedOutcome::Blocked(decision)),
+            None => outcome.map(UnattendedOutcome::Finished),
+        }
+    }
+}
+
+impl Runtime {
     async fn run_depth(
         &self,
         session: &mut Session,
@@ -479,6 +564,7 @@ impl Runtime {
             read_only,
             tier,
             sender,
+            unattended,
         } = placement;
         if session.header().cwd != self.inner.cwd {
             bail!("session belongs to a different working directory");
@@ -533,6 +619,11 @@ impl Runtime {
                 depth == 0,
                 tier,
             )?;
+        }
+        if !matches!(tier, ExecutionTier::Untrusted) && scope.allows(publish::TOOL_NAME) {
+            registry.register(Arc::new(publish::PublishTool {
+                cwd: self.inner.cwd.clone(),
+            }))?;
         }
         if scope.allows("desktop") {
             tools::register_desktop_tools(
@@ -611,6 +702,7 @@ impl Runtime {
         agent.set_hooks(Arc::new(RuntimeHooks {
             mode,
             approval: self.inner.approval.clone(),
+            unattended: unattended.cloned(),
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let future = agent.run(vec![Message::user(prompt)], tx, control.clone());
@@ -741,6 +833,8 @@ fn json_weight(value: &Value) -> u64 {
 struct RuntimeHooks {
     mode: ApprovalMode,
     approval: Option<Arc<dyn ApprovalHandler>>,
+    /// Set for unattended runs: a call outside the profile needs a durable decision, never a prompt.
+    unattended: Option<SharedScope>,
 }
 #[async_trait]
 impl AgentHooks for RuntimeHooks {
@@ -753,12 +847,18 @@ impl AgentHooks for RuntimeHooks {
         if matches!(tier, ToolTier::Read) {
             return Ok(());
         }
-        match self.mode {
-            ApprovalMode::ReadOnly => {
+        match (&self.unattended, &self.mode) {
+            (_, ApprovalMode::ReadOnly) => {
                 Err("read-only execution denies write and process tools".into())
             }
-            ApprovalMode::Allow => Ok(()),
-            ApprovalMode::Ask => {
+            // Unattended runs never prompt. Sandboxed tools are confined by their
+            // tier; a call that leaves the profile needs a granted decision.
+            (Some(scope), _) => match decisions::outside_profile(call) {
+                Some(capability) => scope.admit(call, &capability),
+                None => Ok(()),
+            },
+            (None, ApprovalMode::Allow) => Ok(()),
+            (None, ApprovalMode::Ask) => {
                 let handler = self.approval.as_ref().ok_or_else(|| "tool requires approval; install an ApprovalHandler or explicitly allow tools".to_owned())?;
                 if handler.approve(call, tier, cancel).await? {
                     Ok(())
@@ -789,12 +889,15 @@ struct RunPlacement<'a> {
     /// Id of the child running here, if any. Its messages to `agent://main`
     /// carry this id as `from`; `None` for the main thread.
     sender: Option<&'a str>,
+    /// Set for unattended runs; every run in the tree shares the same scope.
+    unattended: Option<&'a SharedScope>,
 }
 
 struct ChildFactory {
     runtime: Runtime,
     depth: usize,
     inbox: subagents::MainInbox,
+    unattended: Option<SharedScope>,
 }
 
 /// Where an isolated child's workspace is provisioned. Shared by
@@ -814,6 +917,7 @@ impl ChildFactory {
                 runtime: runtime.clone(),
                 depth: self.depth + 1,
                 inbox: self.inbox.clone(),
+                unattended: self.unattended.clone(),
             }),
             runtime.config().max_concurrency,
             control.token(),
@@ -975,6 +1079,7 @@ impl subagents::SubagentFactory for ChildFactory {
                         // falls back to the sandboxed default.
                         tier: spec.tier.unwrap_or(ExecutionTier::Workspace),
                         sender: Some(id),
+                        unattended: self.unattended.as_ref(),
                     },
                     manager,
                 )
@@ -1034,6 +1139,7 @@ impl subagents::SubagentFactory for ChildFactory {
                         // falls back to the sandboxed default.
                         tier: spec.tier.unwrap_or(ExecutionTier::Workspace),
                         sender: Some(id),
+                        unattended: self.unattended.as_ref(),
                     },
                     manager,
                 )
@@ -2028,7 +2134,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn main_thread_advertises_read_and_delegation_tools_only() {
+    async fn main_thread_advertises_read_delegation_and_publish_only() {
         let root = tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         native_repo(&repo);
@@ -2049,6 +2155,7 @@ mod tests {
                 "read",
                 "view",
                 "glob",
+                "publish",
                 "grep",
                 "task",
                 "wait",
@@ -2226,6 +2333,199 @@ mod tests {
         );
     }
 
+    /// Asks for `publish` on each user turn and records the text of the result it
+    /// gets back, so a test can tell a gated call from a call that ran.
+    #[derive(Default)]
+    struct PublishProvider {
+        results: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for PublishProvider {
+        async fn stream(
+            &self,
+            _model: &Model,
+            context: &Context,
+            _options: &StreamOptions,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let message = if let Some(Message::ToolResult { content, .. }) = context.messages.last()
+            {
+                let text: String = content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                self.results.lock().unwrap().push(text);
+                assistant_turn(
+                    vec![ContentBlock::Text {
+                        text: "done".to_string(),
+                    }],
+                    StopReason::Stop,
+                )
+            } else {
+                assistant_turn(
+                    vec![ContentBlock::ToolCall(juto_ai::ToolCall {
+                        id: format!("publish-{}", context.messages.len()),
+                        name: "publish".to_string(),
+                        arguments: serde_json::json!({ "bookmark": "feat/x", "title": "Add x" }),
+                        thought_signature: None,
+                    })],
+                    StopReason::ToolUse,
+                )
+            };
+            let events: Vec<Result<ProviderEvent, ProviderError>> = vec![
+                Ok(ProviderEvent::Start),
+                Ok(ProviderEvent::Done { message }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn unattended_publish_blocks_then_runs_once_after_a_grant() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(PublishProvider::default());
+        let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
+        let mut session =
+            Session::create(&data_dir.join("sessions"), &runtime.inner.cwd).expect("session");
+
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let blocked = match runtime
+            .run_unattended(
+                &mut session,
+                "publish feat/x",
+                events,
+                RunControl::new(),
+                None,
+            )
+            .await
+            .expect("first run")
+        {
+            UnattendedOutcome::Blocked(decision) => decision,
+            UnattendedOutcome::Finished(_) => {
+                panic!("an unattended publish must not run without a grant")
+            }
+        };
+        assert_eq!(blocked.capability, "publish:feat/x");
+        assert_eq!(blocked.status, DecisionStatus::Pending);
+
+        let store = runtime.decision_store();
+        store.resolve(&blocked.id, true).expect("approve");
+
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        match runtime
+            .run_unattended(
+                &mut session,
+                "publish feat/x again",
+                events,
+                RunControl::new(),
+                None,
+            )
+            .await
+            .expect("second run")
+        {
+            UnattendedOutcome::Finished(_) => {}
+            UnattendedOutcome::Blocked(_) => panic!("the approved action must not block again"),
+        }
+        let results = provider.results.lock().unwrap().clone();
+        let last = results.last().expect("the publish call produced a result");
+        assert!(
+            !last.contains("blocked"),
+            "the granted call must run: {last}"
+        );
+        let consumed = store
+            .get(&blocked.id)
+            .expect("read decision")
+            .expect("decision recorded");
+        assert_eq!(consumed.status, DecisionStatus::Consumed);
+    }
+
+    #[tokio::test]
+    async fn rejected_unattended_action_never_runs() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(PublishProvider::default());
+        let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
+        let mut session =
+            Session::create(&data_dir.join("sessions"), &runtime.inner.cwd).expect("session");
+
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let blocked = match runtime
+            .run_unattended(
+                &mut session,
+                "publish feat/x",
+                events,
+                RunControl::new(),
+                None,
+            )
+            .await
+            .expect("first run")
+        {
+            UnattendedOutcome::Blocked(decision) => decision,
+            UnattendedOutcome::Finished(_) => panic!("publish must block without a grant"),
+        };
+        let store = runtime.decision_store();
+        store.resolve(&blocked.id, false).expect("reject");
+
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        match runtime
+            .run_unattended(
+                &mut session,
+                "publish feat/x again",
+                events,
+                RunControl::new(),
+                None,
+            )
+            .await
+            .expect("second run")
+        {
+            UnattendedOutcome::Blocked(decision) => {
+                assert_ne!(
+                    decision.id, blocked.id,
+                    "a rejection leaves no grant behind"
+                );
+            }
+            UnattendedOutcome::Finished(_) => panic!("a rejected action must not run"),
+        }
+        assert!(
+            provider.results.lock().unwrap().is_empty(),
+            "no publish result may reach the model after a rejection"
+        );
+        let rejected = store
+            .get(&blocked.id)
+            .expect("read decision")
+            .expect("decision recorded");
+        assert_eq!(rejected.status, DecisionStatus::Rejected);
+    }
+
+    #[test]
+    fn unattended_runs_are_never_full_and_never_unsandboxed() {
+        assert_eq!(
+            unattended_tier(ExecutionTier::Full),
+            ExecutionTier::Workspace
+        );
+        assert_eq!(
+            unattended_tier(ExecutionTier::Attended),
+            ExecutionTier::Workspace
+        );
+        assert_eq!(
+            unattended_tier(ExecutionTier::Workspace),
+            ExecutionTier::Workspace
+        );
+        assert_eq!(
+            unattended_tier(ExecutionTier::Untrusted),
+            ExecutionTier::Untrusted
+        );
+    }
+
     #[tokio::test]
     async fn scout_child_advertises_read_tools_without_delegation() {
         let root = tempdir().expect("tempdir");
@@ -2273,6 +2573,7 @@ mod tests {
                     read_only: false,
                     tier: ExecutionTier::Attended,
                     sender: None,
+                    unattended: None,
                 },
                 runtime.subagent_manager(),
             )
