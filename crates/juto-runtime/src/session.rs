@@ -28,6 +28,8 @@ pub enum SessionError {
     Corrupt { path: PathBuf, reason: String },
     #[error("unknown branch target {0}")]
     UnknownTarget(String),
+    #[error("span {start}..{end} is not a message range on the active path")]
+    InvalidSpan { start: String, end: String },
 }
 pub type Result<T, E = SessionError> = std::result::Result<T, E>;
 fn io_err(path: &Path) -> impl FnOnce(std::io::Error) -> SessionError + '_ {
@@ -77,6 +79,13 @@ pub enum EntryKind {
     Compaction {
         summary: String,
         first_kept_id: Option<String>,
+        /// Ids of the first and last message this compaction replaced, inclusive,
+        /// on the active path. Absent when it replaced nothing and in journals
+        /// written before spans were recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_start_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        span_end_id: Option<String>,
         /// Page images of the discarded history; absent for text summaries and old journals.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         archive: Option<Archive>,
@@ -326,6 +335,7 @@ impl Session {
                     summary,
                     first_kept_id,
                     archive,
+                    ..
                 } => Some((
                     position,
                     summary.as_str(),
@@ -454,19 +464,47 @@ impl Session {
         archive: Option<Archive>,
         keep_recent_messages: usize,
     ) -> Result<()> {
-        let first_kept_id = {
+        let (first_kept_id, span) = {
             let view = self.path_view()?;
             let visible = view.visible();
-            visible
-                .get(kept_start(visible, keep_recent_messages))
-                .map(|entry| entry.id.to_owned())
+            let start = kept_start(visible, keep_recent_messages);
+            // The replaced span runs from the first visible message through the
+            // last one before the cut. Replacing nothing records no span.
+            let span =
+                (start > 0).then(|| (visible[0].id.to_owned(), visible[start - 1].id.to_owned()));
+            (visible.get(start).map(|entry| entry.id.to_owned()), span)
+        };
+        let (span_start_id, span_end_id) = match span {
+            Some((first, last)) => (Some(first), Some(last)),
+            None => (None, None),
         };
         self.append(EntryKind::Compaction {
             summary,
             first_kept_id,
+            span_start_id,
+            span_end_id,
             archive,
         })?;
         Ok(())
+    }
+    /// Message entries on the active path from `start` through `end`, inclusive,
+    /// in order. Compaction, model and custom entries inside the span replaced no
+    /// history, so they are skipped.
+    pub fn entries_in_span(&self, start: &str, end: &str) -> Result<Vec<&SessionEntry>> {
+        let messages: Vec<&SessionEntry> = self
+            .active_entries()?
+            .into_iter()
+            .filter(|entry| matches!(entry.kind, EntryKind::Message { .. }))
+            .collect();
+        let from = messages.iter().position(|entry| entry.id == start);
+        let to = messages.iter().position(|entry| entry.id == end);
+        match (from, to) {
+            (Some(from), Some(to)) if from <= to => Ok(messages[from..=to].to_vec()),
+            _ => Err(SessionError::InvalidSpan {
+                start: start.to_owned(),
+                end: end.to_owned(),
+            }),
+        }
     }
 }
 /// Move the retained boundary back until every retained tool result has its call.

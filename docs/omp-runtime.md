@@ -122,6 +122,8 @@ message, and `at` pages its body by byte offset. Responses are bounded to about
 16 KB with continuation hints; images are MIME placeholders. Indices are stable
 across compaction, but branch switches select a different path.
 
+Each compaction entry records `span_start_id` and `span_end_id`: the first and last message it replaced, inclusive, on the active path. Journals written before spans omit both fields; `Session::entries_in_span` reads a span back as message entries.
+
 Each `task` call captures one immutable developer-message snapshot shared by all
 siblings, including nested children: the latest main compaction summary (clipped
 if necessary) and the newest visible main messages as index lines, within 12 KB.
