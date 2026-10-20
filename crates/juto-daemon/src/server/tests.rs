@@ -517,3 +517,36 @@ async fn desktop_open_grants_the_session_viewer_and_the_artifact_resolves() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn child_completion_wakes_the_session_that_spawned_it() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon(root.path(), ScriptedProvider::new(false));
+    let spawning = create_session(&daemon).await;
+    // A newer session becomes the one used last; the wake must not go there.
+    let _newer = create_session(&daemon).await;
+    let mut rx = attach(&daemon);
+    tokio::spawn(wake_loop(daemon.clone()));
+
+    let spec = TaskSpec {
+        origin: Some(spawning.info.id.clone()),
+        ..TaskSpec::new("say hello")
+    };
+    daemon.runtime.subagent_manager().spawn(spec).unwrap();
+
+    let woken = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Some(ServerEvent::Session {
+                    session_id,
+                    event: SessionEvent::RunStarted { .. },
+                }) => return session_id,
+                Some(_) => {}
+                None => panic!("event stream closed"),
+            }
+        }
+    })
+    .await
+    .expect("wake run started within 10s");
+    assert_eq!(woken, spawning.info.id);
+}

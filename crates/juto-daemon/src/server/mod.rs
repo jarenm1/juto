@@ -335,24 +335,31 @@ impl Daemon {
         Ok(reply_id)
     }
 
-    /// Starts a run that delivers child messages which arrived while no run was active.
-    /// The inbox is drained under the state lock, so a concurrent prompt cannot race it.
+    /// Starts a run for the oldest waiting child group. A group wakes the session
+    /// that spawned it (its origin); a group with no origin wakes the session last
+    /// used. Other origins stay queued. A group whose run cannot start returns to
+    /// the front of the inbox.
     fn wake_idle(self: &Arc<Self>) -> Result<Wake> {
         let mut state = self.state.lock().unwrap();
         if state.active.is_some() {
             return Ok(Wake::Busy);
         }
-        let Some(session_id) = state.last_session.clone() else {
+        let inbox = self.runtime.subagent_manager().main_inbox();
+        let Some((origin, messages)) = inbox.take_next_group() else {
             return Ok(Wake::Idle);
         };
-        let inbox = self.runtime.subagent_manager().main_inbox();
-        let messages = inbox.drain();
-        if messages.is_empty() {
+        let Some(session_id) = origin.clone().or_else(|| state.last_session.clone()) else {
+            inbox.requeue_front(origin.as_deref(), messages);
+            return Ok(Wake::Idle);
+        };
+        if !state.sessions.contains_key(&session_id) {
+            // The spawning session no longer exists, so nothing can read this group.
+            eprintln!("juto-daemon: dropping child reports for unknown session {session_id}");
             return Ok(Wake::Idle);
         }
         let prompt = juto_runtime::subagents::completion_prompt(&messages);
         if let Err(error) = self.start_locked(&mut state, session_id, prompt) {
-            inbox.requeue_front(None, messages);
+            inbox.requeue_front(origin.as_deref(), messages);
             return Err(error);
         }
         Ok(Wake::Started)
