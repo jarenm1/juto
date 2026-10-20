@@ -192,7 +192,8 @@ and the automation's previous job is open:
   and moves the cursor past now. It does not start a catch-up job.
 - `run-now` starts one job immediately, records a `run-now` event, and does not
   move the schedule.
-- Delete removes the definition. The jobs it started are kept.
+- Delete removes the definition and its event log (`automations/<id>.json` and
+  `automations/<id>.events.jsonl`). The jobs it started are kept in the job store.
 
 ### Dedupe key
 
