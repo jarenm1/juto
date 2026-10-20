@@ -207,9 +207,53 @@ impl Runtime {
         provider: Arc<dyn Provider>,
         approval: Option<Arc<dyn ApprovalHandler>>,
     ) -> Result<Self> {
-        let desks = pools::Desks::new(Broker::new(
-            data_dir.as_ref().join("resources").join("broker"),
-        ));
+        let broker = Broker::new(data_dir.as_ref().join("resources").join("broker"));
+        Self::with_broker(
+            cwd,
+            data_dir,
+            config,
+            credentials,
+            provider,
+            approval,
+            broker,
+        )
+    }
+
+    /// Like [`Runtime::with_provider`], but admission reads `pressure_file` instead of the
+    /// host's memory pressure, so a test's admission does not depend on machine load.
+    #[cfg(feature = "test-support")]
+    pub fn with_provider_and_pressure_file(
+        cwd: impl AsRef<Path>,
+        data_dir: impl AsRef<Path>,
+        config: RuntimeConfig,
+        credentials: Arc<CredentialStore>,
+        provider: Arc<dyn Provider>,
+        approval: Option<Arc<dyn ApprovalHandler>>,
+        pressure_file: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let broker = Broker::new(data_dir.as_ref().join("resources").join("broker"))
+            .with_pressure_file(pressure_file);
+        Self::with_broker(
+            cwd,
+            data_dir,
+            config,
+            credentials,
+            provider,
+            approval,
+            broker,
+        )
+    }
+
+    fn with_broker(
+        cwd: impl AsRef<Path>,
+        data_dir: impl AsRef<Path>,
+        config: RuntimeConfig,
+        credentials: Arc<CredentialStore>,
+        provider: Arc<dyn Provider>,
+        approval: Option<Arc<dyn ApprovalHandler>>,
+        broker: Broker,
+    ) -> Result<Self> {
+        let desks = pools::Desks::new(broker);
         let admission = pools::Admission::new(config.max_concurrency, desks);
         let provider: Arc<dyn Provider> = Arc::new(pools::LimitedProvider::new(
             provider,

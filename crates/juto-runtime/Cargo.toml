@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test seams for downstream crates' tests; not used by the shipped binaries.
+test-support = []
+
 [dependencies]
 juto-ai.workspace = true
 juto-agent.workspace = true

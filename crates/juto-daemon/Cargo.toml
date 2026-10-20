@@ -26,3 +26,4 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 tempfile = { workspace = true }
+juto-runtime = { workspace = true, features = ["test-support"] }
