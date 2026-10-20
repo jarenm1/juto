@@ -136,10 +136,14 @@ pub struct RuntimeConfig {
     pub temperature: Option<f32>,
     pub max_tokens: Option<u64>,
     pub approval_mode: ApprovalMode,
+    /// Ceiling for concurrent model requests across the whole run tree, and for
+    /// concurrent focus threads (the review limit). The provider pool starts at
+    /// this ceiling, halves on rate limits, and grows back on accepted streams.
+    /// Ordinary children are not capped by it; each turn waits for a memory desk.
     pub max_concurrency: usize,
     /// Subagent nesting depth. Root agents run at depth 0. A run at depth >= this
-    /// value gets no `task` tool. Each depth gets its own subagent manager and
-    /// concurrency limit, so a parent never waits on permits it holds.
+    /// value gets no `task` tool. Every depth shares one admission (provider pool,
+    /// review limit, desks), so nested children never multiply those limits.
     pub max_recursion_depth: usize,
     pub max_turns: Option<usize>,
     pub auto_compact: bool,

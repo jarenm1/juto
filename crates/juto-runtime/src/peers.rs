@@ -308,7 +308,7 @@ mod tests {
             Arc::new(TestFactory {
                 sessions: sessions.to_path_buf(),
             }),
-            4,
+            crate::pools::Admission::unmetered(4),
             CancellationToken::new(),
             crate::subagents::MainInbox::default(),
         ))

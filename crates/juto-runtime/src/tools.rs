@@ -2816,13 +2816,18 @@ impl Tool for BashJobTool {
         };
         let mut rx = job.subscribe();
         if args.wait {
-            tokio::select! {
-                biased;
-                () = ctx.cancel.cancelled() => return Err("cancelled".to_string()),
-                waited = rx.wait_for(|state| matches!(state, JobState::Finished(_))) => {
-                    waited.map(|_| ()).map_err(|_| "bash job state unavailable".to_string())?;
+            // The wait gives the caller's desk back: the job may itself need one.
+            crate::pools::release_while(&ctx.cancel, async {
+                tokio::select! {
+                    biased;
+                    () = ctx.cancel.cancelled() => Err("cancelled".to_string()),
+                    waited = rx.wait_for(|state| matches!(state, JobState::Finished(_))) => {
+                        waited.map(|_| ()).map_err(|_| "bash job state unavailable".to_string())
+                    }
                 }
-            }
+            })
+            .await
+            .map_err(|error| error.to_string())??;
         }
         let state = rx.borrow().clone();
         Ok(match state {
