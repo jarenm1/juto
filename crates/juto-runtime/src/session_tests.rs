@@ -358,7 +358,7 @@ fn compaction_plan_reports_previous_and_discarded() {
     s.compact("first".into(), None, 2).unwrap();
     s.append(user("q4")).unwrap();
     let plan = s.compaction_plan(1).unwrap();
-    assert_eq!(plan.previous.unwrap().summary, "first");
+    assert_eq!(plan.previous[0].summary, "first");
     let discarded: Vec<String> = plan
         .discarded
         .iter()

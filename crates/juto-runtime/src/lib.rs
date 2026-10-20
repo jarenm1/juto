@@ -845,7 +845,7 @@ impl Runtime {
         }
         if method.archives_frames(accepts_images) {
             let mut history = Vec::new();
-            let previous_archive = match plan.previous.clone() {
+            let previous_archive = match plan.previous.first().cloned() {
                 Some(PriorCompaction {
                     archive: Some(archive),
                     ..
@@ -888,7 +888,7 @@ impl Runtime {
             }
         }
         let mut input = Vec::new();
-        if let Some(prior) = plan.previous {
+        if let Some(prior) = plan.previous.into_iter().next() {
             let text = match prior.archive {
                 Some(archive) => archive.text(),
                 None => prior.summary,
@@ -2722,7 +2722,7 @@ mod tests {
                 .compact(&mut session, &RunControl::new())
                 .await
                 .unwrap();
-            let prior = session.compaction_plan(0).unwrap().previous.unwrap();
+            let prior = session.compaction_plan(0).unwrap().previous.into_iter().next().unwrap();
             assert!(prior.archive.is_none());
             assert_eq!(prior.summary, "child output");
         }
@@ -2790,7 +2790,7 @@ mod tests {
             .unwrap();
         let session = Session::open(session.path()).unwrap();
         let plan = session.compaction_plan(0).unwrap();
-        let archive = plan.previous.unwrap().archive.unwrap();
+        let archive = plan.previous.into_iter().next().unwrap().archive.unwrap();
         assert!(archive.source.contains("parse_id"));
         assert!(archive.source.contains("byte 42"));
         assert!(archive.source.contains("\\u{6F22}\\u{5B57}"));
@@ -2878,7 +2878,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(*models.lock().unwrap(), vec![expected.to_string()]);
-            let prior = session.compaction_plan(0).unwrap().previous.unwrap();
+            let prior = session.compaction_plan(0).unwrap().previous.into_iter().next().unwrap();
             assert_eq!(prior.summary, "compactor summary");
         }
     }
@@ -2946,7 +2946,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*models.lock().unwrap(), vec!["mock/summarizer".to_string()]);
-        let prior = session.compaction_plan(0).unwrap().previous.unwrap();
+        let prior = session.compaction_plan(0).unwrap().previous.into_iter().next().unwrap();
         assert_eq!(prior.summary, "compactor summary");
     }
 
@@ -2976,7 +2976,7 @@ mod tests {
         assert!(format!("{error:#}").contains("model not found: mock/missing"));
         assert!(models.lock().unwrap().is_empty());
         assert_eq!(std::fs::read(session.path()).unwrap(), journal);
-        assert!(session.compaction_plan(0).unwrap().previous.is_none());
+        assert!(session.compaction_plan(0).unwrap().previous.is_empty());
     }
 
     /// A text-only compactor cannot render snapcompact pages, even though the
@@ -3003,7 +3003,7 @@ mod tests {
         assert!(format!("{error:#}").contains("snapcompact needs a vision model"));
         assert!(models.lock().unwrap().is_empty());
         assert_eq!(std::fs::read(session.path()).unwrap(), journal);
-        assert!(session.compaction_plan(0).unwrap().previous.is_none());
+        assert!(session.compaction_plan(0).unwrap().previous.is_empty());
     }
 
     /// Under `auto`, a text-only compactor takes the summary path even though
@@ -3029,7 +3029,7 @@ mod tests {
                 .compact(&mut session, &RunControl::new())
                 .await
                 .unwrap();
-            let prior = session.compaction_plan(0).unwrap().previous.unwrap();
+            let prior = session.compaction_plan(0).unwrap().previous.into_iter().next().unwrap();
             if expects_summary {
                 assert_eq!(*models.lock().unwrap(), vec!["mock/textonly".to_string()]);
                 assert!(prior.archive.is_none());
