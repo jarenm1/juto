@@ -316,7 +316,7 @@ pub fn desktop_row(artifact: DesktopSessionArtifact) -> Message {
     }
 }
 
-/// Renders a view. A subagent card is clickable and opens its focus thread.
+/// Renders a view. A subagent card is clickable and opens it in focus mode.
 fn card_element(view: &ViewNode, actions: &ViewActions, cx: &Context<ChatView>) -> AnyElement {
     let Some(id) = subagent_card::card_id(view) else {
         return render_view(view, actions);
@@ -853,7 +853,8 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Opens focus mode for thread `id`: a focus thread, or a worker card's child.
+    /// Opens focus mode for subagent `id`. Any subagent opens here, not only
+    /// focus threads.
     fn enter_focus(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(summary) = self
             .subagents
