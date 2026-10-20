@@ -15,6 +15,7 @@ Unattended runs map the configured tier to `workspace`, never `full`:
 - Bash always runs sandboxed for `untrusted` and `workspace`. If the sandbox or
   its network helper is unavailable, the command fails closed. It never runs
   unsandboxed.
+- Browser and desktop tools are not offered on sandboxed tiers, so an unattended run never has them.
 
 ## Decisions
 
@@ -29,6 +30,8 @@ example `publish:feat/x`. Its status moves through:
 
 Records are JSON files in `<data_dir>/decisions/<id>.json`, written atomically,
 so a pending decision survives a daemon restart.
+
+A call that needs a decision after its unattended run has ended is refused with an error and records no decision.
 
 Protocol:
 
@@ -57,6 +60,8 @@ Credentials stay in the daemon. They are never mounted into a sandbox.
 - Unattended calls need a decision for `publish:<bookmark>`. Attended calls use
   the normal approval prompt.
 
+An unattended grant pins the commit the bookmark pointed at when the decision was recorded. An approved `publish` pushes only that commit. If the bookmark has moved since, the call is refused and nothing is pushed. A bookmark that does not exist is an error, not a decision.
+
 ## Operator flow
 
 1. Client sends `prompt` with `unattended: true`.
@@ -67,6 +72,10 @@ Credentials stay in the daemon. They are never mounted into a sandbox.
 5. Daemon persists `approved`, starts the continuation run, and sends
    `DecisionResolved`. The continuation retries `publish` once. The grant is
    consumed, so a second attempt is blocked again.
+
+## Children
+
+Children an unattended run starts belong to that run. When the root run finishes, every child still working is cancelled and settled before the run returns. Their reports reach the session's main inbox.
 
 ## Limitations
 
