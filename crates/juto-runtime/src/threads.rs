@@ -34,7 +34,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Runtime,
+    Runtime, UnattendedOutcome,
     session::{EntryKind, Session},
 };
 
@@ -514,6 +514,39 @@ impl Runtime {
         events: mpsc::UnboundedSender<MainEvent>,
         control: RunControl,
     ) -> Result<RunOutcome> {
+        match self
+            .send_routed(main, target, prompt, events, control, false)
+            .await?
+        {
+            UnattendedOutcome::Finished(outcome) => Ok(outcome),
+            UnattendedOutcome::Blocked(_) => unreachable!("a plain run never blocks"),
+        }
+    }
+
+    /// [`Self::send`] for an unattended run. The routed thread runs through
+    /// [`Self::run_unattended`]; its blocked decisions belong to `main`, so an
+    /// approval resumes through the main session.
+    pub async fn send_unattended(
+        &self,
+        main: &mut MainSession,
+        target: Option<&str>,
+        prompt: impl Into<String>,
+        events: mpsc::UnboundedSender<MainEvent>,
+        control: RunControl,
+    ) -> Result<UnattendedOutcome> {
+        self.send_routed(main, target, prompt, events, control, true)
+            .await
+    }
+
+    async fn send_routed(
+        &self,
+        main: &mut MainSession,
+        target: Option<&str>,
+        prompt: impl Into<String>,
+        events: mpsc::UnboundedSender<MainEvent>,
+        control: RunControl,
+        unattended: bool,
+    ) -> Result<UnattendedOutcome> {
         let prompt = prompt.into();
         if main.journal.header().cwd != self.inner.cwd {
             bail!("session belongs to a different working directory");
@@ -582,11 +615,22 @@ impl Runtime {
                 let _ = forward.send(MainEvent::Agent(event));
             }
         });
-        let result = self.run(&mut session, prompt, agent_events, control).await;
+        let result = if unattended {
+            let owner = main.journal.header().id.clone();
+            self.run_unattended_owned(&mut session, owner, prompt, agent_events, control, None)
+                .await
+        } else {
+            self.run(&mut session, prompt, agent_events, control)
+                .await
+                .map(UnattendedOutcome::Finished)
+        };
         // The run dropped its sender; wait so every agent event precedes the
         // label update below.
         let _ = forwarder.await;
-        let mut outcome = result?;
+        let mut outcome = match result? {
+            UnattendedOutcome::Finished(run) => run,
+            blocked @ UnattendedOutcome::Blocked(_) => return Ok(blocked),
+        };
         outcome.usage.add(&overhead);
 
         if outcome.stop_reason == StopReason::Stop && !cancel.is_cancelled() {
@@ -605,7 +649,7 @@ impl Runtime {
                 }),
             }
         }
-        Ok(outcome)
+        Ok(UnattendedOutcome::Finished(outcome))
     }
 
     async fn plan_route(
