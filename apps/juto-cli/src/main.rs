@@ -1,3 +1,4 @@
+mod automations;
 mod changes;
 mod jobs;
 mod resources;
@@ -65,6 +66,12 @@ enum Command {
     Jobs {
         #[command(subcommand)]
         command: jobs::JobsCommand,
+    },
+    /// Create, list, run, pause, enable, and delete scheduled automations in this
+    /// workspace's daemon.
+    Automations {
+        #[command(subcommand)]
+        command: automations::AutomationsCommand,
     },
     /// Stream a turn in a new or existing main session. The request is routed to one of
     /// the session's internal threads. A prompt of '-' reads stdin.
@@ -165,6 +172,20 @@ async fn main() -> Result<()> {
         }
         return jobs::run(&cwd, command, arguments.json).await;
     }
+    if let Command::Automations { command } = &arguments.command {
+        if arguments.model.is_some()
+            || arguments.thinking.is_some()
+            || arguments.max_tokens.is_some()
+            || arguments.yes
+            || arguments.read_only
+        {
+            bail!(
+                "--model, --thinking, --max-tokens, --yes and --read-only do not apply to automations: \
+                 pin a model with --model-pin; occurrences run under the daemon's unattended rules"
+            );
+        }
+        return automations::run(&cwd, command, arguments.json).await;
+    }
     let data_dir = match arguments.data_dir {
         Some(path) => path,
         None => default_data_dir()?,
@@ -192,6 +213,7 @@ async fn main() -> Result<()> {
         Command::Changes { .. } => unreachable!("handled before runtime initialization"),
         Command::Resources { .. } => unreachable!("handled before runtime initialization"),
         Command::Jobs { .. } => unreachable!("handled before runtime initialization"),
+        Command::Automations { .. } => unreachable!("handled before runtime initialization"),
         Command::Run { prompt, session } => {
             let resumed = session.is_some();
             let prompt = if prompt == "-" {
