@@ -19,12 +19,18 @@ use tokio_util::sync::CancellationToken;
 use crate::budget::estimate_tokens;
 use crate::control::{self, RunControl};
 use crate::error::AgentError;
-use crate::events::{AgentConfig, AgentEvent, AgentHooks, RunOutcome};
+use crate::events::{AgentConfig, AgentEvent, AgentHooks, CompactError, RunOutcome};
 use crate::tool::{ToolContext, ToolOutput, ToolRegistry};
 
 /// Longest backoff a retry sleep may reach; provider `retry_after` hints may
 /// still exceed it.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// Outcome of the pre-request context check.
+enum Fit {
+    Ready,
+    Cancelled,
+}
 
 /// Result of a single provider request inside one turn.
 enum AttemptOutcome {
@@ -149,15 +155,21 @@ impl Agent {
             }
             emit(&events, AgentEvent::TurnStart { turn: turns });
 
-            if let Err(error) = self.ensure_context_fits().await {
-                emit(
-                    &events,
-                    AgentEvent::Error {
-                        error: error.to_string(),
-                    },
-                );
-                self.finish(StopReason::Error, usage, turns, &events);
-                break Err(error);
+            match self.ensure_context_fits().await {
+                Ok(Fit::Ready) => {}
+                Ok(Fit::Cancelled) => {
+                    break Ok(self.finish(StopReason::Aborted, usage, turns, &events));
+                }
+                Err(error) => {
+                    emit(
+                        &events,
+                        AgentEvent::Error {
+                            error: error.to_string(),
+                        },
+                    );
+                    self.finish(StopReason::Error, usage, turns, &events);
+                    break Err(error);
+                }
             }
 
             if let Some(hooks) = &self.hooks
@@ -284,28 +296,30 @@ impl Agent {
 
     /// Keep the next request inside the context budget. Over-budget history
     /// goes through the host's `compact_context`; if the compacted history still
-    /// does not fit, the error is returned and no request is sent.
-    async fn ensure_context_fits(&mut self) -> Result<(), AgentError> {
+    /// does not fit, the error is returned and no request is sent. A cancelled
+    /// compaction returns `Fit::Cancelled` so the run ends as aborted.
+    async fn ensure_context_fits(&mut self) -> Result<Fit, AgentError> {
         let Some(limit) = self.config.context_limit else {
-            return Ok(());
+            return Ok(Fit::Ready);
         };
         let estimated = estimate_tokens(&self.context.messages);
         if estimated <= limit {
-            return Ok(());
+            return Ok(Fit::Ready);
         }
         let Some(hooks) = self.hooks.clone() else {
             return Err(AgentError::ContextOverflow { estimated, limit });
         };
-        let compacted = hooks
-            .compact_context()
-            .await
-            .map_err(AgentError::CompactionFailed)?;
+        let compacted = match hooks.compact_context().await {
+            Ok(messages) => messages,
+            Err(CompactError::Cancelled) => return Ok(Fit::Cancelled),
+            Err(CompactError::Failed(reason)) => return Err(AgentError::CompactionFailed(reason)),
+        };
         let estimated = estimate_tokens(&compacted);
         if estimated > limit {
             return Err(AgentError::ContextOverflow { estimated, limit });
         }
         self.context.messages = compacted;
-        Ok(())
+        Ok(Fit::Ready)
     }
 
     /// One turn's worth of provider requests: connect, stream, and retry

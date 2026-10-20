@@ -19,8 +19,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Agent, AgentConfig, AgentError, AgentEvent, AgentHooks, BlockingWait, RunControl, RunOutcome,
-    Tool, ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier,
+    Agent, AgentConfig, AgentError, AgentEvent, AgentHooks, BlockingWait, CompactError, RunControl,
+    RunOutcome, Tool, ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier,
 };
 
 fn test_model() -> Model {
@@ -1030,11 +1030,11 @@ struct CompactTo {
 
 #[async_trait]
 impl AgentHooks for CompactTo {
-    async fn compact_context(&self) -> Result<Vec<Message>, String> {
+    async fn compact_context(&self) -> Result<Vec<Message>, CompactError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.replacement
             .clone()
-            .ok_or_else(|| "summarizer unavailable".to_owned())
+            .ok_or_else(|| CompactError::Failed("summarizer unavailable".to_owned()))
     }
 }
 
@@ -1158,6 +1158,53 @@ async fn failed_compaction_ends_run_without_sending_request() {
     }
     assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.stream_calls().await, 0);
+    assert_eq!(agent_ends(&events), 1);
+}
+
+/// Host hook whose compaction is cancelled while it runs.
+struct CancelCompaction;
+
+#[async_trait]
+impl AgentHooks for CancelCompaction {
+    async fn compact_context(&self) -> Result<Vec<Message>, CompactError> {
+        Err(CompactError::Cancelled)
+    }
+}
+
+#[tokio::test]
+async fn cancelled_compaction_aborts_without_an_error_event() {
+    let model = test_model();
+    let big = "x".repeat(3000);
+    let provider = ScriptedProvider::new(vec![text_done_script(&model, "never sent")]);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let config = AgentConfig {
+        context_limit: Some(600),
+        ..AgentConfig::for_model(test_model())
+    };
+    let mut agent = Agent::new(
+        config,
+        provider.clone(),
+        ToolRegistry::new(),
+        Context::default(),
+    );
+    agent.set_hooks(Arc::new(CancelCompaction));
+    let outcome = agent
+        .run(vec![Message::user(big.as_str())], tx, RunControl::new())
+        .await;
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+
+    let outcome = outcome.expect("a cancelled compaction is not an error");
+    assert_eq!(outcome.stop_reason, StopReason::Aborted);
+    assert_eq!(provider.stream_calls().await, 0);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Error { .. })),
+        "a cancelled compaction must not emit an error event"
+    );
     assert_eq!(agent_ends(&events), 1);
 }
 

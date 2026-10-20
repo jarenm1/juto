@@ -14,7 +14,7 @@ pub use agent::Agent;
 pub use budget::{IMAGE_TOKEN_ESTIMATE, estimate_tokens};
 pub use control::{BackgroundJob, BlockingWait, RunControl};
 pub use error::AgentError;
-pub use events::{AgentConfig, AgentEvent, AgentHooks, RunOutcome};
+pub use events::{AgentConfig, AgentEvent, AgentHooks, CompactError, RunOutcome};
 pub use tool::{Tool, ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier};
 pub use view::{
     MAX_CHART_POINTS, MAX_TIMELINE_TICKS, VIEW_DETAILS_TYPE, VIEW_TAGS, ViewChild, ViewNode,

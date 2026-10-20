@@ -41,8 +41,8 @@ use anyhow::{Context as _, Result, bail, ensure};
 use async_trait::async_trait;
 use futures::StreamExt;
 use juto_agent::{
-    Agent, AgentConfig, AgentEvent, AgentHooks, RunControl, RunOutcome, Tool, ToolContext,
-    ToolOutput, ToolRegistry, ToolTier, estimate_tokens,
+    Agent, AgentConfig, AgentEvent, AgentHooks, CompactError, RunControl, RunOutcome, Tool,
+    ToolContext, ToolOutput, ToolRegistry, ToolTier, estimate_tokens,
 };
 use juto_ai::{
     ContentBlock, Context, CredentialStore, HttpProvider, Judge, Message, Provider, ProviderEvent,
@@ -769,14 +769,24 @@ impl Runtime {
                         let _ = events.send(event);
                     }
                     let answer = if persistence_error.is_some() {
-                        Err("session persistence failed; run cancelled".to_owned())
+                        Err(CompactError::Failed(
+                            "session persistence failed; run cancelled".to_owned(),
+                        ))
                     } else {
-                        match self.compact(session, &control).await {
-                            Ok(usage) => {
-                                compaction_usage.add(&usage);
-                                session.messages().map_err(|error| format!("{error:#}"))
+                        let compacted = self.compact(session, &control).await;
+                        if control.token().is_cancelled() {
+                            // A cancelled run aborts; the summary is not used.
+                            Err(CompactError::Cancelled)
+                        } else {
+                            match compacted {
+                                Ok(usage) => {
+                                    compaction_usage.add(&usage);
+                                    session
+                                        .messages()
+                                        .map_err(|error| CompactError::Failed(format!("{error:#}")))
+                                }
+                                Err(error) => Err(CompactError::Failed(format!("{error:#}"))),
                             }
-                            Err(error) => Err(format!("{error:#}")),
                         }
                     };
                     let _ = reply.send(answer);
@@ -983,7 +993,7 @@ fn persist_event(session: &mut Session, event: &AgentEvent) -> Result<()> {
 }
 
 /// Asks a run's loop to compact its session; the reply is the compacted history.
-type CompactionRequest = oneshot::Sender<Result<Vec<Message>, String>>;
+type CompactionRequest = oneshot::Sender<Result<Vec<Message>, CompactError>>;
 
 struct RuntimeHooks {
     mode: ApprovalMode,
@@ -1017,14 +1027,14 @@ impl AgentHooks for RuntimeHooks {
         }
     }
 
-    async fn compact_context(&self) -> Result<Vec<Message>, String> {
+    async fn compact_context(&self) -> Result<Vec<Message>, CompactError> {
         let (reply, answer) = oneshot::channel();
         self.compactions
             .send(reply)
-            .map_err(|_| "run loop is no longer compacting".to_owned())?;
+            .map_err(|_| CompactError::Failed("run loop is no longer compacting".to_owned()))?;
         answer
             .await
-            .map_err(|_| "compaction request was dropped".to_owned())?
+            .map_err(|_| CompactError::Failed("compaction request was dropped".to_owned()))?
     }
 }
 
@@ -2444,6 +2454,220 @@ mod tests {
         std::fs::write(&file, b"not json").expect("write corrupt inbox");
         assert!(corrupt_runtime.open_main_inbox(&main).is_err());
         assert_eq!(std::fs::read(&file).expect("read"), b"not json");
+    }
+
+    /// Serves the mid-run compaction path. The first main request calls `read`
+    /// on a file too large for the window. The summary request is identified by
+    /// the compaction prompt. Later main requests answer with text. With
+    /// `cancel_on_summary`, the summary request cancels the run and never answers.
+    #[derive(Default)]
+    struct CompactionFlow {
+        read_path: String,
+        main_contexts: std::sync::Mutex<Vec<Vec<Message>>>,
+        summary_requests: std::sync::atomic::AtomicUsize,
+        cancel_on_summary: Option<CancellationToken>,
+    }
+
+    fn scripted_reply(content: Vec<ContentBlock>, stop_reason: StopReason) -> ProviderStream {
+        let message = AssistantMessage {
+            content,
+            api: "mock".to_string(),
+            provider: "mock".to_string(),
+            model: "mock/test".to_string(),
+            usage: Usage {
+                input: 1,
+                output: 1,
+                cache_read: 0,
+                cache_write: 0,
+                total_tokens: 2,
+                cost: 0.0,
+            },
+            stop_reason,
+            timestamp: timestamp_ms(),
+            response_id: None,
+            error: None,
+        };
+        let events: Vec<Result<ProviderEvent, ProviderError>> = vec![
+            Ok(ProviderEvent::Start),
+            Ok(ProviderEvent::Done { message }),
+        ];
+        Box::pin(futures::stream::iter(events))
+    }
+
+    #[async_trait]
+    impl Provider for CompactionFlow {
+        async fn stream(
+            &self,
+            _model: &Model,
+            context: &Context,
+            _options: &StreamOptions,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            if context.system_prompt.first().map(String::as_str) == Some(COMPACTION_PROMPT) {
+                self.summary_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(token) = &self.cancel_on_summary {
+                    token.cancel();
+                    return Ok(Box::pin(futures::stream::pending::<
+                        Result<ProviderEvent, ProviderError>,
+                    >()));
+                }
+                return Ok(scripted_reply(
+                    vec![ContentBlock::Text {
+                        text: "summary of the read".to_string(),
+                    }],
+                    StopReason::Stop,
+                ));
+            }
+            let first = {
+                let mut contexts = self.main_contexts.lock().unwrap();
+                contexts.push(context.messages.clone());
+                contexts.len() == 1
+            };
+            if first {
+                return Ok(scripted_reply(
+                    vec![ContentBlock::ToolCall(ToolCall {
+                        id: "call-1".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({ "path": self.read_path }),
+                        thought_signature: None,
+                    })],
+                    StopReason::ToolUse,
+                ));
+            }
+            Ok(scripted_reply(
+                vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                StopReason::Stop,
+            ))
+        }
+    }
+
+    /// Writes a file whose `read` result alone exceeds the test window's budget.
+    fn write_large_file(repo: &Path) -> std::path::PathBuf {
+        let path = repo.join("big.txt");
+        std::fs::write(&path, "lorem ipsum dolor sit amet\n".repeat(1800)).expect("write file");
+        path
+    }
+
+    /// Enables only `read`, and keeps no messages through compaction so the
+    /// summary replaces the whole history.
+    fn compaction_config() -> RuntimeConfig {
+        RuntimeConfig {
+            tools: vec!["read".to_string()],
+            keep_recent_messages: 0,
+            ..mock_config()
+        }
+    }
+
+    #[tokio::test]
+    async fn mid_run_compaction_replaces_the_context_and_the_run_completes() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let big = write_large_file(&repo);
+        let provider = Arc::new(CompactionFlow {
+            read_path: big.display().to_string(),
+            ..Default::default()
+        });
+        let runtime = runtime_with(
+            &repo,
+            &root.path().join("data"),
+            compaction_config(),
+            provider.clone(),
+        );
+        let mut session = runtime.new_session().expect("session");
+        let (events, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = runtime
+            .run(
+                &mut session,
+                "Read the file and report.",
+                events,
+                RunControl::new(),
+            )
+            .await
+            .expect("run completes");
+
+        assert_eq!(outcome.stop_reason, StopReason::Stop);
+        assert_eq!(
+            provider
+                .summary_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        let contexts = provider.main_contexts.lock().unwrap().clone();
+        assert_eq!(contexts.len(), 2, "the run continues after compaction");
+        assert!(
+            contexts[1]
+                .iter()
+                .all(|message| !matches!(message, Message::ToolResult { .. })),
+            "the oversized tool result is replaced by the summary"
+        );
+        assert!(
+            serde_json::to_string(&contexts[1])
+                .unwrap()
+                .contains("summary of the read")
+        );
+        let mut emitted = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            emitted.push(event);
+        }
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. })),
+            "a completed compaction must not emit an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_mid_run_compaction_aborts_without_an_error() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let big = write_large_file(&repo);
+        let control = RunControl::new();
+        let provider = Arc::new(CompactionFlow {
+            read_path: big.display().to_string(),
+            cancel_on_summary: Some(control.token()),
+            ..Default::default()
+        });
+        let runtime = runtime_with(
+            &repo,
+            &root.path().join("data"),
+            compaction_config(),
+            provider.clone(),
+        );
+        let mut session = runtime.new_session().expect("session");
+        let (events, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = runtime
+            .run(&mut session, "Read the file and report.", events, control)
+            .await
+            .expect("a cancelled compaction is not an error");
+
+        assert_eq!(outcome.stop_reason, StopReason::Aborted);
+        assert_eq!(
+            provider
+                .summary_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(
+            provider.main_contexts.lock().unwrap().len(),
+            1,
+            "no main request follows a cancelled compaction"
+        );
+        let mut emitted = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            emitted.push(event);
+        }
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Error { .. })),
+            "a cancelled compaction must not emit an error event"
+        );
     }
 
     #[tokio::test]

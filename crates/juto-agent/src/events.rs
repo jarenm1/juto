@@ -90,12 +90,25 @@ pub trait AgentHooks: Send + Sync {
 
     /// Shrink the history before a request that would exceed
     /// `AgentConfig::context_limit`. The returned messages replace the run's
-    /// context. `Err` ends the run with `AgentError::CompactionFailed`. The
-    /// default cannot compact, so an over-budget request then fails with
+    /// context. `Err(CompactError::Cancelled)` ends the run as aborted;
+    /// `Err(CompactError::Failed)` ends it with `AgentError::CompactionFailed`.
+    /// The default cannot compact, so an over-budget request then fails with
     /// `AgentError::ContextOverflow` without being sent.
-    async fn compact_context(&self) -> Result<Vec<Message>, String> {
-        Err("host does not support context compaction".into())
+    async fn compact_context(&self) -> Result<Vec<Message>, CompactError> {
+        Err(CompactError::Failed(
+            "host does not support context compaction".into(),
+        ))
     }
+}
+
+/// Why a host could not compact history for an over-budget request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactError {
+    /// The run was cancelled while the host compacted. Not a failure: the run
+    /// ends as `StopReason::Aborted` with no error event.
+    Cancelled,
+    /// The host failed; the run ends with `AgentError::CompactionFailed`.
+    Failed(String),
 }
 
 /// Per-run configuration. No default turn cap: the loop runs until the model
