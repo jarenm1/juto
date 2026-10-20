@@ -503,13 +503,8 @@ mod tests {
     #[tokio::test]
     async fn calls_after_the_run_ends_are_refused_without_a_decision() {
         let dir = tempfile::tempdir().unwrap();
-        let scope = UnattendedScope::new(
-            dir.path(),
-            dir.path(),
-            "s1".into(),
-            None,
-            RunControl::new(),
-        );
+        let scope =
+            UnattendedScope::new(dir.path(), dir.path(), "s1".into(), None, RunControl::new());
         assert!(scope.finish().is_none());
         let desktop = call("desktop", json!({}));
         let err = scope

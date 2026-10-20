@@ -703,14 +703,21 @@ impl Runtime {
             run_children.clone(),
         ));
         let outcome = self
-            .run_depth(session, prompt.into(), events, control, placement, manager.clone())
+            .run_depth(
+                session,
+                prompt.into(),
+                events,
+                control,
+                placement,
+                manager.clone(),
+            )
             .await;
         forwarder.abort();
         stop_children.abort();
         run_children.cancel();
         settle_children(&manager).await;
         match scope.finish() {
-            Some(decision) => Ok(UnattendedOutcome::Blocked(decision)),
+            Some(decision) => Ok(UnattendedOutcome::Blocked(Box::new(decision))),
             None => outcome.map(UnattendedOutcome::Finished),
         }
     }
@@ -1220,7 +1227,7 @@ pub enum UnattendedOutcome {
     /// The run ran to its own end; see [`RunOutcome::stop_reason`].
     Finished(RunOutcome),
     /// A tool call needs an operator decision. The run stopped before that call.
-    Blocked(Decision),
+    Blocked(Box<Decision>),
 }
 
 /// The tier an unattended run executes under. Unattended runs are always sandboxed
@@ -2560,8 +2567,20 @@ mod tests {
     fn publishable_repo(dir: &Path) {
         native_repo(dir);
         jj(dir, &["git", "init", "--colocate"]);
-        jj(dir, &["config", "set", "--repo", "user.name", "Runtime Test"]);
-        jj(dir, &["config", "set", "--repo", "user.email", "runtime@example.test"]);
+        jj(
+            dir,
+            &["config", "set", "--repo", "user.name", "Runtime Test"],
+        );
+        jj(
+            dir,
+            &[
+                "config",
+                "set",
+                "--repo",
+                "user.email",
+                "runtime@example.test",
+            ],
+        );
         jj(dir, &["describe", "-m", "wip"]);
         jj(dir, &["metaedit", "--update-author"]);
         jj(dir, &["bookmark", "create", "feat/x", "-r", "@-"]);
