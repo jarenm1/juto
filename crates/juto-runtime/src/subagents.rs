@@ -220,6 +220,20 @@ pub struct SubagentSummary {
     pub released: bool,
 }
 
+/// A delegated child's settled outcome, reported by the run that started it.
+#[derive(Debug, Clone)]
+pub struct ChildOutcome {
+    pub id: String,
+    pub name: Option<String>,
+    pub status: SubagentStatus,
+    /// The child's final text, when it completed.
+    pub output: Option<String>,
+    /// Why the child failed or was cancelled.
+    pub error: Option<String>,
+    /// Usage the child reported. Zero for a child that never finished a run.
+    pub usage: Usage,
+}
+
 /// Errors surfaced by [`SubagentManager`]. Distinct variants preserve the
 /// explicit terminal statuses instead of collapsing them into strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1339,6 +1353,42 @@ impl SubagentManager {
                     .cloned()
             })
             .flatten())
+    }
+
+    /// Waits until every child this manager started has reached a terminal
+    /// state, then reports each one. A child can start more children or be
+    /// woken by a message, so the pending set is re-read until it is empty.
+    pub async fn settle_all(&self) -> Vec<ChildOutcome> {
+        loop {
+            let pending: Vec<String> = self
+                .list()
+                .into_iter()
+                .filter(|child| !child.status.is_terminal())
+                .map(|child| child.id)
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            for id in pending {
+                // A child that fails or is cancelled still settles; its outcome is reported below.
+                let _ = self.wait(&id).await;
+            }
+        }
+        self.list()
+            .into_iter()
+            .map(|child| ChildOutcome {
+                output: self
+                    .output(&child.id)
+                    .ok()
+                    .flatten()
+                    .map(|result| result.output),
+                id: child.id,
+                name: child.name,
+                status: child.status,
+                error: child.error,
+                usage: child.usage.unwrap_or_default(),
+            })
+            .collect()
     }
 
     /// Persisted transcript of a completed child, read from its session file.

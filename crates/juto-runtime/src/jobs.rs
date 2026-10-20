@@ -30,8 +30,11 @@ use tokio::sync::{broadcast, mpsc};
 use crate::change_graph::ChangeGraph;
 use crate::decisions::{Decision, DecisionStatus, continuation_prompt};
 use crate::subagents::MainInbox;
+use crate::subagents::{ChildOutcome, SubagentStatus};
 use crate::workspace::SubagentWorkspace;
-use crate::{ChildFactory, Runtime, Session, UnattendedOutcome, reclaim_isolated_workspace};
+use crate::{
+    ChildFactory, Runtime, Session, UnattendedOutcome, UnattendedRun, reclaim_isolated_workspace,
+};
 
 /// Job state transitions a subscriber may fall behind by before it lags.
 const EVENT_BUFFER: usize = 256;
@@ -941,14 +944,25 @@ impl Runtime {
         let (events, mut received) = mpsc::unbounded_channel::<AgentEvent>();
         let drain = tokio::spawn(async move { while received.recv().await.is_some() {} });
         let started = Instant::now();
-        let run = runtime.run_unattended(
-            session,
-            prompt,
-            events,
-            control.clone(),
-            Some(id.to_owned()),
-        );
-        let outcome = tokio::time::timeout(Duration::from_millis(remaining), run).await;
+        // The budget cancels the run, but the run is awaited rather than dropped:
+        // it settles its children before it returns, so the job cannot settle while
+        // one of them still runs.
+        let (outcome, timed_out) = {
+            let mut run = std::pin::pin!(runtime.run_unattended(
+                session,
+                prompt,
+                events,
+                control.clone(),
+                Some(id.to_owned()),
+            ));
+            match tokio::time::timeout(Duration::from_millis(remaining), run.as_mut()).await {
+                Ok(outcome) => (outcome, false),
+                Err(_elapsed) => {
+                    control.cancel();
+                    (run.await, true)
+                }
+            }
+        };
         let spent = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         drain.await.context("job event drain failed")?;
         self.inner.jobs.mutate(id, |job| {
@@ -957,65 +971,63 @@ impl Runtime {
         })?;
 
         let cancelled = self.inner.jobs.cancel_requested(id);
-        let result = last_assistant_text(session);
-        let stopped = matches!(
-            &outcome,
-            Ok(Ok(UnattendedOutcome::Finished(run))) if matches!(run.stop_reason, StopReason::Stop)
-        );
-        let verdict = if stopped && !cancelled {
-            Some(self.verify_contract(&job, result.as_deref()).await)
+        let main = last_assistant_text(session);
+        let (children, stopped) = match &outcome {
+            Ok(run) => (
+                run.children.clone(),
+                matches!(
+                    &run.outcome,
+                    UnattendedOutcome::Finished(finished)
+                        if matches!(finished.stop_reason, StopReason::Stop)
+                ),
+            ),
+            Err(_) => (Vec::new(), false),
+        };
+        let result = job_result(main.as_deref(), &children);
+        let verdict = if stopped && !cancelled && !timed_out {
+            Some(self.verify_contract(&job, main.as_deref()).await)
         } else {
             None
         };
         let settled = match outcome {
-            Err(_elapsed) => {
-                control.cancel();
-                if cancelled {
-                    Settled::Cancelled
-                } else {
-                    Settled::Failed {
-                        error: budget_message(job.budget),
+            _ if cancelled => {
+                if let Ok(UnattendedRun {
+                    outcome: UnattendedOutcome::Blocked(decision),
+                    ..
+                }) = &outcome
+                {
+                    self.reject_pending(decision);
+                }
+                Settled::Cancelled
+            }
+            _ if timed_out => Settled::Failed {
+                error: budget_message(job.budget),
+                result,
+            },
+            Err(error) => Settled::Failed {
+                error: format!("{error:#}"),
+                result,
+            },
+            Ok(UnattendedRun {
+                outcome: UnattendedOutcome::Blocked(decision),
+                ..
+            }) => Settled::Blocked(decision.id),
+            Ok(UnattendedRun {
+                outcome: UnattendedOutcome::Finished(run),
+                ..
+            }) => match run.stop_reason {
+                StopReason::Stop => match verdict.unwrap_or(Ok(())) {
+                    Ok(()) => Settled::Succeeded(result),
+                    Err(reason) => Settled::Failed {
+                        error: format!("completion contract not met: {reason}"),
                         result,
-                    }
-                }
-            }
-            Ok(Err(error)) => {
-                if cancelled {
-                    Settled::Cancelled
-                } else {
-                    Settled::Failed {
-                        error: format!("{error:#}"),
-                        result,
-                    }
-                }
-            }
-            Ok(Ok(UnattendedOutcome::Blocked(decision))) => {
-                if cancelled {
-                    self.reject_pending(&decision);
-                    Settled::Cancelled
-                } else {
-                    Settled::Blocked(decision.id)
-                }
-            }
-            Ok(Ok(UnattendedOutcome::Finished(run))) => {
-                if cancelled {
-                    Settled::Cancelled
-                } else {
-                    match run.stop_reason {
-                        StopReason::Stop => match verdict.unwrap_or(Ok(())) {
-                            Ok(()) => Settled::Succeeded(result),
-                            Err(reason) => Settled::Failed {
-                                error: format!("completion contract not met: {reason}"),
-                                result,
-                            },
-                        },
-                        other => Settled::Failed {
-                            error: format!("the run stopped with {other:?}"),
-                            result,
-                        },
-                    }
-                }
-            }
+                    },
+                },
+                other => Settled::Failed {
+                    error: format!("the run stopped with {other:?}"),
+                    result,
+                },
+            },
         };
         Ok(self.finish(id, settled)?)
     }
@@ -1130,6 +1142,25 @@ fn checkpoint_prompt(status: JobStatus, error: Option<&str>) -> String {
 
 fn budget_message(budget: JobBudget) -> String {
     format!("wall-clock budget of {}s exhausted", budget.wall_secs)
+}
+
+/// The job's result: the main run's final text, then what each child it started
+/// reported. The contract is checked against the main text alone.
+fn job_result(main: Option<&str>, children: &[ChildOutcome]) -> Option<String> {
+    let mut sections: Vec<String> = main.map(str::to_owned).into_iter().collect();
+    for child in children {
+        let name = child.name.as_deref().unwrap_or(&child.id);
+        let (label, body) = match child.status {
+            SubagentStatus::Completed => ("completed", child.output.as_deref()),
+            SubagentStatus::Failed => ("failed", child.error.as_deref()),
+            _ => ("cancelled", child.error.as_deref()),
+        };
+        sections.push(format!(
+            "[child {name}: {label}]\n{}",
+            body.unwrap_or_default()
+        ));
+    }
+    (!sections.is_empty()).then(|| sections.join("\n\n"))
 }
 
 /// The assistant's latest text, skipping assistant turns that only called tools.
