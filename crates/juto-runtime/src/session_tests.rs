@@ -525,3 +525,16 @@ fn journal_without_span_fields_renders_the_same_messages() {
     assert_eq!(actual, expected);
     assert_eq!(latest_span(&s), (None, None));
 }
+
+#[test]
+fn compaction_marker_names_its_entry_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    for text in ["q1", "q2", "q3"] {
+        s.append(user(text)).unwrap();
+    }
+    s.compact("sum".into(), None, 1).unwrap();
+    let id = s.active_entries().unwrap().last().unwrap().id.clone();
+    let messages = s.messages().unwrap();
+    assert!(messages[0].text().contains(&format!("id={id}")));
+}

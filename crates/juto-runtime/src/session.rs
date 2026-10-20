@@ -126,6 +126,8 @@ pub struct PathMessage<'a> {
 /// The latest compaction on the active path.
 #[derive(Debug, Clone, Copy)]
 pub struct CompactionMark<'a> {
+    /// Id of the compaction entry. The marker names it so `zoom` can expand the span.
+    pub id: &'a str,
     pub summary: &'a str,
     pub archive: Option<&'a Archive>,
     /// Index of the first message after the compaction entry.
@@ -373,7 +375,11 @@ impl Session {
                 });
             }
         }
-        let compaction = boundary.map(|(_, summary, _, archive)| CompactionMark {
+        let compaction = boundary.map(|(position, summary, _, archive)| CompactionMark {
+            id: {
+                let entry = entries[position];
+                entry.id.as_str()
+            },
             summary,
             archive,
             at,
@@ -396,8 +402,8 @@ impl Session {
                 let mut content = Vec::with_capacity(archive.frames.len() + 1);
                 content.push(ContentBlock::Text {
                     text: format!(
-                        "[Earlier conversation archive — originals: recall]\n{}",
-                        mark.summary
+                        "[Earlier conversation archive id={} — originals: recall]\n{}",
+                        mark.id, mark.summary
                     ),
                 });
                 content.extend(archive.frames.iter().map(|frame| ContentBlock::Image {
@@ -410,8 +416,8 @@ impl Session {
                 });
             } else {
                 messages.push(Message::developer(format!(
-                    "[Earlier conversation summary — originals: recall]\n{}",
-                    mark.summary
+                    "[Earlier conversation summary id={} — originals: recall]\n{}",
+                    mark.id, mark.summary
                 )));
             }
         }
