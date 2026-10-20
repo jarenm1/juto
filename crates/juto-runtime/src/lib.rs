@@ -663,6 +663,7 @@ impl Runtime {
     ) -> Result<UnattendedOutcome> {
         let scope: SharedScope = Arc::new(UnattendedScope::new(
             &self.inner.data_dir,
+            &self.inner.cwd,
             owner_session_id,
             job_id,
             control.clone(),
@@ -817,6 +818,7 @@ impl Runtime {
         if !matches!(tier, ExecutionTier::Untrusted) && scope.allows(publish::TOOL_NAME) {
             registry.register(Arc::new(publish::PublishTool {
                 cwd: self.inner.cwd.clone(),
+                unattended: unattended.cloned(),
             }))?;
         }
         // Desktop input and display capture reach outside the bash sandbox, so
@@ -1187,7 +1189,7 @@ impl AgentHooks for RuntimeHooks {
             // Unattended runs never prompt. Sandboxed tools are confined by their
             // tier; a call that leaves the profile needs a granted decision.
             (Some(scope), _) => match decisions::outside_profile(call) {
-                Some(capability) => scope.admit(call, &capability),
+                Some(capability) => scope.admit(call, &capability, cancel).await,
                 None => Ok(()),
             },
             (None, ApprovalMode::Allow) => Ok(()),
@@ -2531,6 +2533,30 @@ mod tests {
         git(dir, &["commit", "-q", "-m", "initial"]);
     }
 
+    fn jj(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("jj")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run jj");
+        assert!(
+            out.status.success(),
+            "jj {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A git repo colocated with jj, with bookmark `feat/x` on its initial commit.
+    fn publishable_repo(dir: &Path) {
+        native_repo(dir);
+        jj(dir, &["git", "init", "--colocate"]);
+        jj(dir, &["config", "set", "--repo", "user.name", "Runtime Test"]);
+        jj(dir, &["config", "set", "--repo", "user.email", "runtime@example.test"]);
+        jj(dir, &["describe", "-m", "wip"]);
+        jj(dir, &["metaedit", "--update-author"]);
+        jj(dir, &["bookmark", "create", "feat/x", "-r", "@-"]);
+    }
+
     fn mock_config() -> RuntimeConfig {
         RuntimeConfig {
             model: "mock/test".to_string(),
@@ -3865,7 +3891,7 @@ mod tests {
     async fn unattended_publish_blocks_then_runs_once_after_a_grant() {
         let root = tempdir().expect("tempdir");
         let repo = root.path().join("repo");
-        native_repo(&repo);
+        publishable_repo(&repo);
         let data_dir = root.path().join("data");
         let provider = Arc::new(PublishProvider::default());
         let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
@@ -3927,7 +3953,7 @@ mod tests {
     async fn rejected_unattended_action_never_runs() {
         let root = tempdir().expect("tempdir");
         let repo = root.path().join("repo");
-        native_repo(&repo);
+        publishable_repo(&repo);
         let data_dir = root.path().join("data");
         let provider = Arc::new(PublishProvider::default());
         let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
@@ -3981,6 +4007,73 @@ mod tests {
             .expect("read decision")
             .expect("decision recorded");
         assert_eq!(rejected.status, DecisionStatus::Rejected);
+    }
+
+    /// The bookmark moves between approval and the push. The push must refuse
+    /// rather than publish a commit nobody approved.
+    #[tokio::test]
+    async fn unattended_publish_is_refused_when_the_bookmark_moved_after_approval() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        publishable_repo(&repo);
+        let data_dir = root.path().join("data");
+        let provider = Arc::new(PublishProvider::default());
+        let runtime = runtime_with(&repo, &data_dir, mock_config(), provider.clone());
+        let mut session =
+            Session::create(&data_dir.join("sessions"), &runtime.inner.cwd).expect("session");
+
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let blocked = match runtime
+            .run_unattended(
+                &mut session,
+                "publish feat/x",
+                events,
+                RunControl::new(),
+                None,
+            )
+            .await
+            .expect("first run")
+        {
+            UnattendedOutcome::Blocked(decision) => decision,
+            UnattendedOutcome::Finished(_) => panic!("publish must block without a grant"),
+        };
+        let pinned = blocked
+            .pinned_commit
+            .clone()
+            .expect("an unattended publish is pinned to a commit");
+
+        // The bookmark moves to a new commit before the operator answers.
+        jj(&repo, &["new", "-m", "second"]);
+        jj(&repo, &["bookmark", "set", "feat/x", "-r", "@"]);
+
+        let store = runtime.decision_store();
+        store.resolve(&blocked.id, true).expect("approve");
+
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        match runtime
+            .run_unattended(
+                &mut session,
+                "publish feat/x again",
+                events,
+                RunControl::new(),
+                None,
+            )
+            .await
+            .expect("second run")
+        {
+            UnattendedOutcome::Finished(_) => {}
+            UnattendedOutcome::Blocked(_) => panic!("the approved action must not block again"),
+        }
+        let results = provider.results.lock().unwrap().clone();
+        let last = results.last().expect("the publish call produced a result");
+        assert!(
+            last.contains("moved"),
+            "the push must refuse a moved bookmark: {last}"
+        );
+        assert!(
+            last.contains(&pinned),
+            "the refusal names the approved commit: {last}"
+        );
     }
 
     #[test]

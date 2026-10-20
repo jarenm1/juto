@@ -4,9 +4,9 @@
 //! It runs on the host, outside any run sandbox, using the operator's own `jj`
 //! and `gh` credentials. Credentials never enter a sandbox. The tool is never
 //! registered for `untrusted` runs, and an unattended run needs an operator
-//! decision for each bookmark before it may publish.
+//! decision for each bookmark before it may publish, and then pushes only the commit that decision pinned.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -16,6 +16,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::decisions::{self, SharedScope};
+
 /// Name the model calls the tool by.
 pub const TOOL_NAME: &str = "publish";
 
@@ -24,6 +26,9 @@ const DEFAULT_BASE: &str = "main";
 
 pub struct PublishTool {
     pub cwd: PathBuf,
+    /// Set for unattended runs: the push runs only if the bookmark still points at
+    /// the commit its approved decision pinned.
+    pub unattended: Option<SharedScope>,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +83,7 @@ impl Tool for PublishTool {
     }
 
     async fn execute(&self, arguments: Value, ctx: ToolContext) -> Result<ToolOutput, String> {
+        let digest = decisions::args_digest(TOOL_NAME, &arguments);
         let params: PublishParams = serde_json::from_value(arguments)
             .map_err(|error| format!("invalid publish arguments: {error}"))?;
         if !valid_branch(&params.bookmark) {
@@ -89,6 +95,25 @@ impl Tool for PublishTool {
         }
         if params.title.trim().is_empty() {
             return Err("publish needs a non-empty title".to_string());
+        }
+        if let Some(scope) = &self.unattended {
+            let grant = scope.take_admitted(&digest).ok_or_else(|| {
+                format!(
+                    "publish of `{}` has no approved decision in this run",
+                    params.bookmark
+                )
+            })?;
+            let pinned = grant
+                .pinned_commit
+                .as_deref()
+                .ok_or_else(|| format!("decision {} pins no commit", grant.id))?;
+            let current = resolve_bookmark(&self.cwd, &params.bookmark, &ctx.cancel).await?;
+            if current != pinned {
+                return Err(format!(
+                    "bookmark `{}` moved from {pinned} to {current} after decision {} was recorded; nothing was pushed",
+                    params.bookmark, grant.id
+                ));
+            }
         }
         run(
             "jj",
@@ -154,6 +179,40 @@ async fn run(
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The commit `bookmark` points at right now, read without snapshotting the
+/// working copy. Fails unless the bookmark names exactly one commit.
+pub async fn resolve_bookmark(
+    cwd: &Path,
+    bookmark: &str,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    if !valid_branch(bookmark) {
+        return Err(format!("invalid bookmark `{bookmark}`"));
+    }
+    let revset = format!("bookmarks(exact:\"{bookmark}\")");
+    let stdout = run(
+        "jj",
+        &[
+            "--ignore-working-copy",
+            "log",
+            "--no-graph",
+            "-r",
+            &revset,
+            "-T",
+            "commit_id",
+        ],
+        cwd,
+        cancel,
+    )
+    .await?;
+    let commits: Vec<&str> = stdout.lines().collect();
+    match commits.as_slice() {
+        [commit] => Ok((*commit).to_owned()),
+        [] => Err(format!("bookmark `{bookmark}` does not exist")),
+        _ => Err(format!("bookmark `{bookmark}` is conflicted")),
+    }
 }
 
 #[cfg(test)]
