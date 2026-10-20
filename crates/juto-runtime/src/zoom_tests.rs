@@ -1,6 +1,17 @@
 use crate::session::EntryKind;
-use juto_ai::{ContentBlock, Message};
+use juto_agent::{Agent, AgentConfig, RunControl, ToolRegistry};
+use juto_ai::{
+    AssistantMessage, ContentBlock, Context, Message, Provider, ProviderError, ProviderEvent,
+    ProviderStream, StopReason, StreamOptions, ToolCall, Usage, timestamp_ms,
+};
+use juto_catalog::{Model, ModelCost};
 use serde_json::json;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use super::*;
 
@@ -164,4 +175,211 @@ fn oversized_message_is_cut_and_points_at_recall() {
         text.len()
     );
     assert!(text.contains("more: recall {\"id\": 0"), "{text}");
+}
+
+/// One scripted model turn: a `zoom` call with these JSON arguments, or the final answer.
+enum Step {
+    Call(Value),
+    Answer,
+}
+
+/// Replays one `Step` per model turn. The agent checks each emitted call
+/// against the tool's JSON Schema and then calls `execute`, so the test drives
+/// the same JSON path a model call takes.
+struct ScriptedProvider {
+    steps: Mutex<VecDeque<Step>>,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Provider for ScriptedProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        _context: &Context,
+        _options: &StreamOptions,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        let step = self
+            .steps
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Step::Answer);
+        let (content, stop_reason) = match step {
+            Step::Call(arguments) => {
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                (
+                    vec![ContentBlock::ToolCall(ToolCall {
+                        id: format!("call-{n}"),
+                        name: "zoom".into(),
+                        arguments,
+                        thought_signature: None,
+                    })],
+                    StopReason::ToolUse,
+                )
+            }
+            Step::Answer => (
+                vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                StopReason::Stop,
+            ),
+        };
+        let message = AssistantMessage {
+            content,
+            api: "mock".into(),
+            provider: "mock".into(),
+            model: "mock/test".into(),
+            usage: Usage::default(),
+            stop_reason,
+            timestamp: timestamp_ms(),
+            response_id: None,
+            error: None,
+        };
+        let events: Vec<Result<ProviderEvent, ProviderError>> = vec![
+            Ok(ProviderEvent::Start),
+            Ok(ProviderEvent::Done { message }),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+fn zoom_model() -> Model {
+    Model {
+        id: "test".into(),
+        name: "Mock Model".into(),
+        api: "openai-completions".into(),
+        provider: "mock".into(),
+        base_url: "http://localhost".into(),
+        reasoning: false,
+        input: vec!["text".into()],
+        cost: ModelCost::default(),
+        context_window: Some(8192),
+        max_tokens: Some(1024),
+        kind: "chat".into(),
+        supports_tools: true,
+        compat: Value::Null,
+    }
+}
+
+/// The text one `zoom` page must return, written out literally: the header,
+/// each message's index, id and body, and the `more:` hint when the span continues.
+fn expected_page(
+    id: &str,
+    ids: &[String],
+    from: usize,
+    through: usize,
+    next: Option<usize>,
+) -> String {
+    let mut out = format!(
+        "span of compaction {id}: messages {from}..={through} of {}\n",
+        ids.len()
+    );
+    for k in from..=through {
+        out.push_str(&format!("message {k} (user, id {})\nzz-00{k}\n", ids[k]));
+    }
+    if let Some(next) = next {
+        out.push_str(&format!(
+            "more: zoom {{\"id\":\"{id}\",\"offset\":{next}}}\n"
+        ));
+    }
+    out
+}
+
+/// Drives `zoom` through the agent's JSON tool-call path: a session with a
+/// known four-message span, then exact-text checks on each result.
+#[tokio::test]
+async fn zoom_json_calls_through_the_agent_return_the_exact_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = Session::create(dir.path(), Path::new("/work")).unwrap();
+    for i in 0..6 {
+        session.append(user(&format!("zz-{i:03}"))).unwrap();
+    }
+    // Six messages with two kept: the span is the first four, zz-000..=zz-003.
+    session.compact("summary".into(), None, 2).unwrap();
+    let id = session.active_entries().unwrap().last().unwrap().id.clone();
+    let all: Vec<String> = session
+        .active_entries()
+        .unwrap()
+        .iter()
+        .filter(|entry| matches!(entry.kind, EntryKind::Message { .. }))
+        .map(|entry| entry.id.clone())
+        .collect();
+    assert_eq!(all.len(), 6);
+    let ids = all[..4].to_vec();
+
+    let steps = VecDeque::from([
+        Step::Call(json!({ "id": id })),
+        Step::Call(json!({ "id": "no-such-id" })),
+        Step::Call(json!({ "id": id, "offset": 0, "limit": 3 })),
+        Step::Call(json!({ "id": id, "offset": 3 })),
+        Step::Call(json!({ "id": id, "offset": 0, "limit": 1 })),
+        Step::Call(json!({ "id": id, "offset": 1, "limit": 1 })),
+        Step::Call(json!({ "id": id, "offset": 2, "limit": 1 })),
+        Step::Call(json!({ "id": id, "offset": 3, "limit": 1 })),
+        Step::Answer,
+    ]);
+    let provider = Arc::new(ScriptedProvider {
+        steps: Mutex::new(steps),
+        calls: AtomicUsize::new(0),
+    });
+    let mut tools = ToolRegistry::new();
+    tools
+        .register(Arc::new(ZoomTool::new(session.path().to_path_buf())))
+        .unwrap();
+    let config = AgentConfig {
+        cwd: dir.path().to_path_buf(),
+        session_id: "zoom-smoke".into(),
+        ..AgentConfig::for_model(zoom_model())
+    };
+    let mut agent = Agent::new(
+        config,
+        provider,
+        tools,
+        Context {
+            system_prompt: Vec::new(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+        },
+    );
+    let (events, _events_rx) = mpsc::unbounded_channel();
+    agent
+        .run(
+            vec![Message::user("zoom the summary")],
+            events,
+            RunControl::new(),
+        )
+        .await
+        .unwrap();
+
+    let got: Vec<(String, bool, String)> = agent
+        .context()
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResult {
+                tool_name,
+                is_error,
+                ..
+            } => Some((tool_name.clone(), *is_error, message.text())),
+            _ => None,
+        })
+        .collect();
+    let zoom = |text: String| ("zoom".to_string(), false, text);
+    let want = vec![
+        zoom(expected_page(&id, &ids, 0, 3, None)),
+        (
+            "zoom".to_string(),
+            true,
+            "no entry no-such-id on the main thread's current branch".to_string(),
+        ),
+        zoom(expected_page(&id, &ids, 0, 2, Some(3))),
+        zoom(expected_page(&id, &ids, 3, 3, None)),
+        zoom(expected_page(&id, &ids, 0, 0, Some(1))),
+        zoom(expected_page(&id, &ids, 1, 1, Some(2))),
+        zoom(expected_page(&id, &ids, 2, 2, Some(3))),
+        zoom(expected_page(&id, &ids, 3, 3, None)),
+    ];
+    assert_eq!(got, want);
 }
