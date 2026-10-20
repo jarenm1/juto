@@ -762,6 +762,11 @@ impl Daemon {
             Request::DeleteAutomation { automation_id } => {
                 services::automations::delete(self, &automation_id)
             }
+            Request::CreateGithubWatch { spec } => services::github::create(self, spec),
+            Request::ListGithubWatches => services::github::list(self),
+            Request::DeleteGithubWatch { watch_id } => services::github::delete(self, &watch_id),
+            Request::ListGithubEvents => services::github::events(self),
+            Request::PollGithub => services::github::poll(self).await,
             Request::SetModelRole { role, selector } => {
                 services::set_model_role(self, role, selector)
             }
@@ -1053,6 +1058,7 @@ pub async fn serve(workspace: PathBuf) -> Result<()> {
     }
     tokio::spawn(wake_loop(daemon.clone()));
     tokio::spawn(services::automations::tick_loop(daemon.clone()));
+    tokio::spawn(services::github::poll_loop(daemon.clone()));
     tokio::spawn(inbox_loop(daemon.clone()));
     forward_job_events(&daemon);
     let approval_daemon = daemon.clone();

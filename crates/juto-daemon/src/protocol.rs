@@ -26,6 +26,7 @@ use juto_agent::{AgentEvent, ToolTier};
 use juto_ai::{Message, StopReason, ToolCall};
 use juto_catalog::Model;
 use juto_runtime::automations::{Automation, AutomationHistory, AutomationSpec};
+use juto_runtime::github::{GithubEventRecord, GithubPollReport, GithubWatch, GithubWatchSpec};
 use juto_runtime::jobs::{InboxState, Job, JobBudget, JobContract};
 use juto_runtime::subagents::MainMessage;
 use juto_runtime::{
@@ -34,7 +35,7 @@ use juto_runtime::{
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change to this module.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// One request from a client. `id` is chosen by the client and echoed back.
 #[derive(Clone, Serialize, Deserialize)]
@@ -194,6 +195,21 @@ pub enum Request {
     DeleteAutomation {
         automation_id: String,
     },
+    /// Watches a GitHub repository. Each repository has at most one watch.
+    CreateGithubWatch {
+        spec: GithubWatchSpec,
+    },
+    /// Every GitHub watch, oldest first.
+    ListGithubWatches,
+    /// Removes a GitHub watch and its repository from the allowlist. Jobs it
+    /// started are kept.
+    DeleteGithubWatch {
+        watch_id: String,
+    },
+    /// The ledger of accepted and rejected GitHub items, oldest first.
+    ListGithubEvents,
+    /// Polls every watched repository now, outside the daemon's schedule.
+    PollGithub,
     /// Queues a steering message for the active run of `session_id`. Fails with
     /// [`ErrorCode::Invalid`] if that session has no active run.
     Steer {
@@ -334,6 +350,14 @@ pub enum Reply {
     Automations(Vec<Automation>),
     /// An automation's jobs and event log.
     AutomationHistory(AutomationHistory),
+    /// One GitHub watch.
+    GithubWatch(GithubWatch),
+    /// Every GitHub watch, oldest first.
+    GithubWatches(Vec<GithubWatch>),
+    /// The GitHub event ledger, oldest first.
+    GithubEvents(Vec<GithubEventRecord>),
+    /// The outcome of one GitHub poll across every watch.
+    GithubPoll(GithubPollReport),
     Transcript(Vec<Message>),
     /// Answers [`Request::Timeline`].
     Timeline {
