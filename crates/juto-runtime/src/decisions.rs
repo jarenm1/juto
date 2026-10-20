@@ -290,7 +290,16 @@ pub(crate) struct UnattendedScope {
     session_id: String,
     job_id: Option<String>,
     control: RunControl,
-    blocked: Mutex<Option<Decision>>,
+    state: Mutex<ScopeState>,
+}
+
+/// What an unattended run tree has recorded, guarded by one lock.
+#[derive(Default)]
+struct ScopeState {
+    /// Set when the root run ends. A later call is refused and records nothing.
+    closed: bool,
+    /// The first decision that stopped the run tree, until the run ends.
+    blocked: Option<Decision>,
 }
 
 impl UnattendedScope {
@@ -305,14 +314,23 @@ impl UnattendedScope {
             session_id,
             job_id,
             control,
-            blocked: Mutex::new(None),
+            state: Mutex::new(ScopeState::default()),
         }
     }
 
     /// Admits `call` when an approved grant covers it. Otherwise records a blocked
     /// decision, cancels the run tree, and rejects the call. Any store failure
-    /// also rejects the call, so the action fails closed.
+    /// also rejects the call, so the action fails closed. The state lock is held
+    /// through the check and the write, so a block cannot land after `finish` has
+    /// taken the run's decision.
     pub(crate) fn admit(&self, call: &ToolCall, capability: &str) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed {
+            return Err(format!(
+                "unattended run has ended; `{}` was not run",
+                call.name
+            ));
+        }
         match self.store.take_grant(&self.session_id, call) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
@@ -336,20 +354,17 @@ impl UnattendedScope {
             "blocked: operator decision {} is required for {capability}",
             decision.id
         );
-        {
-            let mut blocked = self.blocked.lock().unwrap_or_else(|p| p.into_inner());
-            blocked.get_or_insert(decision);
-        }
+        state.blocked.get_or_insert(decision);
         self.control.cancel();
         Err(message)
     }
 
-    /// The first decision that stopped the run tree, if any.
-    pub(crate) fn take_blocked(&self) -> Option<Decision> {
-        self.blocked
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take()
+    /// Ends the decision scope when the root run returns. Calls admitted after
+    /// this are refused without a record. Returns the first decision recorded.
+    pub(crate) fn finish(&self) -> Option<Decision> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.closed = true;
+        state.blocked.take()
     }
 }
 
@@ -425,6 +440,22 @@ mod tests {
         let rejected = store.resolve(&decision.id, false).unwrap();
         assert_eq!(rejected.status, DecisionStatus::Rejected);
         assert!(!store.take_grant("s1", &publish).unwrap());
+    }
+
+    #[test]
+    fn calls_after_the_run_ends_are_refused_without_a_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = UnattendedScope::new(dir.path(), "s1".into(), None, RunControl::new());
+        assert!(scope.finish().is_none());
+        let publish = call("publish", json!({"bookmark": "feat/x"}));
+        let err = scope
+            .admit(&publish, "publish:feat/x")
+            .expect_err("an ended scope admits nothing");
+        assert!(err.contains("has ended"), "{err}");
+        assert!(
+            DecisionStore::open(dir.path()).list().unwrap().is_empty(),
+            "a late block must not leave a pending decision nobody is told about"
+        );
     }
 
     #[test]
