@@ -253,11 +253,18 @@ heuristic, not a tokenizer). Over `context window × compactionThreshold`, the h
 first; a compacted history still over budget fails the run with `ContextOverflow`. Run-start
 and mid-run compaction share this budget.
 
-* The compaction summary request is not guarded. History larger than the summarizer's
-  window can overflow it. This predates the guard: run-start compaction has the same gap.
+* Summary requests are chunked to the compactor's window, so an oversized history no longer overflows the summarizer in one request.
 * With `auto_compact` off there is no guard, and requests are sent without a size check.
 * Cancelling during mid-run compaction ends the run as `Aborted` with no `Error` event.
 * If the context window is smaller than the system prompt plus tool schemas, the first request fails with `ContextOverflow` and no request is sent.
+
+Summary nodes (`juto-runtime`, `compaction.rs`): each compaction entry is a node over one span of original path messages, tagged with `level` (0 summarizes raw messages, 1 summarizes level-0 nodes, and so on). Journals without `level` or span fields load as level-0 nodes over the messages they replaced. The view is the node summaries in order followed by the raw tail; nodes never overlap and tile a prefix of history. Tool-call and tool-result pairs stay whole at every cut.
+
+Incremental compaction runs in the background. After a run, when the estimated history exceeds 0.8 × the window budget, a task summarizes the oldest raw messages, keeping `keepRecentMessages` raw. Summary requests are chunked to the compactor's window, with each chunk's rolling summary folded into the next. The finished node joins the view only at the next run start, so the prompt prefix stays stable within a turn. While a summary is pending, the run continues on the current view; an overflow then falls back to the guard path and never sends an oversized request. A synchronous compaction aborts any pending summary first.
+
+The node cap is `MAX_SUMMARY_NODES = 4`. A merge combines the adjacent pair with the lowest maximum level, earliest on ties, into one node at that level plus one, with the union span. Merges take priority: at the cap, a raw summary waits for a merge that makes room, so the applied view never exceeds the cap. A synchronous compaction does the same.
+
+Gaps: background summary usage is not counted in run usage; the post-run estimate covers history only, excluding the system prompt and tool schemas; archive (snapcompact) compaction stays synchronous.
 
 ---
 
