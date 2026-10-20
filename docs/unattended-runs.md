@@ -137,14 +137,26 @@ An automation starts a job on a schedule. Create one with
 and contract flags as `jobs run-now` (`--wall-secs`, `--max-attempts`,
 `--max-turns`, `--max-spend`, `--artifact`, `--output-schema`, `--no-change`).
 Each automation stores its prompt, project, model pin (`--model-pin`), priority,
-budget, contract, schedule, overlap policy, and enabled state. Its project is the
-daemon's workspace. Each occurrence produces the same durable job as `jobs
-run-now`: same budget, contract, inbox, and `jobs` commands.
+budget, contract, schedule, overlap policy, enabled state, tier (`--tier`), and
+permission profile (`--permission-profile`). Its project is the daemon's
+workspace. Each occurrence produces the same durable job as `jobs run-now`: same
+budget, contract, inbox, and `jobs` commands.
 
-Tier and permission profile are not per automation. Every occurrence runs under
-the unattended rules (`workspace` tier, see Execution tier). The product contract
-listed both as settable. They are not, because a stored definition must not widen
-the unattended boundary.
+### Tier and permission profile
+
+- Tier: `untrusted` or `workspace`. The default is `workspace`. `attended` and
+  `full` are refused at create. A stored tier that is not allowed is also refused
+  when an occurrence starts, and that occurrence is recorded as `failed`. The
+  rule is `check_unattended_tier` in `crates/juto-runtime/src/tier.rs`, and the
+  error names it.
+- Effective run tier: `min(stored tier, unattended_tier(configured tier))`. On a
+  daemon configured `untrusted`, a `workspace` automation runs `untrusted`. A
+  definition can narrow the unattended boundary but cannot widen it.
+- Permission profile: `unattended` (the default) or `read-only`. `read-only`
+  restricts the run to the read, glob, and grep tools and sets approval to
+  read-only. `unattended` is the widest profile that exists, so the create check
+  (`check_unattended_profile`) currently admits both values. It is the place where
+  a wider profile would be refused.
 
 ### Recurrence and time zones
 
@@ -213,10 +225,13 @@ resources.md, Admission and queueing). Its subagent runs stay `background`.
 
 Each automation is stored under the data directory as `automations/<id>.json`
 (definition and cursor, written atomically) and `automations/<id>.events.jsonl`
-(event log). Protocol version 4 adds the automation requests: `CreateAutomation`,
-`ListAutomations`, `GetAutomation`, `AutomationHistory`, `RunAutomationNow`,
-`SetAutomationEnabled`, and `DeleteAutomation`. Protocol version 3 has no
-automation requests.
+(event log). Protocol version 5 adds `tier` and `permission` to the automation
+spec and record. Both are optional on create and default to `workspace` and
+`unattended`. Records written by protocol 4 builds lack these fields and do not
+load; re-create those automations. Protocol version 4 adds the automation
+requests: `CreateAutomation`, `ListAutomations`, `GetAutomation`,
+`AutomationHistory`, `RunAutomationNow`, `SetAutomationEnabled`, and
+`DeleteAutomation`. Protocol version 3 has no automation requests.
 
 ## Limitations
 
