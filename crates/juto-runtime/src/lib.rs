@@ -1504,7 +1504,13 @@ async fn reclaim_isolated_workspace(workspace: SubagentWorkspace) -> Reclaimed {
         match tokio::task::spawn_blocking(move || -> Result<()> {
             let graph = ChangeGraph::open(&repo_root)?;
             graph.drop_head(&subagent_id)?;
-            graph.gc()?;
+            let report = graph.gc()?;
+            if report.pruned_nodes > 0 {
+                eprintln!(
+                    "juto: change graph gc pruned {} nodes and released {} snapshot refs",
+                    report.pruned_nodes, report.released_refs
+                );
+            }
             Ok(())
         })
         .await
