@@ -147,6 +147,16 @@ async fn wake_loop(daemon: Arc<Daemon>) {
     }
 }
 
+/// Tells the connected clients whenever the user's inbox changes; they fetch the notices
+/// with `Request::InboxMessages`.
+async fn inbox_loop(daemon: Arc<Daemon>) {
+    let inbox = daemon.runtime.subagent_manager().main_inbox();
+    loop {
+        inbox.user_changed().await;
+        daemon.emit(ServerEvent::Inbox);
+    }
+}
+
 impl Daemon {
     fn next_id(&self) -> u64 {
         self.ids.fetch_add(1, Ordering::Relaxed)
@@ -497,6 +507,18 @@ impl Daemon {
                     Err(e) => Err(failed(e)),
                 }
             }
+            Request::InboxMessages => {
+                let inbox = self.runtime.subagent_manager().main_inbox();
+                Ok(Reply::InboxMessages {
+                    messages: inbox.user_messages(),
+                })
+            }
+            Request::InboxDismiss { message } => {
+                let inbox = self.runtime.subagent_manager().main_inbox();
+                inbox.dismiss_user_message(&message).map_err(failed)?;
+                self.emit(ServerEvent::Inbox);
+                Ok(Reply::Ok)
+            }
         }
     }
 
@@ -507,9 +529,10 @@ impl Daemon {
         let supervisor = self.runtime.desktop_supervisor();
         let cwd = self.runtime.cwd().to_owned();
         tokio::task::spawn_blocking(move || {
+            use juto_desktop::protocol::GrantRole;
             use juto_desktop::supervisor::{
-                CompositorMode, EnvironmentConfig, IdlePolicy, OutputConfig, RenderProfile,
-                SystemLimits,
+                CompositorMode, EnvironmentConfig, IdlePolicy, MAX_GRANT_SECS, OutputConfig,
+                RenderProfile, SystemLimits,
             };
             let env_id = format!("desk-{}", uuid::Uuid::now_v7());
             let config = EnvironmentConfig {
@@ -536,6 +559,12 @@ impl Daemon {
             let env = supervisor
                 .create_environment(config, &env_id)
                 .map_err(failed)?;
+            let grant = env.issue_grant(
+                juto_runtime::SESSION_VIEWER_PRINCIPAL.to_string(),
+                vec![GrantRole::Owner, GrantRole::View, GrantRole::Control],
+                "session".to_string(),
+                MAX_GRANT_SECS,
+            );
             if let Err(error) = env.launch("app", &argv, None, &[], &env_id) {
                 let _ = supervisor.destroy_environment(&env_id);
                 return Err(failed(error));
@@ -544,6 +573,8 @@ impl Daemon {
                 env_id,
                 width: 1280,
                 height: 720,
+                grant_id: grant.grant_id,
+                host_id: juto_runtime::host_identifier(),
             }))
         })
         .await
@@ -701,6 +732,7 @@ pub async fn serve(workspace: PathBuf) -> Result<()> {
         }
     }
     tokio::spawn(wake_loop(daemon.clone()));
+    tokio::spawn(inbox_loop(daemon.clone()));
     let approval_daemon = daemon.clone();
     tokio::spawn(async move {
         while let Some(request) = approvals.recv().await {
