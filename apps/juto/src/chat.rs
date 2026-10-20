@@ -870,6 +870,16 @@ impl ChatView {
                         self.pending_approvals.remove(&approval_id);
                         self.set_approval_state(approval_id, ApprovalState::Cancelled);
                     }
+                    SessionEvent::DecisionBlocked { decision } => {
+                        self.report_error(
+                            format!(
+                                "Blocked: {} needs an operator decision ({}). The run has stopped.",
+                                decision.capability, decision.id
+                            ),
+                            cx,
+                        );
+                    }
+                    SessionEvent::DecisionResolved { .. } => {}
                     SessionEvent::RunFinished {
                         stop_reason, error, ..
                     } => {
@@ -1004,6 +1014,7 @@ impl ChatView {
         let request = Request::Prompt {
             session_id: self.session_id.clone(),
             text: prompt,
+            unattended: false,
         };
         cx.spawn_in(window, async move |this, cx| {
             let result = crate::chat_request::call(client, handle, request).await;

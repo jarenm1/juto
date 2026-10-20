@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use juto_agent::{AgentEvent, RunControl};
 use juto_runtime::{
-    ApprovalRequest, ChannelApprovalHandler, EntryKind, Runtime, RuntimeConfig, Session,
-    SubagentEvent,
+    ApprovalRequest, ChannelApprovalHandler, Decision, EntryKind, Runtime, RuntimeConfig, Session,
+    SubagentEvent, UnattendedOutcome,
 };
 use std::{
     collections::HashMap,
@@ -54,6 +54,39 @@ pub(crate) struct Daemon {
     desktop_socket: PathBuf,
     /// Signalled when a run starts or ends; the idle-wake loop waits on it.
     run_changed: tokio::sync::Notify,
+    /// Operator notice for unattended runs blocked on a decision.
+    notifier: Arc<dyn Notifier>,
+}
+
+/// Best-effort operator notice that an unattended run is blocked on a decision.
+/// Carries the capability and decision id only, never arguments or output.
+pub(crate) trait Notifier: Send + Sync {
+    fn decision_blocked(&self, decision: &Decision);
+}
+
+/// Desktop notification through `notify-send`. A missing binary is ignored: the
+/// decision is still durable and listed by the daemon.
+pub(crate) struct SystemNotifier;
+
+impl Notifier for SystemNotifier {
+    fn decision_blocked(&self, decision: &Decision) {
+        let title = format!("Juto needs a decision: {}", decision.capability);
+        let body = format!("Decision {}. Approve or reject it in Juto.", decision.id);
+        drop(tokio::task::spawn_blocking(move || {
+            std::process::Command::new("notify-send")
+                .arg(title)
+                .arg(body)
+                .status()
+        }));
+    }
+}
+
+/// The message that resumes an approved run: it names the exact action to retry.
+fn continuation_prompt(decision: &Decision) -> String {
+    format!(
+        "The operator approved the blocked action `{}` ({}), decision {}. Continue the task. Retry that exact action once; it is now permitted.",
+        decision.tool, decision.capability, decision.id
+    )
 }
 
 fn failed(error: impl std::fmt::Display) -> RpcError {
@@ -160,7 +193,12 @@ async fn inbox_loop(daemon: Arc<Daemon>) {
 impl Daemon {
     /// Wrap `runtime` for the daemon serving `workspace`. The main inbox is bound
     /// to this workspace's file first, so notices from before a restart are restored.
-    fn new(runtime: Runtime, workspace: &Path, desktop_socket: PathBuf) -> Result<Arc<Self>> {
+    fn new(
+        runtime: Runtime,
+        workspace: &Path,
+        desktop_socket: PathBuf,
+        notifier: Arc<dyn Notifier>,
+    ) -> Result<Arc<Self>> {
         runtime.open_host_inbox(&paths::workspace_key(workspace))?;
         Ok(Arc::new(Daemon {
             runtime,
@@ -169,6 +207,7 @@ impl Daemon {
             logins: Mutex::new(HashMap::new()),
             desktop_socket,
             run_changed: tokio::sync::Notify::new(),
+            notifier,
         }))
     }
 
@@ -238,7 +277,12 @@ impl Daemon {
                 .collect(),
         }))
     }
-    fn start(self: &Arc<Self>, session_id: String, text: String) -> Result<Reply, RpcError> {
+    fn start(
+        self: &Arc<Self>,
+        session_id: String,
+        text: String,
+        unattended: bool,
+    ) -> Result<Reply, RpcError> {
         let mut state = self.state.lock().unwrap();
         if state.active.is_some() {
             return Err(RpcError::new(
@@ -250,9 +294,68 @@ impl Daemon {
             return Err(RpcError::new(ErrorCode::NotFound, "unknown session"));
         }
         let run_id = self
-            .start_locked(&mut state, session_id, text)
+            .start_locked(&mut state, session_id, text, unattended)
             .map_err(failed)?;
         Ok(Reply::Started { run_id })
+    }
+
+    /// Resolves a durable decision. Approval starts a run that retries the blocked
+    /// action once; rejection records the refusal and starts nothing. The decision
+    /// is persisted before the run starts, so a restart keeps it.
+    fn resolve_decision(
+        self: &Arc<Self>,
+        decision_id: String,
+        approve: bool,
+    ) -> Result<Reply, RpcError> {
+        let store = self.runtime.decision_store();
+        let pending = store
+            .get(&decision_id)
+            .map_err(failed)?
+            .ok_or_else(|| RpcError::new(ErrorCode::NotFound, "unknown decision"))?;
+        let mut state = self.state.lock().unwrap();
+        if !approve {
+            let decision = store.resolve(&decision_id, false).map_err(invalid)?;
+            session_event(
+                &mut state,
+                &decision.session_id,
+                SessionEvent::DecisionResolved {
+                    decision: decision.clone(),
+                },
+            );
+            return Ok(Reply::Decision {
+                decision,
+                run_id: None,
+            });
+        }
+        if state.active.is_some() {
+            return Err(RpcError::new(
+                ErrorCode::Busy,
+                "a foreground run is already active",
+            ));
+        }
+        if !state.sessions.contains_key(&pending.session_id) {
+            return Err(RpcError::new(ErrorCode::NotFound, "unknown session"));
+        }
+        let decision = store.resolve(&decision_id, true).map_err(invalid)?;
+        let run_id = self
+            .start_locked(
+                &mut state,
+                decision.session_id.clone(),
+                continuation_prompt(&decision),
+                true,
+            )
+            .map_err(failed)?;
+        session_event(
+            &mut state,
+            &decision.session_id,
+            SessionEvent::DecisionResolved {
+                decision: decision.clone(),
+            },
+        );
+        Ok(Reply::Decision {
+            decision,
+            run_id: Some(run_id),
+        })
     }
 
     /// Starts a run owned by the daemon: nothing here depends on the connection that asked.
@@ -262,6 +365,7 @@ impl Daemon {
         state: &mut State,
         session_id: String,
         text: String,
+        unattended: bool,
     ) -> Result<String> {
         let path = state
             .sessions
@@ -310,16 +414,44 @@ impl Daemon {
                     session_event(&mut pump_daemon.state.lock().unwrap(), &pump_session, event);
                 }
             });
-            let result = daemon.runtime.run(&mut session, text, tx, control).await;
+            let outcome = if unattended {
+                daemon
+                    .runtime
+                    .run_unattended(&mut session, text, tx, control, None)
+                    .await
+                    .map(|outcome| match outcome {
+                        UnattendedOutcome::Finished(run) => (Some(run.stop_reason), None),
+                        UnattendedOutcome::Blocked(decision) => (None, Some(decision)),
+                    })
+            } else {
+                daemon
+                    .runtime
+                    .run(&mut session, text, tx, control)
+                    .await
+                    .map(|run| (Some(run.stop_reason), None))
+            };
+            let (stop_reason, blocked, mut error) = match outcome {
+                Ok((stop_reason, blocked)) => (stop_reason, blocked, None),
+                Err(e) => (None, None, Some(format!("{e:#}"))),
+            };
             let pump_result = pump.await;
-            let mut error = result.as_ref().err().map(|e| format!("{e:#}"));
             if let Err(e) = pump_result {
                 error = Some(format!("event pump failed: {e}"));
             }
             if let Err(e) = marker(&mut session, "daemon_run_finished", &run_id) {
                 error = Some(format!("could not persist run completion: {e:#}"));
             }
+            if let Some(decision) = &blocked {
+                daemon.notifier.decision_blocked(decision);
+            }
             let mut state = daemon.state.lock().unwrap();
+            if let Some(decision) = blocked {
+                session_event(
+                    &mut state,
+                    &session_id,
+                    SessionEvent::DecisionBlocked { decision },
+                );
+            }
             let approvals: Vec<_> = state
                 .approvals
                 .iter()
@@ -340,7 +472,7 @@ impl Daemon {
                 &session_id,
                 SessionEvent::RunFinished {
                     run_id,
-                    stop_reason: result.ok().map(|r| r.stop_reason),
+                    stop_reason,
                     error,
                 },
             );
@@ -372,7 +504,7 @@ impl Daemon {
             return Ok(Wake::Idle);
         }
         let prompt = juto_runtime::subagents::completion_prompt(&messages);
-        if let Err(error) = self.start_locked(&mut state, session_id, prompt) {
+        if let Err(error) = self.start_locked(&mut state, session_id, prompt, false) {
             inbox.requeue_front(origin.as_deref(), messages);
             return Err(error);
         }
@@ -423,7 +555,21 @@ impl Daemon {
                 self.register(&session)?;
                 self.view(session)
             }
-            Request::Prompt { session_id, text } => self.start(session_id, text),
+            Request::Prompt {
+                session_id,
+                text,
+                unattended,
+            } => self.start(session_id, text, unattended),
+            Request::ListDecisions => self
+                .runtime
+                .decision_store()
+                .list()
+                .map(Reply::Decisions)
+                .map_err(failed),
+            Request::ResolveDecision {
+                decision_id,
+                approve,
+            } => self.resolve_decision(decision_id, approve),
             Request::Steer { session_id, text } => {
                 let state = self.state.lock().unwrap();
                 let run = state
@@ -733,7 +879,12 @@ pub async fn serve(workspace: PathBuf) -> Result<()> {
     let (approval_handler, mut approvals) = ChannelApprovalHandler::channel();
     let runtime =
         Runtime::from_config_with_approval(&workspace, &data_dir, config, Some(approval_handler))?;
-    let daemon = Daemon::new(runtime, &workspace, desktop_socket)?;
+    let daemon = Daemon::new(
+        runtime,
+        &workspace,
+        desktop_socket,
+        Arc::new(SystemNotifier),
+    )?;
     for entry in std::fs::read_dir(data_dir.join("sessions"))? {
         let path = entry?.path();
         if path.extension().is_some_and(|ext| ext == "jsonl") {
