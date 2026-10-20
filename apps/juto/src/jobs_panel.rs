@@ -279,6 +279,9 @@ mod tests {
             created_ms: 0,
             started_ms: None,
             finished_ms: None,
+            origin: None,
+            priority: None,
+            model: None,
         }
     }
 

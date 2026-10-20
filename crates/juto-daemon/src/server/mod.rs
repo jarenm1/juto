@@ -93,6 +93,7 @@ fn job_failed(error: JobError) -> RpcError {
     let code = match error {
         JobError::NotFound(_) => ErrorCode::NotFound,
         JobError::Invalid(_) => ErrorCode::Invalid,
+        JobError::Exists(_) => ErrorCode::Invalid,
         JobError::Failed(_) => ErrorCode::Failed,
     };
     RpcError::new(code, error.to_string())
