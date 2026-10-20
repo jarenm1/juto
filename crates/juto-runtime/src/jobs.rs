@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use juto_agent::{AgentEvent, RunControl};
-use juto_ai::{ContentBlock, Message, StopReason, timestamp_ms};
+use juto_ai::{AssistantMessage, ContentBlock, Message, StopReason, timestamp_ms};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
@@ -963,7 +963,12 @@ impl Runtime {
             Ok(Ok(UnattendedOutcome::Finished(run))) if matches!(run.stop_reason, StopReason::Stop)
         );
         let verdict = if stopped && !cancelled {
-            Some(self.verify_contract(&job, result.as_deref()).await)
+            // The contract reads the final message alone, so a silent final turn
+            // cannot pass on an earlier turn's text.
+            Some(
+                self.verify_contract(&job, final_assistant_text(session).as_deref())
+                    .await,
+            )
         } else {
             None
         };
@@ -1136,19 +1141,33 @@ fn budget_message(budget: JobBudget) -> String {
 fn last_assistant_text(session: &Session) -> Option<String> {
     let messages = session.messages().ok()?;
     messages.iter().rev().find_map(|message| match message {
-        Message::Assistant(assistant) => {
-            let text: String = assistant
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect();
-            (!text.is_empty()).then_some(text)
-        }
+        Message::Assistant(assistant) => assistant_text(assistant),
         _ => None,
     })
+}
+
+/// The text of the session's final message, only when that message is an
+/// assistant turn with text. An empty final turn yields nothing, so an earlier
+/// turn's text cannot stand in for it.
+fn final_assistant_text(session: &Session) -> Option<String> {
+    let messages = session.messages().ok()?;
+    match messages.last()? {
+        Message::Assistant(assistant) => assistant_text(assistant),
+        _ => None,
+    }
+}
+
+/// The text blocks of one assistant turn, or nothing when it has none.
+fn assistant_text(assistant: &AssistantMessage) -> Option<String> {
+    let text: String = assistant
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    (!text.is_empty()).then_some(text)
 }
 
 /// Linux procfs liveness. Platforms without `/proc` treat every owner as gone,

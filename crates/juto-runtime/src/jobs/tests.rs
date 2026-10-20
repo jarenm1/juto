@@ -675,6 +675,73 @@ async fn a_model_stop_without_the_promised_artifact_fails_the_job() {
     assert!(error.contains("completion contract not met"), "{error}");
 }
 
+/// Answers its first turn with JSON plus a tool call, then stops on an empty
+/// turn. The job's final answer is the empty turn.
+#[derive(Default)]
+struct JsonThenEmptyStop {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for JsonThenEmptyStop {
+    async fn stream(
+        &self,
+        _model: &Model,
+        _context: &Context,
+        _options: &StreamOptions,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            one_message(assistant(
+                vec![
+                    ContentBlock::Text {
+                        text: r#"{"ok":true}"#.to_string(),
+                    },
+                    ContentBlock::ToolCall(ToolCall {
+                        id: "read-call".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({"path": "missing.txt"}),
+                        thought_signature: None,
+                    }),
+                ],
+                StopReason::ToolUse,
+            ))
+        } else {
+            one_message(assistant(Vec::new(), StopReason::Stop))
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_silent_final_turn_fails_the_output_schema_contract() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let data_dir = root.path().join("data");
+    let runtime = runtime(&repo, &data_dir, Arc::new(JsonThenEmptyStop::default()));
+    let mut events = runtime.subscribe_jobs();
+    let contract = JobContract {
+        output_schema: Some(serde_json::json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"]
+        })),
+        ..Default::default()
+    };
+
+    let started = runtime
+        .start_job("answer", budget(60), contract)
+        .expect("start");
+    let job = settle(&runtime, &mut events, &started.id, |job| {
+        job.status.is_terminal()
+    })
+    .await;
+
+    assert_eq!(job.status, JobStatus::Failed, "the final turn is empty");
+    let error = job.error.expect("failure reason");
+    assert!(error.contains("final answer is empty"), "{error}");
+}
+
 #[tokio::test]
 async fn a_no_change_job_that_edits_its_workspace_fails_its_contract() {
     let root = tempdir().expect("tempdir");
