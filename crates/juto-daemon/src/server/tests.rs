@@ -157,6 +157,65 @@ fn daemon_with_notifier(
     Daemon::new(runtime, &workspace, root.join("desktop.sock"), notifier).unwrap()
 }
 
+/// A git repo colocated with jj, with bookmark `feat/x` on its initial commit, so
+/// `publish` resolves a real bookmark in the daemon's workspace.
+fn publishable_workspace(workspace: &Path) {
+    std::fs::create_dir_all(workspace).unwrap();
+    run_in(workspace, "git", &["init", "-q"]);
+    run_in(
+        workspace,
+        "git",
+        &[
+            "-c",
+            "user.name=Daemon Test",
+            "-c",
+            "user.email=daemon@example.test",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ],
+    );
+    run_in(workspace, "jj", &["git", "init", "--colocate"]);
+    run_in(
+        workspace,
+        "jj",
+        &["config", "set", "--repo", "user.name", "Daemon Test"],
+    );
+    run_in(
+        workspace,
+        "jj",
+        &[
+            "config",
+            "set",
+            "--repo",
+            "user.email",
+            "daemon@example.test",
+        ],
+    );
+    run_in(workspace, "jj", &["describe", "-m", "wip"]);
+    run_in(workspace, "jj", &["metaedit", "--update-author"]);
+    run_in(
+        workspace,
+        "jj",
+        &["bookmark", "create", "feat/x", "-r", "@-"],
+    );
+}
+
+fn run_in(dir: &Path, program: &str, args: &[&str]) {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run command");
+    assert!(
+        out.status.success(),
+        "{program} {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Stands in for a connected client: its events arrive on the returned receiver.
 fn attach(daemon: &Daemon) -> mpsc::UnboundedReceiver<ServerEvent> {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -864,27 +923,39 @@ impl Provider for PublishProvider {
     }
 }
 
-/// Number of `publish` calls that reached the tool. A call the decision gate
-/// stopped is journaled as a `Tool call rejected: blocked:` error and does not count.
+/// Number of `publish` calls that reached the tool, across the main journal and
+/// every thread journal: an unattended run is routed to a thread, which journals
+/// its own messages. A call the decision gate stopped is journaled as a
+/// `Tool call rejected: blocked:` error and does not count.
 fn publish_results(path: &Path) -> usize {
-    Session::open(path)
-        .unwrap()
-        .messages()
-        .unwrap()
-        .iter()
-        .filter(|m| match m {
-            Message::ToolResult {
-                tool_name, content, ..
-            } => {
-                tool_name == "publish"
-                    && !content.iter().any(|block| {
-                        matches!(block, ContentBlock::Text { text }
-                            if text.starts_with("Tool call rejected: blocked:"))
-                    })
-            }
-            _ => false,
+    let main = MainSession::open(path).unwrap();
+    std::iter::once(path.to_path_buf())
+        .chain(
+            main.threads()
+                .iter()
+                .map(|thread| thread.session_path.clone()),
+        )
+        .map(|journal| {
+            Session::open(&journal)
+                .unwrap()
+                .messages()
+                .unwrap()
+                .iter()
+                .filter(|m| match m {
+                    Message::ToolResult {
+                        tool_name, content, ..
+                    } => {
+                        tool_name == "publish"
+                            && !content.iter().any(|block| {
+                                matches!(block, ContentBlock::Text { text }
+                                    if text.starts_with("Tool call rejected: blocked:"))
+                            })
+                    }
+                    _ => false,
+                })
+                .count()
         })
-        .count()
+        .sum()
 }
 
 async fn start_unattended(daemon: &Arc<Daemon>, session_id: &str) {
@@ -923,6 +994,7 @@ async fn resolve(
 #[tokio::test]
 async fn unattended_publish_blocks_then_approval_runs_it_exactly_once() {
     let root = tempfile::tempdir().unwrap();
+    publishable_workspace(&root.path().join("workspace"));
     let notifier = Arc::new(RecordingNotifier::default());
     let daemon = daemon_with_notifier(root.path(), Arc::new(PublishProvider), notifier.clone());
     let view = create_session(&daemon).await;
@@ -972,6 +1044,7 @@ async fn unattended_publish_blocks_then_approval_runs_it_exactly_once() {
 #[tokio::test]
 async fn rejected_decision_never_runs_and_cannot_be_approved_later() {
     let root = tempfile::tempdir().unwrap();
+    publishable_workspace(&root.path().join("workspace"));
     let daemon = daemon(root.path(), Arc::new(PublishProvider));
     let view = create_session(&daemon).await;
     let mut rx = attach(&daemon);
@@ -1015,6 +1088,7 @@ async fn rejected_decision_never_runs_and_cannot_be_approved_later() {
 #[tokio::test]
 async fn pending_decision_survives_a_daemon_restart_and_is_still_approvable() {
     let root = tempfile::tempdir().unwrap();
+    publishable_workspace(&root.path().join("workspace"));
     let first = daemon(root.path(), Arc::new(PublishProvider));
     let view = create_session(&first).await;
     let mut rx = attach(&first);
