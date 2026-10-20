@@ -11,7 +11,7 @@ mod tool;
 mod view;
 
 pub use agent::Agent;
-pub use budget::{IMAGE_TOKEN_ESTIMATE, estimate_tokens};
+pub use budget::{IMAGE_TOKEN_ESTIMATE, estimate_request_tokens, estimate_tokens};
 pub use control::{BackgroundJob, BlockingWait, RunControl};
 pub use error::AgentError;
 pub use events::{AgentConfig, AgentEvent, AgentHooks, CompactError, RunOutcome};

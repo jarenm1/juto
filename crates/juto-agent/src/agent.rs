@@ -16,7 +16,7 @@ use juto_ai::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::budget::estimate_tokens;
+use crate::budget::estimate_request_tokens;
 use crate::control::{self, RunControl};
 use crate::error::AgentError;
 use crate::events::{AgentConfig, AgentEvent, AgentHooks, CompactError, RunOutcome};
@@ -302,7 +302,11 @@ impl Agent {
         let Some(limit) = self.config.context_limit else {
             return Ok(Fit::Ready);
         };
-        let estimated = estimate_tokens(&self.context.messages);
+        let estimated = estimate_request_tokens(
+            &self.context.system_prompt,
+            &self.context.tools,
+            &self.context.messages,
+        );
         if estimated <= limit {
             return Ok(Fit::Ready);
         }
@@ -314,7 +318,8 @@ impl Agent {
             Err(CompactError::Cancelled) => return Ok(Fit::Cancelled),
             Err(CompactError::Failed(reason)) => return Err(AgentError::CompactionFailed(reason)),
         };
-        let estimated = estimate_tokens(&compacted);
+        let estimated =
+            estimate_request_tokens(&self.context.system_prompt, &self.context.tools, &compacted);
         if estimated > limit {
             return Err(AgentError::ContextOverflow { estimated, limit });
         }

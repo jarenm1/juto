@@ -42,7 +42,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use juto_agent::{
     Agent, AgentConfig, AgentEvent, AgentHooks, CompactError, RunControl, RunOutcome, Tool,
-    ToolContext, ToolOutput, ToolRegistry, ToolTier, estimate_tokens,
+    ToolContext, ToolOutput, ToolRegistry, ToolTier, estimate_request_tokens,
 };
 use juto_ai::{
     ContentBlock, Context, CredentialStore, HttpProvider, Judge, Message, Provider, ProviderEvent,
@@ -594,13 +594,6 @@ impl Runtime {
         // One budget gates the run-start compaction and the agent's per-request guard.
         let window_budget =
             (model.context_window.unwrap_or(128_000) as f64 * settings.compaction_threshold) as u64;
-        if settings.auto_compact {
-            let history = session.messages()?;
-            let estimated = estimate_tokens(&history) + (prompt.len() as u64).div_ceil(3);
-            if history.len() > settings.keep_recent_messages && estimated > window_budget {
-                compaction_usage = self.compact(session, &control).await?;
-            }
-        }
         let _children = ChildCancellation(manager.owner());
         // The run's tier decides how `bash` is confined; see `ExecutionTier::bash_limits`.
         // Depth 0 is the user's own session; delegated runs queue as background work.
@@ -712,6 +705,17 @@ impl Runtime {
                 ));
             }
             system_prompt.push(descriptions);
+        }
+        // The estimate covers the first request: system prompt, advertised tools,
+        // and the history plus the new prompt.
+        if settings.auto_compact {
+            let history = session.messages()?;
+            let estimated =
+                estimate_request_tokens(&system_prompt, &registry.definitions(), &history)
+                    + (prompt.len() as u64).div_ceil(3);
+            if history.len() > settings.keep_recent_messages && estimated > window_budget {
+                compaction_usage = self.compact(session, &control).await?;
+            }
         }
         let context = Context {
             system_prompt,
@@ -2356,7 +2360,7 @@ mod tests {
                 reasoning: false,
                 input: vec!["text".to_string()],
                 cost: ModelCost::default(),
-                context_window: Some(8192),
+                context_window: Some(32_768),
                 max_tokens: Some(1024),
                 kind: "chat".to_string(),
                 supports_tools: true,
@@ -2554,11 +2558,15 @@ mod tests {
     /// Enables only `read`, and keeps no messages through compaction so the
     /// summary replaces the whole history.
     fn compaction_config() -> RuntimeConfig {
-        RuntimeConfig {
+        let mut config = RuntimeConfig {
             tools: vec!["read".to_string()],
             keep_recent_messages: 0,
             ..mock_config()
-        }
+        };
+        // Budget 10,800 tokens: a request with the system prompt fits, while the
+        // ~16k-token read result of `write_large_file` does not.
+        config.custom_models[0].context_window = Some(12_000);
+        config
     }
 
     #[tokio::test]

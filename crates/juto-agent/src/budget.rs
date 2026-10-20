@@ -1,7 +1,7 @@
 //! Context-size estimation shared by the agent's window guard and the runtime's
 //! compaction trigger. The estimate is a byte-based heuristic, not a tokenizer.
 
-use juto_ai::{ContentBlock, Message};
+use juto_ai::{ContentBlock, Message, ToolDefinition};
 use serde_json::Value;
 
 /// Token estimate for one image in context accounting.
@@ -34,6 +34,28 @@ pub fn estimate_tokens(messages: &[Message]) -> u64 {
                 .sum::<u64>()
         })
         .sum()
+}
+
+/// Estimated tokens for one provider request: the system prompt and the tool
+/// definitions it advertises count alongside `messages`, using the same
+/// bytes-per-token heuristic as `estimate_tokens`.
+pub fn estimate_request_tokens(
+    system_prompt: &[String],
+    tools: &[ToolDefinition],
+    messages: &[Message],
+) -> u64 {
+    let system: u64 = system_prompt
+        .iter()
+        .map(|text| (text.len() as u64).div_ceil(3))
+        .sum();
+    let schemas: u64 = tools
+        .iter()
+        .map(|tool| {
+            (tool.name.len() as u64 + tool.description.len() as u64 + json_weight(&tool.parameters))
+                .div_ceil(3)
+        })
+        .sum();
+    system + schemas + estimate_tokens(messages)
 }
 
 fn json_weight(value: &Value) -> u64 {

@@ -1254,3 +1254,52 @@ async fn no_budget_means_no_guard_and_no_compaction() {
     assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
     assert_eq!(provider.stream_calls().await, 1);
 }
+
+#[test]
+fn request_estimate_counts_system_prompt_and_tool_schemas() {
+    use crate::budget::estimate_request_tokens;
+
+    let tool = ToolDefinition {
+        name: "read".to_string(),
+        description: "d".repeat(10),
+        parameters: json!({ "type": "object" }),
+    };
+    // 300 prompt bytes are 100 tokens. The tool's name, description, and schema
+    // weigh 4 + 10 + 18 = 32 bytes, which is 11 tokens. There are no messages.
+    assert_eq!(
+        estimate_request_tokens(&["x".repeat(300)], &[tool], &[]),
+        111
+    );
+}
+
+#[tokio::test]
+async fn system_prompt_counts_against_the_budget() {
+    let model = test_model();
+    let provider = ScriptedProvider::new(vec![text_done_script(&model, "never sent")]);
+    let hook = Arc::new(CompactTo {
+        replacement: None,
+        calls: AtomicUsize::new(0),
+    });
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let config = AgentConfig {
+        context_limit: Some(600),
+        ..AgentConfig::for_model(test_model())
+    };
+    // The history alone is a few tokens; the system prompt pushes the request over.
+    let context = Context {
+        system_prompt: vec!["s".repeat(3000)],
+        ..Context::default()
+    };
+    let mut agent = Agent::new(config, provider.clone(), ToolRegistry::new(), context);
+    agent.set_hooks(hook.clone());
+    let outcome = agent
+        .run(vec![Message::user("hi")], tx, RunControl::new())
+        .await;
+
+    match outcome {
+        Err(AgentError::CompactionFailed(reason)) => assert_eq!(reason, "summarizer unavailable"),
+        _ => panic!("expected CompactionFailed"),
+    }
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.stream_calls().await, 0);
+}
