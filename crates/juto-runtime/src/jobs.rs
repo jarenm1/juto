@@ -395,6 +395,24 @@ impl JobStore {
         Ok(())
     }
 
+    /// Claims the record's path for a new job. The record is written to a
+    /// temporary file and hard-linked into place: the link fails when the path
+    /// exists, and no reader sees a partial record. Returns `false` when the
+    /// record already exists.
+    fn create(&self, job: &Job) -> Result<bool> {
+        fs::create_dir_all(&self.dir)?;
+        let path = self.path(&job.id)?;
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        fs::write(&tmp, serde_json::to_vec_pretty(job)?)?;
+        let linked = fs::hard_link(&tmp, &path);
+        let _ = fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn path(&self, id: &str) -> Result<PathBuf> {
         let valid = !id.is_empty()
             && id
@@ -435,14 +453,14 @@ impl JobRegistry {
             .ok_or_else(|| JobError::NotFound(id.to_owned()))
     }
 
-    /// Persists a new record unless one with this id exists. The check and the
-    /// write happen under [`LOCK`], so a second caller cannot create it too.
+    /// Persists a new record unless one with this id exists. The claim is an
+    /// exclusive link, so two processes cannot both create it; the in-process
+    /// [`LOCK`] keeps the rest of the record's transitions ordered.
     fn insert_new(&self, job: &Job) -> Result<(), JobError> {
         let _guard = lock();
-        if self.store.get(&job.id)?.is_some() {
+        if !self.store.create(job)? {
             return Err(JobError::Exists(job.id.clone()));
         }
-        self.store.write(job)?;
         let _ = self.events.send(job.clone());
         Ok(())
     }

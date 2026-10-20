@@ -112,7 +112,7 @@ pub struct Automation {
 
 impl Automation {
     fn every_ms(&self) -> u64 {
-        self.every_secs * 1000
+        self.every_secs.saturating_mul(1000)
     }
 }
 
@@ -259,11 +259,19 @@ fn load(dir: &Path, id: &str) -> Result<Automation, AutomationError> {
         return Err(AutomationError::NotFound(id.to_owned()));
     }
     match std::fs::read_to_string(record_path(dir, id)) {
-        Ok(text) => serde_json::from_str(&text).map_err(|error| {
-            AutomationError::Failed(
-                anyhow::Error::from(error).context(format!("automation `{id}` is corrupt")),
-            )
-        }),
+        Ok(text) => {
+            let automation: Automation = serde_json::from_str(&text).map_err(|error| {
+                AutomationError::Failed(
+                    anyhow::Error::from(error).context(format!("automation `{id}` is corrupt")),
+                )
+            })?;
+            if !(1..=MAX_EVERY_SECS).contains(&automation.every_secs) {
+                return Err(AutomationError::Failed(anyhow::anyhow!(
+                    "automation `{id}` is corrupt: every_secs must be between 1 and {MAX_EVERY_SECS}"
+                )));
+            }
+            Ok(automation)
+        }
         Err(error) if error.kind() == ErrorKind::NotFound => {
             Err(AutomationError::NotFound(id.to_owned()))
         }
@@ -302,6 +310,9 @@ fn read_events(dir: &Path, id: &str) -> Result<Vec<AutomationEvent>> {
         .map(|line| serde_json::from_str(line).context("parse automation event"))
         .collect()
 }
+
+/// One stored record: its id, and what loading it produced.
+type StoredRecord = (String, Result<Automation, AutomationError>);
 
 impl Runtime {
     fn automations_dir(&self) -> PathBuf {
@@ -378,24 +389,40 @@ impl Runtime {
     }
 
     pub fn list_automations(&self) -> Result<Vec<Automation>, AutomationError> {
+        self.read_records()?
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect()
+    }
+
+    /// Every stored record with its id, one result each, so a record that cannot
+    /// be read does not hide the others from the scheduler.
+    fn read_records(&self) -> Result<Vec<StoredRecord>, AutomationError> {
         let dir = self.automations_dir();
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(error.into()),
         };
-        let mut automations = Vec::new();
+        let mut records = Vec::new();
         for entry in entries {
             let path = entry?.path();
             if path.extension() != Some(OsStr::new("json")) {
                 continue;
             }
             if let Some(id) = path.file_stem().and_then(OsStr::to_str) {
-                automations.push(load(&dir, id)?);
+                records.push((id.to_owned(), load(&dir, id)));
             }
         }
-        automations.sort_by(|a, b| (a.created_ms, &a.id).cmp(&(b.created_ms, &b.id)));
-        Ok(automations)
+        records.sort_by_key(|(id, record)| {
+            (
+                record
+                    .as_ref()
+                    .map_or(0, |automation| automation.created_ms),
+                id.clone(),
+            )
+        });
+        Ok(records)
     }
 
     pub fn automation(&self, id: &str) -> Result<Automation, AutomationError> {
@@ -468,6 +495,13 @@ impl Runtime {
         let _guard = lock();
         let dir = self.automations_dir();
         let automation = load(&dir, id)?;
+        if automation.project != self.cwd().to_path_buf() {
+            return Err(AutomationError::Invalid(format!(
+                "automation `{id}` belongs to {}, not this daemon's project {}",
+                automation.project.display(),
+                self.cwd().display()
+            )));
+        }
         if self.open_job(id)?.is_some() {
             return Err(AutomationError::Invalid(format!(
                 "automation `{id}` has a job still open; run it again once that job settles"
@@ -524,9 +558,14 @@ impl Runtime {
         let _guard = lock();
         let dir = self.automations_dir();
         let mut started = Vec::new();
-        for mut automation in self.list_automations()? {
-            if let Some(job) = self.evaluate(&dir, &mut automation, now_ms)? {
-                started.push(job);
+        for (id, record) in self.read_records()? {
+            let outcome =
+                record.and_then(|mut automation| self.evaluate(&dir, &mut automation, now_ms));
+            match outcome {
+                Ok(Some(job)) => started.push(job),
+                Ok(None) => {}
+                // One bad record must not stop the others from firing.
+                Err(error) => eprintln!("juto: automation {id}: {error}"),
             }
         }
         Ok(started)
@@ -551,6 +590,11 @@ impl Runtime {
         automation: &mut Automation,
         now_ms: u64,
     ) -> Result<Option<Job>, AutomationError> {
+        if automation.project != self.cwd().to_path_buf() {
+            // Occurrences run in the automation's own project; another daemon's
+            // automations are not this daemon's to start.
+            return Ok(None);
+        }
         if !automation.enabled || now_ms < automation.next_instant_ms {
             return Ok(None);
         }
