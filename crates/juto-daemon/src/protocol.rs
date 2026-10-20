@@ -27,13 +27,12 @@ use juto_ai::{Message, StopReason, ToolCall};
 use juto_catalog::Model;
 use juto_runtime::subagents::MainMessage;
 use juto_runtime::{
-    RuntimeConfig, SessionEntry, SubagentEvent, SubagentSummary, ThreadEvent, TimelineItem,
-    ViewerRoute,
+    RuntimeConfig, SubagentEvent, SubagentSummary, ThreadEvent, TimelineItem, ViewerRoute,
 };
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change to this module.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// One request from a client. `id` is chosen by the client and echoed back.
 #[derive(Clone, Serialize, Deserialize)]
@@ -296,13 +295,14 @@ pub struct RunInfo {
 
 /// Full state of one session, returned by [`Request::OpenSession`].
 ///
-/// `entries` is the committed journal (active branch). `committed` is the number
-/// of committed message entries it contains; message indexes below it are already
-/// reflected. Partial stream deltas of an in-progress message are not replayed.
+/// `timeline` is the committed history in time order: routing records and every
+/// thread's messages. `committed` is the number of its message items; message
+/// indexes below it are already reflected. Partial stream deltas of an in-progress
+/// message are not replayed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionView {
     pub info: SessionInfo,
-    pub entries: Vec<SessionEntry>,
+    pub timeline: Vec<TimelineItem>,
     pub committed: u64,
     /// Approvals waiting for an answer on this session's active run.
     pub pending_approvals: Vec<PendingApproval>,
