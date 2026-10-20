@@ -40,10 +40,6 @@ pub fn follow_up_unavailable_reason(status: &SubagentStatus) -> Option<&'static 
     }
 }
 
-/// Shown in place of the composer for a worker child, which never takes follow-ups.
-const WORKER_FOLLOW_UP_REASON: &str =
-    "This worker thread takes no follow-ups. Its transcript is read-only.";
-
 /// Pure focus-mode state. `V` is the VCS panel handle, kept generic so the
 /// transitions can be tested without GPUI.
 pub struct FocusState<V> {
@@ -52,8 +48,6 @@ pub struct FocusState<V> {
     vcs: Option<V>,
     /// The main agent released this thread's workspace, so its fork is gone.
     released: bool,
-    /// `true` for a focus thread. Worker children take no follow-ups.
-    focus: bool,
     transcript: Result<Vec<Message>, String>,
     transcript_fresh: bool,
     pending_load: Option<u64>,
@@ -66,14 +60,12 @@ impl<V> FocusState<V> {
         status: SubagentStatus,
         vcs: Option<V>,
         released: bool,
-        focus: bool,
     ) -> Self {
         Self {
             thread_id,
             status,
             vcs,
             released,
-            focus,
             transcript: Ok(Vec::new()),
             transcript_fresh: false,
             pending_load: None,
@@ -100,9 +92,6 @@ impl<V> FocusState<V> {
     /// Why the composer is disabled, or `None` when a follow-up can be sent.
     /// A released thread's fork is gone, so it cannot take follow-ups.
     pub fn follow_up_unavailable(&self) -> Option<&'static str> {
-        if !self.focus {
-            return Some(WORKER_FOLLOW_UP_REASON);
-        }
         follow_up_unavailable_reason(&self.status).or_else(|| {
             self.released
                 .then_some("The workspace was released, so follow-ups are disabled.")
@@ -211,7 +200,7 @@ impl FocusView {
             }
         });
         Self {
-            state: FocusState::enter(summary.id, status, vcs, summary.released, summary.focus),
+            state: FocusState::enter(summary.id, status, vcs, summary.released),
             title: summary.name.unwrap_or(summary.task).into(),
             subagents,
             runtime,
@@ -540,8 +529,7 @@ mod tests {
     fn follow_up_is_enabled_only_when_completed() {
         for status in all_statuses() {
             let expected = status == SubagentStatus::Completed;
-            let state: FocusState<()> =
-                FocusState::enter("t".into(), status.clone(), None, false, true);
+            let state: FocusState<()> = FocusState::enter("t".into(), status.clone(), None, false);
             assert_eq!(state.can_follow_up(), expected, "status {status:?}");
             assert_eq!(
                 follow_up_unavailable_reason(&status).is_none(),
@@ -554,7 +542,7 @@ mod tests {
     #[test]
     fn released_thread_refuses_follow_up_with_reason() {
         let state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None, true, true);
+            FocusState::enter("t".into(), SubagentStatus::Completed, None, true);
         assert!(!state.can_follow_up());
         assert_eq!(
             state.follow_up_unavailable(),
@@ -565,30 +553,17 @@ mod tests {
     #[test]
     fn thread_without_workspace_keeps_follow_up() {
         let state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None, false, true);
+            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
         assert!(state.can_follow_up());
         assert_eq!(state.follow_up_unavailable(), None);
-    }
-
-    #[test]
-    fn worker_child_takes_no_follow_up() {
-        let state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None, false, false);
-        assert!(!state.can_follow_up());
-        assert_eq!(state.follow_up_unavailable(), Some(WORKER_FOLLOW_UP_REASON));
     }
 
     #[test]
     fn exit_releases_the_vcs_handle() {
         let handle = Rc::new(());
         let weak = Rc::downgrade(&handle);
-        let mut state = FocusState::enter(
-            "t".into(),
-            SubagentStatus::Completed,
-            Some(handle),
-            false,
-            true,
-        );
+        let mut state =
+            FocusState::enter("t".into(), SubagentStatus::Completed, Some(handle), false);
         assert!(state.vcs().is_some());
         state.exit();
         assert!(state.vcs().is_none());
@@ -598,7 +573,7 @@ mod tests {
     #[test]
     fn transcript_loads_once_per_terminal_state() {
         let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None, false, true);
+            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
         let token = state
             .begin_transcript_load()
             .expect("terminal thread loads");
@@ -616,14 +591,14 @@ mod tests {
     #[test]
     fn running_thread_has_no_transcript_load() {
         let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Running, None, false, true);
+            FocusState::enter("t".into(), SubagentStatus::Running, None, false);
         assert!(state.begin_transcript_load().is_none());
     }
 
     #[test]
     fn next_terminal_state_reloads_transcript() {
         let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None, false, true);
+            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
         let first = state.begin_transcript_load().expect("first load");
         assert!(state.apply_transcript(first, Ok(Vec::new())));
         state.set_status(SubagentStatus::Running);
@@ -641,7 +616,7 @@ mod tests {
     #[test]
     fn stale_transcript_read_is_ignored() {
         let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None, false, true);
+            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
         let stale = state.begin_transcript_load().expect("first load");
         state.set_status(SubagentStatus::Running);
         state.set_status(SubagentStatus::Completed);
