@@ -2,6 +2,7 @@
 //! retry visibility, steering/follow-up delivery, pause, and cancellation.
 
 use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -18,8 +19,8 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Agent, AgentConfig, AgentError, AgentEvent, AgentHooks, RunControl, RunOutcome, Tool,
-    ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier,
+    Agent, AgentConfig, AgentError, AgentEvent, AgentHooks, BlockingWait, RunControl, RunOutcome,
+    Tool, ToolConcurrency, ToolContext, ToolOutput, ToolRegistry, ToolTier,
 };
 
 fn test_model() -> Model {
@@ -752,6 +753,53 @@ async fn a_run_that_fails_cancels_its_open_background_jobs() {
         Err(AgentError::Provider(ProviderError::Transport(_)))
     ));
     assert!(job_cancel.is_cancelled());
+}
+
+/// Records each background drain that runs through the installed hook.
+#[derive(Debug, Default)]
+struct RecordingWait {
+    drains: AtomicUsize,
+}
+
+#[async_trait]
+impl BlockingWait for RecordingWait {
+    async fn release_while<'a>(
+        &'a self,
+        _cancel: &'a CancellationToken,
+        blocked: Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+    ) {
+        self.drains.fetch_add(1, Ordering::SeqCst);
+        blocked.await;
+    }
+}
+
+#[tokio::test]
+async fn background_drain_waits_through_the_blocking_hook() {
+    let model = test_model();
+    let control = RunControl::new();
+    let hook = Arc::new(RecordingWait::default());
+    control.set_blocking_wait(hook.clone());
+    let job = control.begin_background_job();
+    let job_control = control.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(job_control.steer(Message::user("job result")));
+        drop(job);
+    });
+    let provider = ScriptedProvider::new(vec![
+        text_done_script(&model, "first"),
+        text_done_script(&model, "second"),
+    ]);
+    let (outcome, _events, _context) = run_with_context(
+        provider,
+        ToolRegistry::new(),
+        None,
+        &control,
+        vec![Message::user("go")],
+    )
+    .await;
+    outcome.unwrap();
+    assert!(hook.drains.load(Ordering::SeqCst) > 0);
 }
 
 #[tokio::test]

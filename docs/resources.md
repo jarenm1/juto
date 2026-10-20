@@ -2,8 +2,8 @@
 
 Juto records what each governed command actually used, and derives the limits
 each command runs under from the host's measured capacity. This document covers
-recording, inspection, capacity, grants, and admission queueing (see Admission and
-queueing).
+recording, inspection, capacity, grants, admission queueing, and agent admission
+(see Admission and queueing and Agent admission).
 
 ## Where records live
 
@@ -171,6 +171,33 @@ until the job has a result.
 CLI: `juto-cli resources run` waits in the same queue and prints its position on
 stderr while it waits. Its class defaults to `attended` and is set with
 `--priority`.
+
+## Agent admission
+
+Agents are not capped by a fixed count. Each run tree shares three pools
+(`crates/juto-runtime/src/pools.rs`):
+
+- Desks: each agent turn reserves `budget_bytes / 512` bytes in the same broker
+  ledger, as an `attended` request. A full budget admits 512 desks; later turns
+  queue for memory like any command. A turn holds its desk while it runs, and gives
+  it back while it waits on children (the `task` sync wait and the `wait` tool), then
+  queues for a desk again before it continues.
+- Provider pool: model requests. The limit starts at `max_concurrency`, halves on
+  HTTP 429 (never below one), and grows by one per accepted stream, up to
+  `max_concurrency`. A request holds its slot until its stream ends or is dropped.
+- Review limit: focus threads (`focus: true`) hold one review slot each, at most
+  `max_concurrency` at a time. Ordinary children take no review slot.
+
+A child waiting for a desk or review slot is `queued`. Cancelling it, or cancelling
+its parent, removes it from the queue at once and it never runs.
+
+A parent that waits on children never holds a desk they need: its desk is released
+for the wait and reacquired afterward, so a full budget of waiting parents cannot
+starve their children.
+
+Limitation: without systemd, desks are not reserved, so agents run unmetered, the
+same as the bare command fallback. A turn cancelled while it waits for its desk back
+ends with a cancelled error and runs no further work.
 
 ## Limitations
 

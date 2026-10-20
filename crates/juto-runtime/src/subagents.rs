@@ -1,7 +1,7 @@
 //! Bounded subagent orchestration.
 //!
-//! [`SubagentManager`] queues child runs behind a shared semaphore, propagates
-//! the parent cancellation token to every child [`RunControl`], and keeps
+//! [`SubagentManager`] runs child turns: each turn holds a memory desk, and focus threads also hold a review slot.
+//! propagates the parent cancellation token to every child [`RunControl`], and keeps
 //! terminal results so any number of `wait`/`output` callers observe them.
 //! The runtime owns the production factory: child agents inherit its model,
 //! instructions and approval policy and write independent durable sessions.
@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::main_inbox_store;
 use crate::main_report::{self, DEFAULT_MAIN_REPORT_BYTES};
+use crate::pools::{Admission, TurnDesk};
 use crate::session::Session;
 use crate::tier::ExecutionTier;
 use crate::tools::DesktopSessionArtifact;
@@ -27,7 +28,7 @@ use juto_agent::{AgentEvent, RunControl};
 use juto_ai::{Message, StopReason, Usage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex as AsyncMutex, Notify, Semaphore, broadcast, mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -907,7 +908,7 @@ impl Child {
 
 struct Inner {
     factory: Arc<dyn SubagentFactory>,
-    semaphore: Arc<Semaphore>,
+    admission: Admission,
     main_inbox: MainInbox,
     /// Top-level session every child of this manager reports to. `None` for
     /// the root manager, whose callers stamp each spec with its own session.
@@ -916,10 +917,10 @@ struct Inner {
     children: Mutex<HashMap<String, Arc<Child>>>,
 }
 
-/// Bounded manager for child subagent runs.
+/// Manager for child subagent runs.
 ///
-/// `spawn` never blocks on a semaphore permit; acquisition happens inside the
-/// child task so permits are held only by running children.
+/// `spawn` never blocks. Each turn waits for a desk inside the child task, and
+/// model requests wait in the provider pool. Focus threads also wait for a review slot.
 pub struct SubagentManager {
     inner: Arc<Inner>,
     /// Owns the children this handle spawns: cancelling it stops them.
@@ -929,11 +930,11 @@ pub struct SubagentManager {
 impl SubagentManager {
     pub fn new(
         factory: Arc<dyn SubagentFactory>,
-        max_concurrency: usize,
+        admission: Admission,
         owner: CancellationToken,
         main_inbox: MainInbox,
     ) -> Self {
-        Self::with_origin(factory, max_concurrency, owner, main_inbox, None)
+        Self::with_origin(factory, admission, owner, main_inbox, None)
     }
 
     /// A manager whose children all report to the top-level session `origin`,
@@ -941,7 +942,7 @@ impl SubagentManager {
     /// grandchild's report returns to the thread that started the tree.
     pub fn with_origin(
         factory: Arc<dyn SubagentFactory>,
-        max_concurrency: usize,
+        admission: Admission,
         owner: CancellationToken,
         main_inbox: MainInbox,
         origin: Option<String>,
@@ -958,7 +959,7 @@ impl SubagentManager {
         Self {
             inner: Arc::new(Inner {
                 factory,
-                semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+                admission,
                 main_inbox,
                 origin,
                 children: Mutex::new(HashMap::new()),
@@ -980,12 +981,12 @@ impl SubagentManager {
     }
 
     /// Token that owns the children this handle spawns; cancelling it stops
-    /// them. The registry, semaphore, and inbox are shared by every handle.
+    /// them. The registry, admission, and inbox are shared by every handle.
     pub(crate) fn owner(&self) -> CancellationToken {
         self.owner.clone()
     }
 
-    /// A handle over the same registry, semaphore, and inbox whose children
+    /// A handle over the same registry, admission, and inbox whose children
     /// are owned by `owner`.
     pub(crate) fn scoped(&self, owner: CancellationToken) -> Self {
         Self {
@@ -1022,7 +1023,7 @@ impl SubagentManager {
     }
 
     /// Queue a child run. Returns the generated child id immediately; the
-    /// permit wait, run, and terminal-state publication are asynchronous.
+    /// desk wait, run, and terminal-state publication are asynchronous.
     pub fn spawn(&self, mut spec: TaskSpec) -> Result<String, SubagentError> {
         if spec.focus {
             // A focus thread tracks one task through its own VCS view, so it
@@ -1612,17 +1613,26 @@ impl SubagentManager {
     }
 }
 
-/// Cancellation-safe permit acquisition shared by first turns and follow-up
-/// turns; publishes the terminal state itself on the failure paths.
-async fn acquire_permit(
+/// Reservations one turn holds until its task ends.
+struct Seats {
+    desk: Arc<TurnDesk>,
+    _review: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// Admission for one turn, shared by first and follow-up turns; publishes the
+/// terminal state itself when a wait is cancelled or a desk cannot be reserved.
+/// Every turn holds a desk for its whole run: its memory, admitted by the broker
+/// (queued when the budget is full). Focus threads also take a review slot.
+/// The outer `None` means the turn must not run.
+async fn acquire_seats(
     inner: &Inner,
     child: &Child,
     control: &RunControl,
     owner: &CancellationToken,
     origin: TurnOrigin,
-) -> Option<tokio::sync::OwnedSemaphorePermit> {
+) -> Option<Seats> {
     let cancel = control.token();
-    let permit = tokio::select! {
+    let desk = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
             finish(inner, child, SubagentStatus::Cancelled, Err("cancelled while queued".into()), origin, owner);
@@ -1632,18 +1642,43 @@ async fn acquire_permit(
             finish(inner, child, SubagentStatus::Cancelled, Err("cancelled with parent while queued".into()), origin, owner);
             return None;
         }
-        permit = inner.semaphore.clone().acquire_owned() => match permit {
-            Ok(permit) => permit,
-            Err(_) => {
-                finish(inner, child, SubagentStatus::Failed, Err("subagent semaphore closed".into()), origin, owner);
+        desk = inner.admission.desks.seat(&child.id) => match desk {
+            Ok(desk) => desk,
+            Err(error) => {
+                finish(inner, child, SubagentStatus::Failed, Err(format!("cannot reserve a desk: {error}")), origin, owner);
                 return None;
             }
         },
     };
-    Some(permit)
+    let review = if child.spec.focus {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                finish(inner, child, SubagentStatus::Cancelled, Err("cancelled while queued".into()), origin, owner);
+                return None;
+            }
+            _ = owner.cancelled() => {
+                finish(inner, child, SubagentStatus::Cancelled, Err("cancelled with parent while queued".into()), origin, owner);
+                return None;
+            }
+            permit = inner.admission.review_wip.clone().acquire_owned() => match permit {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    finish(inner, child, SubagentStatus::Failed, Err("review limit closed".into()), origin, owner);
+                    return None;
+                }
+            },
+        }
+    } else {
+        None
+    };
+    Some(Seats {
+        desk: TurnDesk::new(inner.admission.desks.clone(), child.id.clone(), desk),
+        _review: review,
+    })
 }
 
-/// Lifecycle for one spawned child: cancellation-safe permit wait, then one
+/// Lifecycle for one spawned child: cancellation-safe desk wait, then one
 /// turn through the shared settle logic.
 async fn run_child(
     inner: Arc<Inner>,
@@ -1653,7 +1688,7 @@ async fn run_child(
     owner: CancellationToken,
     validator: Option<jsonschema::Validator>,
 ) {
-    let Some(_permit) = acquire_permit(&inner, &child, &control, &owner, TurnOrigin::Main).await
+    let Some(seats) = acquire_seats(&inner, &child, &control, &owner, TurnOrigin::Main).await
     else {
         return;
     };
@@ -1667,21 +1702,23 @@ async fn run_child(
     let spec = child.spec.clone();
     let task_id = id.clone();
     let task_control = control.clone();
-    run_turn(
-        &inner,
-        &child,
-        &control,
-        &owner,
-        validator,
-        TurnOrigin::Main,
-        move |events| async move { factory.run(&task_id, spec, task_control, events).await },
-    )
-    .await;
+    seats
+        .desk
+        .hold(run_turn(
+            &inner,
+            &child,
+            &control,
+            &owner,
+            validator,
+            TurnOrigin::Main,
+            move |events| async move { factory.run(&task_id, spec, task_control, events).await },
+        ))
+        .await;
 }
 
 /// One additional turn on a completed child: same session journal, same
-/// workspace, fresh [`RunControl`]. Like the first turn it waits on the
-/// shared semaphore and publishes exactly one terminal state; `follow_up`
+/// workspace, fresh [`RunControl`]. Like the first turn it passes the same
+/// admission and publishes exactly one terminal state; `follow_up`
 /// already moved the child back to `Running`.
 async fn run_follow_up(
     inner: Arc<Inner>,
@@ -1692,7 +1729,7 @@ async fn run_follow_up(
     control: RunControl,
     origin: TurnOrigin,
 ) {
-    let Some(_permit) = acquire_permit(&inner, &child, &control, &owner, origin).await else {
+    let Some(seats) = acquire_seats(&inner, &child, &control, &owner, origin).await else {
         return;
     };
 
@@ -1705,25 +1742,27 @@ async fn run_follow_up(
     let factory = inner.factory.clone();
     let spec = child.spec.clone();
     let task_control = control.clone();
-    run_turn(
-        &inner,
-        &child,
-        &control,
-        &owner,
-        validator,
-        origin,
-        move |events| async move {
-            match session_path {
-                Some(path) => {
-                    factory
-                        .follow_up(&id, &spec, &path, prompt, task_control, events)
-                        .await
+    seats
+        .desk
+        .hold(run_turn(
+            &inner,
+            &child,
+            &control,
+            &owner,
+            validator,
+            origin,
+            move |events| async move {
+                match session_path {
+                    Some(path) => {
+                        factory
+                            .follow_up(&id, &spec, &path, prompt, task_control, events)
+                            .await
+                    }
+                    None => Err("completed child has no recorded session path".into()),
                 }
-                None => Err("completed child has no recorded session path".into()),
-            }
-        },
-    )
-    .await;
+            },
+        ))
+        .await;
 }
 
 /// Run one factory turn and publish exactly one terminal state: parent
@@ -1741,6 +1780,8 @@ async fn run_turn<F, Fut>(
     F: FnOnce(mpsc::UnboundedSender<AgentEvent>) -> Fut,
     Fut: Future<Output = Result<SubagentResult, String>>,
 {
+    // Waits inside the turn give its desk back through the runtime's hook.
+    control.set_blocking_wait(Arc::new(crate::pools::DeskWaits));
     // Propagate parent cancellation into the child's RunControl for the whole
     // turn, then release the propagation task when the turn finishes.
     let propagation_done = CancellationToken::new();
@@ -1987,6 +2028,7 @@ pub fn extract_json(text: &str) -> Option<Value> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::sync::Semaphore;
     use tokio::time::{Duration as TokioDuration, timeout};
 
     const WAIT_TIMEOUT: TokioDuration = TokioDuration::from_secs(5);
@@ -2007,6 +2049,13 @@ mod tests {
             main_session: None,
             main_snapshot: None,
             tier: None,
+        }
+    }
+
+    fn focus_spec(task: &str) -> TaskSpec {
+        TaskSpec {
+            focus: true,
+            ..spec(task)
         }
     }
 
@@ -2080,7 +2129,12 @@ mod tests {
         max_concurrency: usize,
         owner: CancellationToken,
     ) -> SubagentManager {
-        SubagentManager::new(factory, max_concurrency, owner, MainInbox::default())
+        SubagentManager::new(
+            factory,
+            crate::pools::Admission::unmetered(max_concurrency),
+            owner,
+            MainInbox::default(),
+        )
     }
 
     /// Poll until `running` reaches `n`. Sleeps between checks so blocking
@@ -2135,7 +2189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn semaphore_bounds_concurrent_children() {
+    async fn ordinary_children_are_not_capped_by_the_review_limit() {
         let (gate, gate_rx) = gate();
         let running = Arc::new(AtomicUsize::new(0));
         let max_running = Arc::new(AtomicUsize::new(0));
@@ -2148,7 +2202,34 @@ mod tests {
         for n in 0..5 {
             ids.push(manager.spawn(spec(&format!("task-{n}"))).unwrap());
         }
-        // Closed gate: only the permit count may be running.
+        // Closed gate: ordinary children take desks, not review slots, so all five run.
+        until_running(&running, 5).await;
+        gate.send(true).unwrap();
+        for id in &ids {
+            timeout(WAIT_TIMEOUT, manager.wait(id))
+                .await
+                .expect("wait timed out")
+                .unwrap_or_else(|err| panic!("child {id} failed: {err}"));
+        }
+        assert_eq!(max_running.load(Ordering::SeqCst), 5);
+        assert_eq!(running.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn focus_children_are_bounded_by_the_review_limit() {
+        let (gate, gate_rx) = gate();
+        let running = Arc::new(AtomicUsize::new(0));
+        let max_running = Arc::new(AtomicUsize::new(0));
+        let manager = manager(
+            gate_factory(gate_rx, running.clone(), max_running.clone(), false, None),
+            2,
+            CancellationToken::new(),
+        );
+        let mut ids = Vec::new();
+        for n in 0..5 {
+            ids.push(manager.spawn(focus_spec(&format!("task-{n}"))).unwrap());
+        }
+        // Closed gate: only the review limit may be running.
         until_running(&running, 2).await;
         tokio::time::sleep(TokioDuration::from_millis(20)).await;
         assert_eq!(running.load(Ordering::SeqCst), 2);
@@ -2165,7 +2246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queued_child_waits_for_permit() {
+    async fn focus_child_waits_for_review_slot() {
         let (gate, gate_rx) = gate();
         let running = Arc::new(AtomicUsize::new(0));
         let manager = manager(
@@ -2179,8 +2260,8 @@ mod tests {
             1,
             CancellationToken::new(),
         );
-        let a = manager.spawn(spec("a")).unwrap();
-        let b = manager.spawn(spec("b")).unwrap();
+        let a = manager.spawn(focus_spec("a")).unwrap();
+        let b = manager.spawn(focus_spec("b")).unwrap();
         until_running(&running, 1).await;
         assert_eq!(manager.status(&b), Some(SubagentStatus::Queued));
         gate.send(true).unwrap();
@@ -2224,7 +2305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_queued_child_never_occupies_permit() {
+    async fn cancel_queued_focus_child_never_takes_review_slot() {
         let (gate, gate_rx) = gate();
         let running = Arc::new(AtomicUsize::new(0));
         let manager = manager(
@@ -2238,9 +2319,9 @@ mod tests {
             1,
             CancellationToken::new(),
         );
-        let first = manager.spawn(spec("first")).unwrap();
+        let first = manager.spawn(focus_spec("first")).unwrap();
         until_running(&running, 1).await;
-        let second = manager.spawn(spec("second")).unwrap();
+        let second = manager.spawn(focus_spec("second")).unwrap();
         manager.cancel(&second).unwrap();
         assert!(matches!(
             manager.wait(&second).await,
@@ -2513,8 +2594,8 @@ mod tests {
             1,
             owner.clone(),
         );
-        let first = manager.spawn(spec("running")).unwrap();
-        let second = manager.spawn(spec("queued")).unwrap();
+        let first = manager.spawn(focus_spec("running")).unwrap();
+        let second = manager.spawn(focus_spec("queued")).unwrap();
         until_running(&running, 1).await;
         owner.cancel();
         assert!(matches!(
@@ -2548,7 +2629,7 @@ mod tests {
             owner.clone(),
         );
         let ids: Vec<String> = (0..3)
-            .map(|n| manager.spawn(spec(&format!("c{n}"))).unwrap())
+            .map(|n| manager.spawn(focus_spec(&format!("c{n}"))).unwrap())
             .collect();
         until_running(&running, 1).await;
         owner.cancel();
@@ -2827,8 +2908,8 @@ mod tests {
             1,
             CancellationToken::new(),
         );
-        let first = manager.spawn(spec("first")).unwrap();
-        let queued = manager.spawn(spec("queued")).unwrap();
+        let first = manager.spawn(focus_spec("first")).unwrap();
+        let queued = manager.spawn(focus_spec("queued")).unwrap();
 
         until_running(&running, 1).await;
         let err = manager
@@ -3920,7 +4001,7 @@ mod tests {
                 false,
                 None,
             ),
-            1,
+            crate::pools::Admission::unmetered(1),
             CancellationToken::new(),
             inbox.clone(),
         );
@@ -4278,13 +4359,17 @@ mod tests {
     async fn dropped_managers_release_event_channels_and_prune_registrations() {
         let inbox = MainInbox::default();
         let factory = Arc::new(DesktopFactory);
-        let root =
-            SubagentManager::new(factory.clone(), 1, CancellationToken::new(), inbox.clone());
+        let root = SubagentManager::new(
+            factory.clone(),
+            Admission::unmetered(1),
+            CancellationToken::new(),
+            inbox.clone(),
+        );
         let mut root_events = root.subscribe_events();
         for _ in 0..64 {
             let nested = SubagentManager::with_origin(
                 factory.clone(),
-                1,
+                Admission::unmetered(1),
                 CancellationToken::new(),
                 inbox.clone(),
                 Some("topic".into()),

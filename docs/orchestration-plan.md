@@ -292,8 +292,9 @@ To prevent parallel agents from exhausting host memory, CPU, or lock contention:
    `<data-dir>/resources/usage.jsonl`, read from inside the unit's cgroup. Grants and capacity
   are derived from these records and the measured host. Admission is a shared ledger
   (`resources/broker`): a command waits until its reserved memory fits the budget, and
-  bash commands that wait return a queued job id whose result is steered in later. The
-  desk, provider, and review pools are not implemented yet. See `docs/resources.md`.
+  bash commands that wait return a queued job id whose result is steered in later.
+  Agent desks, the provider pool, and the review limit are implemented; see
+  `docs/resources.md` (Agent admission).
 
 ### 4.3 Repository Setup Skill
 The harness installs the `juto-repo-setup` skill in its global skill directory.

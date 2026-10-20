@@ -1,7 +1,10 @@
 //! Run-scoped control channel: cancellation, pause/resume, and message queues.
 
-use std::sync::Arc;
+use std::fmt::Debug;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 
+use async_trait::async_trait;
 use juto_ai::Message;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -26,6 +29,22 @@ struct Shared {
     jobs: watch::Sender<usize>,
     /// Cancels this run's background jobs; fired when the run ends.
     jobs_cancel: CancellationToken,
+    /// The run's blocking-wait hook, installed by the runtime. Unset, a wait
+    /// keeps whatever the caller holds.
+    blocking: OnceLock<Arc<dyn BlockingWait>>,
+}
+
+/// Runs a blocking wait with the calling turn's desk released. The runtime owns
+/// desks and installs the implementation; this crate only knows a wait may hold one.
+#[async_trait]
+pub trait BlockingWait: Send + Sync + Debug {
+    /// Run `blocked` with the desk given back, then take the desk again. `cancel`
+    /// ends the wait early.
+    async fn release_while<'a>(
+        &'a self,
+        cancel: &'a CancellationToken,
+        blocked: Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+    );
 }
 
 /// External control handle for one `Agent::run`. Clone and hand clones to UI
@@ -58,6 +77,7 @@ impl RunControl {
                 steering_rx: tokio::sync::Mutex::new(Some(steering_rx)),
                 follow_up_rx: tokio::sync::Mutex::new(Some(follow_up_rx)),
                 jobs: watch::channel(0).0,
+                blocking: OnceLock::new(),
             }),
         }
     }
@@ -106,6 +126,12 @@ impl RunControl {
         self.shared.jobs_cancel.clone()
     }
 
+    /// Install the hook that gives a turn's desk back while this run waits on
+    /// background jobs. The first hook wins; later calls are ignored.
+    pub fn set_blocking_wait(&self, hook: Arc<dyn BlockingWait>) {
+        let _ = self.shared.blocking.set(hook);
+    }
+
     /// Cancel every background job still open. Called when the run ends, so a
     /// queued or running job cannot deliver into a run that has finished.
     pub(crate) fn abandon_background_jobs(&self) {
@@ -120,10 +146,16 @@ impl RunControl {
         if *rx.borrow_and_update() == 0 {
             return;
         }
-        tokio::select! {
-            biased;
-            () = cancel.cancelled() => {}
-            _ = rx.changed() => {}
+        let blocked = async {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {}
+                _ = rx.changed() => {}
+            }
+        };
+        match self.shared.blocking.get() {
+            Some(hook) => hook.release_while(cancel, Box::pin(blocked)).await,
+            None => blocked.await,
         }
     }
 

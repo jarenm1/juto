@@ -14,6 +14,7 @@ mod main_inbox_store;
 mod main_report;
 pub mod network;
 pub mod peers;
+mod pools;
 mod recall;
 pub mod replication;
 pub mod resources;
@@ -139,6 +140,7 @@ struct RuntimeInner {
     registry: Registry,
     credentials: Arc<CredentialStore>,
     provider: Arc<dyn Provider>,
+    admission: pools::Admission,
     approval: Option<Arc<dyn ApprovalHandler>>,
     subagent_manager: Mutex<Option<Arc<SubagentManager>>>,
     desktop_supervisor: Mutex<Option<Arc<DesktopSupervisor>>>,
@@ -200,6 +202,36 @@ impl Runtime {
         provider: Arc<dyn Provider>,
         approval: Option<Arc<dyn ApprovalHandler>>,
     ) -> Result<Self> {
+        let desks = pools::Desks::new(Broker::new(
+            data_dir.as_ref().join("resources").join("broker"),
+        ));
+        let admission = pools::Admission::new(config.max_concurrency, desks);
+        let provider: Arc<dyn Provider> = Arc::new(pools::LimitedProvider::new(
+            provider,
+            admission.provider_pool.clone(),
+        ));
+        Self::assemble(
+            cwd,
+            data_dir,
+            config,
+            credentials,
+            provider,
+            admission,
+            approval,
+        )
+    }
+
+    /// Build a runtime around a provider already admitted through `admission`.
+    /// Child runtimes pass their parent's pair so every depth shares one limiter.
+    fn assemble(
+        cwd: impl AsRef<Path>,
+        data_dir: impl AsRef<Path>,
+        config: RuntimeConfig,
+        credentials: Arc<CredentialStore>,
+        provider: Arc<dyn Provider>,
+        admission: pools::Admission,
+        approval: Option<Arc<dyn ApprovalHandler>>,
+    ) -> Result<Self> {
         config.validate()?;
         let cwd = cwd
             .as_ref()
@@ -224,6 +256,7 @@ impl Runtime {
                 registry,
                 credentials,
                 provider,
+                admission,
                 approval,
                 subagent_manager: Mutex::new(None),
                 desktop_supervisor: Mutex::new(None),
@@ -441,7 +474,7 @@ impl Runtime {
         handle
     }
 
-    /// Subagent handle for the run `control` drives. The registry, semaphore,
+    /// Subagent handle for the run `control` drives. The registry, admission,
     /// and inbox are shared process-wide, but each handle owns only the
     /// children it spawns: cancelling this run stops them, while ending another
     /// run leaves its children alone.
@@ -481,7 +514,7 @@ impl Runtime {
                         depth: 1,
                         inbox: inbox.clone(),
                     }),
-                    self.config().max_concurrency,
+                    self.inner.admission.clone(),
                     CancellationToken::new(),
                     inbox,
                 ))
@@ -1046,7 +1079,7 @@ impl ChildFactory {
                 depth: self.depth + 1,
                 inbox: self.inbox.clone(),
             }),
-            runtime.config().max_concurrency,
+            runtime.inner.admission.clone(),
             control.token().child_token(),
             self.inbox.clone(),
             origin,
@@ -1059,9 +1092,18 @@ impl ChildFactory {
         let config = self.runtime.config();
         let credentials = self.runtime.inner.credentials.clone();
         let provider = self.runtime.inner.provider.clone();
+        let admission = self.runtime.inner.admission.clone();
         let approval = self.runtime.inner.approval.clone();
         tokio::task::spawn_blocking(move || {
-            Runtime::with_provider(cwd, data_dir, config, credentials, provider, approval)
+            Runtime::assemble(
+                cwd,
+                data_dir,
+                config,
+                credentials,
+                provider,
+                admission,
+                approval,
+            )
         })
         .await
         .context("child runtime construction task failed")?
@@ -3742,7 +3784,7 @@ mod tests {
         // Below the main thread, focus tasks are rejected before spawning.
         let manager = Arc::new(SubagentManager::new(
             Arc::new(InstantFactory),
-            1,
+            pools::Admission::unmetered(1),
             CancellationToken::new(),
             subagents::MainInbox::default(),
         ));
