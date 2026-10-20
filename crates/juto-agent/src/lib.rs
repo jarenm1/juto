@@ -3,6 +3,7 @@
 //! Behavioral reference: oh-my-pi 579da1d6; see licenses/OMP-MIT.txt.
 
 mod agent;
+mod budget;
 mod control;
 mod error;
 mod events;
@@ -10,6 +11,7 @@ mod tool;
 mod view;
 
 pub use agent::Agent;
+pub use budget::{IMAGE_TOKEN_ESTIMATE, estimate_tokens};
 pub use control::{BackgroundJob, BlockingWait, RunControl};
 pub use error::AgentError;
 pub use events::{AgentConfig, AgentEvent, AgentHooks, RunOutcome};

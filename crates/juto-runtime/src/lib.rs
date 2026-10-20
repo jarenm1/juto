@@ -42,7 +42,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use juto_agent::{
     Agent, AgentConfig, AgentEvent, AgentHooks, RunControl, RunOutcome, Tool, ToolContext,
-    ToolOutput, ToolRegistry, ToolTier,
+    ToolOutput, ToolRegistry, ToolTier, estimate_tokens,
 };
 use juto_ai::{
     ContentBlock, Context, CredentialStore, HttpProvider, Judge, Message, Provider, ProviderEvent,
@@ -87,7 +87,7 @@ impl SignalingHandle {
 }
 use serde_json::{Value, json};
 use tier::ExecutionTier;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 pub use approval::{ApprovalRequest, ChannelApprovalHandler};
@@ -591,12 +591,13 @@ impl Runtime {
             .unwrap_or_else(|| settings.model.clone());
         let (model, stream_options) = self.resolve_model(&selector)?;
         let mut compaction_usage = Usage::default();
+        // One budget gates the run-start compaction and the agent's per-request guard.
+        let window_budget =
+            (model.context_window.unwrap_or(128_000) as f64 * settings.compaction_threshold) as u64;
         if settings.auto_compact {
             let history = session.messages()?;
             let estimated = estimate_tokens(&history) + (prompt.len() as u64).div_ceil(3);
-            let threshold = (model.context_window.unwrap_or(128_000) as f64
-                * settings.compaction_threshold) as u64;
-            if history.len() > settings.keep_recent_messages && estimated > threshold {
+            if history.len() > settings.keep_recent_messages && estimated > window_budget {
                 compaction_usage = self.compact(session, &control).await?;
             }
         }
@@ -725,6 +726,7 @@ impl Runtime {
             max_turns: settings.max_turns,
             max_retries: 2,
             retry_delay: Duration::from_millis(500),
+            context_limit: settings.auto_compact.then_some(window_budget),
         };
         let mut agent = Agent::new(config, self.inner.provider.clone(), registry, context);
         let mode = if read_only {
@@ -732,9 +734,11 @@ impl Runtime {
         } else {
             settings.approval_mode
         };
+        let (compact_tx, mut compact_rx) = mpsc::unbounded_channel();
         agent.set_hooks(Arc::new(RuntimeHooks {
             mode,
             approval: self.inner.approval.clone(),
+            compactions: compact_tx,
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let future = agent.run(vec![Message::user(prompt)], tx, control.clone());
@@ -751,6 +755,31 @@ impl Runtime {
                         control.cancel();
                     }
                     let _ = events.send(event);
+                }
+                Some(reply) = compact_rx.recv() => {
+                    // Persist what the agent already emitted, so the summary covers
+                    // exactly the history the agent is holding.
+                    while let Ok(event) = rx.try_recv() {
+                        if let Err(error) = persist_event(session, &event)
+                            && persistence_error.is_none()
+                        {
+                            persistence_error = Some(error);
+                            control.cancel();
+                        }
+                        let _ = events.send(event);
+                    }
+                    let answer = if persistence_error.is_some() {
+                        Err("session persistence failed; run cancelled".to_owned())
+                    } else {
+                        match self.compact(session, &control).await {
+                            Ok(usage) => {
+                                compaction_usage.add(&usage);
+                                session.messages().map_err(|error| format!("{error:#}"))
+                            }
+                            Err(error) => Err(format!("{error:#}")),
+                        }
+                    };
+                    let _ = reply.send(answer);
                 }
             }
         };
@@ -953,50 +982,13 @@ fn persist_event(session: &mut Session, event: &AgentEvent) -> Result<()> {
     Ok(())
 }
 
-fn estimate_tokens(messages: &[Message]) -> u64 {
-    messages
-        .iter()
-        .map(|message| {
-            let content = match message {
-                Message::User { content, .. }
-                | Message::Developer { content, .. }
-                | Message::ToolResult { content, .. } => content,
-                Message::Assistant(message) => &message.content,
-            };
-            8 + content
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => (text.len() as u64).div_ceil(3),
-                    ContentBlock::Thinking { thinking, .. } => (thinking.len() as u64).div_ceil(3),
-                    ContentBlock::Image { .. } => snapcompact::IMAGE_TOKEN_ESTIMATE,
-                    ContentBlock::ToolCall(call) => {
-                        (json_weight(&call.arguments) + call.name.len() as u64).div_ceil(3)
-                    }
-                    ContentBlock::RedactedThinking { data } => (data.len() as u64).div_ceil(3),
-                })
-                .sum::<u64>()
-        })
-        .sum()
-}
-fn json_weight(value: &Value) -> u64 {
-    match value {
-        Value::Null | Value::Bool(_) => 5,
-        Value::Number(_) => 24,
-        Value::String(value) => value.len() as u64 + 2,
-        Value::Array(items) => items.iter().map(json_weight).sum::<u64>() + items.len() as u64 + 2,
-        Value::Object(items) => {
-            items
-                .iter()
-                .map(|(key, value)| key.len() as u64 + json_weight(value) + 4)
-                .sum::<u64>()
-                + 2
-        }
-    }
-}
+/// Asks a run's loop to compact its session; the reply is the compacted history.
+type CompactionRequest = oneshot::Sender<Result<Vec<Message>, String>>;
 
 struct RuntimeHooks {
     mode: ApprovalMode,
     approval: Option<Arc<dyn ApprovalHandler>>,
+    compactions: mpsc::UnboundedSender<CompactionRequest>,
 }
 #[async_trait]
 impl AgentHooks for RuntimeHooks {
@@ -1023,6 +1015,16 @@ impl AgentHooks for RuntimeHooks {
                 }
             }
         }
+    }
+
+    async fn compact_context(&self) -> Result<Vec<Message>, String> {
+        let (reply, answer) = oneshot::channel();
+        self.compactions
+            .send(reply)
+            .map_err(|_| "run loop is no longer compacting".to_owned())?;
+        answer
+            .await
+            .map_err(|_| "compaction request was dropped".to_owned())?
     }
 }
 

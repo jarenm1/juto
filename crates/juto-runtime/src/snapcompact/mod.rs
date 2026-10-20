@@ -23,8 +23,6 @@ pub use text::serialize_conversation;
 use render::render_page;
 use text::{NEWLINE_GLYPH, normalize};
 
-/// Token estimate for one image in context accounting.
-pub const IMAGE_TOKEN_ESTIMATE: u64 = 4096;
 /// Frame ceiling before provider and context-window limits apply.
 const MAX_FRAMES: usize = 80;
 /// An archive may use at most this fraction of the context window.
@@ -63,7 +61,7 @@ pub fn frame_budget(provider: &str, context_window: Option<u64>) -> usize {
         _ => 5,
     };
     let window_limit = context_window.map_or(MAX_FRAMES, |window| {
-        ((window / WINDOW_SHARE_DIVISOR) / IMAGE_TOKEN_ESTIMATE) as usize
+        ((window / WINDOW_SHARE_DIVISOR) / juto_agent::IMAGE_TOKEN_ESTIMATE) as usize
     });
     provider_limit.min(MAX_FRAMES).min(window_limit)
 }
