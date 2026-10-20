@@ -172,6 +172,9 @@ CLI: `juto-cli resources run` waits in the same queue and prints its position on
 stderr while it waits. Its class defaults to `attended` and is set with
 `--priority`.
 
+Automations: a scheduled occurrence's main run is admitted at the automation's
+priority, `scheduled` by default or `background`. See unattended-runs.md, Automations.
+
 ## Agent admission
 
 Agents are not capped by a fixed count. Each run tree shares three pools

@@ -130,6 +130,93 @@ files therefore delegates the writes: the main agent starts a `task` child and
 calls `wait` for it. If the main agent answers without calling `wait`, the job
 ends and the child is cancelled.
 
+## Automations
+
+An automation starts a job on a schedule. Create one with
+`juto-cli automations create <prompt> --every-secs <n>`, and pass the same budget
+and contract flags as `jobs run-now` (`--wall-secs`, `--max-attempts`,
+`--max-turns`, `--max-spend`, `--artifact`, `--output-schema`, `--no-change`).
+Each automation stores its prompt, project, model pin (`--model-pin`), priority,
+budget, contract, schedule, overlap policy, and enabled state. Its project is the
+daemon's workspace. Each occurrence produces the same durable job as `jobs
+run-now`: same budget, contract, inbox, and `jobs` commands.
+
+Tier and permission profile are not per automation. Every occurrence runs under
+the unattended rules (`workspace` tier, see Execution tier). The product contract
+listed both as settable. They are not, because a stored definition must not widen
+the unattended boundary.
+
+### Recurrence and time zones
+
+The schedule is a fixed interval in UTC. `--every-secs` takes 1 to 31622400 (366
+days). Occurrence `k` (`k >= 1`) falls at `created_ms + k * every_secs * 1000`
+milliseconds since the Unix epoch. The anchor is the creation time.
+
+There are no time zones and no cron expressions. No DST rule applies: an interval
+of 86400 seconds fires at the same UTC instant every day. A local wall-clock
+schedule is not supported. A new schedule kind would need its own spec.
+
+The daemon checks for due occurrences once per second. A job starts within about
+one second of its occurrence instant.
+
+### Restart and missed occurrences
+
+On each tick the runtime looks at the occurrences due since `next_instant_ms`. It
+starts one job for the latest due occurrence and never replays the others. The
+earlier undecided occurrences coalesce into one `missed` event with a count.
+
+- A daemon that was down across several occurrences starts one job at its first
+  tick and records the rest as missed. This runs once, not once per missed tick.
+- The job starts before the cursor (`next_instant_ms`) is saved. If the daemon
+  stops between the two, the restart evaluates the same occurrence again. Its job
+  id already exists, so nothing new starts.
+- Interrupted jobs are not replayed, as for any job (see Jobs).
+
+### Overlap
+
+A job is open while it is queued, running, or blocked. When an occurrence is due
+and the automation's previous job is open:
+
+- `skip` (the default): the occurrence is recorded as `skipped` and the schedule
+  moves on.
+- `queue`: the cursor holds. When the open job settles, one job starts for the
+  latest due occurrence. Earlier due occurrences are recorded as missed. At most
+  one occurrence waits.
+
+`run-now` is refused while a job of the automation is open, under either policy.
+
+### Pause, enable, delete, run now
+
+- A paused automation (`enabled: false`) never fires.
+- Enabling a paused automation records the paused stretch as one `missed` event
+  and moves the cursor past now. It does not start a catch-up job.
+- `run-now` starts one job immediately, records a `run-now` event, and does not
+  move the schedule.
+- Delete removes the definition. The jobs it started are kept.
+
+### Dedupe key
+
+One occurrence is the pair (automation id, scheduled instant in ms). Its job id is
+`auto-<automation id>-<instant ms>`. Starting a second job with that id fails with
+`JobError::Exists`, and the runtime records that as already fired. An occurrence
+therefore produces at most one job, including across restarts. Jobs started by
+`run-now` have no occurrence key.
+
+### Priority
+
+An automation's priority is `scheduled` (the default) or `background`. `attended`
+is refused. The job's main run takes that class through the resource broker (see
+resources.md, Admission and queueing). Its subagent runs stay `background`.
+
+### Storage and protocol
+
+Each automation is stored under the data directory as `automations/<id>.json`
+(definition and cursor, written atomically) and `automations/<id>.events.jsonl`
+(event log). Protocol version 4 adds the automation requests: `CreateAutomation`,
+`ListAutomations`, `GetAutomation`, `AutomationHistory`, `RunAutomationNow`,
+`SetAutomationEnabled`, and `DeleteAutomation`. Protocol version 3 has no
+automation requests.
+
 ## Limitations
 
 - `net:<host>` denials and out-of-workspace file access are hard errors. They
