@@ -118,10 +118,20 @@ pub struct ForkBase {
     pub tree: String,
 }
 
-/// Snapshot id pinning a fork's start tree. Thread names never contain `/`, so the
-/// id is a single ref component.
-fn fork_snapshot_id(thread: &str) -> String {
-    format!("fork-{thread}")
+/// Longest thread name a fork may pin. The hex-encoded snapshot id is one
+/// filesystem path component, which must stay within the 255-byte `NAME_MAX`.
+const MAX_FORK_THREAD_BYTES: usize = 120;
+
+/// Snapshot id pinning a fork's start tree. Hex-encoding the thread name makes
+/// the id a valid Git ref component for every name, and distinct names never
+/// map to the same id.
+fn fork_snapshot_id(thread: &str) -> Result<String> {
+    ensure!(
+        thread.len() <= MAX_FORK_THREAD_BYTES,
+        "fork thread name is longer than {MAX_FORK_THREAD_BYTES} bytes"
+    );
+    let hex: String = thread.bytes().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!("fork-{hex}"))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -535,6 +545,7 @@ impl ChangeGraph {
         sparse: Option<&[String]>,
     ) -> Result<GraphState> {
         validate_thread_name(thread)?;
+        let snapshot = fork_snapshot_id(thread)?;
         let _lock = self.lock()?;
         let mut state = self.load()?;
         ensure!(!state.heads.contains_key(thread), "thread already exists");
@@ -565,9 +576,10 @@ impl ChangeGraph {
                 .fork_workspace(&node.tree, destination, thread)?,
         }
         let tree = node.tree.clone();
-        self.repository
-            .retain_snapshot(&fork_snapshot_id(thread), &tree)?;
+        let mut retained = false;
         let recorded = (|| -> Result<()> {
+            self.repository.retain_snapshot(&snapshot, &tree)?;
+            retained = true;
             let destination = destination.canonicalize()?;
             state.heads.insert(thread.into(), from.clone());
             state
@@ -594,6 +606,11 @@ impl ChangeGraph {
                     .map(|state| state.heads.contains_key(thread))
                     .unwrap_or(false);
                 if !landed {
+                    if retained {
+                        // Release only the pin this call created; a pin that never
+                        // landed must not stay behind for a fork that does not exist.
+                        let _ = self.repository.release_snapshot(&snapshot);
+                    }
                     let _ = fs::remove_dir_all(destination);
                 }
                 Err(error.context("workspace created but native thread bookkeeping failed"))
@@ -1163,8 +1180,10 @@ impl ChangeGraph {
             .collect();
         for path in &stale_forks {
             if let Some(fork) = state.fork_bases.remove(path) {
-                self.repository
-                    .release_snapshot(&fork_snapshot_id(&fork.thread))?;
+                // A name over the cap was never pinned, so there is nothing to release.
+                if let Ok(snapshot) = fork_snapshot_id(&fork.thread) {
+                    self.repository.release_snapshot(&snapshot)?;
+                }
             }
         }
         let by_id: BTreeMap<&str, &ChangeNode> =
