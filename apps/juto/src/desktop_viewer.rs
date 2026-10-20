@@ -142,6 +142,7 @@ pub struct DesktopViewer {
     /// fixed for a resolved grant, None when view-only.
     grant_expires_at: Option<u64>,
     paused: bool,
+    expanded: bool,
     input_seq: u64,
     frame_task: Option<Task<()>>,
     heartbeat_task: Option<Task<()>>,
@@ -199,6 +200,7 @@ impl DesktopViewer {
             access,
             grant_expires_at,
             paused: true,
+            expanded: false,
             input_seq: 0,
             frame_task: None,
             snapshot_task: None,
@@ -227,6 +229,16 @@ impl DesktopViewer {
         viewer.start_cursor_listener(window, cx);
         viewer.capture_snapshot(window, cx);
         viewer
+    }
+
+    pub fn is_expanded(&self) -> bool {
+        self.expanded
+    }
+
+    /// Presentation changes keep the same frame feed, pause state and lease.
+    pub fn set_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
+        self.expanded = expanded;
+        cx.notify();
     }
 
     /// Follows the environment's shared frame feed. Only a live viewer does this.
@@ -819,6 +831,10 @@ impl Render for DesktopViewer {
                 }),
             )
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                if this.paused || this.pointer_position(&event.position).is_none() {
+                    return;
+                }
+                cx.stop_propagation();
                 let delta = event.delta.pixel_delta(window.line_height());
                 let dy = f32::from(delta.y);
                 if dy != 0.0 {
@@ -832,7 +848,13 @@ impl Render for DesktopViewer {
                 }
             }))
             .w_full()
-            .h(px(405.))
+            .map(|view| {
+                if self.expanded {
+                    view.h_full()
+                } else {
+                    view.h(px(405.))
+                }
+            })
             .flex()
             .flex_col()
             .gap_2()

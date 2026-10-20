@@ -297,8 +297,15 @@ pointer, scroll, and keyboard input goes to the virtual seat, and **Take control
 comes from the seat, not from the viewer.
 The viewer letterboxes the frame,
 maps pointer coordinates to desktop pixels, and reports connection state and errors
-instead of showing a stale frame as live. `juto --desktop <command> [args...]` mounts
-the same canvas directly for development.
+instead of showing a stale frame as live. **Expand** moves the same viewer into a
+window-sized overlay; **Back to chat** or clicking outside returns it to its card
+without changing pause state or recreating its control lease. This also works in a
+child's focus-thread transcript. A repeated artifact mounts and renders only at
+its first occurrence in each transcript; later cards point back to that viewer.
+While live, wheel input over the desktop image is consumed by the desktop, not
+the transcript; paused canvases let the chat scroll normally.
+`juto --desktop <command> [args...]` mounts the same canvas directly for development
+and issues a real session grant using the runtime's host identifier.
 
 **Live frame delivery.** Each environment has one producer. It copies and shrinks each
 newly published frame once, and every mounted canvas of that environment shares the

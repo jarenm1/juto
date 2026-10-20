@@ -87,6 +87,11 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   viewer's lifetime, and the control lease renews only while held. Live frames come
   from one producer per environment that blocks on the compositor's publish signal;
   every mounted canvas of that environment shares its output.
+  Expand/Back-to-chat moves the same viewer between its inline card and a
+  window-sized overlay, preserving pause/control state. Within a transcript,
+  repeated artifact identifiers mount and render only at their first occurrence.
+  Wheel input over a live image does not also scroll the surrounding chat;
+  paused canvases leave transcript scrolling enabled.
 - Remote presentation: a GStreamer `webrtcbin` sender (VP8 default, H.264
   available) fed from the composed pool, a one-time-token signaling server that
   serves a browser viewer page and relays SDP/ICE over a WebSocket, pointer and

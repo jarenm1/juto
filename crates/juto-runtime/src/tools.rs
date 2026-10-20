@@ -2072,7 +2072,8 @@ fn run_desktop_action(
     }
 }
 
-pub(crate) fn host_identifier() -> String {
+/// Host identifier used by desktop artifacts and their resolver.
+pub fn host_identifier() -> String {
     std::env::var("HOSTNAME")
         .ok()
         .filter(|h| !h.trim().is_empty())
