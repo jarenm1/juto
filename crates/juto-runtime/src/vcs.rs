@@ -803,6 +803,36 @@ mod tests {
     }
 
     #[test]
+    fn a_fork_reports_only_changes_made_after_it_was_forked() {
+        let directory = repo();
+        let cwd = directory.path();
+        let graph = ChangeGraph::open(cwd).unwrap();
+        // Work captured before the fork is the fork's starting point, not a
+        // change the fork made, so a no-change job must not be blamed for it.
+        std::fs::write(cwd.join("notes.txt"), "work in progress\n").unwrap();
+        let start = graph.capture("main", provenance(), None).unwrap();
+
+        let workspaces = tempfile::tempdir().unwrap();
+        let fork_dir = workspaces.path().join("job");
+        graph.fork("job", &start.id, &fork_dir).unwrap();
+
+        let fork = ChangeGraph::open(&fork_dir).unwrap();
+        assert!(
+            fork.paths_changed_since_base().unwrap().is_empty(),
+            "a fresh fork has changed nothing"
+        );
+
+        apply(&fork_dir, Path::new("result.txt"), "answer\n").unwrap();
+        assert_eq!(
+            ChangeGraph::open(&fork_dir)
+                .unwrap()
+                .paths_changed_since_base()
+                .unwrap(),
+            vec!["result.txt".to_string()]
+        );
+    }
+
+    #[test]
     fn mutation_lock_excludes_itself_in_a_linked_worktree() {
         let directory = repo();
         let main = directory.path();
