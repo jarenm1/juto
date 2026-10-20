@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use juto_agent::{AgentEvent, ToolTier};
 use juto_ai::{Message, StopReason, ToolCall};
 use juto_catalog::Model;
+use juto_runtime::automations::{Automation, AutomationHistory, AutomationSpec};
 use juto_runtime::jobs::{InboxState, Job, JobBudget, JobContract};
 use juto_runtime::subagents::MainMessage;
 use juto_runtime::{
@@ -33,7 +34,7 @@ use juto_runtime::{
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change to this module.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// One request from a client. `id` is chosen by the client and echoed back.
 #[derive(Clone, Serialize, Deserialize)]
@@ -165,6 +166,34 @@ pub enum Request {
     /// Returns finished jobs the main agent has not yet been shown. Each job is
     /// returned once, including across daemon restarts.
     DrainJobs,
+    /// Creates a recurring automation. Each occurrence starts one job, the same as
+    /// `StartJob`, in the daemon's workspace.
+    CreateAutomation {
+        spec: AutomationSpec,
+    },
+    /// Lists every automation, oldest first.
+    ListAutomations,
+    /// One automation's definition.
+    GetAutomation {
+        automation_id: String,
+    },
+    /// The jobs an automation started, and its event log.
+    AutomationHistory {
+        automation_id: String,
+    },
+    /// Starts one job for the automation now. Its schedule does not move.
+    RunAutomationNow {
+        automation_id: String,
+    },
+    /// Pauses (`enabled: false`) or resumes an automation.
+    SetAutomationEnabled {
+        automation_id: String,
+        enabled: bool,
+    },
+    /// Deletes an automation. Jobs it started are kept.
+    DeleteAutomation {
+        automation_id: String,
+    },
     /// Queues a steering message for the active run of `session_id`. Fails with
     /// [`ErrorCode::Invalid`] if that session has no active run.
     Steer {
@@ -299,6 +328,12 @@ pub enum Reply {
     Jobs(Vec<Job>),
     /// One job after a request that read or changed it.
     Job(Job),
+    /// One automation definition.
+    Automation(Automation),
+    /// Every automation, oldest first.
+    Automations(Vec<Automation>),
+    /// An automation's jobs and event log.
+    AutomationHistory(AutomationHistory),
     Transcript(Vec<Message>),
     /// Answers [`Request::Timeline`].
     Timeline {
