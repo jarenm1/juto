@@ -77,10 +77,11 @@ enum Script {
 }
 
 /// Deterministic provider: one scripted response per `stream` call, recording
-/// how many messages the context held at each request.
+/// how many messages the context held at each request, and the requests themselves.
 struct ScriptedProvider {
     scripts: Mutex<VecDeque<Script>>,
     contexts: Mutex<Vec<usize>>,
+    requests: Mutex<Vec<Vec<Message>>>,
 }
 
 impl ScriptedProvider {
@@ -88,6 +89,7 @@ impl ScriptedProvider {
         Arc::new(Self {
             scripts: Mutex::new(scripts.into()),
             contexts: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
         })
     }
 
@@ -106,6 +108,7 @@ impl Provider for ScriptedProvider {
         _cancel: CancellationToken,
     ) -> Result<ProviderStream, ProviderError> {
         self.contexts.lock().await.push(context.messages.len());
+        self.requests.lock().await.push(context.messages.clone());
         let script = self
             .scripts
             .lock()
@@ -1016,4 +1019,191 @@ async fn cancel_before_start_aborts_cleanly() {
     // The prompt still commits before the loop notices cancellation.
     assert_eq!(context.messages.len(), 1);
     assert_eq!(message_ends(&events), 1);
+}
+
+/// Host hook that answers every compaction request with `replacement`, or fails
+/// when there is none.
+struct CompactTo {
+    replacement: Option<Vec<Message>>,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl AgentHooks for CompactTo {
+    async fn compact_context(&self) -> Result<Vec<Message>, String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.replacement
+            .clone()
+            .ok_or_else(|| "summarizer unavailable".to_owned())
+    }
+}
+
+/// Run `prompt` with a context budget of `limit` tokens (`None` disables the
+/// guard) and return the outcome and every event the run emitted.
+async fn run_budgeted(
+    provider: Arc<ScriptedProvider>,
+    tools: ToolRegistry,
+    limit: Option<u64>,
+    hook: Arc<CompactTo>,
+    prompt: Vec<Message>,
+) -> (Result<RunOutcome, AgentError>, Vec<AgentEvent>) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let config = AgentConfig {
+        context_limit: limit,
+        ..AgentConfig::for_model(test_model())
+    };
+    let mut agent = Agent::new(config, provider, tools, Context::default());
+    agent.set_hooks(hook);
+    let outcome = agent.run(prompt, tx, RunControl::new()).await;
+    let mut events = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        events.push(event);
+    }
+    (outcome, events)
+}
+
+#[tokio::test]
+async fn over_budget_request_is_compacted_before_it_is_sent() {
+    let model = test_model();
+    let big = "x".repeat(3000);
+    let provider = ScriptedProvider::new(vec![
+        Script::Events(vec![Ok(ProviderEvent::Done {
+            message: assistant(
+                &model,
+                vec![call("c1", "echo", json!({"text": big}))],
+                StopReason::ToolUse,
+            ),
+        })]),
+        text_done_script(&model, "done"),
+    ]);
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool)).unwrap();
+    let hook = Arc::new(CompactTo {
+        replacement: Some(vec![Message::user("summary of earlier work")]),
+        calls: AtomicUsize::new(0),
+    });
+    let (outcome, events) = run_budgeted(
+        provider.clone(),
+        tools,
+        Some(600),
+        hook.clone(),
+        vec![Message::user("go")],
+    )
+    .await;
+
+    assert_eq!(outcome.unwrap().stop_reason, StopReason::Stop);
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(agent_ends(&events), 1);
+    let requests = provider.requests.lock().await.clone();
+    assert_eq!(requests.len(), 2);
+    // The second request carries only the compacted history, not the 3000-char call.
+    assert_eq!(requests[1].len(), 1);
+}
+
+#[tokio::test]
+async fn oversized_context_is_not_sent_when_compaction_cannot_fit_it() {
+    let model = test_model();
+    let big = "x".repeat(3000);
+    let provider = ScriptedProvider::new(vec![text_done_script(&model, "never sent")]);
+    // The host's compaction returns history that is still over budget.
+    let hook = Arc::new(CompactTo {
+        replacement: Some(vec![Message::user(big.as_str())]),
+        calls: AtomicUsize::new(0),
+    });
+    let (outcome, events) = run_budgeted(
+        provider.clone(),
+        ToolRegistry::new(),
+        Some(600),
+        hook.clone(),
+        vec![Message::user(big.as_str())],
+    )
+    .await;
+
+    match outcome {
+        Err(AgentError::ContextOverflow { limit, estimated }) => {
+            assert_eq!(limit, 600);
+            assert!(estimated > limit);
+        }
+        _ => panic!("expected ContextOverflow"),
+    }
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.stream_calls().await, 0);
+    assert_eq!(agent_ends(&events), 1);
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::Error { .. })));
+}
+
+#[tokio::test]
+async fn failed_compaction_ends_run_without_sending_request() {
+    let model = test_model();
+    let big = "x".repeat(3000);
+    let provider = ScriptedProvider::new(vec![text_done_script(&model, "never sent")]);
+    let hook = Arc::new(CompactTo {
+        replacement: None,
+        calls: AtomicUsize::new(0),
+    });
+    let (outcome, events) = run_budgeted(
+        provider.clone(),
+        ToolRegistry::new(),
+        Some(600),
+        hook.clone(),
+        vec![Message::user(big.as_str())],
+    )
+    .await;
+
+    match outcome {
+        Err(AgentError::CompactionFailed(reason)) => {
+            assert_eq!(reason, "summarizer unavailable");
+        }
+        _ => panic!("expected CompactionFailed"),
+    }
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.stream_calls().await, 0);
+    assert_eq!(agent_ends(&events), 1);
+}
+
+#[tokio::test]
+async fn context_at_exactly_the_budget_is_sent_without_compaction() {
+    let model = test_model();
+    let prompt = Message::user("x".repeat(3000).as_str());
+    let limit = crate::estimate_tokens(std::slice::from_ref(&prompt));
+    let provider = ScriptedProvider::new(vec![text_done_script(&model, "done")]);
+    let hook = Arc::new(CompactTo {
+        replacement: None,
+        calls: AtomicUsize::new(0),
+    });
+    let (outcome, _events) = run_budgeted(
+        provider.clone(),
+        ToolRegistry::new(),
+        Some(limit),
+        hook.clone(),
+        vec![prompt],
+    )
+    .await;
+
+    assert_eq!(outcome.unwrap().stop_reason, StopReason::Stop);
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.stream_calls().await, 1);
+}
+
+#[tokio::test]
+async fn no_budget_means_no_guard_and_no_compaction() {
+    let model = test_model();
+    let prompt = Message::user("x".repeat(3000).as_str());
+    let provider = ScriptedProvider::new(vec![text_done_script(&model, "done")]);
+    let hook = Arc::new(CompactTo {
+        replacement: None,
+        calls: AtomicUsize::new(0),
+    });
+    let (outcome, _events) = run_budgeted(
+        provider.clone(),
+        ToolRegistry::new(),
+        None,
+        hook.clone(),
+        vec![prompt],
+    )
+    .await;
+
+    assert_eq!(outcome.unwrap().stop_reason, StopReason::Stop);
+    assert_eq!(hook.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.stream_calls().await, 1);
 }

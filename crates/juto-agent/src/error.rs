@@ -23,4 +23,12 @@ pub enum AgentError {
 
     #[error("turn limit reached ({0} turns) without the model finishing")]
     TurnLimit(usize),
+
+    /// The context stays over the window budget even after host compaction,
+    /// so the model request was not sent.
+    #[error("context is about {estimated} tokens, over the {limit}-token budget after compaction")]
+    ContextOverflow { estimated: u64, limit: u64 },
+
+    #[error("context compaction failed: {0}")]
+    CompactionFailed(String),
 }

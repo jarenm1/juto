@@ -16,6 +16,7 @@ use juto_ai::{
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::budget::estimate_tokens;
 use crate::control::{self, RunControl};
 use crate::error::AgentError;
 use crate::events::{AgentConfig, AgentEvent, AgentHooks, RunOutcome};
@@ -148,6 +149,17 @@ impl Agent {
             }
             emit(&events, AgentEvent::TurnStart { turn: turns });
 
+            if let Err(error) = self.ensure_context_fits().await {
+                emit(
+                    &events,
+                    AgentEvent::Error {
+                        error: error.to_string(),
+                    },
+                );
+                self.finish(StopReason::Error, usage, turns, &events);
+                break Err(error);
+            }
+
             if let Some(hooks) = &self.hooks
                 && let Err(reason) = hooks.before_model(&self.config.model, &self.context).await
             {
@@ -268,6 +280,32 @@ impl Agent {
             stop_reason,
             turns,
         }
+    }
+
+    /// Keep the next request inside the context budget. Over-budget history
+    /// goes through the host's `compact_context`; if the compacted history still
+    /// does not fit, the error is returned and no request is sent.
+    async fn ensure_context_fits(&mut self) -> Result<(), AgentError> {
+        let Some(limit) = self.config.context_limit else {
+            return Ok(());
+        };
+        let estimated = estimate_tokens(&self.context.messages);
+        if estimated <= limit {
+            return Ok(());
+        }
+        let Some(hooks) = self.hooks.clone() else {
+            return Err(AgentError::ContextOverflow { estimated, limit });
+        };
+        let compacted = hooks
+            .compact_context()
+            .await
+            .map_err(AgentError::CompactionFailed)?;
+        let estimated = estimate_tokens(&compacted);
+        if estimated > limit {
+            return Err(AgentError::ContextOverflow { estimated, limit });
+        }
+        self.context.messages = compacted;
+        Ok(())
     }
 
     /// One turn's worth of provider requests: connect, stream, and retry

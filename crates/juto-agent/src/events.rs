@@ -87,6 +87,15 @@ pub trait AgentHooks: Send + Sync {
     /// Observe a finished tool execution; also called for validation and
     /// rejection results, never for calls skipped by cancellation.
     async fn after_tool(&self, _call: &ToolCall, _result: &crate::tool::ToolOutput) {}
+
+    /// Shrink the history before a request that would exceed
+    /// `AgentConfig::context_limit`. The returned messages replace the run's
+    /// context. `Err` ends the run with `AgentError::CompactionFailed`. The
+    /// default cannot compact, so an over-budget request then fails with
+    /// `AgentError::ContextOverflow` without being sent.
+    async fn compact_context(&self) -> Result<Vec<Message>, String> {
+        Err("host does not support context compaction".into())
+    }
 }
 
 /// Per-run configuration. No default turn cap: the loop runs until the model
@@ -104,6 +113,10 @@ pub struct AgentConfig {
     /// provider `retry_after` hints when larger.
     pub max_retries: usize,
     pub retry_delay: Duration,
+    /// Estimated-token budget for one request (`crate::budget::estimate_tokens`).
+    /// Over budget, the agent asks the host to compact before sending. `None`
+    /// disables the guard.
+    pub context_limit: Option<u64>,
 }
 
 impl AgentConfig {
@@ -117,6 +130,7 @@ impl AgentConfig {
             max_turns: None,
             max_retries: 3,
             retry_delay: Duration::from_millis(500),
+            context_limit: None,
         }
     }
 }
