@@ -716,10 +716,16 @@ impl Render for DesktopViewer {
 
         let surface = match frame {
             Some(frame) => img(frame)
+                .absolute()
+                .top_0()
+                .left_0()
                 .size_full()
                 .object_fit(ObjectFit::Contain)
                 .into_any_element(),
             None => div()
+                .absolute()
+                .top_0()
+                .left_0()
                 .size_full()
                 .flex()
                 .items_center()
@@ -944,6 +950,7 @@ impl Render for DesktopViewer {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    .overflow_hidden()
                     .bg(rgb(0x000000))
                     .cursor(canvas_cursor)
                     .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
