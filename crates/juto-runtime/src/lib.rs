@@ -678,10 +678,12 @@ impl Runtime {
             main_session: Some(&main_session),
             unattended: Some(&scope),
         };
-        // Children of this run are owned by a token of their own, as in `run`.
+        // Children of this run carry its scope, so their decisions reach the same
+        // gate. They report to the process inbox, as every other run's children do.
+        // The run is over once its root returns: its children are cancelled and
+        // settled here, because nothing can answer their decisions or read their work.
         let run_children = CancellationToken::new();
-        let stopped = control.token();
-        let inbox = subagents::MainInbox::default();
+        let inbox = self.subagent_manager().main_inbox();
         let manager = Arc::new(SubagentManager::new(
             Arc::new(ChildFactory {
                 runtime: self.clone(),
@@ -701,13 +703,12 @@ impl Runtime {
             run_children.clone(),
         ));
         let outcome = self
-            .run_depth(session, prompt.into(), events, control, placement, manager)
+            .run_depth(session, prompt.into(), events, control, placement, manager.clone())
             .await;
         forwarder.abort();
         stop_children.abort();
-        if stopped.is_cancelled() {
-            run_children.cancel();
-        }
+        run_children.cancel();
+        settle_children(&manager).await;
         match scope.finish() {
             Some(decision) => Ok(UnattendedOutcome::Blocked(decision)),
             None => outcome.map(UnattendedOutcome::Finished),
@@ -2112,6 +2113,15 @@ async fn forward_main_inbox(inbox: subagents::MainInbox, control: RunControl, se
         }
     }
 }
+
+/// Waits until every child `manager` spawned has reached a terminal state. The
+/// caller cancels them first, so each one settles once its work stops.
+async fn settle_children(manager: &SubagentManager) {
+    for child in manager.list() {
+        let _ = manager.wait(&child.id).await;
+    }
+}
+
 struct SendTool {
     peers: PeerBus,
 }
@@ -4534,6 +4544,21 @@ mod tests {
     struct DelegatingProvider {
         child_gate: watch::Receiver<bool>,
         parent_gate: watch::Receiver<bool>,
+        child_live: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// Counts the child turns that are inside the provider right now.
+    struct LiveGuard(Arc<std::sync::atomic::AtomicUsize>);
+    impl LiveGuard {
+        fn enter(counter: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self(counter.clone())
+        }
+    }
+    impl Drop for LiveGuard {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     impl DelegatingProvider {
@@ -4573,6 +4598,7 @@ mod tests {
             let stopped = || ProviderError::Transport("run stopped while waiting".into());
             let message = match prompt {
                 "child work" => {
+                    let _live = LiveGuard::enter(&self.child_live);
                     if !Self::hold(self.child_gate.clone(), &cancel).await {
                         return Err(stopped());
                     }
@@ -4632,6 +4658,7 @@ mod tests {
             Arc::new(DelegatingProvider {
                 child_gate,
                 parent_gate,
+                child_live: Arc::default(),
             }),
         )
     }
@@ -4664,6 +4691,55 @@ mod tests {
         })
         .await
         .expect("delegated child appears in the registry")
+    }
+
+    /// An unattended run that ends while a child it started is still working
+    /// stops that child before it returns: once the root has finished, nothing
+    /// can answer the child's decisions or read its work.
+    #[tokio::test]
+    async fn unattended_run_settles_its_children_before_returning() {
+        let root = tempdir().expect("tempdir");
+        let (_child_open, child_gate) = watch::channel(false);
+        let (parent_open, parent_gate) = watch::channel(false);
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let runtime = runtime_with(
+            &repo,
+            &root.path().join("data"),
+            mock_config(),
+            Arc::new(DelegatingProvider {
+                child_gate,
+                parent_gate,
+                child_live: live.clone(),
+            }),
+        );
+        let mut session = runtime.new_session().expect("session");
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let run = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                let _events_rx = events_rx;
+                runtime
+                    .run_unattended(&mut session, "delegate", events, RunControl::new(), None)
+                    .await
+            }
+        });
+        timeout(Duration::from_secs(5), async {
+            while live.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the delegated child starts working");
+        parent_open.send(true).expect("open the parent gate");
+        let outcome = run.await.expect("run task").expect("unattended run");
+        assert!(matches!(outcome, UnattendedOutcome::Finished(_)));
+        assert_eq!(
+            live.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the child is stopped before the run returns"
+        );
     }
 
     /// A run stopped before it starts must not leave later runs' subagents
