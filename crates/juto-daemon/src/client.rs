@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::protocol::{
     ClientFrame, ErrorCode, HelloInfo, PROTOCOL_VERSION, Reply, Request, RpcError, ServerEvent,
-    ServerFrame, paths,
+    ServerFrame, binary_id, paths,
 };
 
 const CLIENT_NAME: &str = concat!("juto-daemon-client/", env!("CARGO_PKG_VERSION"));
@@ -57,6 +57,7 @@ pub struct Client {
 impl Client {
     /// Connects to the daemon for `cwd`, starting its systemd `--user` unit if it is
     /// not running. Returns after the `Hello` handshake. Must run inside a Tokio runtime.
+    /// The daemon binary must be found too: a running daemon is checked against it.
     pub async fn connect(cwd: &Path) -> Result<Client, ClientError> {
         let cwd = std::fs::canonicalize(cwd).map_err(|e| {
             ClientError::Start(format!("cannot open workspace {}: {e}", cwd.display()))
@@ -64,7 +65,14 @@ impl Client {
         let socket =
             paths::daemon_socket(&cwd).map_err(|e| ClientError::Start(format!("{e:#}")))?;
         let unit = paths::unit_name(&cwd);
-        open(Target { cwd, socket, unit }).await
+        let binary = daemon_binary()?;
+        open(Target {
+            cwd,
+            socket,
+            unit,
+            binary,
+        })
+        .await
     }
 
     /// Sends `request` and waits for its reply. Fails with `Disconnected` while the
@@ -124,6 +132,8 @@ struct Target {
     cwd: PathBuf,
     socket: PathBuf,
     unit: String,
+    /// The daemon executable this client expects; a running daemon must match it.
+    binary: PathBuf,
 }
 
 /// One established connection: a line reader and a writer.
@@ -264,7 +274,8 @@ async fn connect_or_start(target: &Target) -> Result<(Wire, HelloInfo), ClientEr
 }
 
 /// Opens the socket and exchanges `Hello`. Unreachable or closed sockets yield
-/// `Disconnected`; protocol answers yield `Rpc`.
+/// `Disconnected`; protocol answers yield `Rpc`. A daemon started from another build
+/// than `target.binary` yields `Start`: it is refused, not reused.
 async fn handshake(target: &Target) -> Result<(Wire, HelloInfo), ClientError> {
     let stream = UnixStream::connect(&target.socket)
         .await
@@ -295,6 +306,18 @@ async fn handshake(target: &Target) -> Result<(Wire, HelloInfo), ClientError> {
         Ok(ServerFrame::Response {
             id: HELLO_ID,
             result: Err(err),
+        }) if matches!(err.code, ErrorCode::ProtocolMismatch) => {
+            return Err(ClientError::Rpc(RpcError::new(
+                ErrorCode::ProtocolMismatch,
+                format!(
+                    "daemon rejected protocol {PROTOCOL_VERSION} ({}); run `systemctl --user stop {}` and retry",
+                    err.message, target.unit
+                ),
+            )));
+        }
+        Ok(ServerFrame::Response {
+            id: HELLO_ID,
+            result: Err(err),
         }) => return Err(ClientError::Rpc(err)),
         Ok(_) => {
             return Err(ClientError::Rpc(RpcError::new(
@@ -318,19 +341,32 @@ async fn handshake(target: &Target) -> Result<(Wire, HelloInfo), ClientError> {
             ),
         )));
     }
+    let expected = binary_id(&target.binary).map_err(|e| {
+        ClientError::Start(format!(
+            "cannot read daemon binary {}: {e}",
+            target.binary.display()
+        ))
+    })?;
+    if info.binary_id != expected {
+        return Err(ClientError::Start(format!(
+            "juto daemon for {} was started from a different build than {}; run `systemctl --user stop {}` and retry",
+            target.cwd.display(),
+            target.binary.display(),
+            target.unit
+        )));
+    }
     Ok((Wire { lines, write }, info))
 }
 
 /// Starts the daemon as a transient unit. Only variable names go on the command line;
 /// systemd takes their values from this process's environment.
 async fn start_unit(target: &Target) -> Result<(), ClientError> {
-    let daemon = daemon_binary()?;
     let output = Command::new("systemd-run")
         .args(["--user", "--collect", "--quiet"])
         .arg(format!("--unit={}", target.unit))
         .arg(format!("--working-directory={}", target.cwd.display()))
         .args(forwarded_env_names().map(|name| format!("--setenv={name}")))
-        .arg(&daemon)
+        .arg(&target.binary)
         .arg("--workspace")
         .arg(&target.cwd)
         .output()
@@ -440,18 +476,10 @@ mod tests {
     /// without answering. The pending request must fail with `Disconnected`.
     #[tokio::test]
     async fn pending_request_fails_with_disconnected_when_connection_drops() {
-        let dir =
-            std::env::temp_dir().join(format!("juto-client-{}", uuid::Uuid::now_v7().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("daemon.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let target = Target {
-            cwd: dir.clone(),
-            socket,
-            unit: "juto-daemon-test".to_string(),
-        };
+        let (dir, listener, target) = scratch("pending");
 
         let server_dir = dir.clone();
+        let binary = target.binary.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
@@ -470,7 +498,7 @@ mod tests {
                         cwd: server_dir.clone(),
                         data_dir: server_dir.join("data"),
                         desktop_socket: server_dir.join("desktop.sock"),
-                        binary_id: "test".to_string(),
+                        binary_id: binary_id(&binary).unwrap(),
                     })),
                 },
             )
@@ -490,6 +518,120 @@ mod tests {
         drop(client);
         server.await.unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A daemon started from another build of the binary is refused, not reused.
+    #[tokio::test]
+    async fn a_daemon_from_another_build_is_refused() {
+        let (dir, listener, target) = scratch("stale");
+        // A different file has a different identity, as a rebuilt daemon binary does.
+        let stale = dir.join("juto-daemon-stale");
+        std::fs::write(&stale, b"older daemon").unwrap();
+        let unit = target.unit.clone();
+        let hello = hello_info(&dir, binary_id(&stale).unwrap());
+        let server = tokio::spawn(serve_hello(listener, Ok(Reply::Hello(hello))));
+
+        let err = match open(target).await {
+            Ok(_) => panic!("a daemon started from another build was reused"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(matches!(err, ClientError::Start(_)), "{message}");
+        assert!(
+            message.contains(&format!("systemctl --user stop {unit}")),
+            "{message}"
+        );
+        server.await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A daemon from the same build as the client's binary is attached to.
+    #[tokio::test]
+    async fn a_daemon_from_the_same_build_is_reused() {
+        let (dir, listener, target) = scratch("same");
+        let hello = hello_info(&dir, binary_id(&target.binary).unwrap());
+        let server = tokio::spawn(serve_hello(listener, Ok(Reply::Hello(hello))));
+
+        let client = open(target).await.expect("the same build is accepted");
+        drop(client);
+        server.await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A daemon that rejects our protocol version gets the same restart hint.
+    #[tokio::test]
+    async fn a_protocol_rejection_names_the_restart_command() {
+        let (dir, listener, target) = scratch("protocol");
+        let unit = target.unit.clone();
+        let rejection = RpcError::new(ErrorCode::ProtocolMismatch, "incompatible protocol version");
+        let server = tokio::spawn(serve_hello(listener, Err(rejection)));
+
+        let err = match open(target).await {
+            Ok(_) => panic!("a protocol-rejecting daemon was attached"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            matches!(&err, ClientError::Rpc(rpc) if matches!(rpc.code, ErrorCode::ProtocolMismatch)),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("systemctl --user stop {unit}")),
+            "{message}"
+        );
+        server.await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Scratch workspace: a bound socket, a stand-in daemon binary, and the target.
+    fn scratch(name: &str) -> (PathBuf, UnixListener, Target) {
+        let dir = std::env::temp_dir().join(format!(
+            "juto-client-{name}-{}",
+            uuid::Uuid::now_v7().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let binary = dir.join(DAEMON_BINARY);
+        std::fs::write(&binary, b"daemon").unwrap();
+        let target = Target {
+            cwd: dir.clone(),
+            socket,
+            unit: "juto-daemon-test".to_string(),
+            binary,
+        };
+        (dir, listener, target)
+    }
+
+    fn hello_info(dir: &Path, binary_id: String) -> HelloInfo {
+        HelloInfo {
+            protocol_version: PROTOCOL_VERSION,
+            daemon_version: "test".to_string(),
+            pid: std::process::id(),
+            cwd: dir.to_path_buf(),
+            data_dir: dir.join("data"),
+            desktop_socket: dir.join("desktop.sock"),
+            binary_id,
+        }
+    }
+
+    /// Serves one connection: answers `Hello` with `result`, then holds the connection
+    /// until the client drops it.
+    async fn serve_hello(listener: UnixListener, result: Result<Reply, RpcError>) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let hello = next_client_frame(&mut lines).await;
+        assert!(matches!(hello.request, Request::Hello { .. }));
+        send_server_frame(
+            &mut write,
+            &ServerFrame::Response {
+                id: hello.id,
+                result,
+            },
+        )
+        .await;
+        let _ = lines.next_line().await;
     }
 
     async fn next_client_frame(lines: &mut Lines<BufReader<OwnedReadHalf>>) -> ClientFrame {
