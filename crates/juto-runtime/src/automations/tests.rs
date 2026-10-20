@@ -21,6 +21,8 @@ fn spec(every_secs: u64) -> AutomationSpec {
         contract: no_change(),
         every_secs,
         overlap: None,
+        tier: None,
+        permission: None,
     }
 }
 
@@ -57,6 +59,16 @@ fn rewind_cursor(data: &Path, id: &str, next_instant_ms: u64) {
     std::fs::write(&path, value.to_string()).expect("write record");
 }
 
+/// Simulates a hand-edited record: one field is replaced on disk.
+fn rewrite_record(data: &Path, id: &str, field: &str, value: serde_json::Value) {
+    let path = data.join("automations").join(format!("{id}.json"));
+    let mut record: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read record"))
+            .expect("parse record");
+    record[field] = value;
+    std::fs::write(&path, record.to_string()).expect("write record");
+}
+
 fn origin(automation: &Automation, instant_ms: u64) -> Option<JobOrigin> {
     Some(JobOrigin {
         automation_id: automation.id.clone(),
@@ -65,7 +77,7 @@ fn origin(automation: &Automation, instant_ms: u64) -> Option<JobOrigin> {
 }
 
 #[tokio::test]
-async fn a_due_occurrence_starts_one_job_and_a_repeat_tick_starts_none() {
+async fn a_due_tick_starts_exactly_one_job() {
     let (_root, repo, data) = fixture();
     let runtime = runtime(&repo, &data, Arc::new(Answer("done")));
     let automation = runtime.create_automation_at(spec(60), T0).expect("create");
@@ -86,6 +98,18 @@ async fn a_due_occurrence_starts_one_job_and_a_repeat_tick_starts_none() {
     assert_eq!(first.origin, origin(&automation, T0 + MINUTE));
     assert_eq!(first.priority, Some(Priority::Scheduled));
     wait_for(&runtime, &first.id, |job| job.status.is_terminal()).await;
+    assert_eq!(runtime.list_jobs().expect("list").len(), 1);
+}
+
+#[tokio::test]
+async fn a_repeat_tick_for_the_same_occurrence_starts_no_second_job() {
+    let (_root, repo, data) = fixture();
+    let runtime = runtime(&repo, &data, Arc::new(Answer("done")));
+    let automation = runtime.create_automation_at(spec(60), T0).expect("create");
+
+    let first = runtime.tick_automations(T0 + MINUTE).expect("tick");
+    assert_eq!(first.len(), 1);
+    wait_for(&runtime, &first[0].id, |job| job.status.is_terminal()).await;
 
     assert!(
         runtime
@@ -102,13 +126,13 @@ async fn a_due_occurrence_starts_one_job_and_a_repeat_tick_starts_none() {
         "the next occurrence is not due yet"
     );
 
-    let started = runtime.tick_automations(T0 + 2 * MINUTE).expect("tick");
-    assert_eq!(started.len(), 1);
+    let second = runtime.tick_automations(T0 + 2 * MINUTE).expect("tick");
+    assert_eq!(second.len(), 1);
     assert_ne!(
-        started[0].id, first.id,
+        second[0].id, first[0].id,
         "distinct occurrences, distinct jobs"
     );
-    wait_for(&runtime, &started[0].id, |job| job.status.is_terminal()).await;
+    wait_for(&runtime, &second[0].id, |job| job.status.is_terminal()).await;
 
     let history = runtime.automation_history(&automation.id).expect("history");
     assert_eq!(history.jobs.len(), 2);
@@ -118,15 +142,99 @@ async fn a_due_occurrence_starts_one_job_and_a_repeat_tick_starts_none() {
             AutomationEvent::Fired {
                 at_ms: T0 + MINUTE,
                 instant_ms: T0 + MINUTE,
-                job_id: first.id.clone(),
+                job_id: first[0].id.clone(),
             },
             AutomationEvent::Fired {
                 at_ms: T0 + 2 * MINUTE,
                 instant_ms: T0 + 2 * MINUTE,
-                job_id: started[0].id.clone(),
+                job_id: second[0].id.clone(),
             },
         ]
     );
+}
+
+#[tokio::test]
+async fn a_scheduled_job_carries_the_stored_tier_and_permission_profile() {
+    let (_root, repo, data) = fixture();
+    let runtime = runtime(&repo, &data, Arc::new(Stalled));
+    let automation = runtime
+        .create_automation_at(
+            AutomationSpec {
+                tier: Some(ExecutionTier::Untrusted),
+                permission: Some(PermissionProfile::ReadOnly),
+                ..spec(60)
+            },
+            T0,
+        )
+        .expect("create");
+    assert_eq!(automation.tier, ExecutionTier::Untrusted);
+    assert_eq!(automation.permission, PermissionProfile::ReadOnly);
+
+    let started = runtime.tick_automations(T0 + MINUTE).expect("tick");
+    assert_eq!(started.len(), 1);
+    let job = runtime.job(&started[0].id).expect("job");
+    assert_eq!(job.tier, Some(ExecutionTier::Untrusted));
+    assert_eq!(job.permission, Some(PermissionProfile::ReadOnly));
+    assert_eq!(
+        runtime.automation(&automation.id).expect("load").tier,
+        ExecutionTier::Untrusted,
+        "the stored tier survives a reload"
+    );
+    runtime.cancel_job(&job.id).expect("cancel");
+    wait_for(&runtime, &job.id, |job| job.status.is_terminal()).await;
+}
+
+#[tokio::test]
+async fn a_definition_without_a_tier_runs_workspace_and_unattended() {
+    let (_root, repo, data) = fixture();
+    let runtime = runtime(&repo, &data, Arc::new(Answer("done")));
+    let automation = runtime.create_automation_at(spec(60), T0).expect("create");
+    assert_eq!(automation.tier, ExecutionTier::Workspace);
+    assert_eq!(automation.permission, PermissionProfile::Unattended);
+}
+
+#[tokio::test]
+async fn a_tier_above_the_unattended_ceiling_is_refused_at_create_and_at_start() {
+    let (_root, repo, data) = fixture();
+    let runtime = runtime(&repo, &data, Arc::new(Answer("done")));
+    for tier in [ExecutionTier::Attended, ExecutionTier::Full] {
+        let error = runtime
+            .create_automation_at(
+                AutomationSpec {
+                    tier: Some(tier),
+                    ..spec(60)
+                },
+                T0,
+            )
+            .expect_err("refused");
+        match error {
+            AutomationError::Invalid(message) => {
+                assert!(message.contains(tier.as_str()), "{message}");
+                assert!(message.contains("`untrusted` or `workspace`"), "{message}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+    assert!(runtime.list_automations().expect("list").is_empty());
+
+    let automation = runtime.create_automation_at(spec(60), T0).expect("create");
+    rewrite_record(&data, &automation.id, "tier", "full".into());
+    assert!(
+        runtime
+            .tick_automations(T0 + MINUTE)
+            .expect("tick")
+            .is_empty(),
+        "a record edited past the ceiling starts no job"
+    );
+    assert!(runtime.list_jobs().expect("list").is_empty());
+    assert!(matches!(
+        runtime
+            .automation_history(&automation.id)
+            .expect("history")
+            .events
+            .as_slice(),
+        [AutomationEvent::Failed { .. }]
+    ));
 }
 
 #[tokio::test]

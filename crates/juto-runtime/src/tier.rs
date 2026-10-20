@@ -27,6 +27,48 @@ pub enum ExecutionTier {
     Full,
 }
 
+/// The most permissive tier an unattended run may store or start with. Scheduled
+/// runs never run above `workspace`: `attended` and `full` need a person watching.
+pub(crate) const UNATTENDED_TIER_CEILING: ExecutionTier = ExecutionTier::Workspace;
+
+/// Checks `tier` against [`UNATTENDED_TIER_CEILING`]. Stricter tiers pass. The
+/// error names the rule.
+pub(crate) fn check_unattended_tier(tier: ExecutionTier) -> Result<(), String> {
+    if tier <= UNATTENDED_TIER_CEILING {
+        return Ok(());
+    }
+    Err(format!(
+        "tier `{}` is more permissive than unattended runs allow; a scheduled run uses `untrusted` or `workspace`",
+        tier.as_str()
+    ))
+}
+
+/// Which tools a run may advertise. Variants are ordered from most to least
+/// confined, like [`ExecutionTier`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionProfile {
+    /// Only the read-only tools: `read`, `glob`, `grep` and `recall`.
+    ReadOnly,
+    /// The unattended profile: the role's tools. An action outside it records a
+    /// decision for an operator and stops the run.
+    #[default]
+    Unattended,
+}
+
+/// The widest permission profile an unattended run may store or start with.
+pub(crate) const UNATTENDED_PROFILE_CEILING: PermissionProfile = PermissionProfile::Unattended;
+
+/// Checks `profile` against [`UNATTENDED_PROFILE_CEILING`]. Narrower profiles pass.
+pub(crate) fn check_unattended_profile(profile: PermissionProfile) -> Result<(), String> {
+    if profile <= UNATTENDED_PROFILE_CEILING {
+        return Ok(());
+    }
+    Err(format!(
+        "permission profile `{profile:?}` is wider than the unattended profile allows"
+    ))
+}
+
 impl ExecutionTier {
     /// The name used in config files, `task` arguments, and error messages.
     pub fn as_str(self) -> &'static str {
@@ -92,6 +134,25 @@ impl ExecutionTier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unattended_ceiling_admits_untrusted_and_workspace_only() {
+        assert!(check_unattended_tier(ExecutionTier::Untrusted).is_ok());
+        assert!(check_unattended_tier(ExecutionTier::Workspace).is_ok());
+        for tier in [ExecutionTier::Attended, ExecutionTier::Full] {
+            let err = check_unattended_tier(tier).expect_err("too permissive");
+            assert!(err.contains(tier.as_str()), "{err}");
+            assert!(err.contains("`untrusted` or `workspace`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn read_only_profile_is_narrower_than_unattended() {
+        assert!(PermissionProfile::ReadOnly < PermissionProfile::Unattended);
+        assert_eq!(PermissionProfile::default(), PermissionProfile::Unattended);
+        assert!(check_unattended_profile(PermissionProfile::ReadOnly).is_ok());
+        assert!(check_unattended_profile(PermissionProfile::Unattended).is_ok());
+    }
 
     #[test]
     fn stricter_tiers_order_first() {

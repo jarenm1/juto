@@ -271,6 +271,8 @@ mod tests {
             spend_usd: 0.0,
             session_id: None,
             session_path: None::<PathBuf>,
+            tier: None,
+            permission: None,
             forks: Vec::new(),
             decision_id: None,
             result: None,
