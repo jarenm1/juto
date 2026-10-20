@@ -1989,6 +1989,34 @@ mod tests {
     }
 
     #[test]
+    fn unbounded_memory_limit_is_refused_before_admission() {
+        if !is_systemd_run_available() {
+            return;
+        }
+        let dir = tempdir().expect("tempdir");
+        let ws = SubagentWorkspace {
+            path: dir.path().to_path_buf(),
+            node_id: "test-node".to_string(),
+            thread: "test-ws".to_string(),
+            repo_root: dir.path().to_path_buf(),
+            subagent_id: "test-agent".to_string(),
+        };
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("true");
+        let mut limits = ResourceLimits::default().with_memory_max("infinity");
+        limits.broker = Some(Broker::new(dir.path().join("broker")));
+
+        let error = ws
+            .admission(&cmd, &limits)
+            .err()
+            .expect("an unbounded limit must not be admitted");
+        assert!(
+            error.to_string().contains("cannot be reserved"),
+            "refusal must name the unreservable limit: {error}"
+        );
+    }
+
+    #[test]
     fn test_scoped_command_construction() {
         let ws = SubagentWorkspace {
             path: PathBuf::from("/tmp/test-ws"),
