@@ -826,3 +826,57 @@ async fn drained_results_are_returned_once_even_after_a_restart() {
 fn runtime_for_restart(cwd: &Path, data_dir: &Path) -> Runtime {
     runtime(cwd, data_dir, Arc::new(Answer("unused")))
 }
+
+#[tokio::test]
+async fn a_settled_job_has_no_run_control_left_for_a_retry_to_lose() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let data_dir = root.path().join("data");
+    let runtime = runtime(&repo, &data_dir, Arc::new(Stalled));
+    let mut events = runtime.subscribe_jobs();
+
+    let started = runtime
+        .start_job("stall", budget(60), no_change())
+        .expect("start");
+    settle(&runtime, &mut events, &started.id, |job| {
+        job.status == JobStatus::Running
+    })
+    .await;
+
+    // Hold the live-run map, as a retry does while it registers its control.
+    let live = runtime
+        .inner
+        .jobs
+        .live
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let finisher = {
+        let runtime = runtime.clone();
+        let id = started.id.clone();
+        std::thread::spawn(move || {
+            runtime.finish(
+                &id,
+                Settled::Failed {
+                    error: "attempt failed".to_owned(),
+                    result: None,
+                },
+            )
+        })
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !runtime
+            .job(&started.id)
+            .expect("job exists")
+            .status
+            .is_terminal(),
+        "a job must not show as settled while its run control is still registered"
+    );
+    drop(live);
+    finisher.join().expect("finish thread").expect("finish");
+    assert!(
+        runtime.inner.jobs.control(&started.id).is_err(),
+        "a settled job keeps no run control"
+    );
+}
