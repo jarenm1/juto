@@ -470,6 +470,7 @@ mod tests {
                         cwd: server_dir.clone(),
                         data_dir: server_dir.join("data"),
                         desktop_socket: server_dir.join("desktop.sock"),
+                        binary_id: "test".to_string(),
                     })),
                 },
             )

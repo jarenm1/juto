@@ -560,14 +560,19 @@ impl Daemon {
         match request {
             Request::Hello {
                 protocol_version, ..
-            } if protocol_version == PROTOCOL_VERSION => Ok(Reply::Hello(HelloInfo {
-                protocol_version: PROTOCOL_VERSION,
-                daemon_version: env!("CARGO_PKG_VERSION").into(),
-                pid: std::process::id(),
-                cwd: self.runtime.cwd().to_owned(),
-                data_dir: self.runtime.data_dir().to_owned(),
-                desktop_socket: self.desktop_socket.clone(),
-            })),
+            } if protocol_version == PROTOCOL_VERSION => {
+                // The running image, not a path: the file may be replaced on disk later.
+                let binary_id = binary_id(Path::new("/proc/self/exe")).map_err(failed)?;
+                Ok(Reply::Hello(HelloInfo {
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_version: env!("CARGO_PKG_VERSION").into(),
+                    pid: std::process::id(),
+                    cwd: self.runtime.cwd().to_owned(),
+                    data_dir: self.runtime.data_dir().to_owned(),
+                    desktop_socket: self.desktop_socket.clone(),
+                    binary_id,
+                }))
+            }
             Request::Hello { .. } => Err(RpcError::new(
                 ErrorCode::ProtocolMismatch,
                 "incompatible protocol version",
