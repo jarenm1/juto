@@ -1684,7 +1684,7 @@ impl Tool for TaskTool {
             }
         }
         if !self.async_results {
-            return collect_agents(&self.manager, ids).await;
+            return collect_agents(&self.manager, ids, &ctx.cancel).await;
         }
         let children = ids
             .into_iter()
@@ -1792,7 +1792,7 @@ impl Tool for WaitTool {
             parameters: json!({"type":"object","properties":{"ids":{"type":"array","minItems":1,"items":{"type":"string"}}},"required":["ids"],"additionalProperties":false}),
         }
     }
-    async fn execute(&self, arguments: Value, _ctx: ToolContext) -> Result<ToolOutput, String> {
+    async fn execute(&self, arguments: Value, ctx: ToolContext) -> Result<ToolOutput, String> {
         let ids = arguments
             .get("ids")
             .and_then(Value::as_array)
@@ -1800,27 +1800,39 @@ impl Tool for WaitTool {
             .iter()
             .map(|id| id.as_str().map(str::to_owned).ok_or("id must be a string"))
             .collect::<Result<Vec<_>, _>>()?;
-        collect_agents(&self.manager, ids).await
+        collect_agents(&self.manager, ids, &ctx.cancel).await
     }
 }
-async fn collect_agents(manager: &SubagentManager, ids: Vec<String>) -> Result<ToolOutput, String> {
-    let mut results = Vec::with_capacity(ids.len());
-    let mut failed = false;
-    let inbox = manager.main_inbox();
-    for id in ids {
-        match manager.wait(&id).await {
-            Ok(result) => results.push(json!({"id": id, "result": result})),
-            Err(error) => match inbox.archived(&id) {
-                Some(report) if matches!(error, SubagentError::Unknown(_)) => {
-                    results.push(json!({"id": id, "report": report}))
-                }
-                _ => {
-                    failed = true;
-                    results.push(json!({"id":id,"error":error.to_string()}));
-                }
-            },
+/// Read each child's terminal result in order. The wait runs with the calling
+/// turn's desk released: a parent holding a desk while its children queue for
+/// one could otherwise starve them.
+async fn collect_agents(
+    manager: &SubagentManager,
+    ids: Vec<String>,
+    cancel: &CancellationToken,
+) -> Result<ToolOutput, String> {
+    let (results, failed) = pools::release_while(cancel, async {
+        let mut results = Vec::with_capacity(ids.len());
+        let mut failed = false;
+        let inbox = manager.main_inbox();
+        for id in ids {
+            match manager.wait(&id).await {
+                Ok(result) => results.push(json!({"id": id, "result": result})),
+                Err(error) => match inbox.archived(&id) {
+                    Some(report) if matches!(error, SubagentError::Unknown(_)) => {
+                        results.push(json!({"id": id, "report": report}))
+                    }
+                    _ => {
+                        failed = true;
+                        results.push(json!({"id":id,"error":error.to_string()}));
+                    }
+                },
+            }
         }
-    }
+        (results, failed)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
     let value = Value::Array(results);
     let text = serde_json::to_string(&value).map_err(|error| error.to_string())?;
     Ok(ToolOutput {
@@ -3166,9 +3178,13 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let archived = collect_agents(&manager, vec![args["ids"][0].as_str().unwrap().to_string()])
-            .await
-            .unwrap();
+        let archived = collect_agents(
+            &manager,
+            vec![args["ids"][0].as_str().unwrap().to_string()],
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(archived.details[0]["report"]["body"], full.output);
         for report in reports {
             manager.main_inbox().push_from(Some(origin.clone()), report);
@@ -3747,6 +3763,112 @@ mod tests {
             0,
             "rejected batches must start no child"
         );
+    }
+
+    #[tokio::test]
+    async fn parents_blocked_on_children_release_their_desks() {
+        // Four bytes of budget is four desks (a desk is budget / 512, at least one
+        // byte). Each parent holds a desk while it waits on its child, so the four
+        // children can only be admitted if a waiting parent gives its desk back.
+        struct Child;
+
+        #[async_trait]
+        impl subagents::SubagentFactory for Child {
+            async fn run(
+                &self,
+                id: &str,
+                _spec: TaskSpec,
+                _control: RunControl,
+                _events: mpsc::UnboundedSender<AgentEvent>,
+            ) -> Result<SubagentResult, String> {
+                Ok(SubagentResult {
+                    id: id.to_string(),
+                    output: "child done".to_string(),
+                    data: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    session_path: PathBuf::from("/tmp/child.jsonl"),
+                    change_id: None,
+                })
+            }
+        }
+
+        struct Parent {
+            admission: pools::Admission,
+        }
+
+        #[async_trait]
+        impl subagents::SubagentFactory for Parent {
+            async fn run(
+                &self,
+                id: &str,
+                _spec: TaskSpec,
+                control: RunControl,
+                _events: mpsc::UnboundedSender<AgentEvent>,
+            ) -> Result<SubagentResult, String> {
+                let nested = Arc::new(SubagentManager::new(
+                    Arc::new(Child),
+                    self.admission.clone(),
+                    control.token(),
+                    subagents::MainInbox::default(),
+                ));
+                let tool = TaskTool {
+                    manager: nested,
+                    catalog: Arc::new(BTreeMap::new()),
+                    allow_focus: false,
+                    async_results: false,
+                    main_session: None,
+                    run_tier: ExecutionTier::Attended,
+                };
+                let context = ToolContext {
+                    cwd: PathBuf::from("/repo"),
+                    session_id: id.to_string(),
+                    cancel: control.token(),
+                };
+                let output = tool
+                    .execute(json!({"tasks": [{"task": "child work"}]}), context)
+                    .await?;
+                if output.is_error {
+                    return Err("child failed".to_string());
+                }
+                Ok(SubagentResult {
+                    id: id.to_string(),
+                    output: "parent done".to_string(),
+                    data: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    session_path: PathBuf::from("/tmp/parent.jsonl"),
+                    change_id: None,
+                })
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let broker = Broker::new(dir.path().join("broker"))
+            .with_pressure_file(dir.path().join("no-pressure"));
+        let admission = pools::Admission::new(32, pools::Desks::with_budget(broker, 4));
+        let manager = Arc::new(SubagentManager::new(
+            Arc::new(Parent {
+                admission: admission.clone(),
+            }),
+            admission,
+            CancellationToken::new(),
+            subagents::MainInbox::default(),
+        ));
+        let ids: Vec<String> = (0..4)
+            .map(|n| manager.spawn(TaskSpec::new(format!("parent {n}"))))
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let all_done = async {
+            for id in &ids {
+                manager.wait(id).await.expect("parent run");
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), all_done)
+            .await
+            .expect(
+                "parents and their children all finish: waiting parents must not hold every desk",
+            );
     }
 
     #[tokio::test]
