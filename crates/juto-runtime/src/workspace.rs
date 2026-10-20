@@ -1632,6 +1632,17 @@ pub fn find_repo_root(start_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The repository that owns `cwd`. A native fork has no `.jj` of its own, so jj
+/// state such as bookmarks is read from the repo its marker names; any other
+/// directory is its own owner.
+pub fn owning_repo(cwd: &Path) -> PathBuf {
+    let owner = std::fs::read(cwd.join(WORKSPACE_MARKER))
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<WorkspaceMarker>(&raw).ok())
+        .and_then(|marker| marker.git_dir.parent().map(Path::to_path_buf));
+    owner.unwrap_or_else(|| cwd.to_path_buf())
+}
+
 /// Returns the default directory where subagent workspaces are placed (`~/workspaces`).
 pub fn default_workspaces_dir() -> PathBuf {
     if let Some(dir) = env_var_nonempty("JUTO_WORKSPACES_DIR") {

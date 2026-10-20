@@ -332,7 +332,7 @@ impl UnattendedScope {
     ) -> Self {
         Self {
             store: DecisionStore::open(data_dir),
-            cwd: cwd.to_path_buf(),
+            cwd: crate::workspace::owning_repo(cwd),
             session_id,
             job_id,
             control,
@@ -553,5 +553,45 @@ mod tests {
             outside_profile(&call("bash", json!({"command": "ls"}))),
             None
         );
+    }
+
+    /// A job's fork has no `.jj` of its own; its bookmarks live in the repo that
+    /// owns it, which the fork's marker names.
+    #[tokio::test]
+    async fn publish_pins_a_bookmark_from_the_repo_that_owns_a_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let fork = dir.path().join("fork");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&fork).unwrap();
+        let jj = |args: &[&str]| {
+            let out = std::process::Command::new("jj")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "jj {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        jj(&["git", "init", "--colocate"]);
+        jj(&["bookmark", "create", "feat/x", "-r", "@"]);
+        let marker = json!({"git_dir": repo.join(".git"), "thread": "t"});
+        std::fs::write(fork.join(".juto-workspace.json"), marker.to_string()).unwrap();
+        let scope = UnattendedScope::new(dir.path(), &fork, "s1".into(), None, RunControl::new());
+        let publish = call("publish", json!({"bookmark": "feat/x", "title": "t"}));
+        let err = scope
+            .admit(&publish, "publish:feat/x", CancellationToken::new())
+            .await
+            .expect_err("an unapproved publish is blocked");
+        assert!(err.starts_with("blocked:"), "{err}");
+        let missing = call("publish", json!({"bookmark": "nope", "title": "t"}));
+        let err = scope
+            .admit(&missing, "publish:nope", CancellationToken::new())
+            .await
+            .expect_err("an unresolvable bookmark fails closed");
+        assert!(err.contains("cannot pin publish of `nope`"), "{err}");
     }
 }

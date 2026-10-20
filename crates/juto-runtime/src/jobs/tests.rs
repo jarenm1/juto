@@ -37,6 +37,26 @@ fn native_repo(dir: &Path) {
     git(dir, &["commit", "-q", "-m", "initial"]);
 }
 
+fn jj(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("jj")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run jj");
+    assert!(
+        out.status.success(),
+        "jj {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A git repo colocated with jj, with bookmark `feat/x`, so `publish` can pin it.
+fn publishable_repo(dir: &Path) {
+    native_repo(dir);
+    jj(dir, &["git", "init", "--colocate"]);
+    jj(dir, &["bookmark", "create", "feat/x", "-r", "@-"]);
+}
+
 fn mock_config() -> crate::RuntimeConfig {
     crate::RuntimeConfig {
         model: "mock/test".to_string(),
@@ -344,7 +364,7 @@ async fn a_job_runs_in_its_own_fork_and_leaves_the_repo_untouched() {
 async fn a_blocked_job_resumes_after_approval_and_runs_the_action_once() {
     let root = tempdir().expect("tempdir");
     let repo = root.path().join("repo");
-    native_repo(&repo);
+    publishable_repo(&repo);
     let data_dir = root.path().join("data");
     let provider = Arc::new(PublishThenAnswer::default());
     let runtime = runtime(&repo, &data_dir, provider.clone());
@@ -401,7 +421,7 @@ async fn a_blocked_job_resumes_after_approval_and_runs_the_action_once() {
 async fn a_rejected_block_fails_the_job_without_running_the_action() {
     let root = tempdir().expect("tempdir");
     let repo = root.path().join("repo");
-    native_repo(&repo);
+    publishable_repo(&repo);
     let data_dir = root.path().join("data");
     let provider = Arc::new(PublishThenAnswer::default());
     let runtime = runtime(&repo, &data_dir, provider.clone());
