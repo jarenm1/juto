@@ -225,6 +225,16 @@ fn memory_pressure(path: &Path) -> bool {
     }
 }
 
+/// The pressure file a broker reads by default. Unit tests get an empty path, so
+/// `memory_pressure` reads nothing and reports no stall.
+fn default_pressure_file() -> PathBuf {
+    if cfg!(test) {
+        PathBuf::new()
+    } else {
+        PathBuf::from(PSI_MEMORY)
+    }
+}
+
 fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -240,11 +250,12 @@ pub struct Broker {
 }
 
 impl Broker {
-    /// A broker whose ledger lives in `dir`.
+    /// A broker whose ledger lives in `dir`. Unit tests read no kernel pressure
+    /// file: a host stall from unrelated work would otherwise queue every desk.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
             dir: dir.into(),
-            pressure_file: PathBuf::from(PSI_MEMORY),
+            pressure_file: default_pressure_file(),
         }
     }
 
