@@ -3592,10 +3592,9 @@ mod tests {
             eprintln!("skipping sandboxed-bash test: systemd-run unavailable");
             return;
         }
-        if let Err(err) = crate::network::helper() {
-            eprintln!("skipping sandboxed-bash test: {err}");
-            return;
-        }
+        // Builds this workspace's juto-cli and points the proxy lookup at it. A
+        // failure here fails the test: a sandboxed command cannot run without it.
+        crate::network::ensure_helper_for_tests().expect("sandbox network helper");
         let Some(home) = std::env::var_os("HOME")
             .filter(|home| !home.is_empty())
             .map(PathBuf::from)
