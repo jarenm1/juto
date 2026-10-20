@@ -45,6 +45,14 @@
 //!
 //! Tick, enable, pause and run-now serialize through one lock, so a pause cannot be
 //! overwritten by a concurrent tick.
+//!
+//! # Tier and permission profile
+//! Each automation stores an execution tier and a permission profile, and every
+//! occurrence runs under them. The tier is `untrusted` or `workspace`, the most
+//! permissive tier an unattended run may use: `attended` and `full` are refused
+//! at create and again when a job starts. The profile is `unattended` (the
+//! default) or `read_only`. The daemon's configured tier still caps a run, which
+//! then uses the lower of the two.
 
 use std::ffi::OsStr;
 use std::fs::OpenOptions;
@@ -58,6 +66,9 @@ use serde::{Deserialize, Serialize};
 use crate::Runtime;
 use crate::broker::Priority;
 use crate::jobs::{Job, JobBudget, JobContract, JobError, JobOrigin, JobSpec};
+use crate::tier::{
+    ExecutionTier, PermissionProfile, check_unattended_profile, check_unattended_tier,
+};
 
 /// Longest accepted interval: 366 days. It keeps every occurrence far inside `u64`.
 pub const MAX_EVERY_SECS: u64 = 366 * 24 * 60 * 60;
@@ -71,8 +82,8 @@ pub enum Overlap {
     Queue,
 }
 
-/// A persisted automation. Its runs use the runtime's unattended profile and tier;
-/// they are not configurable per automation.
+/// A persisted automation. Each occurrence starts a job under the stored tier and
+/// permission profile, capped by the daemon's configured tier.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Automation {
@@ -84,6 +95,10 @@ pub struct Automation {
     pub model: Option<String>,
     /// Broker priority of each job's main run: `scheduled` or `background`.
     pub priority: Priority,
+    /// Execution tier of each job's main run: `untrusted` or `workspace`.
+    pub tier: ExecutionTier,
+    /// Tool profile of each job's main run.
+    pub permission: PermissionProfile,
     pub budget: JobBudget,
     pub contract: JobContract,
     pub every_secs: u64,
@@ -114,6 +129,10 @@ pub struct AutomationSpec {
     pub every_secs: u64,
     /// `skip` (the default) or `queue`.
     pub overlap: Option<Overlap>,
+    /// `workspace` (the default) or `untrusted`. Stricter tiers are refused.
+    pub tier: Option<ExecutionTier>,
+    /// `unattended` (the default) or `read_only`.
+    pub permission: Option<PermissionProfile>,
 }
 
 /// One entry in an automation's event log.
@@ -307,6 +326,8 @@ impl Runtime {
             contract,
             every_secs,
             overlap,
+            tier,
+            permission,
         } = spec;
         if prompt.trim().is_empty() {
             return Err(AutomationError::Invalid(
@@ -324,6 +345,10 @@ impl Runtime {
                 "an automation runs as `scheduled` or `background` work".into(),
             ));
         }
+        let tier = tier.unwrap_or(ExecutionTier::Workspace);
+        check_unattended_tier(tier).map_err(AutomationError::Invalid)?;
+        let permission = permission.unwrap_or_default();
+        check_unattended_profile(permission).map_err(AutomationError::Invalid)?;
         budget.validate()?;
         contract.validate()?;
         if let Some(selector) = &model {
@@ -338,6 +363,8 @@ impl Runtime {
             prompt,
             model,
             priority,
+            tier,
+            permission,
             budget,
             contract,
             every_secs,
@@ -453,6 +480,8 @@ impl Runtime {
             contract: automation.contract,
             model: automation.model,
             priority: Some(automation.priority),
+            tier: Some(automation.tier),
+            permission: Some(automation.permission),
             origin: Some(JobOrigin {
                 automation_id: id.to_owned(),
                 instant_ms: now_ms,
@@ -557,6 +586,8 @@ impl Runtime {
             contract: automation.contract.clone(),
             model: automation.model.clone(),
             priority: Some(automation.priority),
+            tier: Some(automation.tier),
+            permission: Some(automation.permission),
             origin: Some(JobOrigin {
                 automation_id: id.clone(),
                 instant_ms: latest,

@@ -1088,6 +1088,8 @@ async fn a_job_spec_with_a_taken_id_starts_nothing_the_second_time() {
         contract: no_change(),
         model: None,
         priority: None,
+        tier: None,
+        permission: None,
         origin: None,
     };
 
@@ -1123,6 +1125,8 @@ async fn a_job_runs_on_the_model_it_names_and_refuses_an_unknown_one() {
         contract: no_change(),
         model: Some(model.into()),
         priority: None,
+        tier: None,
+        permission: None,
         origin: None,
     };
 

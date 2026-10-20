@@ -33,6 +33,9 @@ use crate::change_graph::ChangeGraph;
 use crate::decisions::{Decision, DecisionStatus, continuation_prompt};
 use crate::subagents::MainInbox;
 use crate::subagents::{ChildOutcome, SubagentStatus};
+use crate::tier::{
+    ExecutionTier, PermissionProfile, check_unattended_profile, check_unattended_tier,
+};
 use crate::workspace::SubagentWorkspace;
 use crate::{
     ChildFactory, JobLimits, Runtime, Session, UnattendedOutcome, UnattendedRun,
@@ -197,7 +200,7 @@ pub struct JobOrigin {
 }
 
 /// Everything `start_job` takes, plus the job's identity and provenance. One-off
-/// jobs leave `id`, `model`, `priority` and `origin` unset.
+/// jobs leave `id`, `model`, `tier`, `permission`, `priority` and `origin` unset.
 #[derive(Debug, Clone)]
 pub struct JobSpec {
     /// Persisted job id. `None` mints a fresh one; an id that already exists
@@ -210,6 +213,11 @@ pub struct JobSpec {
     pub model: Option<String>,
     /// Broker priority of the main run; `None` keeps the depth-0 default.
     pub priority: Option<Priority>,
+    /// Execution tier of the main run, capped by the configured tier. `None` keeps
+    /// the unattended default. Must be `untrusted` or `workspace`.
+    pub tier: Option<ExecutionTier>,
+    /// Permission profile of the main run. `None` means `unattended`.
+    pub permission: Option<PermissionProfile>,
     pub origin: Option<JobOrigin>,
 }
 
@@ -259,6 +267,12 @@ pub struct Job {
     /// Model selector pinned on the job's session when it started.
     #[serde(default)]
     pub model: Option<String>,
+    /// Execution tier of the main run, as stored at start. `None` keeps the unattended default.
+    #[serde(default)]
+    pub tier: Option<ExecutionTier>,
+    /// Permission profile of the main run, as stored at start. `None` means `unattended`.
+    #[serde(default)]
+    pub permission: Option<PermissionProfile>,
 }
 
 impl Job {
@@ -288,6 +302,8 @@ impl Job {
             origin: None,
             priority: None,
             model: None,
+            tier: None,
+            permission: None,
         }
     }
 }
@@ -545,6 +561,8 @@ impl Runtime {
             contract,
             model: None,
             priority: None,
+            tier: None,
+            permission: None,
             origin: None,
         })
     }
@@ -559,6 +577,8 @@ impl Runtime {
             budget,
             contract,
             model,
+            tier,
+            permission,
             priority,
             origin,
         } = spec;
@@ -571,11 +591,19 @@ impl Runtime {
             self.resolve_model(selector)
                 .map_err(|error| JobError::Invalid(format!("model `{selector}`: {error:#}")))?;
         }
+        if let Some(tier) = tier {
+            check_unattended_tier(tier).map_err(JobError::Invalid)?;
+        }
+        if let Some(permission) = permission {
+            check_unattended_profile(permission).map_err(JobError::Invalid)?;
+        }
         let id = id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
         let mut job = Job::new(id.clone(), prompt, budget, contract);
         job.model = model;
         job.priority = priority;
         job.origin = origin;
+        job.tier = tier;
+        job.permission = permission;
         self.inner.jobs.insert_new(&job)?;
         self.inner.jobs.register(&id);
         self.spawn_job(id, Attempt::Fresh);
@@ -1113,6 +1141,8 @@ impl Runtime {
                             .max_spend
                             .map(|max| (max - job.spend_usd).max(0.0)),
                         priority: job.priority,
+                        tier: job.tier,
+                        permission: job.permission.unwrap_or_default(),
                     },
                 )
             );

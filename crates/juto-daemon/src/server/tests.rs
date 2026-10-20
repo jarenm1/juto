@@ -1253,6 +1253,8 @@ fn every_second() -> juto_runtime::automations::AutomationSpec {
         prompt: "summarize the repo".into(),
         model: None,
         priority: None,
+        tier: None,
+        permission: None,
         budget: JobBudget {
             wall_secs: 60,
             max_attempts: 1,
