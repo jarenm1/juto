@@ -68,7 +68,7 @@ pub enum ThreadStatus {
 }
 
 /// One internal thread of a main session.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadInfo {
     /// Thread id; equal to its session journal's header id.
@@ -120,7 +120,7 @@ pub struct Route {
 }
 
 /// Thread lifecycle reported alongside a request's agent events.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ThreadEvent {
     /// The request was routed; emitted before its agent events.
@@ -142,7 +142,7 @@ pub enum MainEvent {
 }
 
 /// One row of a main session's merged history, in time order.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TimelineItem {
     /// A request was routed to a thread.
