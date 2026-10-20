@@ -45,6 +45,18 @@ fn fixture() -> TempDir {
     directory
 }
 
+/// Root ignores directory modes, so a 0o500 directory stays writable and the
+/// failure the 0o500 tests provoke never happens. A write probe detects that.
+fn running_as_root() -> bool {
+    let probe = TempDir::new().unwrap();
+    let locked = probe.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+    let writable = fs::write(locked.join("probe"), "x").is_ok();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    writable
+}
+
 fn provenance(session: &str) -> EditProvenance {
     EditProvenance {
         session_id: session.into(),
@@ -127,10 +139,15 @@ fn record_edit_noop_does_not_regress_the_workspace_head() {
 
 #[test]
 fn fork_removes_materialized_directory_when_bookkeeping_fails() {
+    if running_as_root() {
+        eprintln!("skipped: root ignores the 0o500 mode this test relies on");
+        return;
+    }
     let directory = fixture();
     let cwd = directory.path();
     let graph = ChangeGraph::open(cwd).unwrap();
     let root = graph.capture("main", provenance("root"), None).unwrap();
+    let refs_before = snapshot_refs(cwd);
     let state_dir = GitRepository::open(cwd).unwrap().git_dir().join("juto");
     let workspaces = tempfile::tempdir().unwrap();
     let destination = workspaces.path().join("child");
@@ -150,12 +167,131 @@ fn fork_removes_materialized_directory_when_bookkeeping_fails() {
         !destination.exists(),
         "a failed fork must not leave a materialized directory behind"
     );
+    assert_eq!(
+        snapshot_refs(cwd),
+        refs_before,
+        "a failed fork must not leave its snapshot pinned"
+    );
     // The same destination must be usable again.
     graph.fork("child", &root.id, &destination).unwrap();
     assert!(destination.join(".juto-workspace.json").is_file());
     assert_eq!(
         ChangeGraph::open(&destination).unwrap().thread(),
         Some("child")
+    );
+}
+
+#[test]
+fn fork_removes_materialized_directory_when_snapshot_pin_fails() {
+    if running_as_root() {
+        eprintln!("skipped: root ignores the 0o500 mode this test relies on");
+        return;
+    }
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    let snapshots = GitRepository::open(cwd)
+        .unwrap()
+        .git_dir()
+        .join("refs/juto/snapshots");
+    let workspaces = tempfile::tempdir().unwrap();
+    let destination = workspaces.path().join("child");
+
+    // Pinning the fork's start tree writes a ref into this directory. Making
+    // it unwritable fails the pin after the fork directory has been created.
+    let original = fs::metadata(&snapshots).unwrap().permissions();
+    let mut unwritable = original.clone();
+    unwritable.set_mode(0o500);
+    fs::set_permissions(&snapshots, unwritable).unwrap();
+
+    let failed = graph.fork("child", &root.id, &destination);
+    fs::set_permissions(&snapshots, original).unwrap();
+
+    assert!(failed.is_err(), "fork must report the snapshot failure");
+    assert!(
+        !destination.exists(),
+        "a fork whose snapshot pin failed must not leave a directory behind"
+    );
+    graph.fork("child", &root.id, &destination).unwrap();
+}
+
+#[test]
+fn fork_pins_a_valid_snapshot_ref_for_any_thread_name() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+    // Names that are invalid as Git ref components, plus names that collide
+    // if invalid characters were replaced instead of escaped (`a b`, `a_b`).
+    let names = [
+        "my work",
+        "a b",
+        "a_b",
+        "a:b?c*d[e]f\\g~h^i",
+        "dots..here",
+        "at@{brace",
+        "trailing.lock",
+        "tab\tname",
+    ];
+    let before = snapshot_refs(cwd);
+    let destinations: Vec<_> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let destination = workspaces.path().join(index.to_string());
+            graph
+                .fork(name, &root.id, &destination)
+                .unwrap_or_else(|error| panic!("fork {name:?} failed: {error:#}"));
+            destination
+        })
+        .collect();
+    let after = snapshot_refs(cwd);
+    assert_eq!(
+        after.len(),
+        before.len() + names.len(),
+        "every thread must pin its own snapshot"
+    );
+    for refname in after.difference(&before) {
+        let status = Command::new("git")
+            .args(["check-ref-format", refname])
+            .status()
+            .unwrap();
+        assert!(status.success(), "{refname:?} is not a valid ref name");
+    }
+
+    // Removing a fork and collecting garbage releases exactly its snapshot.
+    fs::remove_dir_all(&destinations[0]).unwrap();
+    graph.gc().unwrap();
+    let released = snapshot_refs(cwd);
+    assert_eq!(
+        after.difference(&released).count(),
+        1,
+        "gc must release exactly the removed fork's snapshot"
+    );
+}
+
+#[test]
+fn fork_rejects_thread_names_too_long_to_pin_without_materializing() {
+    let directory = fixture();
+    let cwd = directory.path();
+    let graph = ChangeGraph::open(cwd).unwrap();
+    let root = graph.capture("main", provenance("root"), None).unwrap();
+    let workspaces = tempfile::tempdir().unwrap();
+
+    // The snapshot id is one filesystem path component (at most 255 bytes).
+    let longest = "t".repeat(120);
+    graph
+        .fork(&longest, &root.id, &workspaces.path().join("longest"))
+        .unwrap();
+
+    let too_long = "t".repeat(121);
+    let destination = workspaces.path().join("too-long");
+    assert!(graph.fork(&too_long, &root.id, &destination).is_err());
+    assert!(
+        !destination.exists(),
+        "a rejected fork must not materialize"
     );
 }
 
@@ -574,6 +710,7 @@ fn gc_prunes_abandoned_thread_nodes_and_releases_their_snapshot_refs() {
             released_refs: 1,
             released_node_refs: 0,
             dropped_workspace_heads: 0,
+            release_failures: 0,
         }
     );
 
@@ -619,6 +756,7 @@ fn gc_is_a_no_op_when_every_node_is_reachable() {
             released_refs: 0,
             released_node_refs: 0,
             dropped_workspace_heads: 0,
+            release_failures: 0,
         }
     );
     assert_eq!(

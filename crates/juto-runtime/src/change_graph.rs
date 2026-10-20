@@ -118,10 +118,20 @@ pub struct ForkBase {
     pub tree: String,
 }
 
-/// Snapshot id pinning a fork's start tree. Thread names never contain `/`, so the
-/// id is a single ref component.
-fn fork_snapshot_id(thread: &str) -> String {
-    format!("fork-{thread}")
+/// Longest thread name a fork may pin. The hex-encoded snapshot id is one
+/// filesystem path component, which must stay within the 255-byte `NAME_MAX`.
+const MAX_FORK_THREAD_BYTES: usize = 120;
+
+/// Snapshot id pinning a fork's start tree. Hex-encoding the thread name makes
+/// the id a valid Git ref component for every name, and distinct names never
+/// map to the same id.
+fn fork_snapshot_id(thread: &str) -> Result<String> {
+    ensure!(
+        thread.len() <= MAX_FORK_THREAD_BYTES,
+        "fork thread name is longer than {MAX_FORK_THREAD_BYTES} bytes"
+    );
+    let hex: String = thread.bytes().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!("fork-{hex}"))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -193,6 +203,9 @@ pub struct GcReport {
     /// Workspace-head entries dropped because their directory no longer exists.
     /// A stale entry would otherwise pin that thread's nodes forever.
     pub dropped_workspace_heads: usize,
+    /// Ref releases that failed. Each failure is logged; the sweep carries on
+    /// past it, so one bad ref never blocks the rest of the cleanup.
+    pub release_failures: usize,
 }
 
 /// What a [`ChangeGraph::verify`] pass found.
@@ -535,6 +548,7 @@ impl ChangeGraph {
         sparse: Option<&[String]>,
     ) -> Result<GraphState> {
         validate_thread_name(thread)?;
+        let snapshot = fork_snapshot_id(thread)?;
         let _lock = self.lock()?;
         let mut state = self.load()?;
         ensure!(!state.heads.contains_key(thread), "thread already exists");
@@ -565,9 +579,10 @@ impl ChangeGraph {
                 .fork_workspace(&node.tree, destination, thread)?,
         }
         let tree = node.tree.clone();
-        self.repository
-            .retain_snapshot(&fork_snapshot_id(thread), &tree)?;
+        let mut retained = false;
         let recorded = (|| -> Result<()> {
+            self.repository.retain_snapshot(&snapshot, &tree)?;
+            retained = true;
             let destination = destination.canonicalize()?;
             state.heads.insert(thread.into(), from.clone());
             state
@@ -594,7 +609,21 @@ impl ChangeGraph {
                     .map(|state| state.heads.contains_key(thread))
                     .unwrap_or(false);
                 if !landed {
-                    let _ = fs::remove_dir_all(destination);
+                    if retained {
+                        // Release only the pin this call created; a pin that never
+                        // landed must not stay behind for a fork that does not exist.
+                        if let Err(release) = self.repository.release_snapshot(&snapshot) {
+                            eprintln!(
+                                "juto: could not release the pin of fork `{thread}`: {release:#}"
+                            );
+                        }
+                    }
+                    if let Err(remove) = fs::remove_dir_all(destination) {
+                        eprintln!(
+                            "juto: could not remove the failed fork directory {}: {remove}",
+                            destination.display()
+                        );
+                    }
                 }
                 Err(error.context("workspace created but native thread bookkeeping failed"))
             }
@@ -1152,6 +1181,7 @@ impl ChangeGraph {
             .cloned()
             .collect();
         let dropped_workspace_heads = stale.len();
+        let mut release_failures = 0;
         for path in &stale {
             state.workspace_heads.remove(path);
         }
@@ -1165,8 +1195,16 @@ impl ChangeGraph {
             .collect();
         for path in &stale_forks {
             if let Some(fork) = state.fork_bases.remove(path) {
-                self.repository
-                    .release_snapshot(&fork_snapshot_id(&fork.thread))?;
+                // A name over the cap was never pinned, so there is nothing to release.
+                if let Ok(snapshot) = fork_snapshot_id(&fork.thread) {
+                    if let Err(error) = self.repository.release_snapshot(&snapshot) {
+                        release_failures += 1;
+                        eprintln!(
+                            "juto: gc could not release the pin of fork `{}`: {error:#}",
+                            fork.thread
+                        );
+                    }
+                }
             }
         }
         let by_id: BTreeMap<&str, &ChangeNode> =
@@ -1204,21 +1242,38 @@ impl ChangeGraph {
                 released_refs: 0,
                 released_node_refs: 0,
                 dropped_workspace_heads: 0,
+                release_failures: 0,
             });
         }
         let mut released_refs = 0;
         let mut released_node_refs = 0;
         for node in &pruned {
-            if self.repository.release_snapshot(&node.id)? {
-                released_refs += 1;
+            match self.repository.release_snapshot(&node.id) {
+                Ok(true) => released_refs += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    release_failures += 1;
+                    eprintln!(
+                        "juto: gc could not release the snapshot of node {}: {error:#}",
+                        node.id
+                    );
+                }
             }
             // A replicated node also pins its metadata under `refs/juto/nodes`;
             // releasing only the snapshot ref would leak that ref forever.
-            if self
+            match self
                 .repository
-                .release_ref(&crate::replication::node_ref(&node.id))?
+                .release_ref(&crate::replication::node_ref(&node.id))
             {
-                released_node_refs += 1;
+                Ok(true) => released_node_refs += 1,
+                Ok(false) => {}
+                Err(error) => {
+                    release_failures += 1;
+                    eprintln!(
+                        "juto: gc could not release the replication ref of node {}: {error:#}",
+                        node.id
+                    );
+                }
             }
         }
         self.write_nodes(&retained)?;
@@ -1229,6 +1284,7 @@ impl ChangeGraph {
             released_refs,
             released_node_refs,
             dropped_workspace_heads,
+            release_failures,
         })
     }
 
