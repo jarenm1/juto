@@ -561,6 +561,13 @@ again until a release succeeds, even if the directory was partly removed.
   4. Spawns a `reviewer` subagent to verify tests pass.
   5. Opens a draft PR or reports findings back to the issue tracker.
 
+
+### 6.4 Unattended Runs and Operator Decisions
+
+Unattended prompts never wait for an approval prompt. A blocked action becomes a
+durable decision that an operator approves or rejects. See
+`docs/unattended-runs.md` for tiers, decisions, and the publish tool.
+
 ---
 
 ## 7. Concurrent Workstream Slices for Parallel Agent Execution
