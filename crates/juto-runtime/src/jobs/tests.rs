@@ -12,6 +12,7 @@ use juto_ai::{
 use juto_catalog::{Model, ModelCost};
 use tempfile::tempdir;
 use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 fn git(dir: &Path, args: &[&str]) {
@@ -345,7 +346,10 @@ async fn a_job_runs_in_its_own_fork_and_leaves_the_repo_untouched() {
     let job = settle(&runtime, &mut events, &started.id, terminal_or_blocked).await;
 
     assert_eq!(job.status, JobStatus::Succeeded, "error: {:?}", job.error);
-    assert_eq!(job.result.as_deref(), Some("wrote it"));
+    assert_eq!(
+        job.result.as_deref(),
+        Some("wrote it\n\n[child writer: completed]\nbuilder finished")
+    );
     assert_eq!(job.attempts, 1);
     assert_eq!(job.forks.len(), 1);
     let fork = &job.forks[0].path;
@@ -1024,5 +1028,108 @@ async fn a_settled_job_has_no_run_control_left_for_a_retry_to_lose() {
     assert!(
         runtime.inner.jobs.control(&started.id).is_err(),
         "a settled job keeps no run control"
+    );
+}
+
+/// Delegates the write to a `builder` child without waiting for it, then
+/// answers. The builder's first model call parks until the gate opens, so the
+/// child is still running when the main run ends.
+struct LeaveChildRunning {
+    gate: Semaphore,
+    builder_started: Notify,
+}
+
+#[async_trait]
+impl Provider for LeaveChildRunning {
+    async fn stream(
+        &self,
+        _model: &Model,
+        context: &Context,
+        _options: &StreamOptions,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        let is_builder = context
+            .system_prompt
+            .iter()
+            .any(|part| part.contains("You are a builder"));
+        let message = if is_builder {
+            match context.messages.last() {
+                Some(Message::ToolResult { .. }) => text_answer("builder finished"),
+                _ => {
+                    self.builder_started.notify_one();
+                    self.gate.acquire().await.expect("gate open").forget();
+                    tool_call(
+                        "write",
+                        serde_json::json!({ "path": "job.txt", "content": "from the job" }),
+                    )
+                }
+            }
+        } else {
+            match context.messages.last() {
+                Some(Message::ToolResult { tool_name, .. }) if tool_name == "task" => {
+                    text_answer("delegated the write")
+                }
+                _ => tool_call(
+                    "task",
+                    serde_json::json!({
+                        "tasks": [{
+                            "name": "writer",
+                            "agent": "builder",
+                            "task": "write job.txt",
+                        }]
+                    }),
+                ),
+            }
+        };
+        one_message(message)
+    }
+}
+
+#[tokio::test]
+async fn a_job_settles_only_after_its_delegated_children_finish() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let data_dir = root.path().join("data");
+    let provider = Arc::new(LeaveChildRunning {
+        gate: Semaphore::new(0),
+        builder_started: Notify::new(),
+    });
+    let runtime = runtime(&repo, &data_dir, provider.clone());
+    let mut events = runtime.subscribe_jobs();
+
+    let started = runtime
+        .start_job("write the file", budget(60), artifact("job.txt"))
+        .expect("start");
+    tokio::time::timeout(Duration::from_secs(60), provider.builder_started.notified())
+        .await
+        .expect("builder reached the model");
+    // The main run has answered by now. The job must still be running, because
+    // its child is parked on the gate.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let running = runtime.job(&started.id).expect("job exists");
+    assert_eq!(
+        running.status,
+        JobStatus::Running,
+        "a job must not settle while a child it started is still running; error: {:?}",
+        running.error
+    );
+
+    provider.gate.add_permits(1);
+    let job = settle(&runtime, &mut events, &started.id, terminal_or_blocked).await;
+
+    assert_eq!(job.status, JobStatus::Succeeded, "error: {:?}", job.error);
+    let result = job.result.expect("result");
+    assert!(
+        result.contains("delegated the write"),
+        "the main run's answer is kept: {result}"
+    );
+    assert!(
+        result.contains("builder finished"),
+        "the result must include the child's outcome: {result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(job.forks[0].path.join("job.txt")).expect("file in fork"),
+        "from the job"
     );
 }

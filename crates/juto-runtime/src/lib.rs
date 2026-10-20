@@ -647,7 +647,7 @@ impl Runtime {
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
         job_id: Option<String>,
-    ) -> Result<UnattendedOutcome> {
+    ) -> Result<UnattendedRun> {
         let owner = session.header().id.clone();
         self.run_unattended_owned(session, owner, prompt, events, control, job_id)
             .await
@@ -664,7 +664,7 @@ impl Runtime {
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
         job_id: Option<String>,
-    ) -> Result<UnattendedOutcome> {
+    ) -> Result<UnattendedRun> {
         let scope: SharedScope = Arc::new(UnattendedScope::new(
             &self.inner.data_dir,
             &self.inner.cwd,
@@ -684,8 +684,9 @@ impl Runtime {
         };
         // Children of this run carry its scope, so their decisions reach the same
         // gate. They report to the process inbox, as every other run's children do.
-        // The run is over once its root returns: its children are cancelled and
-        // settled here, because nothing can answer their decisions or read their work.
+        // The run's children outlive its root's turns only until the run settles
+        // them below. They are cancelled when the run is stopped, not when the
+        // root returns, so a child that is still working is waited for.
         let run_children = CancellationToken::new();
         let inbox = self.subagent_manager().main_inbox();
         let manager = Arc::new(SubagentManager::new(
@@ -706,6 +707,7 @@ impl Runtime {
             control.clone(),
             run_children.clone(),
         ));
+        let stopped = control.token();
         let outcome = self
             .run_depth(
                 session,
@@ -716,14 +718,20 @@ impl Runtime {
                 manager.clone(),
             )
             .await;
+        if stopped.is_cancelled() {
+            run_children.cancel();
+        }
+        // The run's own turns can end while children it started still run. Settle
+        // them before the run reports, so a job never settles, or gets archived,
+        // while one of them runs.
+        let children = manager.settle_all().await;
         forwarder.abort();
         stop_children.abort();
-        run_children.cancel();
-        settle_children(&manager).await;
-        match scope.finish() {
-            Some(decision) => Ok(UnattendedOutcome::Blocked(Box::new(decision))),
-            None => outcome.map(UnattendedOutcome::Finished),
-        }
+        let outcome = match scope.finish() {
+            Some(decision) => UnattendedOutcome::Blocked(Box::new(decision)),
+            None => UnattendedOutcome::Finished(outcome?),
+        };
+        Ok(UnattendedRun { outcome, children })
     }
 
     async fn run_depth(
@@ -775,9 +783,6 @@ impl Runtime {
                 compaction_usage = self.compact(session, &control).await?;
             }
         }
-        // Depth 0's children belong to the run's scope, which only a stop cancels (see `run`).
-        // Nested runs own the children they spawn and stop them when they end.
-        let _children = (depth > 0).then(|| ChildCancellation(manager.owner()));
         // The run's tier decides how `bash` is confined; see `ExecutionTier::bash_limits`.
         // Depth 0 is the user's own session; delegated runs queue as background work.
         let priority = if depth == 0 {
@@ -1217,21 +1222,19 @@ impl AgentHooks for RuntimeHooks {
     }
 }
 
-/// Cancels the subagents a run started when the run ends. Only this run's
-/// owner token is cancelled, so children of other runs keep running.
-struct ChildCancellation(CancellationToken);
-impl Drop for ChildCancellation {
-    fn drop(&mut self) {
-        self.0.cancel();
-    }
-}
-
 /// How an unattended run ended.
 pub enum UnattendedOutcome {
     /// The run ran to its own end; see [`RunOutcome::stop_reason`].
     Finished(RunOutcome),
     /// A tool call needs an operator decision. The run stopped before that call.
     Blocked(Box<Decision>),
+}
+
+/// An unattended run's outcome, with the settled outcome of every child it started.
+pub struct UnattendedRun {
+    pub outcome: UnattendedOutcome,
+    /// Every child the run started, each in a terminal state.
+    pub children: Vec<subagents::ChildOutcome>,
 }
 
 /// The tier an unattended run executes under. Unattended runs are always sandboxed
@@ -1667,10 +1670,14 @@ impl subagents::SubagentFactory for ChildFactory {
                         unattended: self.unattended.as_ref(),
                         main_session: spec.main_session.as_deref(),
                     },
-                    manager,
+                    manager.clone(),
                 )
-                .await?;
-            turn_result(id, &session, outcome)
+                .await;
+            // A child's own children are cancelled and settled before it reports,
+            // so none of them outlives the turn that started it.
+            manager.owner().cancel();
+            manager.settle_all().await;
+            turn_result(id, &session, outcome?)
         }.await;
         // The child runtime and session are dropped above; only then may the
         // fork be reclaimed. A completed turn keeps its fork for follow-up turns
@@ -1728,10 +1735,14 @@ impl subagents::SubagentFactory for ChildFactory {
                         unattended: self.unattended.as_ref(),
                         main_session: spec.main_session.as_deref(),
                     },
-                    manager,
+                    manager.clone(),
                 )
-                .await?;
-            turn_result(id, &session, outcome)
+                .await;
+            // A child's own children are cancelled and settled before it reports,
+            // so none of them outlives the turn that started it.
+            manager.owner().cancel();
+            manager.settle_all().await;
+            turn_result(id, &session, outcome?)
         }
         .await;
         settle_isolated_turn(result, workspace)
@@ -2122,14 +2133,6 @@ async fn forward_main_inbox(inbox: subagents::MainInbox, control: RunControl, se
         if !deliver_main_inbox(&inbox, &control, &session_id) {
             return;
         }
-    }
-}
-
-/// Waits until every child `manager` spawned has reached a terminal state. The
-/// caller cancels them first, so each one settles once its work stops.
-async fn settle_children(manager: &SubagentManager) {
-    for child in manager.list() {
-        let _ = manager.wait(&child.id).await;
     }
 }
 
@@ -3942,6 +3945,7 @@ mod tests {
             )
             .await
             .expect("first run")
+            .outcome
         {
             UnattendedOutcome::Blocked(decision) => decision,
             UnattendedOutcome::Finished(_) => {
@@ -3965,6 +3969,7 @@ mod tests {
             )
             .await
             .expect("second run")
+            .outcome
         {
             UnattendedOutcome::Finished(_) => {}
             UnattendedOutcome::Blocked(_) => panic!("the approved action must not block again"),
@@ -4004,6 +4009,7 @@ mod tests {
             )
             .await
             .expect("first run")
+            .outcome
         {
             UnattendedOutcome::Blocked(decision) => decision,
             UnattendedOutcome::Finished(_) => panic!("publish must block without a grant"),
@@ -4022,6 +4028,7 @@ mod tests {
             )
             .await
             .expect("second run")
+            .outcome
         {
             UnattendedOutcome::Blocked(decision) => {
                 assert_ne!(
@@ -4066,6 +4073,7 @@ mod tests {
             )
             .await
             .expect("first run")
+            .outcome
         {
             UnattendedOutcome::Blocked(decision) => decision,
             UnattendedOutcome::Finished(_) => panic!("publish must block without a grant"),
@@ -4093,6 +4101,7 @@ mod tests {
             )
             .await
             .expect("second run")
+            .outcome
         {
             UnattendedOutcome::Finished(_) => {}
             UnattendedOutcome::Blocked(_) => panic!("the approved action must not block again"),
@@ -4716,13 +4725,13 @@ mod tests {
         .expect("delegated child appears in the registry")
     }
 
-    /// An unattended run that ends while a child it started is still working
-    /// stops that child before it returns: once the root has finished, nothing
-    /// can answer the child's decisions or read its work.
+    /// An unattended run waits for the child it started before it returns: the
+    /// child's result reaches the run, and the child is no longer working once
+    /// the run has returned.
     #[tokio::test]
     async fn unattended_run_settles_its_children_before_returning() {
         let root = tempdir().expect("tempdir");
-        let (_child_open, child_gate) = watch::channel(false);
+        let (child_open, child_gate) = watch::channel(false);
         let (parent_open, parent_gate) = watch::channel(false);
         let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let repo = root.path().join("repo");
@@ -4756,13 +4765,29 @@ mod tests {
         .await
         .expect("the delegated child starts working");
         parent_open.send(true).expect("open the parent gate");
-        let outcome = run.await.expect("run task").expect("unattended run");
-        assert!(matches!(outcome, UnattendedOutcome::Finished(_)));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !run.is_finished(),
+            "the run waits for its working child before it returns"
+        );
+        child_open.send(true).expect("open the child gate");
+        let unattended = timeout(Duration::from_secs(10), run)
+            .await
+            .expect("the run returns once its child finishes")
+            .expect("run task")
+            .expect("unattended run");
+        assert!(matches!(unattended.outcome, UnattendedOutcome::Finished(_)));
         assert_eq!(
             live.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "the child is stopped before the run returns"
+            "the child is no longer working when the run returns"
         );
+        assert_eq!(unattended.children.len(), 1);
+        assert!(matches!(
+            unattended.children[0].status,
+            SubagentStatus::Completed
+        ));
+        assert_eq!(unattended.children[0].output.as_deref(), Some("child done"));
     }
 
     /// A run stopped before it starts must not leave later runs' subagents
