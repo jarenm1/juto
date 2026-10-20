@@ -829,7 +829,7 @@ impl Runtime {
         }
         if !matches!(tier, ExecutionTier::Untrusted) && scope.allows(publish::TOOL_NAME) {
             registry.register(Arc::new(publish::PublishTool {
-                cwd: self.inner.cwd.clone(),
+                cwd: workspace::owning_repo(&self.inner.cwd),
                 unattended: unattended.cloned(),
             }))?;
         }

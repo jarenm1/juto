@@ -1238,7 +1238,8 @@ async fn a_job_runs_without_a_client_and_its_result_is_drained_once() {
 #[tokio::test]
 async fn a_blocked_job_resumes_when_its_decision_is_approved_through_resolve_decision() {
     let root = tempfile::tempdir().unwrap();
-    let daemon = daemon_in_repo(root.path(), Arc::new(PublishProvider));
+    publishable_workspace(&root.path().join("workspace"));
+    let daemon = daemon(root.path(), Arc::new(PublishProvider));
     let contract = JobContract {
         no_change: true,
         ..Default::default()
