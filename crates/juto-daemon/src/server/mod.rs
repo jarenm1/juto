@@ -503,11 +503,11 @@ impl Daemon {
                 else {
                     return Ok(Reply::Route(None));
                 };
-                let principal = format!("user:{}", unsafe { libc::geteuid() });
+                // `desktop_open` grants the viewer artifact to this principal, so resolve as it.
                 match self
                     .runtime
                     .desktop_artifact_resolver()
-                    .resolve(&principal, &artifact)
+                    .resolve(juto_runtime::SESSION_VIEWER_PRINCIPAL, &artifact)
                 {
                     Ok(route) => Ok(Reply::Route(Some(route))),
                     Err(juto_runtime::ResolveError::Unsupported(_)) => Ok(Reply::Route(None)),
