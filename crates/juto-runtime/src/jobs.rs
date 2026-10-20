@@ -661,19 +661,23 @@ impl Runtime {
         Ok(job)
     }
 
-    /// Changes a job's inbox state. Archiving requires a finished job, and
-    /// reclaims its isolated workspaces; the session transcript is kept.
+    /// Changes a job's inbox state. Archiving requires a finished job: the job is
+    /// marked archived before its isolated workspaces are reclaimed, so no retry can
+    /// start in a fork being torn down. The session transcript is kept.
     pub async fn set_job_inbox(&self, id: &str, state: InboxState) -> Result<Job, JobError> {
         if state == InboxState::Archived {
-            let job = self.inner.jobs.get(id)?;
-            if !job.status.is_terminal() {
-                return Err(JobError::Invalid(format!(
-                    "job {id} is {} and cannot be archived until it finishes",
-                    job.status.as_str()
-                )));
-            }
-            // Reclaim before the job reads as archived, so an archived job never
-            // still owns a fork.
+            let (job, ()) = self.inner.jobs.mutate(id, |job| {
+                if !job.status.is_terminal() {
+                    return Err(JobError::Invalid(format!(
+                        "job {id} is {} and cannot be archived until it finishes",
+                        job.status.as_str()
+                    )));
+                }
+                job.inbox = InboxState::Archived;
+                Ok(())
+            })?;
+            // A failed reclaim leaves the job archived with its remaining forks
+            // listed; archiving it again resumes the reclaim.
             for fork in job.forks {
                 let workspace = SubagentWorkspace {
                     path: fork.path.clone(),
@@ -691,10 +695,6 @@ impl Runtime {
                     Ok(())
                 })?;
             }
-            self.inner.jobs.mutate(id, |job| {
-                job.inbox = InboxState::Archived;
-                Ok(())
-            })?;
             return self.inner.jobs.get(id);
         }
         let (job, ()) = self.inner.jobs.mutate(id, |job| {

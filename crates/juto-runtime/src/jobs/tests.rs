@@ -599,6 +599,49 @@ async fn archiving_reclaims_the_forks_and_keeps_the_transcript() {
     ));
 }
 
+/// Archiving must reject a retry that lands while its forks are still being
+/// reclaimed; otherwise the retry restarts work in a fork being torn down.
+#[tokio::test]
+async fn a_retry_cannot_land_while_archiving_reclaims_the_forks() {
+    use futures::FutureExt;
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let data_dir = root.path().join("data");
+    let runtime = runtime(&repo, &data_dir, Arc::new(Answer("done")));
+    let mut events = runtime.subscribe_jobs();
+
+    let retryable = JobBudget {
+        max_attempts: 2,
+        ..budget(60)
+    };
+    let started = runtime
+        .start_job("write", retryable, artifact("job.txt"))
+        .expect("start");
+    let failed = settle(&runtime, &mut events, &started.id, |job| {
+        job.status.is_terminal()
+    })
+    .await;
+    assert_eq!(failed.status, JobStatus::Failed);
+    assert!(
+        !failed.forks.is_empty(),
+        "the failed job still owns its fork"
+    );
+
+    let mut archive = Box::pin(runtime.set_job_inbox(&started.id, InboxState::Archived));
+    assert!(
+        archive.as_mut().now_or_never().is_none(),
+        "archiving waits on the fork reclaim"
+    );
+    assert!(
+        matches!(runtime.retry_job(&started.id), Err(JobError::Invalid(_))),
+        "a retry must not land while the job is being archived"
+    );
+    let archived = archive.await.expect("archive");
+    assert_eq!(archived.inbox, InboxState::Archived);
+    assert!(archived.forks.is_empty());
+}
+
 #[tokio::test]
 async fn a_job_that_cannot_be_isolated_fails_before_the_model_runs() {
     let root = tempdir().expect("tempdir");
@@ -799,8 +842,9 @@ async fn a_verified_no_change_job_is_archived_and_its_forks_reclaimed() {
     let started = runtime
         .start_job("look and report", budget(60), no_change())
         .expect("start");
+    // Archiving marks the job first and reclaims its forks after, so wait for both.
     let job = settle(&runtime, &mut events, &started.id, |job| {
-        job.inbox == InboxState::Archived
+        job.inbox == InboxState::Archived && job.forks.is_empty()
     })
     .await;
 
