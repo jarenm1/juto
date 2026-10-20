@@ -755,6 +755,38 @@ async fn a_run_that_fails_cancels_its_open_background_jobs() {
 }
 
 #[tokio::test]
+async fn a_run_stopped_by_the_turn_limit_cancels_its_open_background_jobs() {
+    // The turn limit ends the run with an error after a tool turn, so a queued
+    // command must be cancelled on that path too.
+    let model = test_model();
+    let control = RunControl::new();
+    let _job = control.begin_background_job();
+    let job_cancel = control.background_token();
+    let provider = ScriptedProvider::new(vec![Script::Events(vec![
+        Ok(ProviderEvent::Start),
+        Ok(ProviderEvent::Done {
+            message: assistant(
+                &model,
+                vec![call("c1", "missing", json!({}))],
+                StopReason::ToolUse,
+            ),
+        }),
+    ])]);
+    let mut config = AgentConfig::for_model(model);
+    config.max_turns = Some(1);
+    let (outcome, _events, _context) = run_with_context(
+        provider,
+        ToolRegistry::new(),
+        Some(config),
+        &control,
+        vec![Message::user("go")],
+    )
+    .await;
+    assert!(matches!(outcome, Err(AgentError::TurnLimit(1))));
+    assert!(job_cancel.is_cancelled());
+}
+
+#[tokio::test]
 async fn pause_gates_before_model_call() {
     let model = test_model();
     let control = RunControl::new();
