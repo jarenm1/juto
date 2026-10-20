@@ -14,6 +14,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::main_inbox_store;
@@ -209,7 +210,8 @@ pub struct SubagentSummary {
     pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// `true` for a focus thread that owns one orchestration-started task.
+    /// `true` for a focus thread: an orchestration-started task, or a subagent
+    /// the user followed up.
     pub focus: bool,
     /// The child's dedicated workspace path, when it runs isolated.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -245,8 +247,6 @@ pub enum SubagentError {
     },
     /// Operation timed out.
     Timeout(String),
-    /// The child is not a focus thread and has not completed, so it has no transcript.
-    NotFocus(String),
     /// The child has no persisted transcript: it has not completed a turn, or it ended as failed/cancelled.
     NoTranscript(String),
     /// Reading the child's session file failed.
@@ -274,7 +274,6 @@ impl fmt::Display for SubagentError {
                 write!(f, "invalid transition from {from:?} to {to:?}")
             }
             Self::Timeout(msg) => write!(f, "subagent operation timed out: {msg}"),
-            Self::NotFocus(id) => write!(f, "subagent {id} is not a focus thread"),
             Self::NoTranscript(id) => write!(f, "subagent {id} has no completed transcript"),
             Self::Transcript(err) => write!(f, "failed to read subagent transcript: {err}"),
             Self::NotTerminal(id) => {
@@ -856,7 +855,9 @@ enum WorkspaceState {
 struct Child {
     id: String,
     spec: TaskSpec,
-    focus: bool,
+    /// `true` for orchestration-started focus threads; set once the user
+    /// follows up on any subagent.
+    focus: AtomicBool,
     workspace: Mutex<WorkspaceState>,
     /// Replaced per turn: a fresh turn gets a fresh control so a cancelled or
     /// paused first turn cannot poison a follow-up. Always lock it before
@@ -1058,7 +1059,7 @@ impl SubagentManager {
         let child = Arc::new(Child {
             id: id.clone(),
             spec,
-            focus,
+            focus: AtomicBool::new(focus),
             workspace: Mutex::new(match workspace {
                 Some(path) => WorkspaceState::Live(path),
                 None => WorkspaceState::Unprovisioned,
@@ -1171,8 +1172,9 @@ impl SubagentManager {
         self.start_follow_up(id, prompt, TurnOrigin::Main)
     }
 
-    /// Start a follow-up turn the user typed into a focus thread. The turn gets
-    /// `USER_TURN_PREFACE` first and reports only to the focus view.
+    /// Start a follow-up turn the user typed into any subagent. The turn gets
+    /// `USER_TURN_PREFACE` first, reports only to the focus view, and makes the
+    /// child a focus thread.
     pub fn follow_up_from_user(&self, id: &str, prompt: String) -> Result<(), SubagentError> {
         let prompt = format!("{USER_TURN_PREFACE}\n\n{prompt}");
         self.start_follow_up(id, prompt, TurnOrigin::User)
@@ -1233,6 +1235,12 @@ impl SubagentManager {
         let control = control_guard.clone();
         drop(control_guard);
 
+        if matches!(origin, TurnOrigin::User) {
+            // A user follow-up makes any subagent a focus thread. Store before
+            // the Running status publishes: that event refreshes the sidebar
+            // from `list`, which must already see the flag.
+            child.focus.store(true, Ordering::Release);
+        }
         child.set_status(SubagentStatus::Running);
 
         tokio::spawn(run_follow_up(
@@ -1271,7 +1279,7 @@ impl SubagentManager {
                     status: state.status.clone(),
                     stop_reason,
                     usage,
-                    focus: child.focus,
+                    focus: child.focus.load(Ordering::Acquire),
                     workspace: child.workspace_path(),
                     released: child.workspace_released(),
                     error,
@@ -1298,9 +1306,8 @@ impl SubagentManager {
     }
 
     /// Persisted transcript of a completed child, read from its session file.
-    /// Focus and non-focus children both qualify once they complete. Pending,
-    /// failed, and cancelled children have none: a non-focus child reports
-    /// `NotFocus`, a focus child reports `NoTranscript`.
+    /// Any child qualifies once it completes. Pending, failed, and cancelled
+    /// children have none and report `NoTranscript`.
     pub fn transcript(&self, id: &str) -> Result<Vec<Message>, SubagentError> {
         let child = self.child(id)?;
         if child.workspace_released() {
@@ -1310,7 +1317,6 @@ impl SubagentManager {
             let state = child.state.borrow();
             match (&state.status, &state.outcome) {
                 (SubagentStatus::Completed, Some(Ok(result))) => result.session_path.clone(),
-                _ if !child.focus => return Err(SubagentError::NotFocus(id.to_string())),
                 _ => return Err(SubagentError::NoTranscript(id.to_string())),
             }
         };
@@ -4057,6 +4063,32 @@ mod tests {
                 change_id: None,
             })
         }
+
+        async fn follow_up(
+            &self,
+            id: &str,
+            _spec: &TaskSpec,
+            session_path: &Path,
+            prompt: String,
+            _control: RunControl,
+            _events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<SubagentResult, String> {
+            let mut session = Session::open(session_path).map_err(|err| err.to_string())?;
+            session
+                .append(crate::session::EntryKind::Message {
+                    message: Message::user(prompt.clone()),
+                })
+                .map_err(|err| err.to_string())?;
+            Ok(SubagentResult {
+                id: id.to_string(),
+                output: prompt,
+                data: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                session_path: session_path.to_path_buf(),
+                change_id: None,
+            })
+        }
     }
 
     #[tokio::test]
@@ -4118,7 +4150,7 @@ mod tests {
         assert!(manager.wait(&plain_id).await.is_err());
         assert_eq!(
             manager.transcript(&plain_id).unwrap_err(),
-            SubagentError::NotFocus(plain_id.clone())
+            SubagentError::NoTranscript(plain_id.clone())
         );
 
         let mut focus = spec("focus task");
@@ -4129,6 +4161,41 @@ mod tests {
             manager.transcript(&focus_id).unwrap_err(),
             SubagentError::NoTranscript(focus_id.clone())
         );
+    }
+
+    #[tokio::test]
+    async fn user_follow_up_makes_plain_child_a_focus_thread() {
+        let dir = std::env::temp_dir().join(format!("juto-promote-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = manager(
+            Arc::new(TranscriptFactory { dir: dir.clone() }),
+            1,
+            CancellationToken::new(),
+        );
+
+        let id = manager.spawn(spec("plain task")).unwrap();
+        manager.wait(&id).await.unwrap();
+        assert!(!summary_of(&manager, &id).focus);
+
+        // A main follow-up keeps the child a worker.
+        manager.follow_up(&id, "from main".into()).unwrap();
+        manager.wait(&id).await.unwrap();
+        assert!(!summary_of(&manager, &id).focus);
+
+        manager
+            .follow_up_from_user(&id, "from user".into())
+            .unwrap();
+        manager.wait(&id).await.unwrap();
+        assert!(summary_of(&manager, &id).focus);
+        let texts: Vec<String> = manager
+            .transcript(&id)
+            .unwrap()
+            .iter()
+            .map(Message::text)
+            .collect();
+        assert!(texts.iter().any(|text| text.contains("from user")));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn summary_of(manager: &SubagentManager, id: &str) -> SubagentSummary {

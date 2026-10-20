@@ -406,6 +406,9 @@ only be spawned by the main thread". Spawning a focus spec forces
 `SubagentManager::list` reports `focus` plus the child's `workspace` path so the
 UI can surface the thread's working directory.
 
+A follow-up the user types makes any subagent a focus thread: the runtime sets its
+`focus` flag, so the sidebar lists it. Main-started follow-ups do not promote.
+
 Follow-up turns: `SubagentManager::follow_up(id, prompt)` resumes a `Completed`
 child by reopening its recorded session and reusing its isolated workspace without
 re-provisioning. Queued, running, blocked, failed, and cancelled children reject
@@ -432,7 +435,7 @@ undrained message keeps its `origin`, the top-level session it is addressed to, 
 drains only its own. Reports still waiting for a digest are not persisted; a restart before the
 digest finishes drops them. A file that cannot be read fails the bind instead of being replaced.
 Main-started turns (the first run and an `agent_send` to a completed child) push a notice on every terminal publication. A
-turn the user types in a focus thread pushes none; its result reaches the user through
+turn the user types in any subagent pushes none; its result reaches the user through
 the focus view.
 
 The desktop sidebar's Inbox section lists the notices the user has not dismissed. Reading it never drains the model's queue. Its Dismiss button removes only the user's copy, so the model still receives that message through `agent_inbox`. The user's copies and the model's queue persist in the same file, and dismissals survive a restart.
@@ -466,12 +469,12 @@ PR5 adds focus chat mode. Clicking a focus card opens the thread's view: its
 transcript, a follow-up composer, the VCS panel rooted at its workspace, and a
 `← Main` button that returns to the main transcript and sidebar. The transcript
 is read from the child's session file through `SubagentManager::transcript(id)`,
-which accepts only focus threads. The read runs on the background executor, and
+which accepts any completed subagent. The read runs on the background executor, and
 the view reloads it each time the thread reaches a terminal state. Limitations:
 live streaming is not implemented, so a running thread shows only its status
 (a blocked thread shows its prompt); the transcript refreshes only on terminal
 state, and no transcript is available while a follow-up turn is in progress. A
-`Failed` or `Cancelled` focus child has no transcript and shows the read error.
+`Failed` or `Cancelled` subagent has no transcript and shows the read error.
 The composer is enabled only for `Completed` threads, and rejected follow-ups
 show an error and keep the draft. The main sidebar no longer has a Changes tab;
 VCS is visible only in focus mode.
