@@ -120,13 +120,17 @@ fn daemon(root: &Path, provider: Arc<dyn Provider>) -> Arc<Daemon> {
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
     let credentials = Arc::new(CredentialStore::open(data_dir.join("credentials.json")).unwrap());
-    let runtime = Runtime::with_provider(
+    // Admission reads memory pressure from this file. It is absent, so no stall is
+    // reported; the host's real PSI would otherwise hold a child's desk seat past the
+    // 10 s deadlines when the machine is under memory pressure.
+    let runtime = Runtime::with_provider_and_pressure_file(
         &workspace,
         &data_dir,
         test_config(),
         credentials,
         provider,
         None,
+        root.join("no-pressure"),
     )
     .unwrap();
     Daemon::new(runtime, &workspace, root.join("desktop.sock")).unwrap()
