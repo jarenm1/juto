@@ -388,6 +388,69 @@ async fn reattach_shows_the_live_run_and_then_the_committed_transcript() {
     );
 }
 
+#[tokio::test]
+async fn prompt_routes_to_a_thread_and_subscribed_clients_see_the_route() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon(root.path(), ScriptedProvider::new(false));
+    let view = create_session(&daemon).await;
+    let mut rx = attach(&daemon);
+    let run_id = start_run(&daemon, &view.info.id, "plan the release").await;
+
+    let route = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match rx.recv().await {
+                Some(ServerEvent::Thread {
+                    session_id,
+                    event: ThreadEvent::ThreadRouted { route },
+                }) => {
+                    assert_eq!(session_id, view.info.id);
+                    return route;
+                }
+                Some(_) => {}
+                None => panic!("event stream closed"),
+            }
+        }
+    })
+    .await
+    .expect("a routed thread event within 10s");
+    let finished =
+        next_session_event(&mut rx, |e| matches!(e, SessionEvent::RunFinished { .. })).await;
+    let SessionEvent::RunFinished {
+        run_id: finished_id,
+        error,
+        ..
+    } = finished
+    else {
+        unreachable!("filtered to RunFinished above");
+    };
+    assert_eq!(finished_id, run_id);
+    assert!(error.is_none(), "run failed: {error:?}");
+
+    let timeline = MainSession::open(&view.info.path)
+        .unwrap()
+        .timeline()
+        .unwrap();
+    assert!(
+        timeline.iter().any(|item| matches!(
+            item,
+            TimelineItem::Routed { route: journaled } if journaled.thread == route.thread
+        )),
+        "the route is journaled on the main timeline"
+    );
+    let thread_messages = timeline
+        .iter()
+        .filter(|item| {
+            matches!(item, TimelineItem::Message { thread: Some(t), .. } if *t == route.thread)
+        })
+        .count();
+    assert_eq!(
+        thread_messages, 2,
+        "the user and assistant messages are in the routed thread"
+    );
+    let done = open_session(&daemon, &view.info.id).await;
+    assert_eq!(done.committed, 2);
+}
+
 #[test]
 fn restart_marks_only_unpaired_runs_as_interrupted() {
     let root = tempfile::tempdir().unwrap();
@@ -404,7 +467,7 @@ fn restart_marks_only_unpaired_runs_as_interrupted() {
 
     // The daemon restarts: the run that never finished is recorded as interrupted.
     let mut session = Session::open(&path).unwrap();
-    recover(&mut session).unwrap();
+    recover(&mut session, &[]).unwrap();
 
     let interrupted = custom_markers(&journal(&path), "run_interrupted");
     assert_eq!(interrupted.len(), 1);
@@ -432,9 +495,27 @@ async fn child_completion_starts_a_run_while_no_client_is_prompting() {
     };
     assert!(error.is_none(), "wake run failed: {error:?}");
 
-    let journal_text = std::fs::read_to_string(&view.info.path).unwrap();
+    // The wake run is routed like any prompt, so the child's completion is in a
+    // thread message, not in the main journal's raw text.
+    let timeline = MainSession::open(&view.info.path)
+        .unwrap()
+        .timeline()
+        .unwrap();
+    let thread_messages: String = timeline
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                TimelineItem::Message {
+                    thread: Some(_),
+                    ..
+                }
+            )
+        })
+        .map(|item| serde_json::to_string(item).unwrap())
+        .collect();
     assert!(
-        journal_text.contains(&format!("[subagent {child} Completed]")),
+        thread_messages.contains(&format!("[subagent {child} Completed]")),
         "the wake run must carry the child's completion"
     );
 }
