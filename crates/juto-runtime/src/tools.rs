@@ -1424,9 +1424,8 @@ async fn run_bash_command(
     cancel: &CancellationToken,
 ) -> Result<ToolOutput, String> {
     // Under governance the command runs inside a systemd user scope, so the
-    // caps apply to the whole tree. `enforce_scope` is the caller's choice:
-    // with it off, a host without `systemd-run` degrades to a bare spawn
-    // rather than failing the tool.
+    // caps apply to the whole tree. Without `systemd-run` the governed spawn
+    // fails rather than running the command uncapped.
     // The governed path goes through `spawn_admitted`, whose guard stops the
     // transient unit on drop: a sandboxed command runs as a service that
     // outlives its client, so killing the child alone would leave it running.
