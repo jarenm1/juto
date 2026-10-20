@@ -247,6 +247,17 @@ before continuing, because providers drop unsupported images. Image token accoun
 uses a conservative 4096-token estimate, not model-specific billing. Provider OCR
 accuracy and token savings versus summaries are not established by local tests.
 
+Context window guard (`juto-agent`): before each provider request the agent estimates the
+system prompt, tool schemas, and history with `estimate_request_tokens` (a bytes-per-token
+heuristic, not a tokenizer). Over `context window × compactionThreshold`, the host compacts
+first; a compacted history still over budget fails the run with `ContextOverflow`. Run-start
+and mid-run compaction share this budget.
+
+* The compaction summary request is not guarded. History larger than the summarizer's
+  window can overflow it. This predates the guard: run-start compaction has the same gap.
+* With `auto_compact` off there is no guard, and requests are sent without a size check.
+* Cancelling during mid-run compaction ends the run as `Aborted` with no `Error` event.
+
 ---
 
 ## 4. Workspace Isolation & Resource Governance
