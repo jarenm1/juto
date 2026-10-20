@@ -485,8 +485,10 @@ async fn desktop_open_grants_the_session_viewer_and_the_artifact_resolves() {
     let root = tempfile::tempdir().unwrap();
     let daemon = daemon(root.path(), ScriptedProvider::new(false));
     let Reply::DesktopEnvironment(env) = daemon
+        // A short-lived app can exit before its scope is verified, which fails
+        // verification (`verify_scope` polls `systemctl show`). Keep it running.
         .request(Request::DesktopOpen {
-            argv: vec!["true".to_string()],
+            argv: vec!["sleep".to_string(), "60".to_string()],
         })
         .await
         .unwrap()
@@ -508,6 +510,45 @@ async fn desktop_open_grants_the_session_viewer_and_the_artifact_resolves() {
         .unwrap()
     else {
         panic!("the granted artifact must resolve to a local route");
+    };
+    assert_eq!(env_id, env.env_id);
+    daemon
+        .request(Request::DesktopDestroy {
+            env_id: env.env_id.clone(),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn resolve_over_the_wire_accepts_the_artifact_desktop_open_granted() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon(root.path(), ScriptedProvider::new(false));
+    let Reply::DesktopEnvironment(env) = daemon
+        .request(Request::DesktopOpen {
+            argv: vec!["sleep".to_string(), "60".to_string()],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a desktop environment");
+    };
+    let artifact = DesktopSessionArtifact {
+        version: DESKTOP_SESSION_ARTIFACT_VERSION,
+        artifact_id: format!("dev-{}", env.env_id),
+        title: "Developer compositor session".to_string(),
+        host_id: env.host_id.clone(),
+        environment_id: env.env_id.clone(),
+        grant_id: env.grant_id.clone(),
+    };
+    let Reply::Route(Some(ViewerRoute::Local { env_id, .. })) = daemon
+        .request(Request::ResolveDesktopArtifact {
+            artifact: serde_json::to_value(&artifact).unwrap(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("the artifact granted by DesktopOpen must resolve over the wire");
     };
     assert_eq!(env_id, env.env_id);
     daemon
