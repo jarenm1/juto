@@ -31,4 +31,7 @@ pub enum AgentError {
 
     #[error("context compaction failed: {0}")]
     CompactionFailed(String),
+
+    #[error("spend limit reached ({0:.2} USD) before the model finished")]
+    SpendLimit(f64),
 }

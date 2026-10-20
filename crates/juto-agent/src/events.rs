@@ -121,6 +121,9 @@ pub struct AgentConfig {
     pub session_id: String,
     /// Optional bound on model turns; `None` = unbounded.
     pub max_turns: Option<usize>,
+    /// Optional bound on run spend in USD, checked before each model turn;
+    /// `None` = unbounded.
+    pub max_cost: Option<f64>,
     /// Retries for a failed request *before any streamed content*. `0`
     /// disables retry; each retry doubles the delay up to 30s, honouring
     /// provider `retry_after` hints when larger.
@@ -141,6 +144,7 @@ impl AgentConfig {
             cwd: PathBuf::new(),
             session_id: String::new(),
             max_turns: None,
+            max_cost: None,
             max_retries: 3,
             retry_delay: Duration::from_millis(500),
             context_limit: None,

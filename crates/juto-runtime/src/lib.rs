@@ -583,6 +583,7 @@ impl Runtime {
                         depth: 1,
                         inbox: inbox.clone(),
                         unattended: None,
+                        spend_capped: false,
                     }),
                     self.inner.admission.clone(),
                     CancellationToken::new(),
@@ -608,6 +609,7 @@ impl Runtime {
             sender: None,
             main_session: Some(&main_session),
             unattended: None,
+            limits: JobLimits::default(),
         };
         // Children this run starts are owned by a token of their own. Stopping
         // the run cancels them; ending it normally leaves them running.
@@ -653,7 +655,8 @@ impl Runtime {
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
         job_id: Option<String>,
-    ) -> Result<UnattendedRun> {
+        limits: JobLimits,
+    ) -> UnattendedRun {
         let scope: SharedScope = Arc::new(UnattendedScope::new(
             &self.inner.data_dir,
             session.header().id.clone(),
@@ -661,6 +664,7 @@ impl Runtime {
             control.clone(),
         ));
         let main_session = session.path().to_path_buf();
+        let spend_capped = limits.spend.is_some();
         let placement = RunPlacement {
             depth: 0,
             role: roles::MAIN_ROLE,
@@ -669,6 +673,7 @@ impl Runtime {
             sender: None,
             main_session: Some(&main_session),
             unattended: Some(&scope),
+            limits,
         };
         // Children of this run are owned by a token of their own, as in `run`.
         let run_children = CancellationToken::new();
@@ -680,6 +685,7 @@ impl Runtime {
                 depth: 1,
                 inbox: inbox.clone(),
                 unattended: Some(scope.clone()),
+                spend_capped,
             }),
             self.inner.admission.clone(),
             run_children.clone(),
@@ -712,10 +718,10 @@ impl Runtime {
         forwarder.abort();
         stop_children.abort();
         let outcome = match scope.take_blocked() {
-            Some(decision) => UnattendedOutcome::Blocked(decision),
-            None => UnattendedOutcome::Finished(outcome?),
+            Some(decision) => Ok(UnattendedOutcome::Blocked(decision)),
+            None => outcome.map(UnattendedOutcome::Finished),
         };
-        Ok(UnattendedRun { outcome, children })
+        UnattendedRun { outcome, children }
     }
 
     async fn run_depth(
@@ -735,6 +741,7 @@ impl Runtime {
             sender,
             main_session,
             unattended,
+            limits: job_limits,
         } = placement;
         if session.header().cwd != self.inner.cwd {
             bail!("session belongs to a different working directory");
@@ -905,12 +912,19 @@ impl Runtime {
             messages: session.messages()?,
             tools: Vec::new(),
         };
+        // The job's per-attempt turn budget and the runtime's own limit both
+        // apply; the lower of the two wins.
+        let max_turns = match (settings.max_turns, job_limits.turns) {
+            (Some(own), Some(job)) => Some(own.min(job)),
+            (own, job) => own.or(job),
+        };
         let config = AgentConfig {
             model,
             stream_options,
             cwd: self.inner.cwd.clone(),
             session_id: session.header().id.clone(),
-            max_turns: settings.max_turns,
+            max_turns,
+            max_cost: job_limits.spend,
             max_retries: 2,
             retry_delay: Duration::from_millis(500),
             context_limit: settings.auto_compact.then_some(window_budget),
@@ -1244,7 +1258,7 @@ pub enum UnattendedOutcome {
 
 /// An unattended run's outcome, with the settled outcome of every child it started.
 pub struct UnattendedRun {
-    pub outcome: UnattendedOutcome,
+    pub outcome: Result<UnattendedOutcome>,
     /// Every child the run started, each in a terminal state.
     pub children: Vec<subagents::ChildOutcome>,
 }
@@ -1268,6 +1282,15 @@ async fn cancel_children_on_stop(control: RunControl, children: CancellationToke
     children.cancel();
 }
 
+/// Budget a job's main run is held to for one segment: how many model turns
+/// and how much spend (USD) it may still use. The runtime's own turn limit
+/// still applies to turns; the lower of the two wins.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct JobLimits {
+    pub turns: Option<usize>,
+    pub spend: Option<f64>,
+}
+
 /// Where a run sits in the delegation tree: its depth, the role it runs as,
 /// and whether it is confined to read-only tools.
 #[derive(Clone, Copy)]
@@ -1285,6 +1308,9 @@ struct RunPlacement<'a> {
     main_session: Option<&'a Path>,
     /// Set for unattended runs; every run in the tree shares the same scope.
     unattended: Option<&'a SharedScope>,
+    /// Caps the job that started this run places on its main run. Children
+    /// never inherit them.
+    limits: JobLimits,
 }
 
 struct ChildFactory {
@@ -1292,6 +1318,9 @@ struct ChildFactory {
     depth: usize,
     inbox: subagents::MainInbox,
     unattended: Option<SharedScope>,
+    /// The job that started this tree has a spend budget. Its children must then
+    /// run a priced model: an unpriced run reports zero cost, which never reaches the cap.
+    spend_capped: bool,
 }
 
 /// Where an isolated child's workspace is provisioned. Shared by
@@ -1318,6 +1347,7 @@ impl ChildFactory {
                 depth: self.depth + 1,
                 inbox: self.inbox.clone(),
                 unattended: self.unattended.clone(),
+                spend_capped: self.spend_capped,
             }),
             runtime.inner.admission.clone(),
             control.token().child_token(),
@@ -1423,6 +1453,12 @@ fn keep_isolated_changes(path: &Path, subagent_id: &str) -> Result<Option<String
         false,
     )?;
     Ok(Some(node.id))
+}
+
+/// A model with no pricing reports zero cost, so a spend cap never sees its spend.
+fn unpriced(model: &Model) -> bool {
+    let cost = &model.cost;
+    cost.input == 0.0 && cost.output == 0.0 && cost.cache_read == 0.0 && cost.cache_write == 0.0
 }
 
 /// A child run's model: the `task` entry's `model`, else the first of its
@@ -1664,6 +1700,14 @@ impl subagents::SubagentFactory for ChildFactory {
                 &role_models,
                 &settings,
             )?;
+            if self.spend_capped {
+                let (model, _) = runtime.resolve_model(&selector)?;
+                if unpriced(&model) {
+                    bail!(
+                        "child model `{selector}` has no pricing, so its spend cannot be capped under this job's spend budget"
+                    );
+                }
+            }
             runtime.switch_model(&mut session, &selector)?;
             let mut prompt = spec.task;
             if let Some(schema) = spec.output_schema {
@@ -1686,6 +1730,7 @@ impl subagents::SubagentFactory for ChildFactory {
                         tier: spec.tier.unwrap_or(ExecutionTier::Workspace),
                         sender: Some(id),
                         unattended: self.unattended.as_ref(),
+                        limits: JobLimits::default(),
                         main_session: spec.main_session.as_deref(),
                     },
                     manager,
@@ -1747,6 +1792,7 @@ impl subagents::SubagentFactory for ChildFactory {
                         tier: spec.tier.unwrap_or(ExecutionTier::Workspace),
                         sender: Some(id),
                         unattended: self.unattended.as_ref(),
+                        limits: JobLimits::default(),
                         main_session: spec.main_session.as_deref(),
                     },
                     manager,
@@ -4768,10 +4814,11 @@ mod tests {
                 events,
                 RunControl::new(),
                 None,
+                JobLimits::default(),
             )
             .await
-            .expect("first run")
             .outcome
+            .expect("first run")
         {
             UnattendedOutcome::Blocked(decision) => decision,
             UnattendedOutcome::Finished(_) => {
@@ -4792,10 +4839,11 @@ mod tests {
                 events,
                 RunControl::new(),
                 None,
+                JobLimits::default(),
             )
             .await
-            .expect("second run")
             .outcome
+            .expect("second run")
         {
             UnattendedOutcome::Finished(_) => {}
             UnattendedOutcome::Blocked(_) => panic!("the approved action must not block again"),
@@ -4832,10 +4880,11 @@ mod tests {
                 events,
                 RunControl::new(),
                 None,
+                JobLimits::default(),
             )
             .await
-            .expect("first run")
             .outcome
+            .expect("first run")
         {
             UnattendedOutcome::Blocked(decision) => decision,
             UnattendedOutcome::Finished(_) => panic!("publish must block without a grant"),
@@ -4851,10 +4900,11 @@ mod tests {
                 events,
                 RunControl::new(),
                 None,
+                JobLimits::default(),
             )
             .await
-            .expect("second run")
             .outcome
+            .expect("second run")
         {
             UnattendedOutcome::Blocked(decision) => {
                 assert_ne!(
@@ -4944,6 +4994,7 @@ mod tests {
                     sender: None,
                     main_session: None,
                     unattended: None,
+                    limits: JobLimits::default(),
                 },
                 runtime.subagent_manager(),
             )
@@ -4995,6 +5046,7 @@ mod tests {
                         sender: None,
                         main_session: None,
                         unattended: None,
+                        limits: JobLimits::default(),
                     },
                     runtime.subagent_manager(),
                 )

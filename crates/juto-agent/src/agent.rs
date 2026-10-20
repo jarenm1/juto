@@ -139,6 +139,21 @@ impl Agent {
                 self.commit(message, &events);
             }
 
+            // Checked before the turn starts, on usage this run has already
+            // committed, so no model call is made once the cap is reached.
+            if let Some(max) = self.config.max_cost
+                && usage.cost >= max
+            {
+                let error = AgentError::SpendLimit(max);
+                emit(
+                    &events,
+                    AgentEvent::Error {
+                        error: error.to_string(),
+                    },
+                );
+                self.finish(StopReason::Error, usage, turns, &events);
+                break Err(error);
+            }
             turns += 1;
             if let Some(max) = self.config.max_turns
                 && turns > max
