@@ -28,6 +28,7 @@ use juto_ai::{AssistantMessage, ContentBlock, Message, StopReason, timestamp_ms}
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 
+use crate::broker::Priority;
 use crate::change_graph::ChangeGraph;
 use crate::decisions::{Decision, DecisionStatus, continuation_prompt};
 use crate::subagents::MainInbox;
@@ -185,6 +186,33 @@ pub struct JobFork {
     pub thread: String,
 }
 
+/// The automation occurrence that started a job. Its job id is derived from the
+/// occurrence key, so the same occurrence cannot start two jobs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobOrigin {
+    pub automation_id: String,
+    /// The scheduled instant, in Unix milliseconds.
+    pub instant_ms: u64,
+}
+
+/// Everything `start_job` takes, plus the job's identity and provenance. One-off
+/// jobs leave `id`, `model`, `priority` and `origin` unset.
+#[derive(Debug, Clone)]
+pub struct JobSpec {
+    /// Persisted job id. `None` mints a fresh one; an id that already exists
+    /// fails with [`JobError::Exists`] and starts nothing.
+    pub id: Option<String>,
+    pub prompt: String,
+    pub budget: JobBudget,
+    pub contract: JobContract,
+    /// Model selector pinned on the job's session before its first turn.
+    pub model: Option<String>,
+    /// Broker priority of the main run; `None` keeps the depth-0 default.
+    pub priority: Option<Priority>,
+    pub origin: Option<JobOrigin>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Job {
@@ -222,6 +250,15 @@ pub struct Job {
     pub created_ms: u64,
     pub started_ms: Option<u64>,
     pub finished_ms: Option<u64>,
+    /// The automation occurrence that started this job; `None` for one-off jobs.
+    #[serde(default)]
+    pub origin: Option<JobOrigin>,
+    /// Broker priority of the main run; `None` keeps the depth-0 default.
+    #[serde(default)]
+    pub priority: Option<Priority>,
+    /// Model selector pinned on the job's session when it started.
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 impl Job {
@@ -248,6 +285,9 @@ impl Job {
             created_ms: timestamp_ms(),
             started_ms: None,
             finished_ms: None,
+            origin: None,
+            priority: None,
+            model: None,
         }
     }
 }
@@ -255,6 +295,8 @@ impl Job {
 #[derive(Debug)]
 pub enum JobError {
     NotFound(String),
+    /// An id that is already persisted; nothing was started.
+    Exists(String),
     /// The request does not fit the job's current state.
     Invalid(String),
     Failed(anyhow::Error),
@@ -264,6 +306,7 @@ impl std::fmt::Display for JobError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound(id) => write!(f, "unknown job `{id}`"),
+            Self::Exists(id) => write!(f, "job `{id}` already exists"),
             Self::Invalid(message) => f.write_str(message),
             Self::Failed(error) => write!(f, "{error:#}"),
         }
@@ -376,8 +419,13 @@ impl JobRegistry {
             .ok_or_else(|| JobError::NotFound(id.to_owned()))
     }
 
-    fn insert(&self, job: &Job) -> Result<(), JobError> {
+    /// Persists a new record unless one with this id exists. The check and the
+    /// write happen under [`LOCK`], so a second caller cannot create it too.
+    fn insert_new(&self, job: &Job) -> Result<(), JobError> {
         let _guard = lock();
+        if self.store.get(&job.id)?.is_some() {
+            return Err(JobError::Exists(job.id.clone()));
+        }
         self.store.write(job)?;
         let _ = self.events.send(job.clone());
         Ok(())
@@ -511,15 +559,45 @@ impl Runtime {
         budget: JobBudget,
         contract: JobContract,
     ) -> Result<Job, JobError> {
-        let prompt = prompt.into();
+        self.start_job_spec(JobSpec {
+            id: None,
+            prompt: prompt.into(),
+            budget,
+            contract,
+            model: None,
+            priority: None,
+            origin: None,
+        })
+    }
+
+    /// Queues a job from `spec` and starts it in the background. Returns once the
+    /// record is durable. An id that is already persisted starts nothing and fails
+    /// with [`JobError::Exists`]; the scheduler relies on that for dedupe.
+    pub fn start_job_spec(&self, spec: JobSpec) -> Result<Job, JobError> {
+        let JobSpec {
+            id,
+            prompt,
+            budget,
+            contract,
+            model,
+            priority,
+            origin,
+        } = spec;
         if prompt.trim().is_empty() {
             return Err(JobError::Invalid("a job needs a prompt".into()));
         }
         budget.validate()?;
         contract.validate()?;
-        let id = uuid::Uuid::now_v7().to_string();
-        let job = Job::new(id.clone(), prompt, budget, contract);
-        self.inner.jobs.insert(&job)?;
+        if let Some(selector) = &model {
+            self.resolve_model(selector)
+                .map_err(|error| JobError::Invalid(format!("model `{selector}`: {error:#}")))?;
+        }
+        let id = id.unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+        let mut job = Job::new(id.clone(), prompt, budget, contract);
+        job.model = model;
+        job.priority = priority;
+        job.origin = origin;
+        self.inner.jobs.insert_new(&job)?;
         self.inner.jobs.register(&id);
         self.spawn_job(id, Attempt::Fresh);
         Ok(job)
@@ -881,6 +959,9 @@ impl Runtime {
             Ok(())
         })?;
         let mut session = Session::create(&self.inner.data_dir.join("sessions"), &workspace.path)?;
+        if let Some(selector) = &job.model {
+            runtime.switch_model(&mut session, selector)?;
+        }
         let session_id = session.header().id.clone();
         let session_path = session.path().to_path_buf();
         self.inner.jobs.mutate(id, |job| {
@@ -1039,6 +1120,7 @@ impl Runtime {
                             .budget
                             .max_spend
                             .map(|max| (max - job.spend_usd).max(0.0)),
+                        priority: job.priority,
                     },
                 )
             );

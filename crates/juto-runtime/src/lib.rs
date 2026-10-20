@@ -802,12 +802,8 @@ impl Runtime {
             }
         }
         // The run's tier decides how `bash` is confined; see `ExecutionTier::bash_limits`.
-        // Depth 0 is the user's own session; delegated runs queue as background work.
-        let priority = if depth == 0 {
-            Priority::Attended
-        } else {
-            Priority::Background
-        };
+        // The run's priority at the broker; see `placement_priority`.
+        let priority = placement_priority(depth, job_limits.priority);
         let resources_dir = self.inner.data_dir.join("resources");
         let mut limits = tier.bash_limits(settings.bash_scoped).map(|limits| {
             limits
@@ -1298,6 +1294,18 @@ fn unattended_tier(configured: ExecutionTier) -> ExecutionTier {
     }
 }
 
+/// The broker priority of a run's main work. A depth-0 run is the user's own
+/// session: it queues `attended` unless its job names a priority, which is how
+/// scheduled automations queue `scheduled`. Delegated runs always queue as
+/// background work.
+fn placement_priority(depth: usize, requested: Option<Priority>) -> Priority {
+    match (depth, requested) {
+        (0, Some(priority)) => priority,
+        (0, None) => Priority::Attended,
+        _ => Priority::Background,
+    }
+}
+
 /// Cancels a run's children when the run is stopped. Ending the run without a
 /// stop leaves them running, so `run` aborts this watcher when the run ends.
 async fn cancel_children_on_stop(control: RunControl, children: CancellationToken) {
@@ -1313,6 +1321,9 @@ async fn cancel_children_on_stop(control: RunControl, children: CancellationToke
 pub struct JobLimits {
     pub turns: Option<usize>,
     pub spend: Option<f64>,
+    /// Broker priority for the main run. `None` keeps the depth-0 default
+    /// (`attended`); scheduled automations set `scheduled`.
+    pub priority: Option<Priority>,
 }
 
 /// What a job's runs used this segment and which budget, if any, stopped them.
@@ -2501,6 +2512,23 @@ mod tests {
     use super::*;
     use crate::change_graph::{ChangeGraph, EditProvenance};
     use juto_ai::{AssistantMessage, ProviderError, ProviderStream, StreamOptions, timestamp_ms};
+
+    #[test]
+    fn a_scheduled_priority_applies_only_to_the_depth_zero_run() {
+        assert_eq!(placement_priority(0, None), Priority::Attended);
+        assert_eq!(
+            placement_priority(0, Some(Priority::Scheduled)),
+            Priority::Scheduled
+        );
+        assert_eq!(
+            placement_priority(0, Some(Priority::Background)),
+            Priority::Background
+        );
+        assert_eq!(
+            placement_priority(1, Some(Priority::Scheduled)),
+            Priority::Background
+        );
+    }
     use juto_catalog::ModelCost;
     use std::collections::BTreeSet;
     use tempfile::tempdir;
@@ -5185,6 +5213,7 @@ mod tests {
                 JobLimits {
                     turns: None,
                     spend: Some(0.5),
+                    priority: None,
                 },
             ),
         )

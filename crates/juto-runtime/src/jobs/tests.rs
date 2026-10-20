@@ -1416,3 +1416,74 @@ async fn a_job_budget_needs_positive_turn_and_spend_limits() {
     }
     assert!(runtime.list_jobs().expect("list").is_empty());
 }
+
+#[tokio::test]
+async fn a_job_spec_with_a_taken_id_starts_nothing_the_second_time() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let data_dir = root.path().join("data");
+    let runtime = runtime(&repo, &data_dir, Arc::new(Answer("done")));
+    let mut events = runtime.subscribe_jobs();
+    let spec = || JobSpec {
+        id: Some("occurrence-1".into()),
+        prompt: "report".into(),
+        budget: budget(60),
+        contract: no_change(),
+        model: None,
+        priority: None,
+        origin: None,
+    };
+
+    let first = runtime.start_job_spec(spec()).expect("first start");
+    settle(&runtime, &mut events, &first.id, |job| {
+        job.status.is_terminal()
+    })
+    .await;
+
+    assert!(matches!(
+        runtime.start_job_spec(spec()),
+        Err(JobError::Exists(id)) if id == "occurrence-1"
+    ));
+    assert_eq!(
+        runtime.list_jobs().expect("list").len(),
+        1,
+        "a taken id must not create a second record"
+    );
+}
+
+#[tokio::test]
+async fn a_job_runs_on_the_model_it_names_and_refuses_an_unknown_one() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let data_dir = root.path().join("data");
+    let runtime = runtime(&repo, &data_dir, Arc::new(Answer("done")));
+    let mut events = runtime.subscribe_jobs();
+    let named = |model: &str| JobSpec {
+        id: None,
+        prompt: "report".into(),
+        budget: budget(60),
+        contract: no_change(),
+        model: Some(model.into()),
+        priority: None,
+        origin: None,
+    };
+
+    assert!(matches!(
+        runtime.start_job_spec(named("nope/missing")),
+        Err(JobError::Invalid(_))
+    ));
+    assert!(runtime.list_jobs().expect("list").is_empty());
+
+    let started = runtime.start_job_spec(named("mock/test")).expect("start");
+    let job = settle(&runtime, &mut events, &started.id, |job| {
+        job.status.is_terminal()
+    })
+    .await;
+    assert_eq!(job.status, JobStatus::Succeeded, "error: {:?}", job.error);
+    assert_eq!(job.model.as_deref(), Some("mock/test"));
+    let session =
+        Session::open(job.session_path.as_deref().expect("session path")).expect("open session");
+    assert_eq!(session.current_model().as_deref(), Some("mock/test"));
+}
