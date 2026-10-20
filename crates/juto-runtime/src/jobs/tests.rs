@@ -28,7 +28,7 @@ fn git(dir: &Path, args: &[&str]) {
     );
 }
 
-fn native_repo(dir: &Path) {
+pub(crate) fn native_repo(dir: &Path) {
     std::fs::create_dir_all(dir).expect("create repo dir");
     git(dir, &["init", "-q"]);
     git(dir, &["config", "user.name", "Jobs Test"]);
@@ -60,14 +60,14 @@ fn mock_config() -> crate::RuntimeConfig {
     }
 }
 
-fn runtime(cwd: &Path, data_dir: &Path, provider: Arc<dyn Provider>) -> Runtime {
+pub(crate) fn runtime(cwd: &Path, data_dir: &Path, provider: Arc<dyn Provider>) -> Runtime {
     let credentials =
         Arc::new(CredentialStore::open(data_dir.join("credentials.json")).expect("credentials"));
     Runtime::with_provider(cwd, data_dir, mock_config(), credentials, provider, None)
         .expect("runtime")
 }
 
-fn no_change() -> JobContract {
+pub(crate) fn no_change() -> JobContract {
     JobContract {
         no_change: true,
         ..Default::default()
@@ -81,7 +81,7 @@ fn artifact(path: &str) -> JobContract {
     }
 }
 
-fn budget(wall_secs: u64) -> JobBudget {
+pub(crate) fn budget(wall_secs: u64) -> JobBudget {
     JobBudget {
         wall_secs,
         max_attempts: 1,
@@ -141,7 +141,7 @@ fn tool_call(name: &str, arguments: serde_json::Value) -> AssistantMessage {
 }
 
 /// Answers every turn with the same text.
-struct Answer(&'static str);
+pub(crate) struct Answer(pub(crate) &'static str);
 
 #[async_trait]
 impl Provider for Answer {
@@ -253,7 +253,7 @@ impl Provider for PublishThenAnswer {
 }
 
 /// Never produces a response, so only the wall budget or a cancel can end a run.
-struct Stalled;
+pub(crate) struct Stalled;
 
 #[async_trait]
 impl Provider for Stalled {
