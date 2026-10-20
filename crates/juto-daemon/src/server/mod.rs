@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use juto_agent::{AgentEvent, RunControl};
 use juto_runtime::{
-    ApprovalRequest, ChannelApprovalHandler, EntryKind, MainSession, Runtime, RuntimeConfig,
-    Session, SubagentEvent,
+    ApprovalRequest, ChannelApprovalHandler, EntryKind, MainEvent, MainSession, Runtime,
+    RuntimeConfig, Session, SubagentEvent, TimelineItem,
 };
 use std::{
     collections::HashMap,
@@ -76,12 +76,15 @@ fn session_event(state: &mut State, session_id: &str, event: SessionEvent) {
         },
     );
 }
-fn message_count(session: &Session) -> Result<u64> {
-    Ok(session
-        .active_entries()?
+/// Committed messages on a main session's timeline. Stream indexes count these.
+fn message_count(main: &MainSession) -> Result<u64> {
+    Ok(message_total(&main.timeline()?))
+}
+fn message_total(timeline: &[TimelineItem]) -> u64 {
+    timeline
         .iter()
-        .filter(|e| matches!(e.kind, EntryKind::Message { .. }))
-        .count() as u64)
+        .filter(|item| matches!(item, TimelineItem::Message { .. }))
+        .count() as u64
 }
 fn marker(session: &mut Session, kind: &str, run_id: &str) -> Result<()> {
     session.append(EntryKind::Custom {
@@ -92,7 +95,9 @@ fn marker(session: &mut Session, kind: &str, run_id: &str) -> Result<()> {
 }
 
 /// Repairs interrupted runs before accepting clients, including unpaired tool calls.
-fn recover(session: &mut Session) -> Result<()> {
+/// A run's messages live in a thread journal, and the journal does not record which
+/// thread ran, so every thread in `threads` is repaired alongside the main journal.
+fn recover(session: &mut Session, threads: &[PathBuf]) -> Result<()> {
     let mut pending = HashMap::new();
     for entry in session.active_entries()? {
         if let EntryKind::Custom { custom_type, data } = &entry.kind
@@ -110,7 +115,11 @@ fn recover(session: &mut Session) -> Result<()> {
         }
     }
     for id in pending.keys() {
-        session.append_interrupted(id, "daemon restarted before the run completed")?;
+        let reason = "daemon restarted before the run completed";
+        session.append_interrupted(id, reason)?;
+        for path in threads {
+            Session::open(path)?.append_interrupted(id, reason)?;
+        }
     }
     Ok(())
 }
@@ -220,16 +229,12 @@ impl Daemon {
     fn view(&self, session: Session) -> Result<Reply, RpcError> {
         let mut state = self.state.lock().unwrap();
         state.last_session = Some(session.header().id.clone());
-        let entries = session
-            .active_entries()
-            .map_err(failed)?
-            .into_iter()
-            .cloned()
-            .collect();
+        let main = MainSession::open(session.path()).map_err(failed)?;
+        let timeline = main.timeline().map_err(failed)?;
         Ok(Reply::Session(SessionView {
             info: self.info(&session, &state),
-            entries,
-            committed: message_count(&session).map_err(failed)?,
+            committed: message_total(&timeline),
+            timeline,
             pending_approvals: state
                 .approvals
                 .values()
@@ -268,10 +273,10 @@ impl Daemon {
             .get(&session_id)
             .context("unknown session")?
             .clone();
-        let mut session = Session::open(&path)?;
-        let base = message_count(&session)?;
         let run_id = uuid::Uuid::now_v7().to_string();
-        marker(&mut session, "daemon_run_started", &run_id)?;
+        marker(&mut Session::open(&path)?, "daemon_run_started", &run_id)?;
+        let mut main = MainSession::open(&path)?;
+        let base = message_count(&main)?;
         let control = RunControl::new();
         state.active = Some(ActiveRun {
             session_id: session_id.clone(),
@@ -299,24 +304,39 @@ impl Daemon {
             let pump = tokio::spawn(async move {
                 let mut index = base;
                 while let Some(event) = rx.recv().await {
-                    let event = match event {
-                        AgentEvent::MessageEnd { message } => {
+                    let mut state = pump_daemon.state.lock().unwrap();
+                    match event {
+                        MainEvent::Thread(event) => publish(
+                            &mut state,
+                            ServerEvent::Thread {
+                                session_id: pump_session.clone(),
+                                event,
+                            },
+                        ),
+                        MainEvent::Agent(AgentEvent::MessageEnd { message }) => {
                             let event = SessionEvent::MessageCommitted { index, message };
                             index += 1;
-                            event
+                            session_event(&mut state, &pump_session, event);
                         }
-                        event => SessionEvent::Agent { event },
-                    };
-                    session_event(&mut pump_daemon.state.lock().unwrap(), &pump_session, event);
+                        MainEvent::Agent(event) => {
+                            session_event(&mut state, &pump_session, SessionEvent::Agent { event });
+                        }
+                    }
                 }
             });
-            let result = daemon.runtime.run(&mut session, text, tx, control).await;
+            let result = daemon
+                .runtime
+                .send(&mut main, None, text, tx, control)
+                .await;
             let pump_result = pump.await;
             let mut error = result.as_ref().err().map(|e| format!("{e:#}"));
             if let Err(e) = pump_result {
                 error = Some(format!("event pump failed: {e}"));
             }
-            if let Err(e) = marker(&mut session, "daemon_run_finished", &run_id) {
+            let finished = Session::open(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|mut journal| marker(&mut journal, "daemon_run_finished", &run_id));
+            if let Err(e) = finished {
                 error = Some(format!("could not persist run completion: {e:#}"));
             }
             let mut state = daemon.state.lock().unwrap();
@@ -703,7 +723,12 @@ impl Drop for SocketGuard {
 fn load_session(daemon: &Daemon, path: &Path, workspace: &Path) -> Result<()> {
     let mut session = Session::open(path).with_context(|| format!("opening {}", path.display()))?;
     if session.header().cwd == workspace {
-        recover(&mut session)?;
+        let threads: Vec<PathBuf> = MainSession::open(path)?
+            .threads()
+            .iter()
+            .map(|thread| thread.session_path.clone())
+            .collect();
+        recover(&mut session, &threads)?;
         daemon.register(&session).map_err(anyhow::Error::new)?;
     }
     Ok(())
