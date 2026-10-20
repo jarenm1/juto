@@ -2644,6 +2644,164 @@ mod tests {
         }
     }
 
+    /// A session with one discarded user turn (`keep_recent_messages = 1`),
+    /// so compaction has work to do.
+    fn compactable_session(root: &Path) -> Session {
+        let mut session = Session::create(&root.join("sessions"), root).unwrap();
+        session
+            .append(EntryKind::ModelChange {
+                model: "mock/test".to_string(),
+            })
+            .unwrap();
+        for text in ["Keep this request.", "Continue."] {
+            session
+                .append(EntryKind::Message {
+                    message: Message::user(text),
+                })
+                .unwrap();
+        }
+        session
+    }
+
+    /// The session model accepts images under a large window; the compactor is
+    /// a text-only model from the same provider.
+    fn vision_config_with_text_compactor(method: CompactionMethod) -> RuntimeConfig {
+        let mut config = mock_config();
+        config.custom_models[0].input.push("image".into());
+        config.custom_models[0].context_window = Some(200_000);
+        let mut text_only = config.custom_models[0].clone();
+        text_only.id = "textonly".to_string();
+        text_only.input = vec!["text".to_string()];
+        config.custom_models.push(text_only);
+        config.keep_recent_messages = 1;
+        config.compaction_method = method;
+        config.compactor = Some("mock/textonly".to_string());
+        config
+    }
+
+    /// An `@role` compactor resolves through `model_roles` at compaction time.
+    #[tokio::test]
+    async fn compactor_role_resolves_through_model_roles() {
+        let root = tempdir().unwrap();
+        let mut config = mock_config();
+        let mut summarizer = config.custom_models[0].clone();
+        summarizer.id = "summarizer".to_string();
+        config.custom_models.push(summarizer);
+        config
+            .model_roles
+            .insert("smol".to_string(), "mock/summarizer".to_string());
+        config.keep_recent_messages = 1;
+        config.compactor = Some("@smol".to_string());
+        let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime = runtime_with(
+            root.path(),
+            &root.path().join("data"),
+            config,
+            Arc::new(RecordingProvider {
+                models: models.clone(),
+            }),
+        );
+        let mut session = compactable_session(root.path());
+        runtime
+            .compact(&mut session, &RunControl::new())
+            .await
+            .unwrap();
+        assert_eq!(*models.lock().unwrap(), vec!["mock/summarizer".to_string()]);
+        let prior = session.compaction_plan(0).unwrap().previous.unwrap();
+        assert_eq!(prior.summary, "compactor summary");
+    }
+
+    /// An unresolvable compactor fails the compaction. It does not fall back to
+    /// the session model: no provider call happens and the journal is unchanged.
+    #[tokio::test]
+    async fn unknown_compactor_model_fails_without_journal_entry() {
+        let root = tempdir().unwrap();
+        let mut config = mock_config();
+        config.keep_recent_messages = 1;
+        config.compactor = Some("mock/missing".to_string());
+        let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime = runtime_with(
+            root.path(),
+            &root.path().join("data"),
+            config,
+            Arc::new(RecordingProvider {
+                models: models.clone(),
+            }),
+        );
+        let mut session = compactable_session(root.path());
+        let journal = std::fs::read(session.path()).unwrap();
+        let error = runtime
+            .compact(&mut session, &RunControl::new())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("model not found: mock/missing"));
+        assert!(models.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(session.path()).unwrap(), journal);
+        assert!(session.compaction_plan(0).unwrap().previous.is_none());
+    }
+
+    /// A text-only compactor cannot render snapcompact pages, even though the
+    /// session model accepts images. The error returns before any journal write.
+    #[tokio::test]
+    async fn snapcompact_text_only_compactor_fails_without_journal_entry() {
+        let root = tempdir().unwrap();
+        let config = vision_config_with_text_compactor(CompactionMethod::Snapcompact);
+        let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime = runtime_with(
+            root.path(),
+            &root.path().join("data"),
+            config,
+            Arc::new(RecordingProvider {
+                models: models.clone(),
+            }),
+        );
+        let mut session = compactable_session(root.path());
+        let journal = std::fs::read(session.path()).unwrap();
+        let error = runtime
+            .compact(&mut session, &RunControl::new())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("snapcompact needs a vision model"));
+        assert!(models.lock().unwrap().is_empty());
+        assert_eq!(std::fs::read(session.path()).unwrap(), journal);
+        assert!(session.compaction_plan(0).unwrap().previous.is_none());
+    }
+
+    /// Under `auto`, a text-only compactor takes the summary path even though
+    /// the session model accepts images. Without a compactor, the session model
+    /// archives page images instead.
+    #[tokio::test]
+    async fn auto_with_text_only_compactor_takes_summary_path() {
+        for (compactor, expects_summary) in [(None, false), (Some("mock/textonly"), true)] {
+            let root = tempdir().unwrap();
+            let mut config = vision_config_with_text_compactor(CompactionMethod::Auto);
+            config.compactor = compactor.map(str::to_string);
+            let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let runtime = runtime_with(
+                root.path(),
+                &root.path().join("data"),
+                config,
+                Arc::new(RecordingProvider {
+                    models: models.clone(),
+                }),
+            );
+            let mut session = compactable_session(root.path());
+            runtime
+                .compact(&mut session, &RunControl::new())
+                .await
+                .unwrap();
+            let prior = session.compaction_plan(0).unwrap().previous.unwrap();
+            if expects_summary {
+                assert_eq!(*models.lock().unwrap(), vec!["mock/textonly".to_string()]);
+                assert!(prior.archive.is_none());
+                assert_eq!(prior.summary, "compactor summary");
+            } else {
+                assert!(models.lock().unwrap().is_empty());
+                assert!(prior.archive.is_some());
+            }
+        }
+    }
+
     /// Provision a real fork workspace for `id` under `data_dir`.
     async fn provision_workspace(repo: &Path, data_dir: &Path, id: &str) -> SubagentWorkspace {
         let graph = ChangeGraph::open(repo).expect("open graph");
