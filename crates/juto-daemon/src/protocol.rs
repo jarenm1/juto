@@ -20,7 +20,7 @@
 //! `SessionView::committed`. That rule removes duplicates from the window where a
 //! message is journaled but its event has not been written yet.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use juto_agent::{AgentEvent, ToolTier};
 use juto_ai::{Message, StopReason, ToolCall};
@@ -33,7 +33,7 @@ use juto_runtime::{
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change to this module.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// One request from a client. `id` is chosen by the client and echoed back.
 #[derive(Clone, Serialize, Deserialize)]
@@ -328,6 +328,26 @@ pub struct HelloInfo {
     pub data_dir: PathBuf,
     /// Desktop control socket for this workspace's environments.
     pub desktop_socket: PathBuf,
+    /// [`binary_id`] of the executable this daemon runs. Equal ids mean the same build.
+    pub binary_id: String,
+}
+
+/// Identity of the executable file at `path`: device, inode, size, and mtime. A
+/// rebuild replaces the file and changes one of these, so processes with equal ids
+/// run the same build even when their [`PROTOCOL_VERSION`] matches. A content hash
+/// was rejected: a debug daemon is hundreds of megabytes and this runs on every
+/// connect.
+pub fn binary_id(path: &Path) -> std::io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path)?;
+    Ok(format!(
+        "{}-{}-{}-{}.{:09}",
+        meta.dev(),
+        meta.ino(),
+        meta.size(),
+        meta.mtime(),
+        meta.mtime_nsec()
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
