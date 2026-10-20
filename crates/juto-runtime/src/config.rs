@@ -154,6 +154,9 @@ pub struct RuntimeConfig {
     /// How discarded history is archived. Defaults to `summary`; page images
     /// require explicit `auto` or `snapcompact` opt-in.
     pub compaction_method: CompactionMethod,
+    /// Model selector (`provider/model[:effort]` or `@role`) that writes
+    /// compaction summaries. Unset: the session's current model compacts.
+    pub compactor: Option<String>,
     /// Tool allowlist; empty means all builtin tools.
     pub tools: Vec<String>,
     /// User-defined models merged over the bundled registry.
@@ -194,6 +197,7 @@ impl Default for RuntimeConfig {
             compaction_threshold: default_compaction_threshold(),
             keep_recent_messages: default_keep_recent(),
             compaction_method: CompactionMethod::Summary,
+            compactor: None,
             tools: Vec::new(),
             custom_models: Vec::new(),
             execution_tier: ExecutionTier::Attended,
@@ -285,6 +289,16 @@ impl RuntimeConfig {
             && !VALID_EFFORTS.contains(&level.as_str())
         {
             return Err(ConfigError::UnknownEffort(level.clone()));
+        }
+        if let Some(selector) = &self.compactor {
+            let (base, _) = split_effort(selector);
+            if base.trim().is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "compactor must name a model or @role, got {selector:?}"
+                )));
+            }
+            // Same role resolution as modelRoles, so a broken binding fails at load.
+            let _ = self.resolve_selector(selector)?;
         }
         // Role selectors must resolve (no cycles) — validate eagerly so a
         // broken config fails at load, not mid-run.
@@ -605,5 +619,51 @@ mod tests {
             "customModels:\n  - id: \"\"\n    provider: x\n    api: openai\n",
         );
         assert!(RuntimeConfig::load(&file, &missing).is_err());
+    }
+
+    #[test]
+    fn compactor_layers_and_stays_unset_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("none.yml");
+        assert_eq!(
+            RuntimeConfig::load(&missing, &missing).unwrap().compactor,
+            None
+        );
+        let global = write(
+            dir.path(),
+            "global.yml",
+            "compactor: openai/gpt-5-mini:low\n",
+        );
+        let cfg = RuntimeConfig::load(&global, &missing).unwrap();
+        assert_eq!(cfg.compactor.as_deref(), Some("openai/gpt-5-mini:low"));
+        let project = write(dir.path(), ".juto/config.yml", "compactor: \"@smol\"\n");
+        let cfg = RuntimeConfig::load(&global, &project).unwrap();
+        assert_eq!(cfg.compactor.as_deref(), Some("@smol"));
+        // A null tombstone in the project layer unsets the global value.
+        let unset = write(dir.path(), "unset.yml", "compactor: null\n");
+        assert_eq!(
+            RuntimeConfig::load(&global, &unset).unwrap().compactor,
+            None
+        );
+    }
+
+    #[test]
+    fn invalid_compactor_selector_fails_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("none.yml");
+        for body in [
+            "compactor: \"\"\n",
+            "compactor: \"  \"\n",
+            "compactor: \":high\"\n",
+        ] {
+            let file = write(dir.path(), "bad.yml", body);
+            assert!(
+                matches!(
+                    RuntimeConfig::load(&file, &missing),
+                    Err(ConfigError::Validation(_))
+                ),
+                "selector {body:?} must be rejected"
+            );
+        }
     }
 }

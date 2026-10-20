@@ -206,6 +206,9 @@ claiming complete OMP feature parity.
   budget, otherwise it summarizes. `snapcompact` requires vision and sufficient budget,
   returning an error without changing the journal otherwise. No real-model reading
   accuracy or token savings have been established for this port.
+* `compactor` (optional `provider/model[:effort]` or `@role`, the `modelRoles` grammar)
+  names the model that writes compaction summaries. Unset, compaction uses the session's
+  current model. Invalid selectors fail config load.
 * The public-domain X.org misc-fixed 8x13 Latin-1 glyph table is embedded in `font.rs`
   with its source and public-domain notice; no unused BDF is vendored. Anthropic uses
   11px advance/16px pitch; OpenAI/default uses 8px advance/22px pitch. Frames are
