@@ -129,14 +129,7 @@ fn daemon(root: &Path, provider: Arc<dyn Provider>) -> Arc<Daemon> {
         None,
     )
     .unwrap();
-    Arc::new(Daemon {
-        runtime,
-        state: Mutex::new(State::default()),
-        ids: AtomicU64::new(1),
-        logins: Mutex::new(HashMap::new()),
-        desktop_socket: root.join("desktop.sock"),
-        run_changed: Notify::new(),
-    })
+    Daemon::new(runtime, &workspace, root.join("desktop.sock")).unwrap()
 }
 
 /// Stands in for a connected client: its events arrive on the returned receiver.
@@ -478,6 +471,31 @@ async fn inbox_notices_are_announced_listed_and_dismissed() {
         panic!("expected the inbox");
     };
     assert!(messages.is_empty(), "a dismissed notice must not be listed");
+}
+
+#[tokio::test]
+async fn inbox_notices_survive_a_daemon_restart() {
+    let root = tempfile::tempdir().unwrap();
+    let first = daemon(root.path(), ScriptedProvider::new(false));
+    first.runtime.subagent_manager().main_inbox().push_from(
+        Some("session-a".to_string()),
+        MainMessage {
+            from: "child-1".to_string(),
+            name: None,
+            kind: MainMessageKind::Completed,
+            body: "done before restart".to_string(),
+            digest_of: None,
+        },
+    );
+    drop(first);
+
+    let daemon = daemon(root.path(), ScriptedProvider::new(false));
+    let Reply::InboxMessages { messages } = daemon.request(Request::InboxMessages).await.unwrap()
+    else {
+        panic!("expected the inbox");
+    };
+    assert_eq!(messages.len(), 1, "the notice must survive the restart");
+    assert_eq!(messages[0].body, "done before restart");
 }
 
 #[tokio::test]

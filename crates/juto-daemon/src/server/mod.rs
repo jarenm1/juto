@@ -158,6 +158,20 @@ async fn inbox_loop(daemon: Arc<Daemon>) {
 }
 
 impl Daemon {
+    /// Wrap `runtime` for the daemon serving `workspace`. The main inbox is bound
+    /// to this workspace's file first, so notices from before a restart are restored.
+    fn new(runtime: Runtime, workspace: &Path, desktop_socket: PathBuf) -> Result<Arc<Self>> {
+        runtime.open_host_inbox(&paths::workspace_key(workspace))?;
+        Ok(Arc::new(Daemon {
+            runtime,
+            state: Mutex::new(State::default()),
+            ids: AtomicU64::new(1),
+            logins: Mutex::new(HashMap::new()),
+            desktop_socket,
+            run_changed: tokio::sync::Notify::new(),
+        }))
+    }
+
     fn next_id(&self) -> u64 {
         self.ids.fetch_add(1, Ordering::Relaxed)
     }
@@ -719,14 +733,7 @@ pub async fn serve(workspace: PathBuf) -> Result<()> {
     let (approval_handler, mut approvals) = ChannelApprovalHandler::channel();
     let runtime =
         Runtime::from_config_with_approval(&workspace, &data_dir, config, Some(approval_handler))?;
-    let daemon = Arc::new(Daemon {
-        runtime,
-        state: Mutex::new(State::default()),
-        ids: AtomicU64::new(1),
-        logins: Mutex::new(HashMap::new()),
-        desktop_socket,
-        run_changed: tokio::sync::Notify::new(),
-    });
+    let daemon = Daemon::new(runtime, &workspace, desktop_socket)?;
     for entry in std::fs::read_dir(data_dir.join("sessions"))? {
         let path = entry?.path();
         if path.extension().is_some_and(|ext| ext == "jsonl") {
