@@ -224,6 +224,54 @@ requests: `CreateAutomation`, `ListAutomations`, `GetAutomation`,
 `AutomationHistory`, `RunAutomationNow`, `SetAutomationEnabled`, and
 `DeleteAutomation`. Protocol version 3 has no automation requests.
 
+## GitHub events
+
+A repository watch turns GitHub issue and pull request activity into the same
+durable job as `jobs run-now`. The primary trigger is authenticated REST polling:
+the daemon makes outbound requests only and opens no listener. A webhook path is
+not implemented.
+
+Watches are managed through the protocol (`CreateGithubWatch`,
+`ListGithubWatches`, `DeleteGithubWatch`, `ListGithubEvents`, `PollGithub`). There
+is no CLI command for them yet. The daemon polls every 60 seconds, and
+`PollGithub` polls on demand.
+
+- Endpoints: `GET {base}/repos/{owner}/{repo}/issues` (pull requests excluded)
+  and `GET {base}/repos/{owner}/{repo}/pulls`. Both list open items, sorted by
+  `updated`, 100 per page, at most 10 pages. A poll that reaches the page cap
+  fails rather than truncating. `base` is `https://api.github.com`, overridden by
+  `JUTO_GITHUB_API_BASE`. Plain `http` is accepted only for loopback. Redirects
+  are not followed.
+- Credential: the token is stored under provider `github` in the daemon's
+  credential store (`<data_dir>/credentials.json`), set with
+  `juto-cli login github --api-key`. It is sent only in an `Authorization: Bearer`
+  header. It is never mounted into a sandbox, placed in a prompt, or written to
+  the ledger or logs. With no token stored, a poll fails before any request is
+  made.
+- Allowlist: one watch per repository. Repository names compare
+  case-insensitively. An item from another repository is rejected and recorded.
+  For a pull request, the repository is its base repository. No job starts.
+- Labels and assignees: an item must carry every configured label and at least
+  one configured assignee. An empty list imposes no constraint. Only open items
+  are considered. An item that fails these rules is skipped and not recorded.
+- Dedupe key: an issue is `issue:<repo>#<number>:<id>:<updated_at>`. A pull
+  request is `pull:<repo>#<number>:<head sha>`. The job id is `gh-` plus the
+  first 32 hex digits of SHA-256 of the key. A repeat finds the job already
+  stored (`JobError::Exists`) and starts nothing, including across restarts. A
+  newer revision has a new key and starts the next job.
+- Baseline: a watch's first poll records what already exists and starts no jobs.
+- Job: `untrusted` tier, `unattended` profile, 1 attempt, 1800 s wall clock, 60
+  turns, and a required `PROPOSAL.md` artifact. The item text appears in the
+  prompt only inside `<untrusted_github_event>` tags, and the event cannot change
+  the tier or profile. The job can only propose changes. It cannot push, comment,
+  or open a pull request.
+- Storage: the ledger is `<data_dir>/github/events.jsonl`, one line per accepted
+  or rejected item. Each watch is `<data_dir>/github/watches/<id>.json`, which
+  holds the cursor (`since`) and baseline flag.
+- Limitations: pull requests have no server-side `since`, so every poll fetches
+  all open pull requests. Duplicates are not written to the ledger. While watches
+  exist and no token is stored, the daemon logs an error on every poll.
+
 ## Limitations
 
 - `net:<host>` denials and out-of-workspace file access are hard errors. They
