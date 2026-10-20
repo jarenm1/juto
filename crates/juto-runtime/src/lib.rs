@@ -707,7 +707,7 @@ impl Runtime {
         if stopped.is_cancelled() {
             run_children.cancel();
         }
-        match scope.take_blocked() {
+        match scope.finish() {
             Some(decision) => Ok(UnattendedOutcome::Blocked(decision)),
             None => outcome.map(UnattendedOutcome::Finished),
         }
