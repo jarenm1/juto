@@ -6,13 +6,13 @@ use std::{path::Path, sync::atomic::AtomicBool, time::Duration};
 
 use async_trait::async_trait;
 use juto_ai::{
-    AssistantMessage, ContentBlock, Context, CredentialStore, Provider, ProviderError,
+    AssistantMessage, ContentBlock, Context, CredentialStore, Message, Provider, ProviderError,
     ProviderEvent, ProviderStream, StopReason, StreamOptions, Usage, timestamp_ms,
 };
 use juto_catalog::{Model, ModelCost};
 use juto_runtime::subagents::{MainMessage, MainMessageKind};
 use juto_runtime::tools::{DESKTOP_SESSION_ARTIFACT_VERSION, DesktopSessionArtifact};
-use juto_runtime::{EntryKind, SessionEntry, TaskSpec};
+use juto_runtime::{Decision, DecisionStatus, EntryKind, SessionEntry, TaskSpec};
 use juto_runtime::{Route, RouteKind, ThreadEvent, ViewerRoute};
 use serde_json::Value;
 use tokio::{
@@ -113,8 +113,27 @@ fn test_config() -> RuntimeConfig {
     }
 }
 
+/// Records the decisions the daemon reports to the operator.
+#[derive(Default)]
+struct RecordingNotifier(Mutex<Vec<String>>);
+
+impl Notifier for RecordingNotifier {
+    fn decision_blocked(&self, decision: &Decision) {
+        self.0.lock().unwrap().push(decision.id.clone());
+    }
+}
+
 /// A daemon whose runtime lives under `root`, with no connections attached.
 fn daemon(root: &Path, provider: Arc<dyn Provider>) -> Arc<Daemon> {
+    daemon_with_notifier(root, provider, Arc::new(RecordingNotifier::default()))
+}
+
+/// Like [`daemon`], with operator notices delivered to `notifier`.
+fn daemon_with_notifier(
+    root: &Path,
+    provider: Arc<dyn Provider>,
+    notifier: Arc<RecordingNotifier>,
+) -> Arc<Daemon> {
     let workspace = root.join("workspace");
     let data_dir = root.join("data");
     std::fs::create_dir_all(&workspace).unwrap();
@@ -133,7 +152,7 @@ fn daemon(root: &Path, provider: Arc<dyn Provider>) -> Arc<Daemon> {
         root.join("no-pressure"),
     )
     .unwrap();
-    Daemon::new(runtime, &workspace, root.join("desktop.sock")).unwrap()
+    Daemon::new(runtime, &workspace, root.join("desktop.sock"), notifier).unwrap()
 }
 
 /// Stands in for a connected client: its events arrive on the returned receiver.
@@ -168,6 +187,7 @@ async fn start_run(daemon: &Arc<Daemon>, session_id: &str, text: &str) -> String
     let request = Request::Prompt {
         session_id: session_id.into(),
         text: text.into(),
+        unattended: false,
     };
     match daemon.request(request).await.expect("start run") {
         Reply::Started { run_id } => run_id,
@@ -355,6 +375,7 @@ async fn reattach_shows_the_live_run_and_then_the_committed_transcript() {
         .request(Request::Prompt {
             session_id: view.info.id.clone(),
             text: "again".into(),
+            unattended: false,
         })
         .await;
     assert!(matches!(
@@ -779,4 +800,252 @@ async fn timeline_request_answers_for_a_session() {
         panic!("expected a timeline reply");
     };
     assert!(items.is_empty(), "a fresh session has no routed history");
+}
+
+fn assistant(content: Vec<ContentBlock>, stop_reason: StopReason) -> AssistantMessage {
+    AssistantMessage {
+        content,
+        api: "mock".to_string(),
+        provider: "mock".to_string(),
+        model: "mock/test".to_string(),
+        usage: Usage {
+            input: 1,
+            output: 1,
+            cache_read: 0,
+            cache_write: 0,
+            total_tokens: 2,
+            cost: 0.0,
+        },
+        stop_reason,
+        timestamp: timestamp_ms(),
+        response_id: None,
+        error: None,
+    }
+}
+
+/// Asks for `publish` until a tool result is in, then answers with text. An
+/// unattended run reaches the publish gate on its first request.
+struct PublishProvider;
+
+#[async_trait]
+impl Provider for PublishProvider {
+    async fn stream(
+        &self,
+        _model: &Model,
+        context: &Context,
+        _options: &StreamOptions,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        let message = if matches!(context.messages.last(), Some(Message::ToolResult { .. })) {
+            assistant(
+                vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                StopReason::Stop,
+            )
+        } else {
+            assistant(
+                vec![ContentBlock::ToolCall(juto_ai::ToolCall {
+                    id: format!("publish-{}", context.messages.len()),
+                    name: "publish".to_string(),
+                    arguments: serde_json::json!({ "bookmark": "feat/x", "title": "Add x" }),
+                    thought_signature: None,
+                })],
+                StopReason::ToolUse,
+            )
+        };
+        let events: Vec<Result<ProviderEvent, ProviderError>> = vec![
+            Ok(ProviderEvent::Start),
+            Ok(ProviderEvent::Done { message }),
+        ];
+        Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+/// Number of `publish` calls that reached the tool. A call the decision gate
+/// stopped is journaled as a `Tool call rejected: blocked:` error and does not count.
+fn publish_results(path: &Path) -> usize {
+    Session::open(path)
+        .unwrap()
+        .messages()
+        .unwrap()
+        .iter()
+        .filter(|m| match m {
+            Message::ToolResult {
+                tool_name, content, ..
+            } => {
+                tool_name == "publish"
+                    && !content.iter().any(|block| {
+                        matches!(block, ContentBlock::Text { text }
+                            if text.starts_with("Tool call rejected: blocked:"))
+                    })
+            }
+            _ => false,
+        })
+        .count()
+}
+
+async fn start_unattended(daemon: &Arc<Daemon>, session_id: &str) {
+    let request = Request::Prompt {
+        session_id: session_id.into(),
+        text: "publish the branch".into(),
+        unattended: true,
+    };
+    daemon.request(request).await.expect("start unattended run");
+}
+
+async fn decisions(daemon: &Arc<Daemon>) -> Vec<Decision> {
+    match daemon
+        .request(Request::ListDecisions)
+        .await
+        .expect("list decisions")
+    {
+        Reply::Decisions(list) => list,
+        _ => panic!("expected decisions"),
+    }
+}
+
+async fn resolve(
+    daemon: &Arc<Daemon>,
+    decision_id: &str,
+    approve: bool,
+) -> Result<Reply, RpcError> {
+    daemon
+        .request(Request::ResolveDecision {
+            decision_id: decision_id.into(),
+            approve,
+        })
+        .await
+}
+
+#[tokio::test]
+async fn unattended_publish_blocks_then_approval_runs_it_exactly_once() {
+    let root = tempfile::tempdir().unwrap();
+    let notifier = Arc::new(RecordingNotifier::default());
+    let daemon = daemon_with_notifier(root.path(), Arc::new(PublishProvider), notifier.clone());
+    let view = create_session(&daemon).await;
+    let mut rx = attach(&daemon);
+
+    start_unattended(&daemon, &view.info.id).await;
+    next_session_event(&mut rx, |e| {
+        matches!(e, SessionEvent::DecisionBlocked { .. })
+    })
+    .await;
+    until(|| daemon.state.lock().unwrap().active.is_none()).await;
+
+    let pending = decisions(&daemon).await;
+    assert_eq!(pending.len(), 1);
+    let decision = &pending[0];
+    assert_eq!(decision.tool, "publish");
+    assert_eq!(decision.status, DecisionStatus::Pending);
+    assert_eq!(*notifier.0.lock().unwrap(), vec![decision.id.clone()]);
+    assert_eq!(
+        publish_results(&view.info.path),
+        0,
+        "a blocked action must not run"
+    );
+
+    let Reply::Decision { decision, run_id } = resolve(&daemon, &decision.id.clone(), true)
+        .await
+        .expect("approve")
+    else {
+        panic!("expected a decision reply");
+    };
+    assert_eq!(decision.status, DecisionStatus::Approved);
+    assert!(run_id.is_some(), "approval starts the resumed run");
+    until(|| daemon.state.lock().unwrap().active.is_none()).await;
+
+    assert_eq!(
+        publish_results(&view.info.path),
+        1,
+        "the approved action runs exactly once"
+    );
+    assert_eq!(
+        decisions(&daemon).await[0].status,
+        DecisionStatus::Consumed,
+        "the grant is spent by the run it allowed"
+    );
+}
+
+#[tokio::test]
+async fn rejected_decision_never_runs_and_cannot_be_approved_later() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon(root.path(), Arc::new(PublishProvider));
+    let view = create_session(&daemon).await;
+    let mut rx = attach(&daemon);
+
+    start_unattended(&daemon, &view.info.id).await;
+    next_session_event(&mut rx, |e| {
+        matches!(e, SessionEvent::DecisionBlocked { .. })
+    })
+    .await;
+    until(|| daemon.state.lock().unwrap().active.is_none()).await;
+    let id = decisions(&daemon).await[0].id.clone();
+
+    let Reply::Decision { decision, run_id } = resolve(&daemon, &id, false).await.expect("reject")
+    else {
+        panic!("expected a decision reply");
+    };
+    assert_eq!(decision.status, DecisionStatus::Rejected);
+    assert!(run_id.is_none(), "rejection starts no run");
+    assert!(daemon.state.lock().unwrap().active.is_none());
+    assert_eq!(publish_results(&view.info.path), 0);
+    assert!(matches!(
+        next_session_event(&mut rx, |e| matches!(
+            e,
+            SessionEvent::DecisionResolved { .. }
+        ))
+        .await,
+        SessionEvent::DecisionResolved { .. }
+    ));
+
+    let late = resolve(&daemon, &id, true).await;
+    assert!(matches!(
+        late,
+        Err(RpcError {
+            code: ErrorCode::Invalid,
+            ..
+        })
+    ));
+    assert_eq!(publish_results(&view.info.path), 0);
+}
+
+#[tokio::test]
+async fn pending_decision_survives_a_daemon_restart_and_is_still_approvable() {
+    let root = tempfile::tempdir().unwrap();
+    let first = daemon(root.path(), Arc::new(PublishProvider));
+    let view = create_session(&first).await;
+    let mut rx = attach(&first);
+    start_unattended(&first, &view.info.id).await;
+    next_session_event(&mut rx, |e| {
+        matches!(e, SessionEvent::DecisionBlocked { .. })
+    })
+    .await;
+    until(|| first.state.lock().unwrap().active.is_none()).await;
+    let id = decisions(&first).await[0].id.clone();
+    drop(first);
+
+    // A restarted daemon has no sessions loaded until a client opens one.
+    let restarted = daemon(root.path(), Arc::new(PublishProvider));
+    let pending = decisions(&restarted).await;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, id);
+    assert_eq!(pending[0].status, DecisionStatus::Pending);
+
+    let opened = Request::OpenSessionPath {
+        path: view.info.path.clone(),
+    };
+    restarted
+        .request(opened)
+        .await
+        .expect("open session by path");
+    let Reply::Decision { run_id, .. } = resolve(&restarted, &id, true)
+        .await
+        .expect("approve after restart")
+    else {
+        panic!("expected a decision reply");
+    };
+    assert!(run_id.is_some());
+    until(|| restarted.state.lock().unwrap().active.is_none()).await;
+    assert_eq!(publish_results(&view.info.path), 1);
 }
