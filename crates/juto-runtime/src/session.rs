@@ -89,6 +89,10 @@ pub enum EntryKind {
         /// Page images of the discarded history; absent for text summaries and old journals.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         archive: Option<Archive>,
+        /// Depth of summarization: 0 summarizes original messages, 1 summarizes
+        /// level-0 summaries, and so on. Absent in journals written before nodes.
+        #[serde(default)]
+        level: u32,
     },
     Branch {
         target: Option<String>,
@@ -137,25 +141,42 @@ pub struct CompactionMark<'a> {
     pub first_visible: usize,
 }
 
+/// A summary node on the active path, covering the original messages `start..end`.
+#[derive(Debug, Clone, Copy)]
+pub struct NodeRef<'a> {
+    pub entry_id: &'a str,
+    pub summary: &'a str,
+    pub archive: Option<&'a Archive>,
+    pub level: u32,
+    pub start: usize,
+    pub end: usize,
+}
+
 /// The active path as recall addresses it.
 #[derive(Debug, Clone)]
 pub struct PathView<'a> {
     pub messages: Vec<PathMessage<'a>>,
+    /// Summary nodes in order; together they cover `messages[..raw_start()]`.
+    pub nodes: Vec<NodeRef<'a>>,
+    /// The latest compaction entry on the path.
     pub compaction: Option<CompactionMark<'a>>,
 }
 
 impl<'a> PathView<'a> {
-    /// Messages the model sees: those from the first kept message onward.
+    /// Index of the first message that no node covers.
+    pub fn raw_start(&self) -> usize {
+        self.nodes.last().map_or(0, |node| node.end)
+    }
+    /// Messages the model sees: the raw tail after the nodes.
     pub fn visible(&self) -> &[PathMessage<'a>] {
-        let start = self.compaction.map_or(0, |mark| mark.first_visible);
-        &self.messages[start..]
+        &self.messages[self.raw_start()..]
     }
 }
 
 /// History discarded by a compaction and the preceding summary or frame archive.
 #[derive(Debug)]
 pub struct CompactionPlan {
-    pub previous: Option<PriorCompaction>,
+    pub previous: Vec<PriorCompaction>,
     pub discarded: Vec<Message>,
 }
 
@@ -163,6 +184,42 @@ pub struct CompactionPlan {
 pub struct PriorCompaction {
     pub summary: String,
     pub archive: Option<Archive>,
+}
+
+/// Messages to summarize into one new node, and where the node sits on the path.
+#[derive(Debug, Clone)]
+pub struct NodePlan {
+    pub input: Vec<Message>,
+    pub level: u32,
+    pub span_start_id: String,
+    pub span_end_id: String,
+    /// Entry ids of the live nodes the new node replaces.
+    pub covers: Vec<String>,
+}
+
+impl NodePlan {
+    pub fn into_node(self, summary: String, archive: Option<Archive>) -> NewNode {
+        NewNode {
+            summary,
+            archive,
+            level: self.level,
+            span_start_id: self.span_start_id,
+            span_end_id: self.span_end_id,
+            covers: self.covers,
+        }
+    }
+}
+
+/// A summary node to append: a summary of the messages from `span_start_id` through
+/// `span_end_id`, replacing the live nodes named in `covers`.
+#[derive(Debug, Clone)]
+pub struct NewNode {
+    pub summary: String,
+    pub archive: Option<Archive>,
+    pub level: u32,
+    pub span_start_id: String,
+    pub span_end_id: String,
+    pub covers: Vec<String>,
 }
 
 impl Session {
@@ -321,89 +378,117 @@ impl Session {
         entries.reverse();
         Ok(entries)
     }
-    /// The active path as recall addresses it: every message entry numbered
-    /// from the root, with the latest compaction placed among them. Numbers
-    /// stay put when a compaction is appended and change only when the active
+    /// The active path as recall addresses it: every message entry numbered from the
+    /// root, the summary nodes covering a prefix of it, and the latest compaction.
+    /// Numbers stay put when a compaction is appended and change only when the active
     /// path changes (a branch).
     pub fn path_view(&self) -> Result<PathView<'_>> {
         let entries = self.active_entries()?;
-        let boundary = entries
-            .iter()
-            .copied()
-            .enumerate()
-            .rev()
-            .find_map(|(position, entry)| match &entry.kind {
-                EntryKind::Compaction {
-                    summary,
-                    first_kept_id,
-                    archive,
-                    ..
-                } => Some((
-                    position,
-                    summary.as_str(),
-                    first_kept_id.as_deref(),
-                    archive.as_ref(),
-                )),
-                _ => None,
-            });
-        let floor = match boundary {
-            Some((position, _, Some(id), _)) => Some(
-                entries[..position]
-                    .iter()
-                    .position(|entry| entry.id == id)
-                    .ok_or_else(|| {
-                        corrupt(&self.path, "compaction references a missing retained entry")
-                    })?,
-            ),
-            _ => None,
-        };
-        let mut messages = Vec::new();
-        let mut at = 0;
-        let mut first_visible = None;
-        for (position, &entry) in entries.iter().enumerate() {
-            if Some(position) == floor {
-                first_visible = Some(messages.len());
-            }
-            if boundary.is_some_and(|(compaction_at, _, _, _)| compaction_at == position) {
-                at = messages.len();
-            }
-            if let EntryKind::Message { message } = &entry.kind {
-                messages.push(PathMessage {
+        let mut messages: Vec<PathMessage<'_>> = Vec::new();
+        let mut nodes: Vec<NodeRef<'_>> = Vec::new();
+        let mut latest = None;
+        for entry in entries {
+            match &entry.kind {
+                EntryKind::Message { message } => messages.push(PathMessage {
                     index: messages.len(),
                     id: entry.id.as_str(),
                     message,
-                });
+                }),
+                EntryKind::Compaction {
+                    summary,
+                    first_kept_id,
+                    span_start_id,
+                    span_end_id,
+                    archive,
+                    level,
+                } => {
+                    let (start, end) = match (span_start_id, span_end_id) {
+                        (Some(first), Some(last)) => {
+                            match (
+                                message_index(&messages, first),
+                                message_index(&messages, last),
+                            ) {
+                                (Some(start), Some(end)) if start <= end => (start, end + 1),
+                                _ => {
+                                    return Err(corrupt(
+                                        &self.path,
+                                        "compaction span does not match the active path",
+                                    ));
+                                }
+                            }
+                        }
+                        _ => {
+                            // Journals from before nodes: the entry replaced the whole
+                            // prefix before its first kept message.
+                            let floor = match first_kept_id {
+                                Some(id) => message_index(&messages, id).ok_or_else(|| {
+                                    corrupt(
+                                        &self.path,
+                                        "compaction references a missing retained entry",
+                                    )
+                                })?,
+                                None => messages.len(),
+                            };
+                            (0, floor)
+                        }
+                    };
+                    // A summary supersedes the nodes it contains.
+                    nodes.retain(|node| !(start <= node.start && node.end <= end));
+                    nodes.push(NodeRef {
+                        entry_id: entry.id.as_str(),
+                        summary: summary.as_str(),
+                        archive: archive.as_ref(),
+                        level: *level,
+                        start,
+                        end,
+                    });
+                    latest = Some((
+                        entry.id.as_str(),
+                        summary.as_str(),
+                        archive.as_ref(),
+                        messages.len(),
+                    ));
+                }
+                _ => {}
             }
         }
-        let compaction = boundary.map(|(position, summary, _, archive)| CompactionMark {
-            id: {
-                let entry = entries[position];
-                entry.id.as_str()
-            },
+        nodes.sort_by_key(|node| (node.start, node.end));
+        let mut cursor = 0;
+        for node in &nodes {
+            if node.start != cursor {
+                return Err(corrupt(
+                    &self.path,
+                    "compaction summaries do not cover a contiguous prefix",
+                ));
+            }
+            cursor = node.end;
+        }
+        let compaction = latest.map(|(id, summary, archive, at)| CompactionMark {
+            id,
             summary,
             archive,
             at,
-            first_visible: first_visible.unwrap_or(at),
+            first_visible: cursor,
         });
         Ok(PathView {
             messages,
+            nodes,
             compaction,
         })
     }
     pub fn messages(&self) -> Result<Vec<Message>> {
         let view = self.path_view()?;
         let visible = view.visible();
-        let mut messages =
-            Vec::with_capacity(visible.len() + usize::from(view.compaction.is_some()));
-        if let Some(mark) = view.compaction {
-            if let Some(archive) = mark.archive {
+        let mut messages = Vec::with_capacity(view.nodes.len() + visible.len());
+        for node in &view.nodes {
+            if let Some(archive) = node.archive {
                 // Anthropic system/developer prompts cannot carry images. User content
                 // supports frames on both supported vision wire formats.
                 let mut content = Vec::with_capacity(archive.frames.len() + 1);
                 content.push(ContentBlock::Text {
                     text: format!(
                         "[Earlier conversation archive id={} — originals: recall]\n{}",
-                        mark.id, mark.summary
+                        node.entry_id, node.summary
                     ),
                 });
                 content.extend(archive.frames.iter().map(|frame| ContentBlock::Image {
@@ -417,7 +502,7 @@ impl Session {
             } else {
                 messages.push(Message::developer(format!(
                     "[Earlier conversation summary id={} — originals: recall]\n{}",
-                    mark.id, mark.summary
+                    node.entry_id, node.summary
                 )));
             }
         }
@@ -453,10 +538,14 @@ impl Session {
         let visible = view.visible();
         let start = kept_start(visible, keep_recent_messages);
         Ok(CompactionPlan {
-            previous: view.compaction.map(|mark| PriorCompaction {
-                summary: mark.summary.to_owned(),
-                archive: mark.archive.cloned(),
-            }),
+            previous: view
+                .nodes
+                .iter()
+                .map(|node| PriorCompaction {
+                    summary: node.summary.to_owned(),
+                    archive: node.archive.cloned(),
+                })
+                .collect(),
             discarded: visible[..start]
                 .iter()
                 .map(|entry| entry.message.clone())
@@ -464,32 +553,136 @@ impl Session {
         })
     }
 
+    /// Replace the whole prefix of history (live nodes and raw messages before the kept
+    /// tail) with one node one level above the highest node it replaces. Archives use
+    /// this because an archive holds the whole discarded history.
     pub fn compact(
         &mut self,
         summary: String,
         archive: Option<Archive>,
         keep_recent_messages: usize,
     ) -> Result<()> {
-        let (first_kept_id, span) = {
+        let node = {
             let view = self.path_view()?;
             let visible = view.visible();
-            let start = kept_start(visible, keep_recent_messages);
-            // The replaced span runs from the first visible message through the
-            // last one before the cut. Replacing nothing records no span.
-            let span =
-                (start > 0).then(|| (visible[0].id.to_owned(), visible[start - 1].id.to_owned()));
-            (visible.get(start).map(|entry| entry.id.to_owned()), span)
+            let cut = kept_start(visible, keep_recent_messages);
+            if cut == 0 {
+                return Ok(());
+            }
+            NewNode {
+                summary,
+                archive,
+                level: view
+                    .nodes
+                    .iter()
+                    .map(|node| node.level + 1)
+                    .max()
+                    .unwrap_or(0),
+                span_start_id: view.messages[0].id.to_owned(),
+                span_end_id: visible[cut - 1].id.to_owned(),
+                covers: view
+                    .nodes
+                    .iter()
+                    .map(|node| node.entry_id.to_owned())
+                    .collect(),
+            }
         };
-        let (span_start_id, span_end_id) = match span {
-            Some((first, last)) => (Some(first), Some(last)),
-            None => (None, None),
+        self.append_node(node)
+    }
+    /// Summary request for the oldest raw messages no node covers, keeping
+    /// `keep_recent_messages` raw. `None` when there is nothing to summarize.
+    pub fn raw_summary_plan(&self, keep_recent_messages: usize) -> Result<Option<NodePlan>> {
+        let view = self.path_view()?;
+        let visible = view.visible();
+        let cut = kept_start(visible, keep_recent_messages);
+        if cut == 0 {
+            return Ok(None);
+        }
+        Ok(Some(NodePlan {
+            input: visible[..cut]
+                .iter()
+                .map(|entry| entry.message.clone())
+                .collect(),
+            level: 0,
+            span_start_id: visible[0].id.to_owned(),
+            span_end_id: visible[cut - 1].id.to_owned(),
+            covers: Vec::new(),
+        }))
+    }
+    /// Summary request merging the adjacent pair of nodes with the lowest level; ties go
+    /// to the earliest pair. `None` when no pair of nodes is adjacent and non-empty.
+    pub fn merge_plan(&self) -> Result<Option<NodePlan>> {
+        let view = self.path_view()?;
+        let Some(pair) = view
+            .nodes
+            .windows(2)
+            .filter(|pair| pair[1].end > pair[0].start)
+            .min_by_key(|pair| pair[0].level.max(pair[1].level))
+        else {
+            return Ok(None);
+        };
+        Ok(Some(NodePlan {
+            input: pair
+                .iter()
+                .map(|node| Message::user(node.summary))
+                .collect(),
+            level: pair[0].level.max(pair[1].level) + 1,
+            span_start_id: view.messages[pair[0].start].id.to_owned(),
+            span_end_id: view.messages[pair[1].end - 1].id.to_owned(),
+            covers: vec![pair[0].entry_id.to_owned(), pair[1].entry_id.to_owned()],
+        }))
+    }
+    /// Append a summary node. The live nodes it replaces must be exactly `covers`, and
+    /// the nodes that remain must still tile a prefix with it.
+    pub fn append_node(&mut self, node: NewNode) -> Result<()> {
+        let first_kept_id = {
+            let view = self.path_view()?;
+            let invalid = || SessionError::InvalidSpan {
+                start: node.span_start_id.clone(),
+                end: node.span_end_id.clone(),
+            };
+            let start = message_index(&view.messages, &node.span_start_id).ok_or_else(invalid)?;
+            let end = message_index(&view.messages, &node.span_end_id).ok_or_else(invalid)?;
+            if start > end {
+                return Err(invalid());
+            }
+            let end = end + 1;
+            let mut inside: Vec<&str> = view
+                .nodes
+                .iter()
+                .filter(|n| start <= n.start && n.end <= end)
+                .map(|n| n.entry_id)
+                .collect();
+            let mut expected: Vec<&str> = node.covers.iter().map(String::as_str).collect();
+            inside.sort_unstable();
+            expected.sort_unstable();
+            if inside != expected {
+                return Err(invalid());
+            }
+            let mut ranges: Vec<(usize, usize)> = view
+                .nodes
+                .iter()
+                .filter(|n| !(start <= n.start && n.end <= end))
+                .map(|n| (n.start, n.end))
+                .collect();
+            ranges.push((start, end));
+            ranges.sort_unstable();
+            let mut cursor = 0;
+            for (from, to) in ranges {
+                if from != cursor {
+                    return Err(invalid());
+                }
+                cursor = to;
+            }
+            view.messages.get(end).map(|message| message.id.to_owned())
         };
         self.append(EntryKind::Compaction {
-            summary,
+            summary: node.summary,
             first_kept_id,
-            span_start_id,
-            span_end_id,
-            archive,
+            span_start_id: Some(node.span_start_id),
+            span_end_id: Some(node.span_end_id),
+            archive: node.archive,
+            level: node.level,
         })?;
         Ok(())
     }
@@ -512,6 +705,10 @@ impl Session {
             }),
         }
     }
+}
+
+fn message_index(messages: &[PathMessage<'_>], id: &str) -> Option<usize> {
+    messages.iter().position(|message| message.id == id)
 }
 /// Move the retained boundary back until every retained tool result has its call.
 fn kept_start(messages: &[PathMessage<'_>], keep_recent_messages: usize) -> usize {

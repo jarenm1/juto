@@ -302,11 +302,12 @@ pub(crate) fn snapshot(path: &Path) -> anyhow::Result<String> {
     let mut out = String::from(
         "Main thread snapshot (context only — do your task, not the user's last message)\nOriginal messages: recall {\"id\": N}; indices refer to the current main branch.\n",
     );
-    if let Some(mark) = view.compaction {
+    let per_node = BUDGET / 2 / view.nodes.len().max(1);
+    for node in &view.nodes {
         out.push_str("[Earlier conversation summary]\n");
-        let end = floor_boundary(mark.summary, BUDGET / 2);
-        out.push_str(&mark.summary[..end]);
-        if end < mark.summary.len() {
+        let end = floor_boundary(node.summary, per_node);
+        out.push_str(&node.summary[..end]);
+        if end < node.summary.len() {
             out.push_str("\n[summary clipped]");
         }
         out.push('\n');
