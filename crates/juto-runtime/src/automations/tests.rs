@@ -603,3 +603,62 @@ async fn deleting_removes_the_definition_and_keeps_its_jobs() {
         "the job it started stays in the job store"
     );
 }
+
+#[tokio::test]
+async fn an_automation_of_another_project_never_fires_here() {
+    let (_root, repo, data) = fixture();
+    let runtime = runtime(&repo, &data, Arc::new(Answer("done")));
+    let automation = runtime.create_automation_at(spec(60), T0).expect("create");
+    rewrite_record(&data, &automation.id, "project", "/elsewhere".into());
+
+    assert!(
+        runtime
+            .tick_automations(T0 + MINUTE)
+            .expect("tick")
+            .is_empty(),
+        "a record of another project starts no job on this daemon"
+    );
+    assert!(
+        matches!(
+            runtime.run_automation_now(&automation.id),
+            Err(AutomationError::Invalid(_))
+        ),
+        "run-now refuses an automation of another project"
+    );
+    assert!(runtime.list_jobs().expect("list").is_empty());
+}
+
+#[tokio::test]
+async fn a_zero_interval_record_is_refused_and_does_not_stop_the_others() {
+    let (_root, repo, data) = fixture();
+    let runtime = runtime(&repo, &data, Arc::new(Answer("done")));
+    let healthy = runtime.create_automation_at(spec(60), T0).expect("create");
+    let broken = runtime.create_automation_at(spec(60), T0).expect("create");
+    rewrite_record(&data, &broken.id, "everySecs", 0.into());
+
+    let started = runtime.tick_automations(T0 + MINUTE).expect("tick");
+    assert_eq!(started.len(), 1, "only the healthy automation fires");
+    assert_eq!(started[0].origin, origin(&healthy, T0 + MINUTE));
+    wait_for(&runtime, &started[0].id, |job| job.status.is_terminal()).await;
+    assert!(runtime.automation(&broken.id).is_err());
+}
+
+#[tokio::test]
+async fn a_corrupt_record_does_not_stop_the_others_from_firing() {
+    let (_root, repo, data) = fixture();
+    let runtime = runtime(&repo, &data, Arc::new(Answer("done")));
+    let healthy = runtime.create_automation_at(spec(60), T0).expect("create");
+    let broken = runtime.create_automation_at(spec(60), T0).expect("create");
+    std::fs::write(
+        data.join("automations").join(format!("{}.json", broken.id)),
+        "{not json",
+    )
+    .expect("corrupt the record");
+
+    let started = runtime
+        .tick_automations(T0 + MINUTE)
+        .expect("a corrupt record does not fail the tick");
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].origin, origin(&healthy, T0 + MINUTE));
+    wait_for(&runtime, &started[0].id, |job| job.status.is_terminal()).await;
+}
