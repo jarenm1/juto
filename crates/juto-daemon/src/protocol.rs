@@ -25,11 +25,13 @@ use std::path::PathBuf;
 use juto_agent::{AgentEvent, ToolTier};
 use juto_ai::{Message, StopReason, ToolCall};
 use juto_catalog::Model;
-use juto_runtime::{RuntimeConfig, SessionEntry, SubagentEvent, SubagentSummary, ViewerRoute};
+use juto_runtime::{
+    Decision, RuntimeConfig, SessionEntry, SubagentEvent, SubagentSummary, ViewerRoute,
+};
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change to this module.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// One request from a client. `id` is chosen by the client and echoed back.
 #[derive(Clone, Serialize, Deserialize)]
@@ -113,6 +115,18 @@ pub enum Request {
     Prompt {
         session_id: String,
         text: String,
+        /// Runs without a foreground operator: a blocked action becomes a
+        /// [`Decision`] instead of a prompt. Defaults to an attended run.
+        #[serde(default)]
+        unattended: bool,
+    },
+    /// Lists durable decisions (pending and resolved) for this daemon.
+    ListDecisions,
+    /// Resolves a pending decision. Approving starts a run that retries the
+    /// blocked action once; rejecting records the refusal and starts nothing.
+    ResolveDecision {
+        decision_id: String,
+        approve: bool,
     },
     /// Queues a steering message for the active run of `session_id`. Fails with
     /// [`ErrorCode::Invalid`] if that session has no active run.
@@ -230,6 +244,12 @@ pub enum Reply {
     Config(RuntimeConfig),
     Models(Vec<Model>),
     Subagents(Vec<SubagentSummary>),
+    Decisions(Vec<Decision>),
+    /// `run_id` is set when approval started a run.
+    Decision {
+        decision: Decision,
+        run_id: Option<String>,
+    },
     Transcript(Vec<Message>),
     Credentials(CredentialStatus),
     LoginStarted {
@@ -354,6 +374,13 @@ pub enum SessionEvent {
     },
     ApprovalResolved {
         approval_id: u64,
+    },
+    /// An unattended run stopped at an action that needs an operator decision.
+    DecisionBlocked {
+        decision: Decision,
+    },
+    DecisionResolved {
+        decision: Decision,
     },
 }
 
