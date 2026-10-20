@@ -134,8 +134,8 @@ impl NetworkPolicy {
 }
 
 /// Resolve the shipped helper before starting a service; never fall back to an
-/// unproxied command. An explicit path is useful for separately installed hosts
-/// and for tests, whose binaries have no sibling `juto-cli`.
+/// unproxied command. An explicit path is useful for separately installed hosts.
+/// Tests call [`ensure_helper_for_tests`] instead of relying on a sibling binary.
 pub fn helper() -> io::Result<PathBuf> {
     let explicit = std::env::var_os("JUTO_PROXY_HELPER").map(PathBuf::from);
     if let Some(path) = explicit {
@@ -165,6 +165,69 @@ pub fn helper() -> io::Result<PathBuf> {
     Err(io::Error::other(
         "sandbox network helper unavailable; install juto-cli or set JUTO_PROXY_HELPER",
     ))
+}
+
+/// Points [`helper`] at a `juto-cli` built from this workspace, for tests.
+///
+/// Test binaries run from `target/<profile>/deps`, which has no sibling
+/// `juto-cli`, and a `juto-cli` on `PATH` may be stale. So unless the caller set
+/// `JUTO_PROXY_HELPER` (which still wins), this runs `cargo build -p juto-cli`
+/// once per process and exports the artifact's path. Production never calls it.
+#[doc(hidden)]
+pub fn ensure_helper_for_tests() -> io::Result<PathBuf> {
+    static BUILT: LazyLock<Result<(), String>> = LazyLock::new(|| {
+        let path = build_cli_for_tests()?;
+        // SAFETY: only this initializer writes JUTO_PROXY_HELPER, and it runs at
+        // most once per process; std serializes environment access.
+        unsafe { std::env::set_var("JUTO_PROXY_HELPER", path) };
+        Ok(())
+    });
+    if std::env::var_os("JUTO_PROXY_HELPER").is_none() {
+        LazyLock::force(&BUILT).clone().map_err(io::Error::other)?;
+    }
+    helper()
+}
+
+fn build_cli_for_tests() -> Result<PathBuf, String> {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let output = std::process::Command::new(cargo)
+        .args([
+            "build",
+            "--message-format=json",
+            "-p",
+            "juto-cli",
+            "--bin",
+            "juto-cli",
+            "--manifest-path",
+        ])
+        .arg(&manifest)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|err| format!("cannot run cargo to build juto-cli: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "`cargo build -p juto-cli` failed: {}",
+            output.status
+        ));
+    }
+    output
+        .stdout
+        .split(|&byte| byte == b'\n')
+        .find_map(|line| {
+            let message: serde_json::Value = serde_json::from_slice(line).ok()?;
+            let is_bin = message["target"]["kind"]
+                .as_array()
+                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "bin"));
+            if message["reason"] != "compiler-artifact"
+                || message["target"]["name"] != "juto-cli"
+                || !is_bin
+            {
+                return None;
+            }
+            message["executable"].as_str().map(PathBuf::from)
+        })
+        .ok_or_else(|| "cargo build -p juto-cli reported no juto-cli executable".to_string())
 }
 
 /// Hidden CLI entry point. Arguments are socket, executable, and its arguments.

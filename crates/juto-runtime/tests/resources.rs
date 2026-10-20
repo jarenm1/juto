@@ -92,9 +92,8 @@ async fn sandboxed_run_records_a_completed_usage() {
         eprintln!("skipping: systemd-run unavailable");
         return;
     }
-    if let Err(err) = juto_runtime::network::helper() {
-        eprintln!("skipping: {err}");
-        return;
+    if let Err(err) = juto_runtime::network::ensure_helper_for_tests() {
+        panic!("sandbox network helper: {err}");
     }
     let Some(home) = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
