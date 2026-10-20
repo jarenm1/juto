@@ -218,6 +218,20 @@ pub struct SubagentSummary {
     pub released: bool,
 }
 
+/// A delegated child's settled outcome, reported by the run that started it.
+#[derive(Debug, Clone)]
+pub struct ChildOutcome {
+    pub id: String,
+    pub name: Option<String>,
+    pub status: SubagentStatus,
+    /// The child's final text, when it completed.
+    pub output: Option<String>,
+    /// Why the child failed or was cancelled.
+    pub error: Option<String>,
+    /// Usage the child reported. Zero for a child that never finished a run.
+    pub usage: Usage,
+}
+
 /// Errors surfaced by [`SubagentManager`]. Distinct variants preserve the
 /// explicit terminal statuses instead of collapsing them into strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1323,6 +1337,64 @@ impl SubagentManager {
                     .cloned()
             })
             .flatten())
+    }
+
+    /// Waits until every child this manager started has reached a terminal
+    /// state, then reports each one. A child can start more children or be
+    /// woken by a message, so the pending set is re-read until it is empty.
+    pub async fn settle_all(&self) -> Vec<ChildOutcome> {
+        loop {
+            let pending: Vec<String> = self
+                .list()
+                .into_iter()
+                .filter(|child| !child.status.is_terminal())
+                .map(|child| child.id)
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            // A child that fails, is cancelled, or is parked on a question still settles.
+            futures::future::join_all(pending.iter().map(|id| self.settle_child(id))).await;
+        }
+        self.list()
+            .into_iter()
+            .map(|child| ChildOutcome {
+                output: self
+                    .output(&child.id)
+                    .ok()
+                    .flatten()
+                    .map(|result| result.output),
+                id: child.id,
+                name: child.name,
+                status: child.status,
+                error: child.error,
+                usage: child.usage.unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    /// Waits for one child to reach a terminal state. A child parked on a
+    /// question is cancelled rather than waited on: once its run has ended,
+    /// nothing answers that question.
+    async fn settle_child(&self, id: &str) {
+        let Ok(mut rx) = self.state_receiver(id) else {
+            return;
+        };
+        loop {
+            let (terminal, blocked) = {
+                let snapshot = rx.borrow();
+                (snapshot.status.is_terminal(), snapshot.status.is_blocked())
+            };
+            if terminal {
+                return;
+            }
+            if blocked {
+                let _ = self.cancel(id);
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Persisted transcript of a completed child, read from its session file.
@@ -2976,6 +3048,33 @@ mod tests {
         let result = manager.wait(&id).await;
         assert!(matches!(result, Err(SubagentError::Cancelled)));
         assert_eq!(manager.status(&id), Some(SubagentStatus::Cancelled));
+    }
+
+    /// A job settles its children before it settles, so a child blocked on a
+    /// question no one can answer must not hold the job: settling cancels it.
+    #[tokio::test]
+    async fn settle_all_cancels_a_child_blocked_on_a_question() {
+        let holder = Arc::new(Mutex::new(None));
+        let factory = Arc::new(BlockingFactory {
+            manager_holder: holder.clone(),
+            reason: BlockerReason::UserInput,
+            prompt: "Which database?".to_string(),
+        });
+        let manager = Arc::new(manager(factory, 1, CancellationToken::new()));
+        *holder.lock().unwrap() = Some(manager.clone());
+
+        let id = manager.spawn(spec("blocked-child")).unwrap();
+        let mut status_rx = manager.subscribe_status(&id).unwrap();
+        status_rx
+            .wait_for(|s| matches!(s, SubagentStatus::Blocked { .. }))
+            .await
+            .unwrap();
+
+        let children = timeout(WAIT_TIMEOUT, manager.settle_all())
+            .await
+            .expect("settle_all must not wait on a child blocked on a question");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, SubagentStatus::Cancelled);
     }
 
     #[tokio::test]

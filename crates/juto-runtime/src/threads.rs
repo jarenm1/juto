@@ -619,6 +619,7 @@ impl Runtime {
             let owner = main.journal.header().id.clone();
             self.run_unattended_owned(&mut session, owner, prompt, agent_events, control, None)
                 .await
+                .map(|run| run.outcome)
         } else {
             self.run(&mut session, prompt, agent_events, control)
                 .await
