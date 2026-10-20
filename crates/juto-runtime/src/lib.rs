@@ -92,7 +92,7 @@ impl SignalingHandle {
     }
 }
 use serde_json::{Value, json};
-use tier::ExecutionTier;
+use tier::{ExecutionTier, PermissionProfile};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -648,7 +648,9 @@ impl Runtime {
     /// Runs `prompt` as an unattended run in `session`. The run never prompts. A
     /// tool call that leaves its profile records a [`Decision`], cancels the run
     /// tree, and the outcome is [`UnattendedOutcome::Blocked`]. The run uses the
-    /// sandboxed tier from [`unattended_tier`]; its subagents inherit the same scope.
+    /// sandboxed tier from [`unattended_tier`] unless `limits` stores one, capped
+    /// by it. `limits.permission` picks the tool profile; its subagents inherit the
+    /// same scope.
     pub async fn run_unattended(
         &self,
         session: &mut Session,
@@ -669,8 +671,8 @@ impl Runtime {
         let placement = RunPlacement {
             depth: 0,
             role: roles::MAIN_ROLE,
-            read_only: false,
-            tier: unattended_tier(self.config().execution_tier),
+            read_only: limits.permission == PermissionProfile::ReadOnly,
+            tier: job_run_tier(limits.tier, self.config().execution_tier),
             sender: None,
             main_session: Some(&main_session),
             unattended: Some(&scope),
@@ -1272,6 +1274,14 @@ fn unattended_tier(configured: ExecutionTier) -> ExecutionTier {
     }
 }
 
+/// The tier a job's main run executes under: the tier the job stores, capped by
+/// [`unattended_tier`] of the configured tier. A job that stores no tier gets the
+/// unattended tier. The daemon's configured tier therefore still caps every job.
+fn job_run_tier(stored: Option<ExecutionTier>, configured: ExecutionTier) -> ExecutionTier {
+    let ceiling = unattended_tier(configured);
+    stored.map_or(ceiling, |tier| tier.min(ceiling))
+}
+
 /// The broker priority of a run's main work. A depth-0 run is the user's own
 /// session: it queues `attended` unless its job names a priority, which is how
 /// scheduled automations queue `scheduled`. Delegated runs always queue as
@@ -1301,6 +1311,11 @@ pub struct JobLimits {
     /// Broker priority for the main run. `None` keeps the depth-0 default
     /// (`attended`); scheduled automations set `scheduled`.
     pub priority: Option<Priority>,
+    /// Execution tier for the main run, capped by the configured tier. `None`
+    /// keeps the unattended tier.
+    pub tier: Option<ExecutionTier>,
+    /// Tools the main run may advertise.
+    pub permission: PermissionProfile,
 }
 
 /// Where a run sits in the delegation tree: its depth, the role it runs as,
@@ -4970,6 +4985,30 @@ mod tests {
         );
         assert_eq!(
             unattended_tier(ExecutionTier::Untrusted),
+            ExecutionTier::Untrusted
+        );
+    }
+
+    #[test]
+    fn a_stored_tier_is_capped_by_the_configured_tier() {
+        assert_eq!(
+            job_run_tier(Some(ExecutionTier::Untrusted), ExecutionTier::Attended),
+            ExecutionTier::Untrusted
+        );
+        assert_eq!(
+            job_run_tier(Some(ExecutionTier::Workspace), ExecutionTier::Untrusted),
+            ExecutionTier::Untrusted
+        );
+        assert_eq!(
+            job_run_tier(Some(ExecutionTier::Workspace), ExecutionTier::Attended),
+            ExecutionTier::Workspace
+        );
+        assert_eq!(
+            job_run_tier(None, ExecutionTier::Attended),
+            ExecutionTier::Workspace
+        );
+        assert_eq!(
+            job_run_tier(None, ExecutionTier::Untrusted),
             ExecutionTier::Untrusted
         );
     }
