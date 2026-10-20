@@ -1323,3 +1323,181 @@ async fn job_changes_are_published_to_attached_clients() {
     .expect("a finished job event within 10s");
     assert_eq!(finished_id, started.id);
 }
+
+/// A one-second automation whose jobs succeed without changing the workspace.
+fn every_second() -> juto_runtime::automations::AutomationSpec {
+    juto_runtime::automations::AutomationSpec {
+        prompt: "summarize the repo".into(),
+        model: None,
+        priority: None,
+        budget: JobBudget {
+            wall_secs: 60,
+            max_attempts: 1,
+            max_turns: None,
+            max_spend: None,
+        },
+        contract: JobContract {
+            no_change: true,
+            ..Default::default()
+        },
+        every_secs: 1,
+        overlap: None,
+    }
+}
+
+async fn expect_rpc_error(daemon: &Arc<Daemon>, request: Request) -> RpcError {
+    match daemon.request(request).await {
+        Err(error) => error,
+        Ok(_) => panic!("expected an error reply"),
+    }
+}
+
+async fn set_enabled(daemon: &Arc<Daemon>, automation_id: &str, enabled: bool) {
+    let request = Request::SetAutomationEnabled {
+        automation_id: automation_id.into(),
+        enabled,
+    };
+    match daemon.request(request).await.expect("set enabled") {
+        Reply::Automation(_) => {}
+        _ => panic!("expected an automation reply"),
+    }
+}
+
+#[tokio::test]
+async fn a_scheduled_automation_starts_one_job_per_occurrence_and_pausing_stops_it() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon_in_repo(root.path(), ScriptedProvider::new(false));
+    let automation = match daemon
+        .request(Request::CreateAutomation {
+            spec: every_second(),
+        })
+        .await
+        .expect("create automation")
+    {
+        Reply::Automation(automation) => automation,
+        _ => panic!("expected an automation reply"),
+    };
+    let ticks = tokio::spawn(super::services::automations::tick_loop(daemon.clone()));
+    until(|| daemon.runtime.list_jobs().unwrap().len() >= 2).await;
+
+    set_enabled(&daemon, &automation.id, false).await;
+    let paused_count = daemon.runtime.list_jobs().unwrap().len();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    ticks.abort();
+    let jobs = daemon.runtime.list_jobs().unwrap();
+    assert_eq!(
+        jobs.len(),
+        paused_count,
+        "a paused automation starts no job"
+    );
+
+    let mut instants: Vec<u64> = jobs
+        .iter()
+        .map(|job| {
+            let origin = job
+                .origin
+                .as_ref()
+                .expect("an automation job names its origin");
+            assert_eq!(origin.automation_id, automation.id);
+            origin.instant_ms
+        })
+        .collect();
+    let total = instants.len();
+    assert!(total >= 2, "the tick loop fired at least two occurrences");
+    instants.sort_unstable();
+    instants.dedup();
+    assert_eq!(
+        instants.len(),
+        total,
+        "each occurrence starts exactly one job"
+    );
+
+    until(|| {
+        daemon
+            .runtime
+            .list_jobs()
+            .unwrap()
+            .iter()
+            .all(|job| job.status.is_terminal())
+    })
+    .await;
+    let manual = match daemon
+        .request(Request::RunAutomationNow {
+            automation_id: automation.id.clone(),
+        })
+        .await
+        .expect("run now")
+    {
+        Reply::Job(job) => job,
+        _ => panic!("expected a job reply"),
+    };
+    let history = match daemon
+        .request(Request::AutomationHistory {
+            automation_id: automation.id.clone(),
+        })
+        .await
+        .expect("history")
+    {
+        Reply::AutomationHistory(history) => history,
+        _ => panic!("expected an automation history reply"),
+    };
+    assert_eq!(history.jobs.len(), total + 1, "history keeps every job");
+    assert!(history.jobs.iter().any(|job| job.id == manual.id));
+
+    match daemon
+        .request(Request::DeleteAutomation {
+            automation_id: automation.id.clone(),
+        })
+        .await
+        .expect("delete")
+    {
+        Reply::Ok => {}
+        _ => panic!("expected an ok reply"),
+    }
+    let gone = expect_rpc_error(
+        &daemon,
+        Request::GetAutomation {
+            automation_id: automation.id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(gone.code, crate::protocol::ErrorCode::NotFound);
+    assert_eq!(
+        daemon.runtime.list_jobs().unwrap().len(),
+        total + 1,
+        "delete keeps the jobs the automation started"
+    );
+}
+
+#[tokio::test]
+async fn automation_requests_fail_with_typed_errors() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon_in_repo(root.path(), ScriptedProvider::new(false));
+    let unknown = "auto-missing".to_string();
+    for request in [
+        Request::GetAutomation {
+            automation_id: unknown.clone(),
+        },
+        Request::DeleteAutomation {
+            automation_id: unknown.clone(),
+        },
+        Request::RunAutomationNow {
+            automation_id: unknown.clone(),
+        },
+    ] {
+        let error = expect_rpc_error(&daemon, request).await;
+        assert_eq!(error.code, crate::protocol::ErrorCode::NotFound);
+    }
+
+    let mut zero = every_second();
+    zero.every_secs = 0;
+    let error = expect_rpc_error(&daemon, Request::CreateAutomation { spec: zero }).await;
+    assert_eq!(error.code, crate::protocol::ErrorCode::Invalid);
+
+    let mut attended = every_second();
+    attended.priority = Some(juto_runtime::broker::Priority::Attended);
+    let error = expect_rpc_error(&daemon, Request::CreateAutomation { spec: attended }).await;
+    assert_eq!(error.code, crate::protocol::ErrorCode::Invalid);
+
+    assert!(daemon.runtime.list_automations().unwrap().is_empty());
+}
