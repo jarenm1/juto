@@ -276,8 +276,8 @@ fn expected_page(
         "span of compaction {id}: messages {from}..={through} of {}\n",
         ids.len()
     );
-    for k in from..=through {
-        out.push_str(&format!("message {k} (user, id {})\nzz-00{k}\n", ids[k]));
+    for (k, entry) in ids.iter().enumerate().skip(from).take(through + 1 - from) {
+        out.push_str(&format!("message {k} (user, id {entry})\nzz-00{k}\n"));
     }
     if let Some(next) = next {
         out.push_str(&format!(
