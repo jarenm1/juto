@@ -11,6 +11,7 @@ mod contextual;
 pub mod decisions;
 pub mod desktop_artifact;
 pub mod git_transfer;
+pub mod jobs;
 mod main_inbox_store;
 mod main_report;
 pub mod network;
@@ -94,7 +95,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use approval::{ApprovalRequest, ChannelApprovalHandler};
 pub use config::{ApprovalMode, CompactionMethod, RuntimeConfig};
-pub use decisions::{Decision, DecisionStatus, DecisionStore};
+pub use decisions::{Decision, DecisionStatus, DecisionStore, continuation_prompt};
 use decisions::{SharedScope, UnattendedScope};
 pub use desktop_artifact::{
     DesktopArtifactResolver, ResolveError, SESSION_VIEWER_PRINCIPAL, ViewerRoute,
@@ -151,6 +152,7 @@ struct RuntimeInner {
     signaling: Mutex<Option<Arc<SignalingHandle>>>,
     /// Browser processes and named tabs shared across runs.
     browser: Arc<browser::BrowserManager>,
+    jobs: jobs::JobRegistry,
 }
 pub fn default_data_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("JUTO_DATA_DIR") {
@@ -295,6 +297,7 @@ impl Runtime {
         for model in &config.custom_models {
             registry.upsert(model.clone());
         }
+        let jobs = jobs::JobRegistry::open(&data_dir);
         let runtime = Self {
             inner: Arc::new(RuntimeInner {
                 cwd,
@@ -309,6 +312,7 @@ impl Runtime {
                 subagent_manager: Mutex::new(None),
                 desktop_supervisor: Mutex::new(None),
                 signaling: Mutex::new(None),
+                jobs,
             }),
         };
         if !runtime.inner.config.read().model.is_empty() {

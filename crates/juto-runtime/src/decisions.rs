@@ -221,6 +221,14 @@ impl DecisionStore {
     }
 }
 
+/// The message that resumes an approved run: it names the exact action to retry.
+pub fn continuation_prompt(decision: &Decision) -> String {
+    format!(
+        "The operator approved the blocked action `{}` ({}), decision {}. Continue the task. Retry that exact action once; it is now permitted.",
+        decision.tool, decision.capability, decision.id
+    )
+}
+
 /// The profile capability a tool call needs from an operator, if it leaves the
 /// unattended profile. Sandboxed tools (`bash`, file tools) are confined by their
 /// tier and need no decision; privileged in-process tools do.

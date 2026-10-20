@@ -112,6 +112,17 @@ impl ChatInput {
         text
     }
 
+    /// Replaces the composer text and moves the caret to its end.
+    pub fn set_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        // Line breaks become spaces, as typed text does.
+        let text = text.replace(['\r', '\n'], " ");
+        self.selected_range = text.len()..text.len();
+        self.selection_reversed = false;
+        self.marked_range = None;
+        self.content = text.into();
+        cx.notify();
+    }
+
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
         if !self.is_composing() {
             cx.emit(SubmitMessage);
