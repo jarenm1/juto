@@ -381,7 +381,6 @@ fn unreservable(size: &str) -> WorkspaceError {
 /// Governance always runs the command under `systemd-run`. When `systemd-run` is
 /// missing the command fails with [`WorkspaceError::SystemdUnavailable`]: there
 /// is no uncapped fallback.
-/// Resource constraints and governance parameters for subagent execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceLimits {
     /// Explicit per-scope CPU cap (e.g. "200%"); unset leaves CPU shared by weight.
