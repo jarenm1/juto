@@ -1,6 +1,6 @@
 //! Chat UI wired to the agent runtime and session persistence.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -55,6 +55,7 @@ pub enum ActiveModal {
     None,
     ModelPicker,
     AuthModal,
+    Desktop,
 }
 
 /// The inline canvas for one desktop artifact, mounted once per artifact.
@@ -413,6 +414,7 @@ pub struct ChatView {
     run_task: Option<Task<()>>,
     artifact_notice: Option<SharedString>,
     desktop_canvases: HashMap<String, DesktopCanvas>,
+    expanded_desktop: Option<Entity<crate::desktop_viewer::DesktopViewer>>,
     approval_requests: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<ApprovalRequest>>>,
     pending_approvals: HashMap<u64, ApprovalRequest>,
     next_approval_id: u64,
@@ -589,6 +591,7 @@ impl ChatView {
             attachment_error: None,
             artifact_notice: None,
             desktop_canvases: HashMap::new(),
+            expanded_desktop: None,
             picker: None,
             scroll: ScrollHandle::new(),
             runtime,
@@ -658,6 +661,9 @@ impl ChatView {
     }
 
     pub fn open_model_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_modal == ActiveModal::Desktop {
+            self.close_modal(window, cx);
+        }
         if self.active_modal == ActiveModal::AuthModal {
             self.auth_modal.update(cx, |modal, cx| modal.dismiss(cx));
         }
@@ -670,6 +676,7 @@ impl ChatView {
     }
 
     pub fn open_auth_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_modal(window, cx);
         self.active_modal = ActiveModal::AuthModal;
         self.auth_modal
             .update(cx, |modal, cx| modal.refresh_credentials(cx));
@@ -736,13 +743,23 @@ impl ChatView {
                 return;
             }
         };
+        let grant = env.issue_grant(
+            juto_runtime::SESSION_VIEWER_PRINCIPAL.to_string(),
+            vec![
+                juto_runtime::protocol::GrantRole::Owner,
+                juto_runtime::protocol::GrantRole::View,
+                juto_runtime::protocol::GrantRole::Control,
+            ],
+            "session".to_string(),
+            juto_runtime::MAX_GRANT_SECS,
+        );
         let artifact = DesktopSessionArtifact {
-            version: 1,
+            version: juto_runtime::DESKTOP_SESSION_ARTIFACT_VERSION,
             artifact_id: format!("dev-{env_id}"),
             title: "Developer compositor session".to_string(),
-            host_id: "local".to_string(),
+            host_id: juto_runtime::host_identifier(),
             environment_id: env_id.clone(),
-            grant_id: "dev".to_string(),
+            grant_id: grant.grant_id,
         };
         let launch_env = env.clone();
         let launch_argv = argv;
@@ -798,9 +815,32 @@ impl ChatView {
         cx.notify();
     }
 
+    fn expand_desktop(
+        &mut self,
+        viewer: Entity<crate::desktop_viewer::DesktopViewer>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_modal == ActiveModal::AuthModal {
+            self.auth_modal.update(cx, |modal, cx| modal.dismiss(cx));
+        }
+        if let Some(previous) = self.expanded_desktop.take() {
+            previous.update(cx, |viewer, cx| viewer.set_expanded(false, cx));
+        }
+        viewer.update(cx, |viewer, cx| viewer.set_expanded(true, cx));
+        self.expanded_desktop = Some(viewer);
+        self.active_modal = ActiveModal::Desktop;
+        cx.notify();
+    }
+
     pub fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_modal == ActiveModal::AuthModal {
             self.auth_modal.update(cx, |modal, cx| modal.dismiss(cx));
+        }
+        if let Some(viewer) = self.expanded_desktop.take() {
+            viewer.update(cx, |viewer, cx| viewer.set_expanded(false, cx));
+            if let Some(focus) = &self.focus {
+                focus.update(cx, |_, cx| cx.notify());
+            }
         }
         self.active_modal = ActiveModal::None;
         self.focus_input(window, cx);
@@ -836,8 +876,9 @@ impl ChatView {
         let runtime = self.runtime.clone();
         let focus =
             cx.new(|cx| FocusView::new(summary, updates, subagents, runtime, tokio_handle, cx));
-        let subscription = cx.subscribe(&focus, |this, _, _: &FocusEvent, cx| {
-            this.exit_focus(cx);
+        let subscription = cx.subscribe(&focus, |this, _, event: &FocusEvent, cx| match event {
+            FocusEvent::Exit => this.exit_focus(cx),
+            FocusEvent::ExpandDesktop(viewer) => this.expand_desktop(viewer.clone(), cx),
         });
         self.focus = Some(focus);
         self._focus_subscription = Some(subscription);
@@ -1521,6 +1562,7 @@ impl ChatView {
     fn message_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let messages = self.messages.clone();
         let actions = self.view_actions(cx);
+        let mut seen_desktops = HashSet::new();
         div()
             .id("messages")
             .flex_1()
@@ -1604,7 +1646,22 @@ impl ChatView {
                             .when(!artifacts.is_empty(), |row| {
                                 row.child(div().mt_3().flex().flex_col().gap_2().children(
                                     artifacts.into_iter().map(|artifact| {
-                                        let body = canvas_body(&self.desktop_canvases, &artifact);
+                                        let id = artifact.artifact_id.clone();
+                                        let body = canvas_body(
+                                            &self.desktop_canvases,
+                                            &artifact,
+                                            &mut seen_desktops,
+                                            cx.listener(
+                                                move |this, _: &ClickEvent, _window, cx| {
+                                                    if let Some(DesktopCanvas::Live(viewer)) =
+                                                        this.desktop_canvases.get(&id)
+                                                    {
+                                                        this.expand_desktop(viewer.clone(), cx);
+                                                    }
+                                                },
+                                            ),
+                                            cx,
+                                        );
                                         desktop_artifact_card(&artifact, body)
                                     }),
                                 ))
@@ -1946,6 +2003,7 @@ impl ChatView {
         match self.active_modal {
             ActiveModal::ModelPicker => Some(self.model_picker.clone().into()),
             ActiveModal::AuthModal => Some(self.auth_modal.clone().into()),
+            ActiveModal::Desktop => self.expanded_desktop.clone().map(Into::into),
             ActiveModal::None => None,
         }
     }
@@ -1962,6 +2020,9 @@ impl ChatView {
                 .flex()
                 .items_center()
                 .justify_center()
+                .when(self.active_modal == ActiveModal::Desktop, |scrim| {
+                    scrim.p_4()
+                })
                 .bg(rgba(0x00000080))
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1977,7 +2038,39 @@ impl ChatView {
                                 cx.stop_propagation();
                             }),
                         )
-                        .child(content),
+                        .map(|panel| {
+                            if self.active_modal == ActiveModal::Desktop {
+                                panel
+                                    .w_full()
+                                    .max_w(px(1100.))
+                                    .h_full()
+                                    .max_h(px(820.))
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .p_3()
+                                    .rounded_lg()
+                                    .bg(rgb(0x202124))
+                                    .child(
+                                        div().flex().justify_end().child(
+                                            div()
+                                                .id("desktop-back-to-chat")
+                                                .px_3()
+                                                .py_1()
+                                                .cursor_pointer()
+                                                .child("Back to chat")
+                                                .on_click(cx.listener(
+                                                    |this, _: &ClickEvent, window, cx| {
+                                                        this.close_modal(window, cx);
+                                                    },
+                                                )),
+                                        ),
+                                    )
+                                    .child(div().flex_1().min_h_0().child(content))
+                            } else {
+                                panel.child(content)
+                            }
+                        }),
                 ),
         )
         .with_priority(10)
@@ -2029,6 +2122,18 @@ fn menu_item(
         .child(div().text_xs().text_color(rgb(0x909090)).child(detail))
 }
 
+/// The first descriptor for each artifact wins, including when it is repeated
+/// within one message or mirrored into a later tool-result row.
+fn distinct_desktop_artifacts(
+    messages: &[Message],
+) -> impl Iterator<Item = &DesktopSessionArtifact> {
+    let mut seen = HashSet::new();
+    messages
+        .iter()
+        .flat_map(|message| &message.desktop_artifacts)
+        .filter(move |artifact| seen.insert(artifact.artifact_id.as_str()))
+}
+
 /// Mounts an inline canvas for each artifact in `messages` that has no live
 /// canvas yet. A live viewer is cached so rendering does not re-resolve it on
 /// every frame. An unavailable outcome is re-resolved on each pass, because its
@@ -2040,9 +2145,7 @@ pub(crate) fn mount_canvases<T: 'static>(
     window: &mut Window,
     cx: &mut Context<T>,
 ) {
-    let pending: Vec<DesktopSessionArtifact> = messages
-        .iter()
-        .flat_map(|message| message.desktop_artifacts.iter())
+    let pending: Vec<DesktopSessionArtifact> = distinct_desktop_artifacts(messages)
         .filter(|artifact| {
             !matches!(
                 canvases.get(&artifact.artifact_id),
@@ -2110,9 +2213,41 @@ fn resolve_desktop_canvas<T: 'static>(
 pub(crate) fn canvas_body(
     canvases: &HashMap<String, DesktopCanvas>,
     artifact: &DesktopSessionArtifact,
+    seen: &mut HashSet<String>,
+    on_expand: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    cx: &App,
 ) -> AnyElement {
+    if !seen.insert(artifact.artifact_id.clone()) {
+        return div()
+            .text_sm()
+            .child("Desktop shown in an earlier card.")
+            .into_any_element();
+    }
     match canvases.get(&artifact.artifact_id) {
-        Some(DesktopCanvas::Live(viewer)) => viewer.clone().into_any_element(),
+        Some(DesktopCanvas::Live(viewer)) if viewer.read(cx).is_expanded() => div()
+            .text_sm()
+            .child("Desktop is open in the expanded viewer.")
+            .into_any_element(),
+        Some(DesktopCanvas::Live(viewer)) => div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div().flex().justify_end().child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "expand-{}",
+                            artifact.artifact_id
+                        )))
+                        .px_3()
+                        .py_1()
+                        .cursor_pointer()
+                        .child("Expand")
+                        .on_click(on_expand),
+                ),
+            )
+            .child(viewer.clone())
+            .into_any_element(),
         Some(DesktopCanvas::Unavailable(reason)) => div()
             .text_sm()
             .text_color(rgb(0xcbd5e1))
@@ -2254,6 +2389,32 @@ impl Render for ChatView {
 mod tests {
     use super::*;
     use juto_runtime::{EntryKind, Session};
+
+    #[test]
+    fn repeated_desktop_descriptors_keep_the_first_identity_and_order() {
+        let artifact = |id: &str, grant: &str| DesktopSessionArtifact {
+            version: 1,
+            artifact_id: id.into(),
+            title: id.into(),
+            host_id: "host".into(),
+            environment_id: format!("env-{id}"),
+            grant_id: grant.into(),
+        };
+        let first = artifact("a", "first");
+        let second = artifact("b", "second");
+        let mut row = desktop_row(first.clone());
+        row.desktop_artifacts.push(artifact("a", "shadowed-in-row"));
+        let messages = vec![
+            row,
+            desktop_row(second.clone()),
+            desktop_row(artifact("a", "shadowed-in-later-row")),
+        ];
+        assert_eq!(
+            distinct_desktop_artifacts(&messages).collect::<Vec<_>>(),
+            vec![&first, &second]
+        );
+        assert_eq!(distinct_desktop_artifacts(&[]).count(), 0);
+    }
 
     #[test]
     fn bash_approval_shows_exact_command_and_cwd() {

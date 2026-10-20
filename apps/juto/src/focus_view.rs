@@ -1,7 +1,7 @@
 //! Focus mode for a focus thread: its transcript, a follow-up composer, and the
 //! VCS panel rooted at its workspace.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::{
@@ -159,6 +159,7 @@ impl<V> FocusState<V> {
 /// Emitted when the user leaves focus mode.
 pub enum FocusEvent {
     Exit,
+    ExpandDesktop(Entity<crate::desktop_viewer::DesktopViewer>),
 }
 
 pub struct FocusView {
@@ -332,17 +333,20 @@ impl FocusView {
         );
     }
 
-    fn transcript_panel(&self) -> impl IntoElement {
+    fn transcript_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut seen_desktops = HashSet::new();
         let body = match self.state.transcript() {
             Ok(messages) if messages.is_empty() => div()
                 .text_sm()
                 .text_color(rgb(0x9ca3af))
                 .child(empty_transcript_hint(self.state.status())),
-            Ok(messages) => div().flex().flex_col().gap_4().children(
-                messages
-                    .iter()
-                    .map(|message| render_message(message, &self.desktop_canvases)),
-            ),
+            Ok(messages) => div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .children(messages.iter().map(|message| {
+                    render_message(message, &self.desktop_canvases, &mut seen_desktops, cx)
+                })),
             Err(err) => div().text_sm().text_color(rgb(0xf87171)).child(err.clone()),
         };
         div()
@@ -439,7 +443,7 @@ impl Render for FocusView {
                     .min_w_0()
                     .h_full()
                     .child(self.header(cx))
-                    .child(self.transcript_panel())
+                    .child(self.transcript_panel(cx))
                     .child(self.composer(cx)),
             )
             .child(self.vcs_panel())
@@ -470,7 +474,9 @@ fn empty_transcript_hint(status: &SubagentStatus) -> &'static str {
 fn render_message(
     message: &Message,
     canvases: &HashMap<String, DesktopCanvas>,
-) -> impl IntoElement {
+    seen_desktops: &mut HashSet<String>,
+    cx: &mut Context<FocusView>,
+) -> gpui::Div {
     let author = match message.role {
         MessageRole::User => "You",
         MessageRole::Assistant => "Assistant",
@@ -482,12 +488,22 @@ fn render_message(
         .gap_1()
         .child(div().text_xs().text_color(rgb(0x9ca3af)).child(author))
         .child(div().text_sm().child(message.text.clone()))
-        .children(
-            message
-                .desktop_artifacts
-                .iter()
-                .map(|artifact| desktop_artifact_card(artifact, canvas_body(canvases, artifact))),
-        )
+        .children(message.desktop_artifacts.iter().map(|artifact| {
+            let id = artifact.artifact_id.clone();
+            let body = canvas_body(
+                canvases,
+                artifact,
+                seen_desktops,
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if let Some(DesktopCanvas::Live(viewer)) = this.desktop_canvases.get(&id) {
+                        cx.emit(FocusEvent::ExpandDesktop(viewer.clone()));
+                        cx.notify();
+                    }
+                }),
+                cx,
+            );
+            desktop_artifact_card(artifact, body)
+        }))
         .children(
             message
                 .views
