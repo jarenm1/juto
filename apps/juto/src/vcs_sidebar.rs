@@ -625,6 +625,7 @@ mod tests {
             heads: BTreeMap::new(),
             workspace_heads: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
+            fork_bases: BTreeMap::new(),
         };
         let layout = GraphLayout::new(&state);
         assert_eq!(layout.lanes, [0, 1, 0, 0]);

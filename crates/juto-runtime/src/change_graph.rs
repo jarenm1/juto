@@ -108,6 +108,22 @@ pub enum ReconcileOutcome {
     },
 }
 
+/// The start of a fork: the thread it belongs to and the tree it was created from.
+///
+/// A fork's no-change contract compares against this tree, not the repository's
+/// base, so work committed after the graph was created does not count as a change.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkBase {
+    pub thread: String,
+    pub tree: String,
+}
+
+/// Snapshot id pinning a fork's start tree. Thread names never contain `/`, so the
+/// id is a single ref component.
+fn fork_snapshot_id(thread: &str) -> String {
+    format!("fork-{thread}")
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GraphState {
     pub version: u32,
@@ -119,6 +135,10 @@ pub struct GraphState {
     pub heads: BTreeMap<String, String>,
     pub workspace_heads: BTreeMap<String, String>,
     pub checkpoints: BTreeMap<String, String>,
+    /// Start tree of each fork, keyed by fork path. Graphs written before forks
+    /// recorded one have none, so their checks fall back to `base_tree`.
+    #[serde(default)]
+    pub fork_bases: BTreeMap<String, ForkBase>,
 }
 
 /// On-disk journal format. Version 3 splits the graph into a small, frequently
@@ -138,6 +158,8 @@ struct GraphHeader {
     heads: BTreeMap<String, String>,
     workspace_heads: BTreeMap<String, String>,
     checkpoints: BTreeMap<String, String>,
+    #[serde(default)]
+    fork_bases: BTreeMap<String, ForkBase>,
 }
 
 impl From<&GraphState> for GraphHeader {
@@ -149,6 +171,7 @@ impl From<&GraphState> for GraphHeader {
             heads: state.heads.clone(),
             workspace_heads: state.workspace_heads.clone(),
             checkpoints: state.checkpoints.clone(),
+            fork_bases: state.fork_bases.clone(),
         }
     }
 }
@@ -252,6 +275,7 @@ impl ChangeGraph {
                 heads: BTreeMap::new(),
                 workspace_heads: BTreeMap::new(),
                 checkpoints: BTreeMap::new(),
+                fork_bases: BTreeMap::new(),
             };
             graph.write_nodes(&state.nodes)?;
             graph.save_header(&state)?;
@@ -297,9 +321,14 @@ impl ChangeGraph {
         let _lock =
             crate::vcs::MutationLock::acquire(self.workspace()).map_err(anyhow::Error::msg)?;
         let state = self.state()?;
+        let base = state
+            .fork_bases
+            .get(&self.workspace_key())
+            .map(|fork| fork.tree.clone())
+            .unwrap_or(state.base_tree);
         let baseline = self.capture_baseline()?;
         let current = self.repository.capture_tree(&baseline)?;
-        self.repository.changed_paths(&state.base_tree, &current)
+        self.repository.changed_paths(&base, &current)
     }
 
     /// The tree a workspace capture is layered on: this workspace's head, the
@@ -535,12 +564,22 @@ impl ChangeGraph {
                 .repository
                 .fork_workspace(&node.tree, destination, thread)?,
         }
+        let tree = node.tree.clone();
+        let snapshot = fork_snapshot_id(thread);
         let recorded = (|| -> Result<()> {
+            self.repository.retain_snapshot(&snapshot, &tree)?;
             let destination = destination.canonicalize()?;
             state.heads.insert(thread.into(), from.clone());
             state
                 .workspace_heads
                 .insert(destination.to_string_lossy().into_owned(), from.clone());
+            state.fork_bases.insert(
+                destination.to_string_lossy().into_owned(),
+                ForkBase {
+                    thread: thread.into(),
+                    tree: tree.clone(),
+                },
+            );
             self.save_header(&state)
         })();
         match recorded {
@@ -555,6 +594,7 @@ impl ChangeGraph {
                     .map(|state| state.heads.contains_key(thread))
                     .unwrap_or(false);
                 if !landed {
+                    let _ = self.repository.release_snapshot(&snapshot);
                     let _ = fs::remove_dir_all(destination);
                 }
                 Err(error.context("workspace created but native thread bookkeeping failed"))
@@ -1116,6 +1156,18 @@ impl ChangeGraph {
         for path in &stale {
             state.workspace_heads.remove(path);
         }
+        let stale_forks: Vec<String> = state
+            .fork_bases
+            .keys()
+            .filter(|path| !Path::new(path).is_dir())
+            .cloned()
+            .collect();
+        for path in &stale_forks {
+            if let Some(fork) = state.fork_bases.remove(path) {
+                self.repository
+                    .release_snapshot(&fork_snapshot_id(&fork.thread))?;
+            }
+        }
         let by_id: BTreeMap<&str, &ChangeNode> =
             state.nodes.iter().map(|n| (n.id.as_str(), n)).collect();
         let mut keep: BTreeSet<&str> = BTreeSet::new();
@@ -1144,7 +1196,7 @@ impl ChangeGraph {
         // publish and import — has to walk. Packing is transparent and
         // idempotent, so do it on every sweep.
         self.repository.pack_refs()?;
-        if pruned.is_empty() && dropped_workspace_heads == 0 {
+        if pruned.is_empty() && dropped_workspace_heads == 0 && stale_forks.is_empty() {
             return Ok(GcReport {
                 pruned_nodes: 0,
                 retained_nodes: retained.len(),
@@ -1362,6 +1414,7 @@ impl ChangeGraph {
             heads: header.heads,
             workspace_heads: header.workspace_heads,
             checkpoints: header.checkpoints,
+            fork_bases: header.fork_bases,
         })
     }
 
