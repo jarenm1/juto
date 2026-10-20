@@ -126,9 +126,9 @@ pub struct AgentConfig {
     /// provider `retry_after` hints when larger.
     pub max_retries: usize,
     pub retry_delay: Duration,
-    /// Estimated-token budget for one request (`crate::budget::estimate_tokens`).
-    /// Over budget, the agent asks the host to compact before sending. `None`
-    /// disables the guard.
+    /// Estimated-token budget for one request, counting the system prompt and
+    /// tool definitions (`crate::budget::estimate_request_tokens`). Over budget,
+    /// the agent asks the host to compact before sending. `None` disables the guard.
     pub context_limit: Option<u64>,
 }
 
