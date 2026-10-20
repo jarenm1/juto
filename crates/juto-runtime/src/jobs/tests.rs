@@ -105,6 +105,8 @@ fn budget(wall_secs: u64) -> JobBudget {
     JobBudget {
         wall_secs,
         max_attempts: 1,
+        max_turns: None,
+        max_spend: None,
     }
 }
 
@@ -526,6 +528,8 @@ async fn a_restart_interrupts_unfinished_jobs_and_retry_runs_them_again() {
         JobBudget {
             wall_secs: 60,
             max_attempts: 2,
+            max_turns: None,
+            max_spend: None,
         },
         no_change(),
     );
@@ -1050,4 +1054,365 @@ async fn a_job_settles_only_after_its_delegated_children_finish() {
         std::fs::read_to_string(job.forks[0].path.join("job.txt")).expect("file in fork"),
         "from the job"
     );
+}
+
+/// Asks for a tool on every turn and answers only after `answer_after` calls,
+/// so a job that its budget does not stop would keep running.
+struct Looping {
+    calls: AtomicUsize,
+    cost: f64,
+    answer_after: usize,
+}
+
+#[async_trait]
+impl Provider for Looping {
+    async fn stream(
+        &self,
+        _model: &Model,
+        _context: &Context,
+        _options: &StreamOptions,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut message = if call > self.answer_after {
+            text_answer("gave up looking")
+        } else {
+            tool_call("read", serde_json::json!({ "path": "job.txt" }))
+        };
+        message.usage.cost = self.cost;
+        one_message(message)
+    }
+}
+
+#[tokio::test]
+async fn a_job_over_its_turn_budget_fails_instead_of_looping() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let provider = Arc::new(Looping {
+        calls: AtomicUsize::new(0),
+        cost: 0.0,
+        answer_after: 5,
+    });
+    let runtime = runtime(&repo, &root.path().join("data"), provider.clone());
+    let mut events = runtime.subscribe_jobs();
+
+    let limits = JobBudget {
+        max_turns: Some(2),
+        ..budget(60)
+    };
+    let started = runtime
+        .start_job("keep reading", limits, no_change())
+        .expect("start");
+    let job = settle(&runtime, &mut events, &started.id, terminal_or_blocked).await;
+
+    assert_eq!(job.status, JobStatus::Failed);
+    let error = job.error.expect("the failure names its budget");
+    assert!(error.contains("turn budget"), "error: {error}");
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        2,
+        "the model must not get a third turn"
+    );
+}
+
+#[tokio::test]
+async fn a_job_over_its_spend_budget_fails_instead_of_looping() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let provider = Arc::new(Looping {
+        calls: AtomicUsize::new(0),
+        cost: 0.4,
+        answer_after: 5,
+    });
+    let runtime = runtime(&repo, &root.path().join("data"), provider.clone());
+    let mut events = runtime.subscribe_jobs();
+
+    let limits = JobBudget {
+        max_spend: Some(1.0),
+        ..budget(60)
+    };
+    let started = runtime
+        .start_job("keep reading", limits, no_change())
+        .expect("start");
+    let job = settle(&runtime, &mut events, &started.id, terminal_or_blocked).await;
+
+    assert_eq!(job.status, JobStatus::Failed);
+    let error = job.error.expect("the failure names its budget");
+    assert!(error.contains("spend budget"), "error: {error}");
+    let calls = provider.calls.load(Ordering::SeqCst);
+    assert_eq!(
+        calls, 3,
+        "three turns cost 1.2 USD; the fourth must never be requested"
+    );
+    assert!(
+        (job.spend_usd - 1.2).abs() < 1e-9,
+        "spend: {}",
+        job.spend_usd
+    );
+}
+
+/// Plays a job whose main thread delegates to a `builder` child, then reports.
+/// The builder's model calls each cost `cost`. It reads until it has made
+/// `answer_after` calls, or, with `fail`, ends its first call with an error stop.
+struct DelegatingBuilder {
+    cost: f64,
+    answer_after: usize,
+    fail: bool,
+    builder_calls: AtomicUsize,
+    total_calls: AtomicUsize,
+}
+
+fn with_cost(mut message: AssistantMessage, cost: f64) -> AssistantMessage {
+    message.usage.cost = cost;
+    message
+}
+
+#[async_trait]
+impl Provider for DelegatingBuilder {
+    async fn stream(
+        &self,
+        _model: &Model,
+        context: &Context,
+        _options: &StreamOptions,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.total_calls.fetch_add(1, Ordering::SeqCst);
+        let is_builder = context
+            .system_prompt
+            .iter()
+            .any(|part| part.contains("You are a builder"));
+        let message = if is_builder {
+            let call = self.builder_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail {
+                let mut message = assistant(
+                    vec![ContentBlock::Text {
+                        text: "builder broke".to_string(),
+                    }],
+                    StopReason::Error,
+                );
+                message.error = Some("builder broke".to_string());
+                with_cost(message, self.cost)
+            } else if call > self.answer_after {
+                text_answer("builder finished")
+            } else {
+                with_cost(
+                    tool_call("read", serde_json::json!({ "path": "job.txt" })),
+                    self.cost,
+                )
+            }
+        } else if context
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult { .. }))
+        {
+            text_answer("delegated the work")
+        } else {
+            tool_call(
+                "task",
+                serde_json::json!({
+                    "tasks": [{ "name": "builder", "agent": "builder", "task": "keep reading" }]
+                }),
+            )
+        };
+        one_message(message)
+    }
+}
+
+#[tokio::test]
+async fn a_child_turn_counts_against_the_job_turn_budget() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let provider = Arc::new(DelegatingBuilder {
+        cost: 0.0,
+        answer_after: 5,
+        fail: false,
+        builder_calls: AtomicUsize::new(0),
+        total_calls: AtomicUsize::new(0),
+    });
+    let runtime = runtime(&repo, &root.path().join("data"), provider.clone());
+    let mut events = runtime.subscribe_jobs();
+
+    let limits = JobBudget {
+        max_turns: Some(2),
+        ..budget(60)
+    };
+    let started = runtime
+        .start_job("delegate the reading", limits, no_change())
+        .expect("start");
+    let job = settle(&runtime, &mut events, &started.id, terminal_or_blocked).await;
+
+    assert_eq!(job.status, JobStatus::Failed);
+    let error = job.error.expect("the failure names its budget");
+    assert!(error.contains("turn budget"), "error: {error}");
+    assert_eq!(
+        provider.total_calls.load(Ordering::SeqCst),
+        2,
+        "the job's two turns cover the main run and its builder together"
+    );
+}
+
+#[tokio::test]
+async fn a_child_spend_counts_against_the_job_spend_budget() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let provider = Arc::new(DelegatingBuilder {
+        cost: 0.4,
+        answer_after: 5,
+        fail: false,
+        builder_calls: AtomicUsize::new(0),
+        total_calls: AtomicUsize::new(0),
+    });
+    let runtime = runtime(&repo, &root.path().join("data"), provider.clone());
+    let mut events = runtime.subscribe_jobs();
+
+    let limits = JobBudget {
+        max_spend: Some(1.0),
+        ..budget(60)
+    };
+    let started = runtime
+        .start_job("delegate the reading", limits, no_change())
+        .expect("start");
+    let job = settle(&runtime, &mut events, &started.id, terminal_or_blocked).await;
+
+    assert_eq!(job.status, JobStatus::Failed);
+    let error = job.error.expect("the failure names its budget");
+    assert!(error.contains("spend budget"), "error: {error}");
+    assert_eq!(
+        provider.builder_calls.load(Ordering::SeqCst),
+        3,
+        "three builder turns cost 1.2 USD; the builder's fourth turn must never be requested"
+    );
+}
+
+/// Plays a job whose main thread delegates to a `builder` child, which delegates
+/// to a `deep dive` grandchild. The grandchild pays for one model call of 0.4 USD.
+struct NestedSpender;
+
+#[async_trait]
+impl Provider for NestedSpender {
+    async fn stream(
+        &self,
+        _model: &Model,
+        context: &Context,
+        _options: &StreamOptions,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        let is_grandchild = context.messages.iter().any(|message| match message {
+            Message::User { content, .. } => content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text { text } if text == "deep dive")),
+            _ => false,
+        });
+        let answered = context
+            .messages
+            .iter()
+            .any(|message| matches!(message, Message::ToolResult { .. }));
+        let is_builder = context
+            .system_prompt
+            .iter()
+            .any(|part| part.contains("You are a builder"));
+        let message = if is_grandchild {
+            with_cost(text_answer("deep dived"), 0.4)
+        } else if is_builder && !answered {
+            tool_call(
+                "task",
+                serde_json::json!({ "tasks": [{ "task": "deep dive" }] }),
+            )
+        } else if is_builder {
+            text_answer("builder finished")
+        } else if answered {
+            text_answer("delegated the work")
+        } else {
+            tool_call(
+                "task",
+                serde_json::json!({
+                    "tasks": [{ "name": "builder", "agent": "builder", "task": "keep reading" }]
+                }),
+            )
+        };
+        one_message(message)
+    }
+}
+
+#[tokio::test]
+async fn a_grandchild_spend_counts_against_the_job_spend_budget() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let runtime = runtime(&repo, &root.path().join("data"), Arc::new(NestedSpender));
+    let mut events = runtime.subscribe_jobs();
+
+    let started = runtime
+        .start_job("delegate the reading", budget(60), no_change())
+        .expect("start");
+    let job = settle(&runtime, &mut events, &started.id, terminal_or_blocked).await;
+
+    assert!(
+        (job.spend_usd - 0.4).abs() < 1e-9,
+        "the grandchild's 0.4 USD call must count against the job; spend: {}",
+        job.spend_usd
+    );
+}
+
+#[tokio::test]
+async fn an_errored_child_still_counts_its_spend() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let provider = Arc::new(DelegatingBuilder {
+        cost: 0.4,
+        answer_after: 0,
+        fail: true,
+        builder_calls: AtomicUsize::new(0),
+        total_calls: AtomicUsize::new(0),
+    });
+    let runtime = runtime(&repo, &root.path().join("data"), provider.clone());
+    let mut events = runtime.subscribe_jobs();
+
+    let started = runtime
+        .start_job("delegate the reading", budget(60), no_change())
+        .expect("start");
+    let job = settle(&runtime, &mut events, &started.id, terminal_or_blocked).await;
+
+    assert!(
+        (job.spend_usd - 0.4).abs() < 1e-9,
+        "the errored builder's 0.4 USD call must be counted, spend: {}",
+        job.spend_usd
+    );
+}
+
+#[tokio::test]
+async fn a_job_budget_needs_positive_turn_and_spend_limits() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let runtime = runtime(&repo, &root.path().join("data"), Arc::new(Answer("x")));
+
+    for limits in [
+        JobBudget {
+            max_turns: Some(0),
+            ..budget(60)
+        },
+        JobBudget {
+            max_spend: Some(0.0),
+            ..budget(60)
+        },
+        JobBudget {
+            max_spend: Some(f64::NAN),
+            ..budget(60)
+        },
+    ] {
+        assert!(
+            matches!(
+                runtime.start_job("work", limits, no_change()),
+                Err(JobError::Invalid(_))
+            ),
+            "{limits:?} must be refused"
+        );
+    }
+    assert!(runtime.list_jobs().expect("list").is_empty());
 }

@@ -13,16 +13,17 @@
 //! is recorded as interrupted rather than run again.
 //!
 //! `wall_secs` bounds the total time a job spends running, across attempts and
-//! decision resumptions. Turn and token budgets are not enforced per job.
+//! decision resumptions. `max_turns` and `max_spend` are enforced per job too;
+//! exhausting either one fails the job.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use juto_agent::{AgentEvent, RunControl};
+use juto_agent::{AgentError, AgentEvent, RunControl};
 use juto_ai::{AssistantMessage, ContentBlock, Message, StopReason, timestamp_ms};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
@@ -33,7 +34,8 @@ use crate::subagents::MainInbox;
 use crate::subagents::{ChildOutcome, SubagentStatus};
 use crate::workspace::SubagentWorkspace;
 use crate::{
-    ChildFactory, Runtime, Session, UnattendedOutcome, UnattendedRun, reclaim_isolated_workspace,
+    ChildFactory, Exhausted, JobLimits, JobMeter, Runtime, Session, UnattendedOutcome,
+    UnattendedRun, reclaim_isolated_workspace,
 };
 
 /// Job state transitions a subscriber may fall behind by before it lags.
@@ -85,13 +87,19 @@ pub enum InboxState {
     Archived,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobBudget {
     /// Total wall-clock seconds the job may spend running.
     pub wall_secs: u64,
     /// Attempts a job may start, counting the first.
     pub max_attempts: u32,
+    /// Model turns one attempt may take. Unset leaves only the runtime's own turn limit.
+    #[serde(default)]
+    pub max_turns: Option<u32>,
+    /// USD the job may spend across all attempts, children included, priced by the model catalog. Unset means no spend limit.
+    #[serde(default)]
+    pub max_spend: Option<f64>,
 }
 
 impl JobBudget {
@@ -101,6 +109,16 @@ impl JobBudget {
         }
         if self.max_attempts == 0 {
             return Err(JobError::Invalid("max_attempts must be at least 1".into()));
+        }
+        if self.max_turns == Some(0) {
+            return Err(JobError::Invalid("max_turns must be at least 1".into()));
+        }
+        if let Some(spend) = self.max_spend
+            && !(spend.is_finite() && spend > 0.0)
+        {
+            return Err(JobError::Invalid(
+                "max_spend must be a positive USD amount".into(),
+            ));
         }
         Ok(())
     }
@@ -167,7 +185,7 @@ pub struct JobFork {
     pub thread: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Job {
     pub id: String,
@@ -184,6 +202,12 @@ pub struct Job {
     /// Wall-clock milliseconds spent running, across attempts and resumptions.
     #[serde(default)]
     pub run_ms: u64,
+    /// Model turns the current attempt has taken. Resets when an attempt starts.
+    #[serde(default)]
+    pub turns: u32,
+    /// USD spent across attempts, children included.
+    #[serde(default)]
+    pub spend_usd: f64,
     pub session_id: Option<String>,
     pub session_path: Option<PathBuf>,
     /// Every attempt's workspace, oldest first. The last one is the current workspace.
@@ -212,6 +236,8 @@ impl Job {
             drained: false,
             attempts: 0,
             run_ms: 0,
+            turns: 0,
+            spend_usd: 0.0,
             session_id: None,
             session_path: None,
             forks: Vec::new(),
@@ -536,6 +562,11 @@ impl Runtime {
                     "job {id} has used its wall-clock budget"
                 )));
             }
+            if job.budget.max_spend.is_some_and(|max| job.spend_usd >= max) {
+                return Err(JobError::Invalid(format!(
+                    "job {id} has used its spend budget"
+                )));
+            }
             // A job that saved a workspace and session continues from that
             // checkpoint; one that never got that far starts over.
             let attempt = match (&job.session_path, job.forks.is_empty()) {
@@ -822,6 +853,7 @@ impl Runtime {
         self.inner.jobs.mutate(id, |job| {
             job.status = JobStatus::Running;
             job.attempts += 1;
+            job.turns = 0;
             job.started_ms = Some(timestamp_ms());
             job.finished_ms = None;
             job.error = None;
@@ -833,6 +865,7 @@ impl Runtime {
             depth: 0,
             inbox: MainInbox::default(),
             unattended: None,
+            meter: Arc::new(JobMeter::new(JobLimits::default())),
         };
         let (runtime, workspace) = factory
             .isolated_runtime(&fork_id)
@@ -886,6 +919,7 @@ impl Runtime {
             depth: 0,
             inbox: MainInbox::default(),
             unattended: None,
+            meter: Arc::new(JobMeter::new(JobLimits::default())),
         };
         let runtime = factory.runtime_at(fork.path.clone()).await?;
         let mut session = Session::open(&session_path)?;
@@ -919,6 +953,7 @@ impl Runtime {
         self.inner.jobs.mutate(id, |job| {
             job.status = JobStatus::Running;
             job.attempts += 1;
+            job.turns = 0;
             job.finished_ms = None;
             job.error = None;
             job.result = None;
@@ -929,6 +964,7 @@ impl Runtime {
             depth: 0,
             inbox: MainInbox::default(),
             unattended: None,
+            meter: Arc::new(JobMeter::new(JobLimits::default())),
         };
         let runtime = factory.runtime_at(fork.path.clone()).await?;
         let mut session = Session::open(&session_path)?;
@@ -940,8 +976,8 @@ impl Runtime {
             .await
     }
 
-    /// Runs one stretch of a job's session inside the remaining wall budget and
-    /// records how it ended.
+    /// Runs one stretch of a job's session inside its remaining wall, turn and
+    /// spend budgets, and records how it ended.
     async fn segment(
         &self,
         id: &str,
@@ -962,22 +998,52 @@ impl Runtime {
                 },
             )?);
         }
+        if job.budget.max_spend.is_some_and(|max| job.spend_usd >= max) {
+            return Ok(self.finish(
+                id,
+                Settled::Failed {
+                    error: spend_message(job.budget),
+                    result: last_assistant_text(session),
+                },
+            )?);
+        }
+        // The turns this attempt may still take. The runtime enforces the cap, so
+        // the model never gets the turn beyond it.
+        let turn_limit = job
+            .budget
+            .max_turns
+            .map(|max| usize::try_from(max.saturating_sub(job.turns)).unwrap_or(usize::MAX));
+        // The job's cap is the one that stopped a run only when it is no looser
+        // than the runtime's own limit.
+        let job_turns_bind = turn_limit
+            .is_some_and(|limit| runtime.config().max_turns.is_none_or(|own| own >= limit));
         let (events, mut received) = mpsc::unbounded_channel::<AgentEvent>();
+        // The run's meter does the accounting. This only drains the events, since
+        // a closed channel would end the run as aborted.
         let drain = tokio::spawn(async move { while received.recv().await.is_some() {} });
         let started = Instant::now();
         // The budget cancels the run, but the run is awaited rather than dropped:
         // it settles its children before it returns, so the job cannot settle while
         // one of them still runs.
-        let (outcome, timed_out) = {
-            let mut run = std::pin::pin!(runtime.run_unattended(
-                session,
-                prompt,
-                events,
-                control.clone(),
-                Some(id.to_owned()),
-            ));
+        let (run, timed_out) = {
+            let mut run = std::pin::pin!(
+                runtime.run_unattended(
+                    session,
+                    prompt,
+                    events,
+                    control.clone(),
+                    Some(id.to_owned()),
+                    JobLimits {
+                        turns: turn_limit,
+                        spend: job
+                            .budget
+                            .max_spend
+                            .map(|max| (max - job.spend_usd).max(0.0)),
+                    },
+                )
+            );
             match tokio::time::timeout(Duration::from_millis(remaining), run.as_mut()).await {
-                Ok(outcome) => (outcome, false),
+                Ok(run) => (run, false),
                 Err(_elapsed) => {
                     control.cancel();
                     (run.await, true)
@@ -985,27 +1051,39 @@ impl Runtime {
             }
         };
         let spent = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        drain.await.context("job event drain failed")?;
+        drain.abort();
+        let UnattendedRun {
+            outcome,
+            children,
+            spent: segment,
+        } = run;
         self.inner.jobs.mutate(id, |job| {
             job.run_ms = job.run_ms.saturating_add(spent);
+            job.turns = job
+                .turns
+                .saturating_add(u32::try_from(segment.turns).unwrap_or(u32::MAX));
+            job.spend_usd += segment.cost;
             Ok(())
         })?;
+        // The run's meter refuses any turn the budget cannot pay for, so
+        // `exhausted` names the budget that stopped it. Spend is also checked
+        // against the job's total, since the run only sees this segment's share.
+        let turns_over = segment.exhausted == Some(Exhausted::Turns);
+        let spend_over = segment.exhausted == Some(Exhausted::Spend)
+            || job
+                .budget
+                .max_spend
+                .is_some_and(|max| job.spend_usd + segment.cost >= max);
 
         let cancelled = self.inner.jobs.cancel_requested(id);
         let main = last_assistant_text(session);
-        let (children, stopped) = match &outcome {
-            Ok(run) => (
-                run.children.clone(),
-                matches!(
-                    &run.outcome,
-                    UnattendedOutcome::Finished(finished)
-                        if matches!(finished.stop_reason, StopReason::Stop)
-                ),
-            ),
-            Err(_) => (Vec::new(), false),
-        };
+        let stopped = matches!(
+            &outcome,
+            Ok(UnattendedOutcome::Finished(finished))
+                if matches!(finished.stop_reason, StopReason::Stop)
+        );
         let result = job_result(main.as_deref(), &children);
-        let verdict = if stopped && !cancelled && !timed_out {
+        let verdict = if stopped && !cancelled && !timed_out && !spend_over && !turns_over {
             // The contract reads the final message alone, so a silent final turn
             // cannot pass on an earlier turn's text.
             Some(
@@ -1015,45 +1093,47 @@ impl Runtime {
         } else {
             None
         };
-        let settled = match outcome {
-            _ if cancelled => {
-                if let Ok(UnattendedRun {
-                    outcome: UnattendedOutcome::Blocked(decision),
-                    ..
-                }) = &outcome
-                {
-                    self.reject_pending(decision);
-                }
-                Settled::Cancelled
+        let settled = if cancelled {
+            if let Ok(UnattendedOutcome::Blocked(decision)) = &outcome {
+                self.reject_pending(decision);
             }
-            _ if timed_out => Settled::Failed {
+            Settled::Cancelled
+        } else if timed_out {
+            Settled::Failed {
                 error: budget_message(job.budget),
                 result,
-            },
-            Err(error) => Settled::Failed {
-                error: format!("{error:#}"),
+            }
+        } else if spend_over {
+            Settled::Failed {
+                error: spend_message(job.budget),
                 result,
-            },
-            Ok(UnattendedRun {
-                outcome: UnattendedOutcome::Blocked(decision),
-                ..
-            }) => Settled::Blocked(decision.id),
-            Ok(UnattendedRun {
-                outcome: UnattendedOutcome::Finished(run),
-                ..
-            }) => match run.stop_reason {
-                StopReason::Stop => match verdict.unwrap_or(Ok(())) {
-                    Ok(()) => Settled::Succeeded(result),
-                    Err(reason) => Settled::Failed {
-                        error: format!("completion contract not met: {reason}"),
+            }
+        } else if turns_over {
+            Settled::Failed {
+                error: turns_message(job.budget),
+                result,
+            }
+        } else {
+            match outcome {
+                Err(error) => Settled::Failed {
+                    error: run_error(&error, job.budget, job_turns_bind),
+                    result,
+                },
+                Ok(UnattendedOutcome::Blocked(decision)) => Settled::Blocked(decision.id),
+                Ok(UnattendedOutcome::Finished(run)) => match run.stop_reason {
+                    StopReason::Stop => match verdict.unwrap_or(Ok(())) {
+                        Ok(()) => Settled::Succeeded(result),
+                        Err(reason) => Settled::Failed {
+                            error: format!("completion contract not met: {reason}"),
+                            result,
+                        },
+                    },
+                    other => Settled::Failed {
+                        error: format!("the run stopped with {other:?}"),
                         result,
                     },
                 },
-                other => Settled::Failed {
-                    error: format!("the run stopped with {other:?}"),
-                    result,
-                },
-            },
+            }
         };
         Ok(self.finish(id, settled)?)
     }
@@ -1167,6 +1247,33 @@ fn checkpoint_prompt(status: JobStatus, error: Option<&str>) -> String {
 
 fn budget_message(budget: JobBudget) -> String {
     format!("wall-clock budget of {}s exhausted", budget.wall_secs)
+}
+
+fn turns_message(budget: JobBudget) -> String {
+    format!(
+        "turn budget exhausted: the job allows {} model turns per attempt",
+        budget.max_turns.unwrap_or_default()
+    )
+}
+
+fn spend_message(budget: JobBudget) -> String {
+    format!(
+        "spend budget of {:.2} USD exhausted",
+        budget.max_spend.unwrap_or_default()
+    )
+}
+
+/// The error a failed run reports. A run stopped by the job's own turn budget
+/// names that budget rather than the runtime's limit.
+fn run_error(error: &anyhow::Error, budget: JobBudget, job_turns_bind: bool) -> String {
+    match error.downcast_ref::<AgentError>() {
+        Some(AgentError::TurnLimit(_)) if job_turns_bind => format!(
+            "turn budget exhausted: the job allows {} model turns per attempt",
+            budget.max_turns.unwrap_or_default()
+        ),
+        Some(AgentError::SpendLimit(_)) => spend_message(budget),
+        _ => format!("{error:#}"),
+    }
 }
 
 /// The job's result: the main run's final text, then what each child it started

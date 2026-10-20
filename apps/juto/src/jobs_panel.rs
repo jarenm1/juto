@@ -37,6 +37,8 @@ pub fn background_request(prompt: String) -> Request {
         budget: JobBudget {
             wall_secs: BACKGROUND_WALL_SECS,
             max_attempts: BACKGROUND_MAX_ATTEMPTS,
+            max_turns: None,
+            max_spend: None,
         },
         contract: JobContract {
             no_change: true,
@@ -253,6 +255,8 @@ mod tests {
             budget: JobBudget {
                 wall_secs: 60,
                 max_attempts: 1,
+                max_turns: None,
+                max_spend: None,
             },
             contract: JobContract {
                 no_change: true,
@@ -263,6 +267,8 @@ mod tests {
             drained: false,
             attempts: 1,
             run_ms: 0,
+            turns: 0,
+            spend_usd: 0.0,
             session_id: None,
             session_path: None::<PathBuf>,
             forks: Vec::new(),

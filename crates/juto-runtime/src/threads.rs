@@ -34,7 +34,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Runtime, UnattendedOutcome,
+    JobLimits, JobRun, Runtime, UnattendedOutcome,
     session::{EntryKind, Session},
 };
 
@@ -617,9 +617,19 @@ impl Runtime {
         });
         let result = if unattended {
             let owner = main.journal.header().id.clone();
-            self.run_unattended_owned(&mut session, owner, prompt, agent_events, control, None)
-                .await
-                .map(|run| run.outcome)
+            self.run_unattended_owned(
+                &mut session,
+                owner,
+                prompt,
+                agent_events,
+                control,
+                JobRun {
+                    id: None,
+                    limits: JobLimits::default(),
+                },
+            )
+            .await
+            .outcome
         } else {
             self.run(&mut session, prompt, agent_events, control)
                 .await

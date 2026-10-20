@@ -87,6 +87,10 @@ pub trait AgentHooks: Send + Sync {
     /// Observe a finished tool execution; also called for validation and
     /// rejection results, never for calls skipped by cancellation.
     async fn after_tool(&self, _call: &ToolCall, _result: &crate::tool::ToolOutput) {}
+
+    /// Observe the usage of each finished model turn, including a turn that
+    /// ends in a provider error stop, before the run acts on its stop reason.
+    async fn after_model(&self, _usage: &Usage) {}
 }
 
 /// Per-run configuration. No default turn cap: the loop runs until the model
@@ -99,6 +103,9 @@ pub struct AgentConfig {
     pub session_id: String,
     /// Optional bound on model turns; `None` = unbounded.
     pub max_turns: Option<usize>,
+    /// Optional bound on run spend in USD, checked before each model turn;
+    /// `None` = unbounded.
+    pub max_cost: Option<f64>,
     /// Retries for a failed request *before any streamed content*. `0`
     /// disables retry; each retry doubles the delay up to 30s, honouring
     /// provider `retry_after` hints when larger.
@@ -115,6 +122,7 @@ impl AgentConfig {
             cwd: PathBuf::new(),
             session_id: String::new(),
             max_turns: None,
+            max_cost: None,
             max_retries: 3,
             retry_delay: Duration::from_millis(500),
         }
