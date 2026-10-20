@@ -105,8 +105,15 @@ Budgets and states:
 
 - `--wall-secs` bounds total running time across attempts and decision
   resumptions. When it runs out the job fails with
-  `wall-clock budget of <n>s exhausted`. Turn and token budgets are not
-  enforced per job.
+  `wall-clock budget of <n>s exhausted`.
+- `--max-turns` bounds the model turns each attempt may take. When an attempt
+  reaches the cap the job fails with `turn budget exhausted: ...`. The
+  runtime's own turn limit still applies; the lower of the two wins.
+- `--max-spend` bounds the USD the job may spend across all attempts, priced by
+  the model catalog. The cap is checked before each model turn of the job's own
+  run, so no turn starts once it is reached, and the job fails with
+  `spend budget of <n> USD exhausted`. Subagent spend is added when each
+  subagent settles, so a subagent still running is not yet counted.
 - `--max-attempts` bounds the attempts the job may start, counting the first.
   `jobs retry` starts a new attempt within the budget.
 - A runtime that stops while a job is queued or running leaves it

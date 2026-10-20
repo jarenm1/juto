@@ -132,6 +132,21 @@ impl Agent {
                 self.commit(message, &events);
             }
 
+            // Checked before the turn starts, on usage this run has already
+            // committed, so no model call is made once the cap is reached.
+            if let Some(max) = self.config.max_cost
+                && usage.cost >= max
+            {
+                let error = AgentError::SpendLimit(max);
+                emit(
+                    &events,
+                    AgentEvent::Error {
+                        error: error.to_string(),
+                    },
+                );
+                self.finish(StopReason::Error, usage, turns, &events);
+                break Err(error);
+            }
             turns += 1;
             if let Some(max) = self.config.max_turns
                 && turns > max
@@ -180,6 +195,9 @@ impl Agent {
             };
 
             usage.add(&assistant.usage);
+            if let Some(hooks) = &self.hooks {
+                hooks.after_model(&assistant.usage).await;
+            }
             let calls: Vec<ToolCall> = assistant.tool_calls().cloned().collect();
             let assistant_stop = assistant.stop_reason;
             let assistant_error = assistant.error.clone();

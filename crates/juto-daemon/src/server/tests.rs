@@ -1165,6 +1165,8 @@ async fn start_job(
         budget: JobBudget {
             wall_secs: 60,
             max_attempts: 1,
+            max_turns: None,
+            max_spend: None,
         },
         contract,
     };

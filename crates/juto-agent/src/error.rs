@@ -23,4 +23,7 @@ pub enum AgentError {
 
     #[error("turn limit reached ({0} turns) without the model finishing")]
     TurnLimit(usize),
+
+    #[error("spend limit reached ({0:.2} USD) before the model finished")]
+    SpendLimit(f64),
 }

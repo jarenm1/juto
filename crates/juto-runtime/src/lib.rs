@@ -52,7 +52,7 @@ use juto_ai::{
     StopReason, StreamOptions, TextJudge, ToolCall, ToolDefinition, Usage, create_judge,
     judge_for_model, judge_role_accepts, supports_judge_model,
 };
-use juto_catalog::{Model, Registry};
+use juto_catalog::{Model, ModelCost, Registry};
 pub use juto_desktop::protocol;
 pub use juto_desktop::signaling::{SignalingServer, ViewerReport};
 pub use juto_desktop::supervisor::{
@@ -577,6 +577,7 @@ impl Runtime {
                         depth: 1,
                         inbox: inbox.clone(),
                         unattended: None,
+                        meter: Arc::new(JobMeter::new(JobLimits::default())),
                     }),
                     self.inner.admission.clone(),
                     CancellationToken::new(),
@@ -594,6 +595,7 @@ impl Runtime {
         control: RunControl,
     ) -> Result<RunOutcome> {
         let main_session = session.path().to_path_buf();
+        let meter = Arc::new(JobMeter::new(JobLimits::default()));
         let placement = RunPlacement {
             depth: 0,
             role: roles::MAIN_ROLE,
@@ -602,6 +604,8 @@ impl Runtime {
             sender: None,
             main_session: Some(&main_session),
             unattended: None,
+            limits: JobLimits::default(),
+            meter: &meter,
         };
         // Children this run starts are owned by a token of their own. Stopping
         // the run cancels them; ending it normally leaves them running.
@@ -647,9 +651,11 @@ impl Runtime {
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
         job_id: Option<String>,
-    ) -> Result<UnattendedRun> {
+        limits: JobLimits,
+    ) -> UnattendedRun {
         let owner = session.header().id.clone();
-        self.run_unattended_owned(session, owner, prompt, events, control, job_id)
+        let job = JobRun { id: job_id, limits };
+        self.run_unattended_owned(session, owner, prompt, events, control, job)
             .await
     }
 
@@ -663,8 +669,9 @@ impl Runtime {
         prompt: impl Into<String>,
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
-        job_id: Option<String>,
-    ) -> Result<UnattendedRun> {
+        job: JobRun,
+    ) -> UnattendedRun {
+        let JobRun { id: job_id, limits } = job;
         let scope: SharedScope = Arc::new(UnattendedScope::new(
             &self.inner.data_dir,
             &self.inner.cwd,
@@ -672,6 +679,7 @@ impl Runtime {
             job_id,
             control.clone(),
         ));
+        let meter = Arc::new(JobMeter::new(limits));
         let main_session = session.path().to_path_buf();
         let placement = RunPlacement {
             depth: 0,
@@ -681,6 +689,8 @@ impl Runtime {
             sender: None,
             main_session: Some(&main_session),
             unattended: Some(&scope),
+            limits,
+            meter: &meter,
         };
         // Children of this run carry its scope, so their decisions reach the same
         // gate. They report to the process inbox, as every other run's children do.
@@ -695,6 +705,7 @@ impl Runtime {
                 depth: 1,
                 inbox: inbox.clone(),
                 unattended: Some(scope.clone()),
+                meter: meter.clone(),
             }),
             self.inner.admission.clone(),
             run_children.clone(),
@@ -728,10 +739,14 @@ impl Runtime {
         forwarder.abort();
         stop_children.abort();
         let outcome = match scope.finish() {
-            Some(decision) => UnattendedOutcome::Blocked(Box::new(decision)),
-            None => UnattendedOutcome::Finished(outcome?),
+            Some(decision) => Ok(UnattendedOutcome::Blocked(Box::new(decision))),
+            None => outcome.map(UnattendedOutcome::Finished),
         };
-        Ok(UnattendedRun { outcome, children })
+        UnattendedRun {
+            outcome,
+            children,
+            spent: meter.spent(),
+        }
     }
 
     async fn run_depth(
@@ -751,6 +766,8 @@ impl Runtime {
             sender,
             main_session,
             unattended,
+            limits: job_limits,
+            meter,
         } = placement;
         if session.header().cwd != self.inner.cwd {
             bail!("session belongs to a different working directory");
@@ -773,6 +790,14 @@ impl Runtime {
             .current_model()
             .unwrap_or_else(|| settings.model.clone());
         let (model, stream_options) = self.resolve_model(&selector)?;
+        // A catalog row with no price prices every turn at zero, so a spend
+        // budget could never be reached. Refuse the run instead of running it
+        // uncapped. A model that is genuinely free cannot take a spend budget.
+        if job_limits.spend.is_some() && model.cost == ModelCost::default() {
+            bail!(
+                "model `{selector}` has no catalog price, so the job's spend budget cannot be enforced"
+            );
+        }
         let mut compaction_usage = Usage::default();
         if settings.auto_compact {
             let history = session.messages()?;
@@ -781,6 +806,7 @@ impl Runtime {
                 * settings.compaction_threshold) as u64;
             if history.len() > settings.keep_recent_messages && estimated > threshold {
                 compaction_usage = self.compact(session, &control).await?;
+                meter.charge(compaction_usage.cost);
             }
         }
         // The run's tier decides how `bash` is confined; see `ExecutionTier::bash_limits`.
@@ -907,12 +933,19 @@ impl Runtime {
             messages: session.messages()?,
             tools: Vec::new(),
         };
+        // The job's per-attempt turn budget and the runtime's own limit both
+        // apply; the lower of the two wins.
+        let max_turns = match (settings.max_turns, job_limits.turns) {
+            (Some(own), Some(job)) => Some(own.min(job)),
+            (own, job) => own.or(job),
+        };
         let config = AgentConfig {
             model,
             stream_options,
             cwd: self.inner.cwd.clone(),
             session_id: session.header().id.clone(),
-            max_turns: settings.max_turns,
+            max_turns,
+            max_cost: job_limits.spend,
             max_retries: 2,
             retry_delay: Duration::from_millis(500),
         };
@@ -926,6 +959,7 @@ impl Runtime {
             mode,
             approval: self.inner.approval.clone(),
             unattended: unattended.cloned(),
+            meter: meter.clone(),
         }));
         let (tx, mut rx) = mpsc::unbounded_channel();
         let future = agent.run(vec![Message::user(prompt)], tx, control.clone());
@@ -1187,6 +1221,8 @@ struct RuntimeHooks {
     approval: Option<Arc<dyn ApprovalHandler>>,
     /// Set for unattended runs: a call outside the profile needs a durable decision, never a prompt.
     unattended: Option<SharedScope>,
+    /// The job's turn and spend meter, shared by every run in the job's tree.
+    meter: Arc<JobMeter>,
 }
 #[async_trait]
 impl AgentHooks for RuntimeHooks {
@@ -1220,6 +1256,19 @@ impl AgentHooks for RuntimeHooks {
             }
         }
     }
+
+    async fn before_model(&self, _model: &Model, _context: &Context) -> Result<(), String> {
+        self.meter
+            .admit_turn()
+            .map_err(|exhausted| match exhausted {
+                Exhausted::Turns => "turn budget exhausted".to_owned(),
+                Exhausted::Spend => "spend budget exhausted".to_owned(),
+            })
+    }
+
+    async fn after_model(&self, usage: &Usage) {
+        self.meter.charge(usage.cost);
+    }
 }
 
 /// How an unattended run ended.
@@ -1230,11 +1279,19 @@ pub enum UnattendedOutcome {
     Blocked(Box<Decision>),
 }
 
+/// The budget an unattended run runs under, and the job it belongs to, if any.
+struct JobRun {
+    id: Option<String>,
+    limits: JobLimits,
+}
+
 /// An unattended run's outcome, with the settled outcome of every child it started.
 pub struct UnattendedRun {
-    pub outcome: UnattendedOutcome,
+    pub outcome: Result<UnattendedOutcome>,
     /// Every child the run started, each in a terminal state.
     pub children: Vec<subagents::ChildOutcome>,
+    /// What the job's runs spent this segment, and the budget that stopped them.
+    pub spent: JobSpend,
 }
 
 /// The tier an unattended run executes under. Unattended runs are always sandboxed
@@ -1256,6 +1313,88 @@ async fn cancel_children_on_stop(control: RunControl, children: CancellationToke
     children.cancel();
 }
 
+/// Budget a job's run tree is held to for one segment: how many model turns and
+/// how much spend (USD) it may still use, delegated children included. The
+/// runtime's own turn limit still applies to the main run's turns; the lower of
+/// the two wins.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct JobLimits {
+    pub turns: Option<usize>,
+    pub spend: Option<f64>,
+}
+
+/// What a job's runs used this segment and which budget, if any, stopped them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct JobSpend {
+    pub turns: usize,
+    pub cost: f64,
+    pub exhausted: Option<Exhausted>,
+}
+
+/// The budget that stopped a job's runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Exhausted {
+    Turns,
+    Spend,
+}
+
+/// Turns and spend shared by every run in one job segment's tree, the main run
+/// and each delegated child. A model turn is admitted before it starts and its
+/// cost is charged when it finishes, so no run in the tree can take turns or
+/// spend past the segment's budget.
+struct JobMeter {
+    limits: JobLimits,
+    state: Mutex<MeterState>,
+}
+
+#[derive(Default)]
+struct MeterState {
+    turns: usize,
+    spend: f64,
+    exhausted: Option<Exhausted>,
+}
+
+impl JobMeter {
+    fn new(limits: JobLimits) -> Self {
+        Self {
+            limits,
+            state: Mutex::new(MeterState::default()),
+        }
+    }
+
+    /// Admits one model turn, or refuses it when the segment has no turn or
+    /// spend left. A refused turn is never sent to the model.
+    fn admit_turn(&self) -> Result<(), Exhausted> {
+        let mut state = self.state.lock();
+        let refused = if self.limits.spend.is_some_and(|max| state.spend >= max) {
+            Some(Exhausted::Spend)
+        } else if self.limits.turns.is_some_and(|max| state.turns >= max) {
+            Some(Exhausted::Turns)
+        } else {
+            None
+        };
+        if let Some(reason) = refused {
+            state.exhausted.get_or_insert(reason);
+            return Err(reason);
+        }
+        state.turns += 1;
+        Ok(())
+    }
+
+    fn charge(&self, cost: f64) {
+        self.state.lock().spend += cost;
+    }
+
+    fn spent(&self) -> JobSpend {
+        let state = self.state.lock();
+        JobSpend {
+            turns: state.turns,
+            cost: state.spend,
+            exhausted: state.exhausted,
+        }
+    }
+}
+
 /// Where a run sits in the delegation tree: its depth, the role it runs as,
 /// and whether it is confined to read-only tools.
 #[derive(Clone, Copy)]
@@ -1273,6 +1412,11 @@ struct RunPlacement<'a> {
     main_session: Option<&'a Path>,
     /// Set for unattended runs; every run in the tree shares the same scope.
     unattended: Option<&'a SharedScope>,
+    /// Caps the job that started this run places on its main run. Children
+    /// never inherit them.
+    limits: JobLimits,
+    /// The job's meter, shared by every run in the tree this placement starts.
+    meter: &'a Arc<JobMeter>,
 }
 
 struct ChildFactory {
@@ -1280,6 +1424,7 @@ struct ChildFactory {
     depth: usize,
     inbox: subagents::MainInbox,
     unattended: Option<SharedScope>,
+    meter: Arc<JobMeter>,
 }
 
 /// Where an isolated child's workspace is provisioned. Shared by
@@ -1306,6 +1451,7 @@ impl ChildFactory {
                 depth: self.depth + 1,
                 inbox: self.inbox.clone(),
                 unattended: self.unattended.clone(),
+                meter: self.meter.clone(),
             }),
             runtime.inner.admission.clone(),
             control.token().child_token(),
@@ -1668,6 +1814,8 @@ impl subagents::SubagentFactory for ChildFactory {
                         tier: spec.tier.unwrap_or(ExecutionTier::Workspace),
                         sender: Some(id),
                         unattended: self.unattended.as_ref(),
+                        limits: JobLimits::default(),
+                        meter: &self.meter,
                         main_session: spec.main_session.as_deref(),
                     },
                     manager.clone(),
@@ -1733,6 +1881,8 @@ impl subagents::SubagentFactory for ChildFactory {
                         tier: spec.tier.unwrap_or(ExecutionTier::Workspace),
                         sender: Some(id),
                         unattended: self.unattended.as_ref(),
+                        limits: JobLimits::default(),
+                        meter: &self.meter,
                         main_session: spec.main_session.as_deref(),
                     },
                     manager.clone(),
@@ -3942,10 +4092,11 @@ mod tests {
                 events,
                 RunControl::new(),
                 None,
+                JobLimits::default(),
             )
             .await
-            .expect("first run")
             .outcome
+            .expect("first run")
         {
             UnattendedOutcome::Blocked(decision) => decision,
             UnattendedOutcome::Finished(_) => {
@@ -3966,10 +4117,11 @@ mod tests {
                 events,
                 RunControl::new(),
                 None,
+                JobLimits::default(),
             )
             .await
-            .expect("second run")
             .outcome
+            .expect("second run")
         {
             UnattendedOutcome::Finished(_) => {}
             UnattendedOutcome::Blocked(_) => panic!("the approved action must not block again"),
@@ -4006,10 +4158,11 @@ mod tests {
                 events,
                 RunControl::new(),
                 None,
+                JobLimits::default(),
             )
             .await
-            .expect("first run")
             .outcome
+            .expect("first run")
         {
             UnattendedOutcome::Blocked(decision) => decision,
             UnattendedOutcome::Finished(_) => panic!("publish must block without a grant"),
@@ -4025,10 +4178,11 @@ mod tests {
                 events,
                 RunControl::new(),
                 None,
+                JobLimits::default(),
             )
             .await
-            .expect("second run")
             .outcome
+            .expect("second run")
         {
             UnattendedOutcome::Blocked(decision) => {
                 assert_ne!(
@@ -4070,10 +4224,11 @@ mod tests {
                 events,
                 RunControl::new(),
                 None,
+                JobLimits::default(),
             )
             .await
-            .expect("first run")
             .outcome
+            .expect("first run")
         {
             UnattendedOutcome::Blocked(decision) => decision,
             UnattendedOutcome::Finished(_) => panic!("publish must block without a grant"),
@@ -4098,10 +4253,11 @@ mod tests {
                 events,
                 RunControl::new(),
                 None,
+                JobLimits::default(),
             )
             .await
-            .expect("second run")
             .outcome
+            .expect("second run")
         {
             UnattendedOutcome::Finished(_) => {}
             UnattendedOutcome::Blocked(_) => panic!("the approved action must not block again"),
@@ -4173,6 +4329,7 @@ mod tests {
         // Depth 2 is the limit: the same builder role loses its delegation tools.
         let mut session = runtime.new_session().expect("session");
         let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let meter = Arc::new(JobMeter::new(JobLimits::default()));
         runtime
             .run_depth(
                 &mut session,
@@ -4187,6 +4344,8 @@ mod tests {
                     sender: None,
                     main_session: None,
                     unattended: None,
+                    limits: JobLimits::default(),
+                    meter: &meter,
                 },
                 runtime.subagent_manager(),
             )
@@ -4224,6 +4383,7 @@ mod tests {
         for tier in tiers {
             let mut session = runtime.new_session().expect("session");
             let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+            let meter = Arc::new(JobMeter::new(JobLimits::default()));
             runtime
                 .run_depth(
                     &mut session,
@@ -4238,6 +4398,8 @@ mod tests {
                         sender: None,
                         main_session: None,
                         unattended: None,
+                        limits: JobLimits::default(),
+                        meter: &meter,
                     },
                     runtime.subagent_manager(),
                 )
@@ -4753,7 +4915,14 @@ mod tests {
             async move {
                 let _events_rx = events_rx;
                 runtime
-                    .run_unattended(&mut session, "delegate", events, RunControl::new(), None)
+                    .run_unattended(
+                        &mut session,
+                        "delegate",
+                        events,
+                        RunControl::new(),
+                        None,
+                        JobLimits::default(),
+                    )
                     .await
             }
         });
@@ -4774,9 +4943,9 @@ mod tests {
         let unattended = timeout(Duration::from_secs(10), run)
             .await
             .expect("the run returns once its child finishes")
-            .expect("run task")
-            .expect("unattended run");
-        assert!(matches!(unattended.outcome, UnattendedOutcome::Finished(_)));
+            .expect("run task");
+        let outcome = unattended.outcome.expect("unattended run");
+        assert!(matches!(outcome, UnattendedOutcome::Finished(_)));
         assert_eq!(
             live.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -4788,6 +4957,253 @@ mod tests {
             SubagentStatus::Completed
         ));
         assert_eq!(unattended.children[0].output.as_deref(), Some("child done"));
+    }
+
+    /// Sets a flag when dropped, so a test can see that a model call was torn down.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Delegates a `nest` child, which delegates a `grandchild work` run. The
+    /// grandchild pays for one model turn, then waits for a stop. A child's
+    /// `task` call waits for its own children, so the child only ends while the
+    /// grandchild still works when the run is stopped.
+    struct NestingProvider {
+        grandchild_started: Arc<tokio::sync::Notify>,
+        grandchild_torn_down: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Provider for NestingProvider {
+        async fn stream(
+            &self,
+            _model: &Model,
+            context: &Context,
+            _options: &StreamOptions,
+            cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let prompt = context
+                .messages
+                .iter()
+                .find_map(|message| match message {
+                    Message::User { content, .. } => content.iter().find_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    }),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let answered_by_tool = context
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::ToolResult { .. }));
+            let spawn = |task: &str| {
+                assistant_turn(
+                    vec![ContentBlock::ToolCall(juto_ai::ToolCall {
+                        id: "task-1".into(),
+                        name: "task".into(),
+                        arguments: json!({"tasks": [{"task": task}]}),
+                        thought_signature: None,
+                    })],
+                    StopReason::ToolUse,
+                )
+            };
+            let answer = |reply: &str| {
+                assistant_turn(
+                    vec![ContentBlock::Text { text: reply.into() }],
+                    StopReason::Stop,
+                )
+            };
+            let message = match prompt {
+                "delegate nest" if !answered_by_tool => spawn("nest"),
+                "nest" if !answered_by_tool => spawn("grandchild work"),
+                "grandchild work" if !answered_by_tool => {
+                    let mut turn = assistant_turn(
+                        vec![ContentBlock::ToolCall(juto_ai::ToolCall {
+                            id: "paid-1".into(),
+                            name: "no_such_tool".into(),
+                            arguments: json!({}),
+                            thought_signature: None,
+                        })],
+                        StopReason::ToolUse,
+                    );
+                    turn.usage.cost = 0.4;
+                    turn
+                }
+                "delegate nest" | "nest" | "grandchild work" => {
+                    // Only the grandchild's model call is watched for teardown.
+                    let grandchild = prompt == "grandchild work";
+                    let _torn_down =
+                        grandchild.then(|| DropFlag(self.grandchild_torn_down.clone()));
+                    if grandchild {
+                        self.grandchild_started.notify_one();
+                    }
+                    cancel.cancelled().await;
+                    return Err(ProviderError::Protocol("run stopped while waiting".into()));
+                }
+                _ => answer("quick done"),
+            };
+            let events: Vec<Result<ProviderEvent, ProviderError>> = vec![
+                Ok(ProviderEvent::Start),
+                Ok(ProviderEvent::Done { message }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// A stopped run tears down the grandchild's model call before it returns,
+    /// so the grandchild is settled rather than left running in the background.
+    #[tokio::test]
+    async fn unattended_run_settles_grandchildren_before_returning() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let grandchild_started = Arc::new(tokio::sync::Notify::new());
+        let grandchild_torn_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runtime = runtime_with(
+            &repo,
+            &root.path().join("data"),
+            mock_config(),
+            Arc::new(NestingProvider {
+                grandchild_started: grandchild_started.clone(),
+                grandchild_torn_down: grandchild_torn_down.clone(),
+            }),
+        );
+        let mut session = runtime.new_session().expect("session");
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let _events_rx = events_rx;
+        let stop = RunControl::new();
+        let run = runtime.run_unattended(
+            &mut session,
+            "delegate nest",
+            events,
+            stop.clone(),
+            None,
+            JobLimits::default(),
+        );
+        let stop_while_working = async {
+            grandchild_started.notified().await;
+            stop.cancel();
+        };
+        let (run, ()) = timeout(Duration::from_secs(10), async {
+            tokio::join!(run, stop_while_working)
+        })
+        .await
+        .expect("the stopped run returns");
+        // How the stopped run itself ends is not under test.
+        let _ = run.outcome;
+        assert_eq!(run.children.len(), 1, "the run started one child, nest");
+        assert!(
+            grandchild_torn_down.load(std::sync::atomic::Ordering::SeqCst),
+            "the grandchild's model call must be torn down before the run returns"
+        );
+    }
+
+    /// Plays a run that starts over the compaction threshold. The compaction call
+    /// costs 0.9 USD; the model turn after it is the only main-run model call.
+    struct CompactingProvider {
+        main_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for CompactingProvider {
+        async fn stream(
+            &self,
+            _model: &Model,
+            context: &Context,
+            _options: &StreamOptions,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let compacting = context
+                .system_prompt
+                .iter()
+                .any(|part| part.as_str() == COMPACTION_PROMPT);
+            let message = if compacting {
+                let mut summary = assistant_turn(
+                    vec![ContentBlock::Text {
+                        text: "summary of earlier work".into(),
+                    }],
+                    StopReason::Stop,
+                );
+                summary.usage.cost = 0.9;
+                summary
+            } else {
+                self.main_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assistant_turn(
+                    vec![ContentBlock::Text {
+                        text: "answered".into(),
+                    }],
+                    StopReason::Stop,
+                )
+            };
+            let events: Vec<Result<ProviderEvent, ProviderError>> = vec![
+                Ok(ProviderEvent::Start),
+                Ok(ProviderEvent::Done { message }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// Compaction spend is charged to the job: a 0.9 USD compaction leaves the
+    /// model turn after it no room under a 0.5 USD cap.
+    #[tokio::test]
+    async fn compaction_spend_counts_against_the_job_spend_budget() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let main_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let config = crate::RuntimeConfig {
+            auto_compact: true,
+            compaction_threshold: 0.000_001,
+            keep_recent_messages: 1,
+            compaction_method: crate::config::CompactionMethod::Summary,
+            ..mock_config()
+        };
+        let runtime = runtime_with(
+            &repo,
+            &root.path().join("data"),
+            config,
+            Arc::new(CompactingProvider {
+                main_calls: main_calls.clone(),
+            }),
+        );
+        let mut session = runtime.new_session().expect("session");
+        for note in 0..4 {
+            session
+                .append(EntryKind::Message {
+                    message: Message::developer(format!("earlier note {note}")),
+                })
+                .expect("append history");
+        }
+        let (events, events_rx) = mpsc::unbounded_channel();
+        let _events_rx = events_rx;
+        let run = timeout(
+            Duration::from_secs(10),
+            runtime.run_unattended(
+                &mut session,
+                "continue",
+                events,
+                RunControl::new(),
+                None,
+                JobLimits {
+                    turns: None,
+                    spend: Some(0.5),
+                },
+            ),
+        )
+        .await
+        .expect("the run returns");
+        drop(run);
+        assert_eq!(
+            main_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the compaction's 0.9 USD must stop the model turn after it"
+        );
     }
 
     /// A run stopped before it starts must not leave later runs' subagents

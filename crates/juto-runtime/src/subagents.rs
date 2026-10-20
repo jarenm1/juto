@@ -3073,10 +3073,13 @@ mod tests {
 
         let id = manager.spawn(spec("blocked-child")).unwrap();
         let mut status_rx = manager.subscribe_status(&id).unwrap();
-        status_rx
-            .wait_for(|s| matches!(s, SubagentStatus::Blocked { .. }))
-            .await
-            .unwrap();
+        timeout(
+            WAIT_TIMEOUT,
+            status_rx.wait_for(|s| matches!(s, SubagentStatus::Blocked { .. })),
+        )
+        .await
+        .expect("child reaches blocked")
+        .unwrap();
 
         let children = timeout(WAIT_TIMEOUT, manager.settle_all())
             .await

@@ -20,6 +20,12 @@ pub enum JobsCommand {
         /// Attempts the job may start, counting the first.
         #[arg(long)]
         max_attempts: u32,
+        /// Model turns one attempt may take. Unset leaves only the runtime's own turn limit.
+        #[arg(long)]
+        max_turns: Option<u32>,
+        /// USD the job may spend across attempts, priced by the model catalog. Unset means no spend limit.
+        #[arg(long)]
+        max_spend: Option<f64>,
         /// Completion contract: a workspace-relative file that must exist and be non-empty.
         #[arg(long)]
         artifact: Option<String>,
@@ -61,6 +67,8 @@ pub async fn run(cwd: &Path, command: &JobsCommand, json: bool) -> Result<()> {
             prompt,
             wall_secs,
             max_attempts,
+            max_turns,
+            max_spend,
             artifact,
             output_schema,
             no_change,
@@ -81,6 +89,8 @@ pub async fn run(cwd: &Path, command: &JobsCommand, json: bool) -> Result<()> {
                 budget: JobBudget {
                     wall_secs: *wall_secs,
                     max_attempts: *max_attempts,
+                    max_turns: *max_turns,
+                    max_spend: *max_spend,
                 },
                 contract: JobContract {
                     artifact: artifact.clone(),
