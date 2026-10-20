@@ -2684,6 +2684,375 @@ mod tests {
         );
     }
 
+    /// Serves incremental compaction. Each run makes two main requests: the first
+    /// calls `read` on a small file, the second answers `done`. Summary requests
+    /// answer `NODE-SUMMARY-<n>`. With `block_first_summary`, the first summary
+    /// request waits for `summary_gate`. At main request `release_on_main_request`
+    /// the gate opens. With `yield_in_run`, the second main request of a run yields
+    /// long enough for a background summary to finish.
+    struct NodeFlow {
+        read_path: String,
+        main_requests: std::sync::Mutex<Vec<Vec<Message>>>,
+        summaries: std::sync::atomic::AtomicUsize,
+        block_first_summary: std::sync::atomic::AtomicBool,
+        summary_gate: Arc<tokio::sync::Semaphore>,
+        release_on_main_request: Option<usize>,
+        yield_in_run: bool,
+    }
+
+    impl NodeFlow {
+        fn new(read_path: String) -> Self {
+            Self {
+                read_path,
+                main_requests: Default::default(),
+                summaries: Default::default(),
+                block_first_summary: Default::default(),
+                summary_gate: Arc::new(tokio::sync::Semaphore::new(0)),
+                release_on_main_request: None,
+                yield_in_run: false,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for NodeFlow {
+        async fn stream(
+            &self,
+            _model: &Model,
+            context: &Context,
+            _options: &StreamOptions,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            if context.system_prompt.first().map(String::as_str) == Some(COMPACTION_PROMPT) {
+                let n = self
+                    .summaries
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                if self
+                    .block_first_summary
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    self.summary_gate
+                        .acquire()
+                        .await
+                        .expect("gate open")
+                        .forget();
+                }
+                return Ok(scripted_reply(
+                    vec![ContentBlock::Text {
+                        text: format!("NODE-SUMMARY-{n}"),
+                    }],
+                    StopReason::Stop,
+                ));
+            }
+            let request = {
+                let mut requests = self.main_requests.lock().unwrap();
+                requests.push(context.messages.clone());
+                requests.len()
+            };
+            if self.release_on_main_request == Some(request) {
+                self.summary_gate.add_permits(1 << 20);
+            }
+            if request % 2 == 1 {
+                return Ok(scripted_reply(
+                    vec![ContentBlock::ToolCall(ToolCall {
+                        id: format!("call-{request}"),
+                        name: "read".to_string(),
+                        arguments: serde_json::json!({ "path": self.read_path }),
+                        thought_signature: None,
+                    })],
+                    StopReason::ToolUse,
+                ));
+            }
+            if self.yield_in_run {
+                for _ in 0..200 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            Ok(scripted_reply(
+                vec![ContentBlock::Text {
+                    text: "done".to_string(),
+                }],
+                StopReason::Stop,
+            ))
+        }
+    }
+
+    /// Window of 20,000 tokens: the budget is 18,000 and background summaries start
+    /// at 14,400 estimated tokens. A 45,000-byte prompt (15,000 tokens) crosses that
+    /// alone.
+    fn node_config() -> RuntimeConfig {
+        let mut config = RuntimeConfig {
+            tools: vec!["read".to_string()],
+            keep_recent_messages: 0,
+            ..mock_config()
+        };
+        config.custom_models[0].context_window = Some(20_000);
+        config
+    }
+
+    fn big_prompt(tag: &str) -> String {
+        format!("{tag}: {}", "x".repeat(45_000))
+    }
+
+    /// Whether the session's background summary is pending, or finished but not yet
+    /// applied. `None` when no job is recorded.
+    fn background_finished(runtime: &Runtime, session_id: &str) -> Option<bool> {
+        runtime
+            .inner
+            .compactions
+            .lock()
+            .get(session_id)
+            .map(|job| job.is_finished())
+    }
+
+    async fn settle_background(runtime: &Runtime, session_id: &str) {
+        for _ in 0..2_000 {
+            if background_finished(runtime, session_id) != Some(false) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("background summary did not finish");
+    }
+
+    #[tokio::test]
+    async fn incremental_nodes_keep_the_view_under_budget_and_merge_at_the_cap() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let small = repo.join("small.txt");
+        std::fs::write(&small, "ok\n").expect("write file");
+        let provider = Arc::new(NodeFlow::new(small.display().to_string()));
+        let runtime = runtime_with(
+            &repo,
+            &root.path().join("data"),
+            node_config(),
+            provider.clone(),
+        );
+        let mut session = runtime.new_session().expect("session");
+        let session_id = session.header().id.clone();
+        for turn in 0..8 {
+            let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+            let outcome = runtime
+                .run(
+                    &mut session,
+                    &big_prompt(&format!("turn {turn}")),
+                    events,
+                    RunControl::new(),
+                )
+                .await
+                .expect("run completes");
+            assert_eq!(outcome.stop_reason, StopReason::Stop);
+            settle_background(&runtime, &session_id).await;
+        }
+
+        let window_budget = 18_000;
+        for (index, request) in provider.main_requests.lock().unwrap().iter().enumerate() {
+            assert!(
+                estimate_request_tokens(&[], &[], request) <= window_budget,
+                "main request {index} exceeds the window budget"
+            );
+            let nodes = serde_json::to_string(request)
+                .unwrap()
+                .matches("Earlier conversation summary")
+                .count();
+            assert!(
+                nodes <= crate::compaction::MAX_SUMMARY_NODES,
+                "main request {index} carries {nodes} summary nodes"
+            );
+        }
+
+        let view = session.path_view().expect("view");
+        let nodes = view.nodes.len();
+        assert!(
+            (1..=crate::compaction::MAX_SUMMARY_NODES).contains(&nodes),
+            "the view holds {nodes} nodes"
+        );
+        assert!(
+            view.nodes.iter().any(|node| node.level >= 1),
+            "merging adjacent nodes produces a level-1 node"
+        );
+        let mut covered = 0;
+        for node in &view.nodes {
+            assert_eq!(node.start, covered, "node spans tile from the start");
+            covered = node.end;
+        }
+        assert_eq!(view.raw_start(), covered);
+        assert_eq!(
+            session.messages().expect("messages").len(),
+            nodes + view.visible().len(),
+            "the view is the node summaries followed by the raw tail"
+        );
+        assert!(
+            estimate_request_tokens(&[], &[], &session.messages().expect("messages"))
+                <= window_budget
+        );
+    }
+
+    #[tokio::test]
+    async fn a_background_summary_joins_the_view_only_at_the_next_turn_start() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let small = repo.join("small.txt");
+        std::fs::write(&small, "ok\n").expect("write file");
+        let mut flow = NodeFlow::new(small.display().to_string());
+        flow.block_first_summary
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        flow.release_on_main_request = Some(3);
+        flow.yield_in_run = true;
+        let provider = Arc::new(flow);
+        let runtime = runtime_with(
+            &repo,
+            &root.path().join("data"),
+            node_config(),
+            provider.clone(),
+        );
+        let mut session = runtime.new_session().expect("session");
+        let session_id = session.header().id.clone();
+
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime
+            .run(
+                &mut session,
+                &big_prompt("first turn"),
+                events,
+                RunControl::new(),
+            )
+            .await
+            .expect("first turn completes");
+        assert_eq!(
+            background_finished(&runtime, &session_id),
+            Some(false),
+            "the first turn leaves a blocked background summary"
+        );
+
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime
+            .run(&mut session, "second turn", events, RunControl::new())
+            .await
+            .expect("second turn completes");
+        assert_eq!(
+            background_finished(&runtime, &session_id),
+            Some(true),
+            "the summary finished during the second turn"
+        );
+        {
+            let requests = provider.main_requests.lock().unwrap();
+            for request in &requests[2..4] {
+                let json = serde_json::to_string(request).unwrap();
+                assert!(
+                    json.contains("first turn"),
+                    "the second turn keeps the old view"
+                );
+                assert!(!json.contains("NODE-SUMMARY"), "no summary mid-turn");
+            }
+        }
+
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime
+            .run(&mut session, "third turn", events, RunControl::new())
+            .await
+            .expect("third turn completes");
+        let requests = provider.main_requests.lock().unwrap();
+        let json = serde_json::to_string(&requests[4]).unwrap();
+        assert!(
+            json.contains("NODE-SUMMARY-"),
+            "the third turn starts from the summary"
+        );
+        assert!(
+            !json.contains("first turn"),
+            "the summarized turn left the view"
+        );
+    }
+
+    async fn a_pending_summary_body() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+        let small = repo.join("small.txt");
+        std::fs::write(&small, "ok\n").expect("write file");
+        let flow = NodeFlow::new(small.display().to_string());
+        flow.block_first_summary
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let provider = Arc::new(flow);
+        let runtime = runtime_with(
+            &repo,
+            &root.path().join("data"),
+            node_config(),
+            provider.clone(),
+        );
+        let mut session = runtime.new_session().expect("session");
+        let session_id = session.header().id.clone();
+
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime
+            .run(
+                &mut session,
+                &big_prompt("first turn"),
+                events,
+                RunControl::new(),
+            )
+            .await
+            .expect("first turn completes");
+        // Let the background summary start and park at the gate. A task that never ran
+        // would be aborted before its request, and the guard's summary would take the
+        // one-shot block instead.
+        for _ in 0..1000 {
+            if provider.summaries.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            provider.summaries.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert_eq!(background_finished(&runtime, &session_id), Some(false));
+
+        // The second prompt alone overflows the window while the summary is pending.
+        let (events, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let outcome = runtime
+            .run(
+                &mut session,
+                &big_prompt("second turn"),
+                events,
+                RunControl::new(),
+            )
+            .await
+            .expect("the guard compacts and the run completes");
+        assert_eq!(outcome.stop_reason, StopReason::Stop);
+        assert!(
+            !runtime.has_background_compaction(&session_id),
+            "the synchronous compaction replaced the pending summary"
+        );
+        assert!(
+            provider.summaries.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the guard issued its own summary request"
+        );
+        for (index, request) in provider.main_requests.lock().unwrap().iter().enumerate() {
+            assert!(
+                estimate_request_tokens(&[], &[], request) <= 18_000,
+                "main request {index} would overflow the window"
+            );
+        }
+        assert!(
+            serde_json::to_string(&session.messages().expect("messages"))
+                .unwrap()
+                .contains("NODE-SUMMARY-"),
+            "the guard's summary replaced the overflowing history"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_summary_yields_to_the_guard_when_the_view_overflows() {
+        // A regression must fail here, not hang the test binary.
+        tokio::time::timeout(std::time::Duration::from_secs(30), a_pending_summary_body())
+            .await
+            .expect("the guard run finished within 30s");
+    }
+
     #[tokio::test]
     async fn summary_is_safe_default_and_explicit_auto_falls_back_when_needed() {
         for (vision, window, method) in [
@@ -2723,7 +3092,13 @@ mod tests {
                 .compact(&mut session, &RunControl::new())
                 .await
                 .unwrap();
-            let prior = session.compaction_plan(0).unwrap().previous.into_iter().next().unwrap();
+            let prior = session
+                .compaction_plan(0)
+                .unwrap()
+                .previous
+                .into_iter()
+                .next()
+                .unwrap();
             assert!(prior.archive.is_none());
             assert_eq!(prior.summary, "child output");
         }
@@ -2879,7 +3254,13 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(*models.lock().unwrap(), vec![expected.to_string()]);
-            let prior = session.compaction_plan(0).unwrap().previous.into_iter().next().unwrap();
+            let prior = session
+                .compaction_plan(0)
+                .unwrap()
+                .previous
+                .into_iter()
+                .next()
+                .unwrap();
             assert_eq!(prior.summary, "compactor summary");
         }
     }
@@ -2947,7 +3328,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*models.lock().unwrap(), vec!["mock/summarizer".to_string()]);
-        let prior = session.compaction_plan(0).unwrap().previous.into_iter().next().unwrap();
+        let prior = session
+            .compaction_plan(0)
+            .unwrap()
+            .previous
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!(prior.summary, "compactor summary");
     }
 
@@ -3030,7 +3417,13 @@ mod tests {
                 .compact(&mut session, &RunControl::new())
                 .await
                 .unwrap();
-            let prior = session.compaction_plan(0).unwrap().previous.into_iter().next().unwrap();
+            let prior = session
+                .compaction_plan(0)
+                .unwrap()
+                .previous
+                .into_iter()
+                .next()
+                .unwrap();
             if expects_summary {
                 assert_eq!(*models.lock().unwrap(), vec!["mock/textonly".to_string()]);
                 assert!(prior.archive.is_none());

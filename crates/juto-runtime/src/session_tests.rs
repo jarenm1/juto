@@ -443,12 +443,12 @@ fn second_compaction_span_starts_at_the_previous_first_kept_message() {
     s.append(user("q7")).unwrap();
     s.append(user("q8")).unwrap();
     let ids = message_ids(&s);
-    // The first compaction kept q5 onward, so the second replaces q5 through q7.
-    // Its own compaction entry sits between q6 and q7 on the path and is skipped.
+    // The first compaction covers q1 through q4 and keeps q5 and q6 raw. The second
+    // supersedes it: its node spans q1 through q7 and folds the first summary in.
     s.compact("second".into(), None, 1).unwrap();
     assert_eq!(
         latest_span(&s),
-        (Some(ids[4].clone()), Some(ids[6].clone()))
+        (Some(ids[0].clone()), Some(ids[6].clone()))
     );
     assert_eq!(span_texts(&s, &ids[4], &ids[6]), ["q5", "q6", "q7"]);
     assert_eq!(span_texts(&s, &ids[4], &ids[4]), ["q5"]);
@@ -483,14 +483,14 @@ fn entries_in_span_rejects_reversed_unknown_and_off_path_boundaries() {
 }
 
 #[test]
-fn compaction_that_replaces_nothing_records_no_span() {
+fn compaction_that_replaces_nothing_records_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
     s.append(user("q1")).unwrap();
     s.append(user("q2")).unwrap();
     s.compact("summary".into(), None, 2).unwrap();
-    assert_eq!(latest_span(&s), (None, None));
-    assert_eq!(s.messages().unwrap().len(), 3);
+    assert!(s.path_view().unwrap().nodes.is_empty());
+    assert_eq!(s.messages().unwrap().len(), 2);
 }
 
 #[test]
@@ -505,7 +505,7 @@ fn journal_without_span_fields_renders_the_same_messages() {
     let expected: Vec<String> = s.messages().unwrap().iter().map(Message::text).collect();
     let path = s.path().to_path_buf();
     drop(s);
-    // Rewrite the journal as the previous build wrote it: compaction records carry no span.
+    // Rewrite the journal as the previous build wrote it: no span and no level.
     let legacy: String = std::fs::read_to_string(&path)
         .unwrap()
         .lines()
@@ -514,16 +514,77 @@ fn journal_without_span_fields_renders_the_same_messages() {
             if let Some(fields) = record.as_object_mut() {
                 fields.remove("span_start_id");
                 fields.remove("span_end_id");
+                fields.remove("level");
             }
             format!("{record}\n")
         })
         .collect();
     std::fs::write(&path, &legacy).unwrap();
     assert!(!legacy.contains("span_"));
+    assert!(!legacy.contains("\"level\""));
     let s = Session::open(&path).unwrap();
     let actual: Vec<String> = s.messages().unwrap().iter().map(Message::text).collect();
     assert_eq!(actual, expected);
     assert_eq!(latest_span(&s), (None, None));
+    // The spanless legacy node is a level-0 node over the messages it replaced.
+    let view = s.path_view().unwrap();
+    assert_eq!(view.nodes.len(), 1);
+    assert_eq!(view.nodes[0].level, 0);
+    assert_eq!((view.nodes[0].start, view.nodes[0].end), (0, 2));
+}
+
+#[test]
+fn adjacent_nodes_merge_into_one_level_one_node_over_their_union() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    s.append(user("m1")).unwrap();
+    s.append(user("m2")).unwrap();
+    // Node A covers m1 and keeps m2 raw.
+    let plan = s.raw_summary_plan(1).unwrap().unwrap();
+    s.append_node(plan.into_node("A".into(), None)).unwrap();
+    s.append(user("m3")).unwrap();
+    s.append(user("m4")).unwrap();
+    // Node B covers m2 and m3 and keeps m4 raw.
+    let plan = s.raw_summary_plan(1).unwrap().unwrap();
+    s.append_node(plan.into_node("B".into(), None)).unwrap();
+    assert_eq!(s.path_view().unwrap().nodes.len(), 2);
+
+    let plan = s.merge_plan().unwrap().unwrap();
+    assert_eq!(plan.level, 1);
+    s.append_node(plan.into_node("AB".into(), None)).unwrap();
+
+    let view = s.path_view().unwrap();
+    assert_eq!(view.nodes.len(), 1);
+    assert_eq!(view.nodes[0].level, 1);
+    assert_eq!((view.nodes[0].start, view.nodes[0].end), (0, 3));
+    assert_eq!(view.nodes[0].summary, "AB");
+    let (start, end) = latest_span(&s);
+    assert_eq!(
+        span_texts(&s, start.as_deref().unwrap(), end.as_deref().unwrap()),
+        ["m1", "m2", "m3"]
+    );
+}
+
+#[test]
+fn node_with_reversed_or_unknown_span_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    for text in ["m1", "m2", "m3"] {
+        s.append(user(text)).unwrap();
+    }
+    let ids = message_ids(&s);
+    let plan = s.raw_summary_plan(1).unwrap().unwrap();
+    let mut node = plan.into_node("bad".into(), None);
+    node.span_start_id = ids[1].clone();
+    node.span_end_id = ids[0].clone();
+    assert!(s.append_node(node).is_err());
+
+    let plan = s.raw_summary_plan(1).unwrap().unwrap();
+    let mut node = plan.into_node("bad".into(), None);
+    node.span_end_id = "no-such-entry".into();
+    assert!(s.append_node(node).is_err());
+
+    assert!(s.path_view().unwrap().nodes.is_empty());
 }
 
 #[test]
