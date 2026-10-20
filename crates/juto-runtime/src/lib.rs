@@ -12,6 +12,7 @@ mod contextual;
 pub mod decisions;
 pub mod desktop_artifact;
 pub mod git_transfer;
+pub mod github;
 pub mod jobs;
 mod main_inbox_store;
 mod main_report;
