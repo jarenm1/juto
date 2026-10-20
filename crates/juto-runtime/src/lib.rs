@@ -2005,7 +2005,7 @@ impl Tool for SubagentReleaseTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "subagent_release".into(),
-            description: "Release a finished focus thread's isolated workspace. Afterwards its follow-up and transcript are refused. A running or queued thread cannot be released. Its changes stay kept as the checkpoint `subagent/<id>` until `subagent_join` takes them or `subagent_drop` removes them.".into(),
+            description: "Release a finished subagent's isolated workspace. Afterwards its follow-up and transcript are refused. A subagent with no isolated workspace is left unchanged. A running or queued subagent cannot be released. Its changes stay kept as the checkpoint `subagent/<id>` until `subagent_join` takes them or `subagent_drop` removes them.".into(),
             parameters: json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}),
         }
     }
