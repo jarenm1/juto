@@ -7,8 +7,8 @@ use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use juto_agent::{AgentEvent, RunControl};
 use juto_runtime::{
-    ApprovalRequest, ChannelApprovalHandler, EntryKind, Runtime, RuntimeConfig, Session,
-    SubagentEvent,
+    ApprovalRequest, ChannelApprovalHandler, EntryKind, MainSession, Runtime, RuntimeConfig,
+    Session, SubagentEvent,
 };
 use std::{
     collections::HashMap,
@@ -418,6 +418,13 @@ impl Daemon {
                 self.view(session)
             }
             Request::OpenSession { session_id } => self.view(self.open(&session_id)?),
+            Request::Timeline { session_id } => {
+                let session = self.open(&session_id)?;
+                let main = MainSession::open(session.path()).map_err(failed)?;
+                Ok(Reply::Timeline {
+                    items: main.timeline().map_err(failed)?,
+                })
+            }
             Request::OpenSessionPath { path } => {
                 let session = Session::open(&path).map_err(failed)?;
                 self.register(&session)?;
