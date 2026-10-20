@@ -489,7 +489,7 @@ impl Daemon {
                     .runtime
                     .run_unattended(&mut session, text, agent_tx, control, None)
                     .await
-                    .map(|outcome| match outcome {
+                    .map(|unattended| match unattended.outcome {
                         UnattendedOutcome::Finished(run) => (Some(run.stop_reason), None),
                         UnattendedOutcome::Blocked(decision) => (None, Some(decision)),
                     });

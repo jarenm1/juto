@@ -653,7 +653,7 @@ impl Runtime {
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
         job_id: Option<String>,
-    ) -> Result<UnattendedOutcome> {
+    ) -> Result<UnattendedRun> {
         let scope: SharedScope = Arc::new(UnattendedScope::new(
             &self.inner.data_dir,
             session.header().id.clone(),
@@ -693,17 +693,29 @@ impl Runtime {
             run_children.clone(),
         ));
         let outcome = self
-            .run_depth(session, prompt.into(), events, control, placement, manager)
+            .run_depth(
+                session,
+                prompt.into(),
+                events,
+                control,
+                placement,
+                manager.clone(),
+            )
             .await;
-        forwarder.abort();
-        stop_children.abort();
         if stopped.is_cancelled() {
             run_children.cancel();
         }
-        match scope.take_blocked() {
-            Some(decision) => Ok(UnattendedOutcome::Blocked(decision)),
-            None => outcome.map(UnattendedOutcome::Finished),
-        }
+        // The run's own turns can end while children it started still run. Settle
+        // them before the run reports, so a job never settles, or gets archived,
+        // while one of them runs.
+        let children = manager.settle_all().await;
+        forwarder.abort();
+        stop_children.abort();
+        let outcome = match scope.take_blocked() {
+            Some(decision) => UnattendedOutcome::Blocked(decision),
+            None => UnattendedOutcome::Finished(outcome?),
+        };
+        Ok(UnattendedRun { outcome, children })
     }
 
     async fn run_depth(
@@ -1228,6 +1240,13 @@ pub enum UnattendedOutcome {
     Finished(RunOutcome),
     /// A tool call needs an operator decision. The run stopped before that call.
     Blocked(Decision),
+}
+
+/// An unattended run's outcome, with the settled outcome of every child it started.
+pub struct UnattendedRun {
+    pub outcome: UnattendedOutcome,
+    /// Every child the run started, each in a terminal state.
+    pub children: Vec<subagents::ChildOutcome>,
 }
 
 /// The tier an unattended run executes under. Unattended runs are always sandboxed
@@ -4746,6 +4765,7 @@ mod tests {
             )
             .await
             .expect("first run")
+            .outcome
         {
             UnattendedOutcome::Blocked(decision) => decision,
             UnattendedOutcome::Finished(_) => {
@@ -4769,6 +4789,7 @@ mod tests {
             )
             .await
             .expect("second run")
+            .outcome
         {
             UnattendedOutcome::Finished(_) => {}
             UnattendedOutcome::Blocked(_) => panic!("the approved action must not block again"),
@@ -4808,6 +4829,7 @@ mod tests {
             )
             .await
             .expect("first run")
+            .outcome
         {
             UnattendedOutcome::Blocked(decision) => decision,
             UnattendedOutcome::Finished(_) => panic!("publish must block without a grant"),
@@ -4826,6 +4848,7 @@ mod tests {
             )
             .await
             .expect("second run")
+            .outcome
         {
             UnattendedOutcome::Blocked(decision) => {
                 assert_ne!(
