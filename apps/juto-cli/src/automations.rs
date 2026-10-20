@@ -11,6 +11,7 @@ use juto_runtime::automations::{
 };
 use juto_runtime::broker::Priority;
 use juto_runtime::jobs::{Job, JobBudget, JobContract};
+use juto_runtime::tier::{ExecutionTier, PermissionProfile};
 
 #[derive(Subcommand)]
 pub enum AutomationsCommand {
@@ -52,6 +53,12 @@ pub enum AutomationsCommand {
         /// Pin this model selector on each occurrence's session. Unset uses the daemon's model.
         #[arg(long)]
         model_pin: Option<String>,
+        /// Execution tier of each occurrence's job: `untrusted` or `workspace`. Unset uses `workspace`.
+        #[arg(long, value_enum)]
+        tier: Option<TierArg>,
+        /// Permission profile of each occurrence's job. Unset uses `unattended`.
+        #[arg(long, value_enum)]
+        permission_profile: Option<PermissionArg>,
     },
     /// List automations, oldest first.
     List,
@@ -77,6 +84,36 @@ pub enum OverlapArg {
     Queue,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+pub enum TierArg {
+    Untrusted,
+    Workspace,
+}
+
+impl From<TierArg> for ExecutionTier {
+    fn from(tier: TierArg) -> Self {
+        match tier {
+            TierArg::Untrusted => Self::Untrusted,
+            TierArg::Workspace => Self::Workspace,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum PermissionArg {
+    ReadOnly,
+    Unattended,
+}
+
+impl From<PermissionArg> for PermissionProfile {
+    fn from(profile: PermissionArg) -> Self {
+        match profile {
+            PermissionArg::ReadOnly => Self::ReadOnly,
+            PermissionArg::Unattended => Self::Unattended,
+        }
+    }
+}
+
 pub async fn run(cwd: &Path, command: &AutomationsCommand, json: bool) -> Result<()> {
     let client = Client::connect(cwd)
         .await
@@ -95,6 +132,8 @@ pub async fn run(cwd: &Path, command: &AutomationsCommand, json: bool) -> Result
             background,
             overlap,
             model_pin,
+            tier,
+            permission_profile,
         } => {
             let spec = AutomationSpec {
                 prompt: prompt.clone(),
@@ -116,6 +155,8 @@ pub async fn run(cwd: &Path, command: &AutomationsCommand, json: bool) -> Result
                     OverlapArg::Skip => Overlap::Skip,
                     OverlapArg::Queue => Overlap::Queue,
                 }),
+                tier: tier.map(ExecutionTier::from),
+                permission: permission_profile.map(PermissionProfile::from),
             };
             print_automation(
                 &expect_automation(client.request(Request::CreateAutomation { spec }).await?)?,
@@ -281,10 +322,15 @@ fn summary(automation: &Automation) -> String {
         Overlap::Skip => "skip",
         Overlap::Queue => "queue",
     };
+    let profile = match automation.permission {
+        PermissionProfile::ReadOnly => "read-only",
+        PermissionProfile::Unattended => "unattended",
+    };
     format!(
-        "{}  every:{}s  {state}  overlap:{overlap}  next:{}  {}",
+        "{}  every:{}s  {state}  overlap:{overlap}  tier:{}  profile:{profile}  next:{}  {}",
         automation.id,
         automation.every_secs,
+        automation.tier.as_str(),
         automation.next_instant_ms,
         automation.prompt.lines().next().unwrap_or("")
     )
