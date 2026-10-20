@@ -778,9 +778,12 @@ impl Runtime {
         if session.messages()?.is_empty() {
             bail!("cannot compact an empty session");
         }
-        let selector = session
-            .current_model()
-            .unwrap_or_else(|| self.config().model);
+        let selector = match self.config().compactor {
+            Some(compactor) => compactor,
+            None => session
+                .current_model()
+                .unwrap_or_else(|| self.config().model),
+        };
         let (model, mut options) = self.resolve_model(&selector)?;
         let method = self.config().compaction_method;
         let accepts_images = model.input.iter().any(|input| input == "image");
@@ -2556,6 +2559,89 @@ mod tests {
         assert!(
             matches!(&rebuilt[0], Message::User { content, .. } if content.iter().any(|b| matches!(b, ContentBlock::Image { .. })))
         );
+    }
+
+    /// Records the model each provider call streams to, and answers with a
+    /// fixed summary so compaction completes.
+    struct RecordingProvider {
+        models: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecordingProvider {
+        async fn stream(
+            &self,
+            model: &Model,
+            _: &Context,
+            _: &StreamOptions,
+            _: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let selector = format!("{}/{}", model.provider, model.id);
+            self.models.lock().unwrap().push(selector.clone());
+            let message = AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: "compactor summary".to_string(),
+                }],
+                api: "mock".to_string(),
+                provider: model.provider.clone(),
+                model: selector,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                timestamp: timestamp_ms(),
+                response_id: None,
+                error: None,
+            };
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                ProviderEvent::Done { message },
+            )])))
+        }
+    }
+
+    /// `compactor` picks the model that writes the summary; unset keeps
+    /// compacting with the session's current model.
+    #[tokio::test]
+    async fn compaction_uses_configured_compactor_model() {
+        for (compactor, expected) in [
+            (None, "mock/test"),
+            (Some("mock/summarizer"), "mock/summarizer"),
+        ] {
+            let root = tempdir().unwrap();
+            let mut config = mock_config();
+            let mut summarizer = config.custom_models[0].clone();
+            summarizer.id = "summarizer".to_string();
+            config.custom_models.push(summarizer);
+            config.keep_recent_messages = 1;
+            config.compactor = compactor.map(str::to_string);
+            let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let runtime = runtime_with(
+                root.path(),
+                &root.path().join("data"),
+                config,
+                Arc::new(RecordingProvider {
+                    models: models.clone(),
+                }),
+            );
+            let mut session = Session::create(&root.path().join("sessions"), root.path()).unwrap();
+            session
+                .append(EntryKind::ModelChange {
+                    model: "mock/test".to_string(),
+                })
+                .unwrap();
+            for text in ["Keep this request.", "Continue."] {
+                session
+                    .append(EntryKind::Message {
+                        message: Message::user(text),
+                    })
+                    .unwrap();
+            }
+            runtime
+                .compact(&mut session, &RunControl::new())
+                .await
+                .unwrap();
+            assert_eq!(*models.lock().unwrap(), vec![expected.to_string()]);
+            let prior = session.compaction_plan(0).unwrap().previous.unwrap();
+            assert_eq!(prior.summary, "compactor summary");
+        }
     }
 
     /// Provision a real fork workspace for `id` under `data_dir`.
