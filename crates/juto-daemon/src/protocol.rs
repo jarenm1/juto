@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use juto_agent::{AgentEvent, ToolTier};
 use juto_ai::{Message, StopReason, ToolCall};
 use juto_catalog::Model;
+use juto_runtime::subagents::MainMessage;
 use juto_runtime::{RuntimeConfig, SessionEntry, SubagentEvent, SubagentSummary, ViewerRoute};
 use serde::{Deserialize, Serialize};
 
@@ -188,6 +189,14 @@ pub enum Request {
     ResolveDesktopArtifact {
         artifact: serde_json::Value,
     },
+
+    // ---- inbox ----
+    /// Lists the notices waiting in the main inbox for the user.
+    InboxMessages,
+    /// Dismisses one notice from the user's inbox. The agent keeps its copy.
+    InboxDismiss {
+        message: MainMessage,
+    },
 }
 
 /// Actions on one subagent.
@@ -236,6 +245,9 @@ pub enum Reply {
         login_id: u64,
     },
     DesktopEnvironment(DesktopEnvironmentInfo),
+    InboxMessages {
+        messages: Vec<MainMessage>,
+    },
     /// `None` when the artifact is not a desktop artifact this daemon can route.
     Route(Option<ViewerRoute>),
     /// Used by requests that succeed without data.
@@ -304,6 +316,11 @@ pub struct DesktopEnvironmentInfo {
     pub env_id: String,
     pub width: u32,
     pub height: u32,
+    /// Grant for the viewer principal on this environment; a desktop artifact
+    /// for it carries this id.
+    pub grant_id: String,
+    /// Host the environment runs on, matching the artifact's `host_id`.
+    pub host_id: String,
 }
 
 /// Pushed events.
@@ -324,6 +341,8 @@ pub enum ServerEvent {
     Config {
         config: RuntimeConfig,
     },
+    /// The user's inbox changed; fetch it with `Request::InboxMessages`.
+    Inbox,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

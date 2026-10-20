@@ -10,6 +10,9 @@ use juto_ai::{
     ProviderEvent, ProviderStream, StopReason, StreamOptions, Usage, timestamp_ms,
 };
 use juto_catalog::{Model, ModelCost};
+use juto_runtime::ViewerRoute;
+use juto_runtime::subagents::{MainMessage, MainMessageKind};
+use juto_runtime::tools::{DESKTOP_SESSION_ARTIFACT_VERSION, DesktopSessionArtifact};
 use juto_runtime::{EntryKind, SessionEntry, TaskSpec};
 use serde_json::Value;
 use tokio::{
@@ -437,4 +440,80 @@ async fn child_completion_starts_a_run_while_no_client_is_prompting() {
         journal_text.contains(&format!("[subagent {child} Completed]")),
         "the wake run must carry the child's completion"
     );
+}
+
+#[tokio::test]
+async fn inbox_notices_are_announced_listed_and_dismissed() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon(root.path(), ScriptedProvider::new(false));
+    let mut rx = attach(&daemon);
+    tokio::spawn(inbox_loop(daemon.clone()));
+
+    let inbox = daemon.runtime.subagent_manager().main_inbox();
+    inbox.push(MainMessage {
+        from: "child-1".to_string(),
+        name: None,
+        kind: MainMessageKind::Completed,
+        body: "done".to_string(),
+        digest_of: None,
+    });
+    assert!(matches!(rx.recv().await, Some(ServerEvent::Inbox)));
+
+    let Reply::InboxMessages { messages } = daemon.request(Request::InboxMessages).await.unwrap()
+    else {
+        panic!("expected the inbox");
+    };
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].body, "done");
+
+    daemon
+        .request(Request::InboxDismiss {
+            message: messages[0].clone(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(rx.recv().await, Some(ServerEvent::Inbox)));
+    let Reply::InboxMessages { messages } = daemon.request(Request::InboxMessages).await.unwrap()
+    else {
+        panic!("expected the inbox");
+    };
+    assert!(messages.is_empty(), "a dismissed notice must not be listed");
+}
+
+#[tokio::test]
+async fn desktop_open_grants_the_session_viewer_and_the_artifact_resolves() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon(root.path(), ScriptedProvider::new(false));
+    let Reply::DesktopEnvironment(env) = daemon
+        .request(Request::DesktopOpen {
+            argv: vec!["true".to_string()],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("expected a desktop environment");
+    };
+    let artifact = DesktopSessionArtifact {
+        version: DESKTOP_SESSION_ARTIFACT_VERSION,
+        artifact_id: format!("dev-{}", env.env_id),
+        title: "Developer compositor session".to_string(),
+        host_id: env.host_id.clone(),
+        environment_id: env.env_id.clone(),
+        grant_id: env.grant_id.clone(),
+    };
+    let ViewerRoute::Local { env_id, .. } = daemon
+        .runtime
+        .desktop_artifact_resolver()
+        .resolve(juto_runtime::SESSION_VIEWER_PRINCIPAL, &artifact)
+        .unwrap()
+    else {
+        panic!("the granted artifact must resolve to a local route");
+    };
+    assert_eq!(env_id, env.env_id);
+    daemon
+        .request(Request::DesktopDestroy {
+            env_id: env.env_id.clone(),
+        })
+        .await
+        .unwrap();
 }
