@@ -29,6 +29,7 @@ fn candidate(kind: GithubItemKind, repo: &str, number: u64, updated_at: &str) ->
         url: format!("https://github.com/{repo}/issues/{number}"),
         labels: Vec::new(),
         assignees: Vec::new(),
+        author_association: "MEMBER".to_owned(),
         head_sha: match kind {
             GithubItemKind::Issue => None,
             GithubItemKind::PullRequest => Some("a".repeat(40)),
@@ -53,9 +54,48 @@ fn watch(labels: &[&str], assignees: &[&str]) -> GithubWatch {
 #[test]
 fn issue_key_changes_with_each_revision() {
     let first = candidate(GithubItemKind::Issue, REPO, 7, T1);
-    let second = candidate(GithubItemKind::Issue, REPO, 7, T2);
+    let mut second = candidate(GithubItemKind::Issue, REPO, 7, T2);
+    second.body = Some("edited".to_owned());
     assert_ne!(event_key(&first), event_key(&second));
     assert_eq!(event_key(&first), event_key(&first.clone()));
+}
+
+#[test]
+fn an_issue_revision_is_its_text_not_its_timestamp() {
+    let first = candidate(GithubItemKind::Issue, REPO, 7, T1);
+    let later = candidate(GithubItemKind::Issue, REPO, 7, T3);
+    assert_eq!(event_key(&first), event_key(&later));
+}
+
+#[test]
+fn a_repository_name_is_read_from_the_common_github_remote_forms() {
+    assert_eq!(
+        repo_from_remote("https://github.com/Acme/App.git").as_deref(),
+        Some("acme/app")
+    );
+    assert_eq!(
+        repo_from_remote("git@github.com:acme/app.git\n").as_deref(),
+        Some("acme/app")
+    );
+    assert_eq!(
+        repo_from_remote("ssh://git@github.com/acme/app").as_deref(),
+        Some("acme/app")
+    );
+    assert_eq!(repo_from_remote("/srv/git/app"), None);
+}
+
+#[test]
+fn a_github_job_has_a_spend_cap() {
+    let spec = job_spec(&candidate(GithubItemKind::Issue, REPO, 14, T1), "key");
+    assert_eq!(spec.budget.max_spend, Some(JOB_MAX_SPEND));
+}
+
+#[test]
+fn a_watch_id_is_sixteen_hex_digits_after_gh() {
+    assert!(valid_watch_id(&watch_id(REPO)));
+    assert!(!valid_watch_id("../victim"));
+    assert!(!valid_watch_id("gh-0123456789ABCDEF"));
+    assert!(!valid_watch_id("gh-0123456789abcde/"));
 }
 
 #[test]
@@ -73,10 +113,9 @@ fn job_id_is_derived_from_the_key() {
     let key = event_key(&candidate(GithubItemKind::Issue, REPO, 7, T1));
     assert_eq!(job_id(&key), job_id(&key));
     assert!(job_id(&key).starts_with("gh-"));
-    assert_ne!(
-        job_id(&key),
-        job_id(&event_key(&candidate(GithubItemKind::Issue, REPO, 7, T2)))
-    );
+    let mut edited = candidate(GithubItemKind::Issue, REPO, 7, T1);
+    edited.body = Some("edited".to_owned());
+    assert_ne!(job_id(&key), job_id(&event_key(&edited)));
 }
 
 #[test]
@@ -265,6 +304,7 @@ fn issue(
         "labels": labels.iter().map(|name| json!({ "name": name })).collect::<Vec<_>>(),
         "assignees": assignees.iter().map(|login| json!({ "login": login })).collect::<Vec<_>>(),
         "repository_url": format!("https://api.github.com/repos/{repo}"),
+        "author_association": "MEMBER",
     })
 }
 
@@ -281,6 +321,7 @@ fn pull(number: u64, repo: &str, sha: &str, updated: &str) -> Value {
         "assignees": [],
         "head": { "sha": sha },
         "base": { "repo": { "full_name": repo } },
+        "author_association": "MEMBER",
     })
 }
 
@@ -290,11 +331,22 @@ struct Harness {
     data: std::path::PathBuf,
 }
 
+fn set_origin(cwd: &Path, url: &str) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["remote", "add", "origin", url])
+        .status()
+        .expect("git remote add");
+    assert!(status.success(), "git remote add failed");
+}
+
 fn harness() -> Harness {
     let dir = tempdir().expect("tempdir");
     let cwd = dir.path().join("repo");
     let data = dir.path().join("data");
     native_repo(&cwd);
+    set_origin(&cwd, "https://github.com/acme/app.git");
     Harness {
         _dir: dir,
         cwd,
@@ -606,4 +658,115 @@ async fn the_token_is_sent_only_as_a_bearer_header() {
         std::fs::read_to_string(watch_file(&h.data, &watch_id(REPO))).expect("watch file");
     assert!(!events.contains(FIXTURE_TOKEN));
     assert!(!watches.contains(FIXTURE_TOKEN));
+}
+
+#[tokio::test]
+async fn an_issue_edit_that_keeps_its_text_starts_no_second_job() {
+    let h = harness();
+    let fixture = Fixture::start().await;
+    let rt = open(&h);
+    store_token(&rt);
+    rt.create_github_watch(GithubWatchSpec {
+        repo: REPO.into(),
+        labels: vec![],
+        assignees: vec![],
+    })
+    .expect("watch");
+    rt.poll_github(&fixture.base).await.expect("baseline");
+    fixture.set(
+        "/repos/acme/app/issues",
+        json!([issue(9, REPO, T2, &[], &[], "same text")]),
+    );
+    rt.poll_github(&fixture.base).await.expect("first revision");
+    // A label bumps updated_at without changing the title or body.
+    fixture.set(
+        "/repos/acme/app/issues",
+        json!([issue(9, REPO, T3, &["bug"], &[], "same text")]),
+    );
+    rt.poll_github(&fixture.base).await.expect("timestamp edit");
+    assert_eq!(job_ids(&rt).len(), 1, "a timestamp-only edit starts no job");
+}
+
+#[tokio::test]
+async fn an_item_from_a_non_member_is_rejected_without_a_job() {
+    let h = harness();
+    let fixture = Fixture::start().await;
+    let rt = open(&h);
+    store_token(&rt);
+    rt.create_github_watch(GithubWatchSpec {
+        repo: REPO.into(),
+        labels: vec![],
+        assignees: vec![],
+    })
+    .expect("watch");
+    rt.poll_github(&fixture.base).await.expect("baseline");
+    let mut item = issue(13, REPO, T2, &[], &[], "from outside");
+    item["author_association"] = json!("NONE");
+    fixture.set("/repos/acme/app/issues", json!([item]));
+    let report = rt.poll_github(&fixture.base).await.expect("poll");
+    assert!(job_ids(&rt).is_empty(), "a non-member's item starts no job");
+    assert_eq!(report.records.len(), 1);
+    assert!(matches!(
+        report.records[0].outcome,
+        GithubOutcome::Rejected { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_watch_needs_a_checkout_whose_origin_is_the_watched_repo() {
+    let h = harness();
+    let rt = open(&h);
+    let error = rt
+        .create_github_watch(GithubWatchSpec {
+            repo: "other/thing".into(),
+            labels: vec![],
+            assignees: vec![],
+        })
+        .expect_err("a foreign checkout must refuse the watch");
+    assert!(matches!(error, GithubError::Invalid(_)), "got {error}");
+    assert!(rt.list_github_watches().expect("list").is_empty());
+
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&h.cwd)
+        .args(["remote", "remove", "origin"])
+        .status()
+        .expect("remove origin");
+    let error = rt
+        .create_github_watch(GithubWatchSpec {
+            repo: REPO.into(),
+            labels: vec![],
+            assignees: vec![],
+        })
+        .expect_err("a checkout without origin must refuse the watch");
+    assert!(matches!(error, GithubError::Invalid(_)), "got {error}");
+}
+
+#[tokio::test]
+async fn a_watch_id_cannot_name_a_file_outside_the_watches_directory() {
+    let h = harness();
+    let rt = open(&h);
+    let victim = h.data.join("github").join("victim.json");
+    std::fs::create_dir_all(h.data.join("github").join("watches")).expect("watches dir");
+    std::fs::write(&victim, "{}").expect("victim");
+    let error = rt
+        .delete_github_watch("../victim")
+        .expect_err("a traversal id must be refused");
+    assert!(matches!(error, GithubError::Invalid(_)), "got {error}");
+    assert!(victim.exists(), "the file outside the watches survives");
+}
+
+#[tokio::test]
+async fn a_watch_file_whose_id_does_not_match_its_name_is_refused() {
+    let h = harness();
+    let rt = open(&h);
+    let mut forged = watch(&[], &[]);
+    forged.id = "../victim".to_owned();
+    let path = watch_file(&h.data, &watch_id(REPO));
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+    std::fs::write(&path, serde_json::to_vec(&forged).expect("json")).expect("write");
+    let error = rt
+        .list_github_watches()
+        .expect_err("a forged id must be refused");
+    assert!(matches!(error, GithubError::Failed(_)), "got {error}");
 }
