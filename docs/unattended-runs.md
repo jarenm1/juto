@@ -283,8 +283,13 @@ is no CLI command for them yet. The daemon polls every 60 seconds, and
   turns, a 2.0 USD spend cap that includes child runs, and a required
   `PROPOSAL.md` artifact. The item text appears in the prompt only inside
   `<untrusted_github_event>` tags, and the event cannot change the tier or
-  profile. Publishing a proposal is not part of the event: it needs an operator
-  decision.
+  profile. The prompt states that the workspace is a copy of the daemon's
+  checkout, which may be at a different commit than the item. The job's `bash`
+  runs in the `untrusted` filesystem sandbox (writes and reads limited to the
+  workspace) with package-mirror network access only. The nix daemon is reachable
+  from that sandbox, and `untrusted` output is not restricted, so injected text
+  has tool authority inside the sandbox. Nothing in the daemon publishes the
+  proposal; an operator decision is needed for that.
 - Watch ids: `gh-` plus 16 lowercase hex digits. Deleting a watch and listing
   watches reject any other id, and a watch file whose id does not match its file
   name is refused.
