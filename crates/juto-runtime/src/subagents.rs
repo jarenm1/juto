@@ -656,11 +656,19 @@ impl MainInbox {
         taken.into_iter().map(|queued| queued.message).collect()
     }
 
-    /// Remove the oldest message's origin group: every pending message that
-    /// shares its origin, in arrival order. Other origins stay queued.
-    pub fn take_next_group(&self) -> Option<(Option<String>, Vec<MainMessage>)> {
+    /// Remove the oldest origin group that `deliverable` accepts: every pending
+    /// message sharing its origin, in arrival order. Groups it rejects, and the
+    /// groups behind the taken one, stay queued.
+    pub fn take_next_group(
+        &self,
+        deliverable: impl Fn(Option<&str>) -> bool,
+    ) -> Option<(Option<String>, Vec<MainMessage>)> {
         let mut guard = self.messages.lock().expect("main inbox poisoned");
-        let origin = guard.first()?.origin.clone();
+        let origin = guard
+            .iter()
+            .find(|queued| deliverable(queued.origin.as_deref()))?
+            .origin
+            .clone();
         let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *guard)
             .into_iter()
             .partition(|queued| queued.origin == origin);
@@ -3628,11 +3636,11 @@ mod tests {
         assert_eq!(bodies, ["b1", "anyone"]);
 
         // Waking idle threads takes one origin group at a time, oldest first.
-        let (origin, group) = inbox.take_next_group().expect("thread a group");
+        let (origin, group) = inbox.take_next_group(|_| true).expect("thread a group");
         assert_eq!(origin.as_deref(), Some("thread-a"));
         let bodies: Vec<String> = group.into_iter().map(|m| m.body).collect();
         assert_eq!(bodies, ["a1", "a2"]);
-        assert!(inbox.take_next_group().is_none());
+        assert!(inbox.take_next_group(|_| true).is_none());
     }
 
     #[tokio::test]
