@@ -348,6 +348,7 @@ fn compaction_span_fields_round_trip_and_default_to_none_in_old_journals() {
         span_start_id: Some("start".into()),
         span_end_id: Some("end".into()),
         archive: None,
+        level: 1,
     };
     let json = serde_json::to_string(&kind).unwrap();
     let back: EntryKind = serde_json::from_str(&json).unwrap();
@@ -357,6 +358,7 @@ fn compaction_span_fields_round_trip_and_default_to_none_in_old_journals() {
         span_start_id,
         span_end_id,
         archive,
+        level,
     } = back
     else {
         panic!("compaction round trip changed the entry kind");
@@ -365,6 +367,7 @@ fn compaction_span_fields_round_trip_and_default_to_none_in_old_journals() {
     assert_eq!(first_kept_id.as_deref(), Some("kept"));
     assert_eq!(span_start_id.as_deref(), Some("start"));
     assert_eq!(span_end_id.as_deref(), Some("end"));
+    assert_eq!(level, 1);
     assert!(archive.is_none());
 
     let old: EntryKind =
@@ -518,7 +521,7 @@ fn compaction_that_keeps_nothing_replaces_the_whole_path_with_its_span() {
 }
 
 #[test]
-fn second_compaction_after_keep_nothing_starts_at_first_visible_message() {
+fn second_compaction_after_keep_nothing_replaces_the_whole_path() {
     let dir = tempfile::tempdir().unwrap();
     let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
     for text in ["q1", "q2", "q3"] {
@@ -540,15 +543,13 @@ fn second_compaction_after_keep_nothing_starts_at_first_visible_message() {
     }
     let ids = message_ids(&s);
     s.compact("second".into(), None, 1).unwrap();
-    // The first compaction kept nothing, so the second span starts at q4, the first
-    // visible message.
+    // The second compaction replaces the whole prefix, including the first summary:
+    // its span runs from q1 through q4, and only q5 stays visible.
     assert_eq!(
         latest_span(&s),
-        (Some(ids[3].clone()), Some(ids[3].clone()))
+        (Some(ids[0].clone()), Some(ids[3].clone()))
     );
-    assert_eq!(span_texts(&s, &ids[3], &ids[3]), ["q4"]);
-    // The first span (q1 through q3) stays disjoint from the second.
-    assert_eq!(span_texts(&s, &ids[0], &ids[2]), ["q1", "q2", "q3"]);
+    assert_eq!(span_texts(&s, &ids[0], &ids[3]), ["q1", "q2", "q3", "q4"]);
     // The second summary plus q5, the only message after its cut.
     assert_eq!(s.messages().unwrap().len(), 2);
 }
