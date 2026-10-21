@@ -669,7 +669,9 @@ async fn another_projects_automation_cannot_be_listed_toggled_or_deleted_here() 
     let runtime = runtime(&repo, &data, Arc::new(Answer("done")));
     let foreign = runtime.create_automation_at(spec(60), T0).expect("create");
     rewrite_record(&data, &foreign.id, "project", "/elsewhere".into());
-    let record = data.join("automations").join(format!("{}.json", foreign.id));
+    let record = data
+        .join("automations")
+        .join(format!("{}.json", foreign.id));
 
     assert!(
         runtime
@@ -697,7 +699,10 @@ async fn another_projects_automation_cannot_be_listed_toggled_or_deleted_here() 
     let stored: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&record).expect("read record"))
             .expect("parse record");
-    assert_eq!(stored["enabled"], true, "the refused toggle changes nothing");
+    assert_eq!(
+        stored["enabled"], true,
+        "the refused toggle changes nothing"
+    );
 }
 
 #[tokio::test]
@@ -715,6 +720,9 @@ async fn a_corrupt_record_does_not_hide_the_good_one_from_the_list() {
     let listed = runtime
         .list_automations()
         .expect("a corrupt record does not fail the list");
-    let ids: Vec<&str> = listed.iter().map(|automation| automation.id.as_str()).collect();
+    let ids: Vec<&str> = listed
+        .iter()
+        .map(|automation| automation.id.as_str())
+        .collect();
     assert_eq!(ids, [good.id.as_str()]);
 }
