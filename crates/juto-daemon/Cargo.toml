@@ -14,6 +14,7 @@ juto-ai = { workspace = true }
 juto-catalog = { workspace = true }
 juto-desktop = { workspace = true }
 juto-runtime = { workspace = true }
+object = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

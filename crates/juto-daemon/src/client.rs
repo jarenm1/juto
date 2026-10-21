@@ -15,7 +15,7 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::protocol::{
     ClientFrame, ErrorCode, HelloInfo, PROTOCOL_VERSION, Reply, Request, RpcError, ServerEvent,
-    ServerFrame, binary_id, paths,
+    ServerFrame, paths,
 };
 
 const CLIENT_NAME: &str = concat!("juto-daemon-client/", env!("CARGO_PKG_VERSION"));
@@ -341,12 +341,28 @@ async fn handshake(target: &Target) -> Result<(Wire, HelloInfo), ClientError> {
             ),
         )));
     }
-    let expected = binary_id(&target.binary).map_err(|e| {
-        ClientError::Start(format!(
-            "cannot read daemon binary {}: {e}",
-            target.binary.display()
-        ))
-    })?;
+    // Execute the resolved launcher: packaged installs may put a shell wrapper
+    // here, while Hello identifies the ELF image behind that wrapper.
+    let output = Command::new(&target.binary)
+        .arg("--build-id")
+        .output()
+        .await
+        .map_err(|e| {
+            ClientError::Start(format!(
+                "cannot identify daemon binary {}: {e}",
+                target.binary.display()
+            ))
+        })?;
+    let expected = String::from_utf8_lossy(&output.stdout);
+    let expected = expected.trim();
+    if !output.status.success() || expected.is_empty() {
+        return Err(ClientError::Start(format!(
+            "cannot identify daemon binary {} with --build-id ({}): {}; reinstall matching Juto binaries",
+            target.binary.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
     if info.binary_id != expected {
         return Err(ClientError::Start(format!(
             "juto daemon for {} was started from a different build than {}; run `systemctl --user stop {}` and retry",
@@ -468,6 +484,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
 
     use super::*;
@@ -479,7 +496,6 @@ mod tests {
         let (dir, listener, target) = scratch("pending");
 
         let server_dir = dir.clone();
-        let binary = target.binary.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let (read, mut write) = stream.into_split();
@@ -498,7 +514,7 @@ mod tests {
                         cwd: server_dir.clone(),
                         data_dir: server_dir.join("data"),
                         desktop_socket: server_dir.join("desktop.sock"),
-                        binary_id: binary_id(&binary).unwrap(),
+                        binary_id: "test-build".into(),
                     })),
                 },
             )
@@ -524,11 +540,8 @@ mod tests {
     #[tokio::test]
     async fn a_daemon_from_another_build_is_refused() {
         let (dir, listener, target) = scratch("stale");
-        // A different file has a different identity, as a rebuilt daemon binary does.
-        let stale = dir.join("juto-daemon-stale");
-        std::fs::write(&stale, b"older daemon").unwrap();
         let unit = target.unit.clone();
-        let hello = hello_info(&dir, binary_id(&stale).unwrap());
+        let hello = hello_info(&dir, "older-build".into());
         let server = tokio::spawn(serve_hello(listener, Ok(Reply::Hello(hello))));
 
         let err = match open(target).await {
@@ -549,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn a_daemon_from_the_same_build_is_reused() {
         let (dir, listener, target) = scratch("same");
-        let hello = hello_info(&dir, binary_id(&target.binary).unwrap());
+        let hello = hello_info(&dir, "test-build".into());
         let server = tokio::spawn(serve_hello(listener, Ok(Reply::Hello(hello))));
 
         let client = open(target).await.expect("the same build is accepted");
@@ -593,7 +606,8 @@ mod tests {
         let socket = dir.join("daemon.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let binary = dir.join(DAEMON_BINARY);
-        std::fs::write(&binary, b"daemon").unwrap();
+        std::fs::write(&binary, b"#!/bin/sh\nprintf '%s\\n' test-build\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         let target = Target {
             cwd: dir.clone(),
             socket,
