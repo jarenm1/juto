@@ -263,17 +263,31 @@ is no CLI command for them yet. The daemon polls every 60 seconds, and
 - Labels and assignees: an item must carry every configured label and at least
   one configured assignee. An empty list imposes no constraint. Only open items
   are considered. An item that fails these rules is skipped and not recorded.
-- Dedupe key: an issue is `issue:<repo>#<number>:<id>:<updated_at>`. A pull
-  request is `pull:<repo>#<number>:<head sha>`. The job id is `gh-` plus the
-  first 32 hex digits of SHA-256 of the key. A repeat finds the job already
-  stored (`JobError::Exists`) and starts nothing, including across restarts. A
-  newer revision has a new key and starts the next job.
+- Checkout: the job runs in the daemon's checkout, so a watch is accepted only
+  when that checkout's `origin` remote names the watched repository on
+  github.com. This is checked when the watch is created and before each poll.
+  A watch that fails the check is reported as a poll error and starts no jobs.
+  There is no per-watch checkout path.
+- Author gate: an item is accepted only when its `author_association` is
+  `OWNER`, `MEMBER`, or `COLLABORATOR`. Any other item is rejected and recorded,
+  and starts no job.
+- Dedupe key: an issue is `issue:<repo>#<number>:<id>:<sha256>`, where the hash
+  covers its title and body. An edit that keeps the title and body (a label, an
+  assignee, or a comment) starts no job. A pull request is
+  `pull:<repo>#<number>:<head sha>`. The job id is `gh-` plus the first 32 hex
+  digits of SHA-256 of the key. A repeat finds the job already stored
+  (`JobError::Exists`) and starts nothing, including across restarts. A newer
+  revision has a new key and starts the next job.
 - Baseline: a watch's first poll records what already exists and starts no jobs.
 - Job: `untrusted` tier, `unattended` profile, 1 attempt, 1800 s wall clock, 60
-  turns, and a required `PROPOSAL.md` artifact. The item text appears in the
-  prompt only inside `<untrusted_github_event>` tags, and the event cannot change
-  the tier or profile. The job can only propose changes. It cannot push, comment,
-  or open a pull request.
+  turns, a 2.0 USD spend cap that includes child runs, and a required
+  `PROPOSAL.md` artifact. The item text appears in the prompt only inside
+  `<untrusted_github_event>` tags, and the event cannot change the tier or
+  profile. Publishing a proposal is not part of the event: it needs an operator
+  decision.
+- Watch ids: `gh-` plus 16 lowercase hex digits. Deleting a watch and listing
+  watches reject any other id, and a watch file whose id does not match its file
+  name is refused.
 - Storage: the ledger is `<data_dir>/github/events.jsonl`, one line per accepted
   or rejected item. Each watch is `<data_dir>/github/watches/<id>.json`, which
   holds the cursor (`since`) and baseline flag.
