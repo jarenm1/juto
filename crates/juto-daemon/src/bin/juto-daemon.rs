@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
-const USAGE: &str = "Usage: juto-daemon [--workspace <directory>]\n\nHosts Juto sessions and agents independently of the GUI.\nThe GUI starts this executable as a systemd user service when needed.\n\nOptions:\n  --workspace <directory>  Workspace to serve (default: current directory)\n  --help                  Print this help\n  --version               Print the version";
+const USAGE: &str = "Usage: juto-daemon [--workspace <directory>]\n\nHosts Juto sessions and agents independently of the GUI.\nThe GUI starts this executable as a systemd user service when needed.\n\nOptions:\n  --workspace <directory>  Workspace to serve (default: current directory)\n  --help                  Print this help\n  --version               Print the version\n  --build-id              Print the executable's GNU build ID without starting a daemon";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,6 +18,13 @@ async fn main() -> Result<()> {
             }
             Some("--version" | "-V") => {
                 println!("juto-daemon {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            Some("--build-id") => {
+                println!(
+                    "{}",
+                    juto_daemon::protocol::binary_id(std::path::Path::new("/proc/self/exe"))?
+                );
                 return Ok(());
             }
             Some("--workspace") => {

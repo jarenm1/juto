@@ -391,22 +391,31 @@ pub struct HelloInfo {
     pub binary_id: String,
 }
 
-/// Identity of the executable file at `path`: device, inode, size, and mtime. A
-/// rebuild replaces the file and changes one of these, so processes with equal ids
-/// run the same build even when their [`PROTOCOL_VERSION`] matches. A content hash
-/// was rejected: a debug daemon is hundreds of megabytes and this runs on every
-/// connect.
+/// GNU build ID of the ELF executable at `path`, independent of its installation
+/// path, inode, timestamps, and debug stripping. Reads only ELF metadata and notes,
+/// not the entire (potentially very large) debug executable.
+///
+/// Pass `/proc/self/exe` for the running image, which may have been replaced on
+/// disk. Launchers must be executed with `--build-id`, not parsed as ELF files.
 pub fn binary_id(path: &Path) -> std::io::Result<String> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)?;
-    Ok(format!(
-        "{}-{}-{}-{}.{:09}",
-        meta.dev(),
-        meta.ino(),
-        meta.size(),
-        meta.mtime(),
-        meta.mtime_nsec()
-    ))
+    use std::fmt::Write;
+    use std::io::{Error, ErrorKind};
+
+    use object::Object;
+
+    let data = object::read::ReadCache::new(std::fs::File::open(path)?);
+    let executable =
+        object::File::parse(&data).map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
+    let id = executable
+        .build_id()
+        .map_err(|err| Error::new(ErrorKind::InvalidData, err))?
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "executable has no GNU build ID"))?;
+    let mut identity = String::with_capacity(id.len() * 2);
+    for byte in id {
+        write!(identity, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(identity)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

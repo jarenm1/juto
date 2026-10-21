@@ -29,6 +29,7 @@ gstreamer-webrtc = { version = "0.24", features = ["v1_24"] }
 ignore = "0.4"
 image = { version = "0.25", default-features = false }
 jsonschema = { version = "0.33", default-features = false }
+object = { version = "0.39", default-features = false, features = ["read_core", "elf", "std"] }
 parking_lot = "0.12"
 png = "0.18"
 libc = "=0.2.186"

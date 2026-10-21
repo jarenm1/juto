@@ -19,6 +19,16 @@ See [the full OMP runtime inventory and port plan](docs/omp-runtime.md) for the
 capabilities to preserve, primary-source references, and acceptance criteria.
 Agent contributors should read [AGENTS.md](AGENTS.md).
 
+**Daemon build compatibility.** Clients check the wire protocol version and the
+daemon executable's GNU build ID separately; the package version alone does not
+identify a build. `juto-daemon --build-id` reports the executable behind a launcher
+without starting a service. This works through Nix wrappers and accepts copied or
+debug-stripped installs of the same build, rather than comparing file metadata.
+A genuinely different running build is refused with a workspace-specific
+`systemctl --user stop ...` command; retrying then starts the installed daemon.
+After upgrading from the old metadata-based check, stop the old workspace daemon
+once using that command.
+
 **Workspace isolation and resource governance.** `juto-runtime` provides `SubagentWorkspace`
 for provisioning a dedicated fork directory per subagent task: a native change-graph fork that
 shares the parent's Git object store, not a `jj` workspace and not a Git worktree. Commands run
@@ -665,8 +675,10 @@ outside the project source; a remote `/tmp` path does not render for reviewers.
 - Rust 2024 workspace, resolver 3; workspace-wide dependency versions.
 - Unoptimized dev/test builds, line-table debug information, incremental
   compilation. Dependencies remain unoptimized too: no `opt-level = 3` override.
-- Clang + mold on `x86_64-unknown-linux-gnu`. No dev LTO, single-codegen-unit
-  override, compiler-cache wrapper, or forced host-specific CPU flags.
+- Clang + mold on `x86_64-unknown-linux-gnu`, with `--build-id=sha1` for stable
+  daemon executable identification. Keep build IDs enabled in custom builds.
+  No dev LTO, single-codegen-unit override, compiler-cache wrapper, or forced
+  host-specific CPU flags.
 - Cargo retains its per-workspace `target/` cache. Agent builds use jtech's
   adapted resource wrapper: four jobs by default, with CPU/memory caps and a
   shared hardware GPU lock. See AGENTS.md for overrides and concurrency rules.
