@@ -388,11 +388,32 @@ impl Runtime {
         Ok(automation)
     }
 
+    /// Automations of this daemon's project. A record that cannot be read is
+    /// logged and skipped, so one bad record does not hide the others.
     pub fn list_automations(&self) -> Result<Vec<Automation>, AutomationError> {
-        self.read_records()?
-            .into_iter()
-            .map(|(_, record)| record)
-            .collect()
+        let mut automations = Vec::new();
+        for (id, record) in self.read_records()? {
+            match record {
+                Ok(automation) if automation.project == self.cwd().to_path_buf() => {
+                    automations.push(automation);
+                }
+                Ok(_) => {}
+                Err(error) => eprintln!("skipping automation `{id}`: {error}"),
+            }
+        }
+        Ok(automations)
+    }
+
+    /// Refuses an automation that belongs to another project's daemon.
+    fn owned_here(&self, id: &str, automation: &Automation) -> Result<(), AutomationError> {
+        if automation.project == self.cwd().to_path_buf() {
+            return Ok(());
+        }
+        Err(AutomationError::Invalid(format!(
+            "automation `{id}` belongs to {}, not this daemon's project {}",
+            automation.project.display(),
+            self.cwd().display()
+        )))
     }
 
     /// Every stored record with its id, one result each, so a record that cannot
@@ -426,7 +447,9 @@ impl Runtime {
     }
 
     pub fn automation(&self, id: &str) -> Result<Automation, AutomationError> {
-        load(&self.automations_dir(), id)
+        let automation = load(&self.automations_dir(), id)?;
+        self.owned_here(id, &automation)?;
+        Ok(automation)
     }
 
     /// Pauses or enables an automation. Enabling skips the occurrences that fell
@@ -448,6 +471,7 @@ impl Runtime {
         let _guard = lock();
         let dir = self.automations_dir();
         let mut automation = load(&dir, id)?;
+        self.owned_here(id, &automation)?;
         if automation.enabled == enabled {
             return Ok(automation);
         }
@@ -476,7 +500,7 @@ impl Runtime {
     pub fn delete_automation(&self, id: &str) -> Result<(), AutomationError> {
         let _guard = lock();
         let dir = self.automations_dir();
-        load(&dir, id)?;
+        self.owned_here(id, &load(&dir, id)?)?;
         std::fs::remove_file(record_path(&dir, id))?;
         match std::fs::remove_file(events_path(&dir, id)) {
             Ok(()) => Ok(()),
@@ -534,7 +558,7 @@ impl Runtime {
 
     pub fn automation_history(&self, id: &str) -> Result<AutomationHistory, AutomationError> {
         let dir = self.automations_dir();
-        load(&dir, id)?;
+        self.owned_here(id, &load(&dir, id)?)?;
         let mut jobs: Vec<Job> = self
             .list_jobs()?
             .into_iter()

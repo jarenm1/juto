@@ -662,3 +662,59 @@ async fn a_corrupt_record_does_not_stop_the_others_from_firing() {
     assert_eq!(started[0].origin, origin(&healthy, T0 + MINUTE));
     wait_for(&runtime, &started[0].id, |job| job.status.is_terminal()).await;
 }
+
+#[tokio::test]
+async fn another_projects_automation_cannot_be_listed_toggled_or_deleted_here() {
+    let (_root, repo, data) = fixture();
+    let runtime = runtime(&repo, &data, Arc::new(Answer("done")));
+    let foreign = runtime.create_automation_at(spec(60), T0).expect("create");
+    rewrite_record(&data, &foreign.id, "project", "/elsewhere".into());
+    let record = data.join("automations").join(format!("{}.json", foreign.id));
+
+    assert!(
+        runtime
+            .list_automations()
+            .expect("list")
+            .iter()
+            .all(|automation| automation.id != foreign.id),
+        "a record of another project is not listed here"
+    );
+    assert!(
+        matches!(
+            runtime.set_enabled_at(&foreign.id, false, T0),
+            Err(AutomationError::Invalid(_))
+        ),
+        "enable and disable refuse another project's automation"
+    );
+    assert!(
+        matches!(
+            runtime.delete_automation(&foreign.id),
+            Err(AutomationError::Invalid(_))
+        ),
+        "delete refuses another project's automation"
+    );
+    assert!(record.exists(), "the refused delete leaves the record");
+    let stored: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record).expect("read record"))
+            .expect("parse record");
+    assert_eq!(stored["enabled"], true, "the refused toggle changes nothing");
+}
+
+#[tokio::test]
+async fn a_corrupt_record_does_not_hide_the_good_one_from_the_list() {
+    let (_root, repo, data) = fixture();
+    let runtime = runtime(&repo, &data, Arc::new(Answer("done")));
+    let good = runtime.create_automation_at(spec(60), T0).expect("create");
+    let broken = runtime.create_automation_at(spec(60), T0).expect("create");
+    std::fs::write(
+        data.join("automations").join(format!("{}.json", broken.id)),
+        "{not json",
+    )
+    .expect("corrupt the record");
+
+    let listed = runtime
+        .list_automations()
+        .expect("a corrupt record does not fail the list");
+    let ids: Vec<&str> = listed.iter().map(|automation| automation.id.as_str()).collect();
+    assert_eq!(ids, [good.id.as_str()]);
+}
