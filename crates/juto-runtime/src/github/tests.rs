@@ -180,6 +180,14 @@ fn payload_cannot_close_the_untrusted_fence() {
 }
 
 #[test]
+fn a_job_prompt_does_not_claim_the_item_code_is_checked_out() {
+    let item = candidate(GithubItemKind::PullRequest, REPO, 15, T1);
+    let prompt = job_spec(&item, "k").prompt;
+    assert!(!prompt.contains("checked-out code"), "{prompt}");
+    assert!(prompt.contains("may be at a different commit"), "{prompt}");
+}
+
+#[test]
 fn api_base_refuses_plain_http_off_loopback() {
     assert!(validate_api_base("https://api.github.com").is_ok());
     assert!(validate_api_base("http://127.0.0.1:9").is_ok());
@@ -740,6 +748,37 @@ async fn a_watch_needs_a_checkout_whose_origin_is_the_watched_repo() {
         })
         .expect_err("a checkout without origin must refuse the watch");
     assert!(matches!(error, GithubError::Invalid(_)), "got {error}");
+}
+
+#[tokio::test]
+async fn a_checkout_repointed_after_the_watch_starts_no_jobs() {
+    let h = harness();
+    let fixture = Fixture::start().await;
+    let rt = open(&h);
+    store_token(&rt);
+    rt.create_github_watch(GithubWatchSpec {
+        repo: REPO.into(),
+        labels: vec![],
+        assignees: vec![],
+    })
+    .expect("watch");
+    rt.poll_github(&fixture.base).await.expect("baseline poll");
+
+    fixture.set(
+        "/repos/acme/app/issues",
+        json!([issue(21, REPO, T2, &[], &[], "new")]),
+    );
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(&h.cwd)
+        .args(["remote", "set-url", "origin", "https://github.com/evil/other.git"])
+        .status()
+        .expect("repoint origin");
+
+    let report = rt.poll_github(&fixture.base).await.expect("poll");
+    assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+    assert!(report.records.is_empty());
+    assert!(job_ids(&rt).is_empty(), "a repointed checkout starts no job");
 }
 
 #[tokio::test]
