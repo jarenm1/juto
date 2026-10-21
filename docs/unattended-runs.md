@@ -263,28 +263,37 @@ is no CLI command for them yet. The daemon polls every 60 seconds, and
 - Labels and assignees: an item must carry every configured label and at least
   one configured assignee. An empty list imposes no constraint. Only open items
   are considered. An item that fails these rules is skipped and not recorded.
-- Checkout: the job runs in the daemon's checkout, so a watch is accepted only
-  when that checkout's `origin` remote names the watched repository on
-  github.com. This is checked when the watch is created and before each poll.
-  A watch that fails the check is reported as a poll error and starts no jobs.
-  There is no per-watch checkout path.
+- Checkout: the job runs in a copy of the daemon's checkout, so a watch is accepted
+  only when that checkout's `origin` remote names the watched repository on
+  github.com. This is checked when the watch is created and before each poll. A
+  watch that fails the check is reported as a poll error and starts no jobs. There is
+  no per-watch checkout path.
+- Head gate: a pull request starts a job only when the checkout's `HEAD` commit
+  equals the pull request's head SHA, checked just before the job is started. On a
+  mismatch no job starts. The refusal names both SHAs and is recorded once, the poll
+  reports it as an error, and the watch holds its cursor at that item: the watch file
+  and the watch list show the reason in `stalled`. Items after the held item wait.
+  Every later poll retries it; once the checkout reaches the head, the job starts once
+  and `stalled` clears.
+- Issues: no job starts from an issue. The daemon has no commit to check an issue's
+  code against, so each issue is rejected with the reason `issue jobs disabled` and
+  recorded once.
 - Author gate: an item is accepted only when its `author_association` is
   `OWNER`, `MEMBER`, or `COLLABORATOR`. Any other item is rejected and recorded,
   and starts no job.
-- Dedupe key: an issue is `issue:<repo>#<number>:<id>:<sha256>`, where the hash
-  covers its title and body. An edit that keeps the title and body (a label, an
-  assignee, or a comment) starts no job. A pull request is
-  `pull:<repo>#<number>:<head sha>`. The job id is `gh-` plus the first 32 hex
-  digits of SHA-256 of the key. A repeat finds the job already stored
-  (`JobError::Exists`) and starts nothing, including across restarts. A newer
-  revision has a new key and starts the next job.
+- Dedupe key: a pull request is `pull:<repo>#<number>:<head sha>`. The job id is
+  `gh-` plus the first 32 hex digits of SHA-256 of the key. A repeat finds the job
+  already stored (`JobError::Exists`) and starts nothing, including across restarts.
+  A new head commit has a new key and starts the next job. A timestamp change alone,
+  with the same head, starts nothing. An issue key
+  (`issue:<repo>#<number>:<id>:<sha256>`) is computed, but no issue job starts from it.
 - Baseline: a watch's first poll records what already exists and starts no jobs.
 - Job: `untrusted` tier, `unattended` profile, 1 attempt, 1800 s wall clock, 60
   turns, a 2.0 USD spend cap that includes child runs, and a required
   `PROPOSAL.md` artifact. The item text appears in the prompt only inside
   `<untrusted_github_event>` tags, and the event cannot change the tier or
-  profile. The prompt states that the workspace is a copy of the daemon's
-  checkout, which may be at a different commit than the item. The job's `bash`
+  profile. The prompt names the head commit the daemon checked before admission and
+  asks the job to state which commit it examined. The job's `bash`
   runs in the `untrusted` filesystem sandbox (writes and reads limited to the
   workspace) with package-mirror network access only. The nix daemon is reachable
   from that sandbox, and `untrusted` output is not restricted, so injected text
@@ -293,12 +302,13 @@ is no CLI command for them yet. The daemon polls every 60 seconds, and
 - Watch ids: `gh-` plus 16 lowercase hex digits. Deleting a watch and listing
   watches reject any other id, and a watch file whose id does not match its file
   name is refused.
-- Storage: the ledger is `<data_dir>/github/events.jsonl`, one line per accepted
-  or rejected item. Each watch is `<data_dir>/github/watches/<id>.json`, which
-  holds the cursor (`since`) and baseline flag.
-- Limitations: pull requests have no server-side `since`, so every poll fetches
-  all open pull requests. Duplicates are not written to the ledger. While watches
-  exist and no token is stored, the daemon logs an error on every poll.
+- Storage: the ledger is `<data_dir>/github/events.jsonl`, one line per accepted or
+  rejected item. A refusal or hold is written once per item, key and reason, not on
+  every poll. Each watch is `<data_dir>/github/watches/<id>.json`, which holds the
+  cursor (`since`), the baseline flag, and `stalled` while a pull request is held.
+- Limitations: pull requests have no server-side `since`, so every poll fetches all
+  open pull requests. Issue jobs are disabled. While watches exist and no token is
+  stored, the daemon logs an error on every poll.
 
 ## Limitations
 
