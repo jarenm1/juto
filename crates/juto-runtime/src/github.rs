@@ -82,6 +82,12 @@ const JOB_WALL_SECS: u64 = 1800;
 /// Model turns one GitHub job may take.
 const JOB_MAX_TURNS: u32 = 60;
 
+/// The author associations whose items a watch accepts: repository owners, members and
+/// collaborators.
+const TRUSTED_AUTHORS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
+/// USD cap on one GitHub-triggered job, children included.
+const JOB_MAX_SPEND: f64 = 2.0;
+
 static POLL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A repository watch: the allowlist entry and its label and assignee rules.
@@ -191,6 +197,7 @@ pub(crate) struct Candidate {
     pub labels: Vec<String>,
     pub assignees: Vec<String>,
     pub head_sha: Option<String>,
+    pub author_association: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -211,7 +218,10 @@ pub(crate) fn event_key(candidate: &Candidate) -> String {
     match candidate.kind {
         GithubItemKind::Issue => format!(
             "issue:{}#{}:{}:{}",
-            candidate.repo, candidate.number, candidate.item_id, candidate.updated_at
+            candidate.repo,
+            candidate.number,
+            candidate.item_id,
+            issue_revision(candidate)
         ),
         GithubItemKind::PullRequest => format!(
             "pull:{}#{}:{}",
@@ -220,6 +230,16 @@ pub(crate) fn event_key(candidate: &Candidate) -> String {
             candidate.head_sha.as_deref().unwrap_or_default()
         ),
     }
+}
+
+/// The content revision of an issue: its title and body. Comments, labels and assignees
+/// do not change it, so they do not start a job again.
+fn issue_revision(candidate: &Candidate) -> String {
+    let mut digest = Sha256::new();
+    digest.update(candidate.title.as_bytes());
+    digest.update([0]);
+    digest.update(candidate.body.as_deref().unwrap_or_default().as_bytes());
+    hex(&digest.finalize())[..16].to_owned()
 }
 
 /// The persisted job id for a dedupe key.
@@ -231,6 +251,45 @@ pub(crate) fn job_id(key: &str) -> String {
 pub(crate) fn watch_id(repo: &str) -> String {
     let digest = Sha256::digest(repo.as_bytes());
     format!("gh-{}", &hex(&digest)[..16])
+}
+
+/// A watch id is `gh-` and 16 lowercase hex digits. Anything else could name a file
+/// outside the watches directory.
+pub(crate) fn valid_watch_id(id: &str) -> bool {
+    id.len() == 19
+        && id.starts_with("gh-")
+        && id[3..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The `owner/name` a github.com remote URL names: `https://github.com/owner/name(.git)`,
+/// `git@github.com:owner/name(.git)` or `ssh://git@github.com/owner/name`. Any other
+/// remote, such as a local path, names no GitHub repository.
+fn repo_from_remote(url: &str) -> Option<String> {
+    let trimmed = url.trim().trim_end_matches('/');
+    if !(trimmed.contains("github.com/") || trimmed.contains("github.com:")) {
+        return None;
+    }
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    let mut parts = trimmed.rsplit(['/', ':']);
+    let name = parts.next().filter(|part| !part.is_empty())?;
+    let owner = parts.next().filter(|part| !part.is_empty())?;
+    Some(format!("{owner}/{name}").to_ascii_lowercase())
+}
+
+/// The `owner/name` of the daemon's own checkout, from its `origin` remote.
+fn checkout_repo(cwd: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["config", "--get", "remote.origin.url"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    repo_from_remote(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Decides one candidate against one watch. Foreign-repository items are rejected and
@@ -266,6 +325,12 @@ pub(crate) fn evaluate(watch: &GithubWatch, candidate: &Candidate) -> Verdict {
             return Verdict::Skip;
         }
     }
+    if !TRUSTED_AUTHORS.contains(&candidate.author_association.as_str()) {
+        return Verdict::Reject(format!(
+            "author association `{}` is not an owner, member or collaborator of {}",
+            candidate.author_association, watch.repo
+        ));
+    }
     Verdict::Accept
 }
 
@@ -279,7 +344,7 @@ pub(crate) fn job_spec(candidate: &Candidate, key: &str) -> JobSpec {
             wall_secs: JOB_WALL_SECS,
             max_attempts: 1,
             max_turns: Some(JOB_MAX_TURNS),
-            max_spend: None,
+            max_spend: Some(JOB_MAX_SPEND),
         },
         contract: JobContract {
             artifact: Some(PROPOSAL_FILE.to_owned()),
@@ -427,6 +492,8 @@ struct RawItem {
     head: Option<RawHead>,
     #[serde(default)]
     base: Option<RawBase>,
+    #[serde(default)]
+    author_association: String,
 }
 
 /// `https://api.github.com/repos/owner/name` → `owner/name`.
@@ -494,6 +561,7 @@ impl RawItem {
             labels: self.labels.into_iter().map(|label| label.name).collect(),
             assignees: self.assignees.into_iter().map(|user| user.login).collect(),
             head_sha,
+            author_association: self.author_association,
         }))
     }
 }
@@ -645,6 +713,7 @@ impl Runtime {
     /// Watches a repository. Each repository has at most one watch.
     pub fn create_github_watch(&self, spec: GithubWatchSpec) -> Result<GithubWatch, GithubError> {
         let repo = validate_repo(&spec.repo)?;
+        self.require_checkout_of(&repo)?;
         let id = watch_id(&repo);
         let path = watch_path(self.data_dir(), &id);
         if path.exists() {
@@ -678,7 +747,16 @@ impl Runtime {
                 .map_err(|error| GithubError::Failed(error.to_string()))?
                 .path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                watches.push(read_watch(&path)?);
+                let watch = read_watch(&path)?;
+                if !valid_watch_id(&watch.id)
+                    || path.file_stem().and_then(|stem| stem.to_str()) != Some(watch.id.as_str())
+                {
+                    return Err(GithubError::Failed(format!(
+                        "{}: the watch id does not match its file name",
+                        path.display()
+                    )));
+                }
+                watches.push(watch);
             }
         }
         watches.sort_by(|a, b| a.created_ms.cmp(&b.created_ms).then(a.id.cmp(&b.id)));
@@ -687,6 +765,11 @@ impl Runtime {
 
     /// Removes a watch and its repository from the allowlist. Jobs it started are kept.
     pub fn delete_github_watch(&self, id: &str) -> Result<(), GithubError> {
+        if !valid_watch_id(id) {
+            return Err(GithubError::Invalid(format!(
+                "`{id}` is not a GitHub watch id"
+            )));
+        }
         let path = watch_path(self.data_dir(), id);
         if !path.exists() {
             return Err(GithubError::NotFound(format!(
@@ -710,6 +793,20 @@ impl Runtime {
                     .map_err(|error| GithubError::Failed(format!("ledger: {error}")))
             })
             .collect()
+    }
+
+    /// A job reviews the daemon's own checkout, so a watch is accepted only when that
+    /// checkout's `origin` remote is the watched repository.
+    fn require_checkout_of(&self, repo: &str) -> Result<(), GithubError> {
+        match checkout_repo(self.cwd()) {
+            Some(found) if found == repo.to_ascii_lowercase() => Ok(()),
+            Some(found) => Err(GithubError::Invalid(format!(
+                "this daemon's checkout is {found}; a job reviews that checkout, so {repo} cannot be watched from it"
+            ))),
+            None => Err(GithubError::Invalid(format!(
+                "this daemon's checkout has no `origin` remote naming {repo}; a job reviews that checkout, so {repo} cannot be watched"
+            ))),
+        }
     }
 
     /// Polls every watch once and starts a job for each accepted revision.
@@ -737,7 +834,11 @@ impl Runtime {
         let client = GithubClient::new(base, token.expose_secret().to_owned())?;
         drop(token);
         for watch in &mut watches {
-            if let Err(error) = self.poll_watch(&client, watch, &mut report).await {
+            let outcome = match self.require_checkout_of(&watch.repo) {
+                Ok(()) => self.poll_watch(&client, watch, &mut report).await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = outcome {
                 report.errors.push(format!("{}: {error}", watch.repo));
             }
         }
