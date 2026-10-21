@@ -771,14 +771,22 @@ async fn a_checkout_repointed_after_the_watch_starts_no_jobs() {
     std::process::Command::new("git")
         .arg("-C")
         .arg(&h.cwd)
-        .args(["remote", "set-url", "origin", "https://github.com/evil/other.git"])
+        .args([
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/evil/other.git",
+        ])
         .status()
         .expect("repoint origin");
 
     let report = rt.poll_github(&fixture.base).await.expect("poll");
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     assert!(report.records.is_empty());
-    assert!(job_ids(&rt).is_empty(), "a repointed checkout starts no job");
+    assert!(
+        job_ids(&rt).is_empty(),
+        "a repointed checkout starts no job"
+    );
 }
 
 #[tokio::test]
