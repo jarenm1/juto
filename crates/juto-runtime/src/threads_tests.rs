@@ -464,7 +464,7 @@ async fn a_subagent_report_returns_to_the_thread_that_spawned_it() {
     // A report that missed the spawning run waits for that thread, and the
     // host can run it there directly.
     let inbox = manager.main_inbox();
-    if let Some((origin, reports)) = inbox.take_next_group() {
+    if let Some((origin, reports)) = inbox.take_next_group(|_| true) {
         assert_eq!(origin.as_deref(), Some(spawner.thread.as_str()));
         let prompt = reports
             .iter()

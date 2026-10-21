@@ -696,6 +696,36 @@ async fn child_completion_wakes_the_session_that_spawned_it() {
 }
 
 #[tokio::test]
+async fn child_report_for_a_missing_session_stays_queued() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon(root.path(), ScriptedProvider::new(false));
+    let spawning = create_session(&daemon).await;
+    let inbox = daemon.runtime.subagent_manager().main_inbox();
+    let report = |body: &str| MainMessage {
+        from: "child-1".to_string(),
+        name: None,
+        kind: MainMessageKind::Completed,
+        body: body.to_string(),
+        digest_of: None,
+    };
+    // The oldest group names a session that no longer exists. The group behind it
+    // belongs to a live session and must still wake that session.
+    inbox.push_from(Some("gone-session".to_string()), report("orphan"));
+    inbox.push_from(Some(spawning.info.id.clone()), report("live"));
+
+    assert!(
+        matches!(daemon.wake_idle(), Ok(Wake::Started)),
+        "the live group must wake its session"
+    );
+    let (origin, orphans) = inbox
+        .take_next_group(|_| true)
+        .expect("the orphaned group must stay queued");
+    assert_eq!(origin.as_deref(), Some("gone-session"));
+    let bodies: Vec<&str> = orphans.iter().map(|m| m.body.as_str()).collect();
+    assert_eq!(bodies, ["orphan"]);
+}
+
+#[tokio::test]
 async fn thread_events_reach_subscribed_clients() {
     let root = tempfile::tempdir().unwrap();
     let daemon = daemon(root.path(), ScriptedProvider::new(false));

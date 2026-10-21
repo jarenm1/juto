@@ -369,28 +369,30 @@ impl Daemon {
         Ok(reply_id)
     }
 
-    /// Starts a run for the oldest waiting child group. A group wakes the session
-    /// that spawned it (its origin); a group with no origin wakes the session last
-    /// used. Other origins stay queued. A group whose run cannot start returns to
-    /// the front of the inbox.
+    /// Starts a run for the oldest child group that has a session to wake. A group
+    /// wakes the session that spawned it (its origin); a group with no origin wakes
+    /// the session last used. Other groups, including those whose session is gone,
+    /// stay queued. A group whose run cannot start returns to the front of the inbox.
     fn wake_idle(self: &Arc<Self>) -> Result<Wake> {
         let mut state = self.state.lock().unwrap();
         if state.active.is_some() {
             return Ok(Wake::Busy);
         }
         let inbox = self.runtime.subagent_manager().main_inbox();
-        let Some((origin, messages)) = inbox.take_next_group() else {
+        // A group wakes its origin, or the session last used when it has none. A group
+        // whose session no longer exists stays queued: no run can read it, and taking it
+        // would drop its reports.
+        let deliverable = |origin: Option<&str>| match origin {
+            Some(id) => state.sessions.contains_key(id),
+            None => state.last_session.is_some(),
+        };
+        let Some((origin, messages)) = inbox.take_next_group(deliverable) else {
             return Ok(Wake::Idle);
         };
         let Some(session_id) = origin.clone().or_else(|| state.last_session.clone()) else {
             inbox.requeue_front(origin.as_deref(), messages);
             return Ok(Wake::Idle);
         };
-        if !state.sessions.contains_key(&session_id) {
-            // The spawning session no longer exists, so nothing can read this group.
-            eprintln!("juto-daemon: dropping child reports for unknown session {session_id}");
-            return Ok(Wake::Idle);
-        }
         let prompt = juto_runtime::subagents::completion_prompt(&messages);
         if let Err(error) = self.start_locked(&mut state, session_id, prompt) {
             inbox.requeue_front(origin.as_deref(), messages);
@@ -426,8 +428,16 @@ impl Daemon {
                     .collect();
                 let mut sessions = Vec::new();
                 for path in paths {
-                    let session = Session::open(&path).map_err(failed)?;
-                    sessions.push(self.info(&session, &self.state.lock().unwrap()));
+                    match Session::open(&path) {
+                        Ok(session) => {
+                            sessions.push(self.info(&session, &self.state.lock().unwrap()));
+                        }
+                        // One unreadable journal must not fail the list: skip it and log.
+                        Err(error) => eprintln!(
+                            "juto-daemon: skipping session journal {}: {error:#}",
+                            path.display()
+                        ),
+                    }
                 }
                 sessions.sort_by_key(|s| s.created_ms);
                 Ok(Reply::Sessions(sessions))
