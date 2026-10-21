@@ -1196,14 +1196,14 @@ impl ChangeGraph {
         for path in &stale_forks {
             if let Some(fork) = state.fork_bases.remove(path) {
                 // A name over the cap was never pinned, so there is nothing to release.
-                if let Ok(snapshot) = fork_snapshot_id(&fork.thread) {
-                    if let Err(error) = self.repository.release_snapshot(&snapshot) {
-                        release_failures += 1;
-                        eprintln!(
-                            "juto: gc could not release the pin of fork `{}`: {error:#}",
-                            fork.thread
-                        );
-                    }
+                if let Ok(snapshot) = fork_snapshot_id(&fork.thread)
+                    && let Err(error) = self.repository.release_snapshot(&snapshot)
+                {
+                    release_failures += 1;
+                    eprintln!(
+                        "juto: gc could not release the pin of fork `{}`: {error:#}",
+                        fork.thread
+                    );
                 }
             }
         }
