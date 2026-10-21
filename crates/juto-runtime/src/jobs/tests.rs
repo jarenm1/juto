@@ -477,6 +477,88 @@ async fn a_job_over_its_wall_budget_fails() {
     assert!(job.run_ms >= 1000, "run_ms: {}", job.run_ms);
 }
 
+/// Spawns a builder, then stalls the root run. The builder acts only after a delay
+/// that outlives the job's wall budget, and records whether it acted after the test
+/// saw the job fail.
+#[derive(Default)]
+struct LateChildWriter {
+    failed_seen: std::sync::atomic::AtomicBool,
+    late_child_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl Provider for LateChildWriter {
+    async fn stream(
+        &self,
+        _model: &Model,
+        context: &Context,
+        _options: &StreamOptions,
+        _cancel: CancellationToken,
+    ) -> Result<ProviderStream, ProviderError> {
+        let is_builder = context
+            .system_prompt
+            .iter()
+            .any(|part| part.contains("You are a builder"));
+        if is_builder {
+            if matches!(context.messages.last(), Some(Message::ToolResult { .. })) {
+                return one_message(text_answer("done"));
+            }
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if self.failed_seen.load(Ordering::SeqCst) {
+                self.late_child_calls.fetch_add(1, Ordering::SeqCst);
+            }
+            return one_message(tool_call(
+                "write",
+                serde_json::json!({ "path": "late.txt", "content": "late" }),
+            ));
+        }
+        if matches!(
+            context.messages.last(),
+            Some(Message::ToolResult { tool_name, .. }) if tool_name == "task"
+        ) {
+            return Ok(Box::pin(futures::stream::pending()));
+        }
+        one_message(tool_call(
+            "task",
+            serde_json::json!({
+                "tasks": [{
+                    "name": "writer",
+                    "agent": "builder",
+                    "task": "write late.txt",
+                }]
+            }),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn a_timed_out_job_leaves_no_child_acting_after_it_fails() {
+    let root = tempdir().expect("tempdir");
+    let repo = root.path().join("repo");
+    native_repo(&repo);
+    let data_dir = root.path().join("data");
+    let provider = Arc::new(LateChildWriter::default());
+    let runtime = runtime(&repo, &data_dir, provider.clone());
+    let mut events = runtime.subscribe_jobs();
+
+    let started = runtime
+        .start_job("delegate and stall", budget(1), no_change())
+        .expect("start");
+    let job = settle(&runtime, &mut events, &started.id, |job| {
+        job.status.is_terminal()
+    })
+    .await;
+    assert_eq!(job.status, JobStatus::Failed);
+    provider.failed_seen.store(true, Ordering::SeqCst);
+    // Outlive the child's delay so a child still running would act after Failed.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        provider.late_child_calls.load(Ordering::SeqCst),
+        0,
+        "a child acted after the job was Failed"
+    );
+}
+
 #[tokio::test]
 async fn cancelling_a_running_job_settles_it_cancelled() {
     let root = tempdir().expect("tempdir");

@@ -969,7 +969,19 @@ impl Runtime {
             control.clone(),
             Some(id.to_owned()),
         );
-        let outcome = tokio::time::timeout(Duration::from_millis(remaining), run).await;
+        // A run past its budget is cancelled and awaited, not dropped: the run's own
+        // cleanup cancels and settles its children and closes its decision scope, and
+        // dropping the future would skip all of it.
+        let (timed_out, outcome) = {
+            let mut run = std::pin::pin!(run);
+            match tokio::time::timeout(Duration::from_millis(remaining), &mut run).await {
+                Ok(outcome) => (false, outcome),
+                Err(_elapsed) => {
+                    control.cancel();
+                    (true, run.await)
+                }
+            }
+        };
         let spent = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         drain.await.context("job event drain failed")?;
         self.inner.jobs.mutate(id, |job| {
@@ -981,9 +993,9 @@ impl Runtime {
         let result = last_assistant_text(session);
         let stopped = matches!(
             &outcome,
-            Ok(Ok(UnattendedOutcome::Finished(run))) if matches!(run.stop_reason, StopReason::Stop)
+            Ok(UnattendedOutcome::Finished(run)) if matches!(run.stop_reason, StopReason::Stop)
         );
-        let verdict = if stopped && !cancelled {
+        let verdict = if stopped && !cancelled && !timed_out {
             // The contract reads the final message alone, so a silent final turn
             // cannot pass on an earlier turn's text.
             Some(
@@ -993,52 +1005,55 @@ impl Runtime {
         } else {
             None
         };
-        let settled = match outcome {
-            Err(_elapsed) => {
-                control.cancel();
-                if cancelled {
-                    Settled::Cancelled
-                } else {
-                    Settled::Failed {
-                        error: budget_message(job.budget),
-                        result,
+        let settled = if timed_out {
+            if let Ok(UnattendedOutcome::Blocked(decision)) = &outcome {
+                self.reject_pending(decision);
+            }
+            if cancelled {
+                Settled::Cancelled
+            } else {
+                Settled::Failed {
+                    error: budget_message(job.budget),
+                    result,
+                }
+            }
+        } else {
+            match outcome {
+                Err(error) => {
+                    if cancelled {
+                        Settled::Cancelled
+                    } else {
+                        Settled::Failed {
+                            error: format!("{error:#}"),
+                            result,
+                        }
                     }
                 }
-            }
-            Ok(Err(error)) => {
-                if cancelled {
-                    Settled::Cancelled
-                } else {
-                    Settled::Failed {
-                        error: format!("{error:#}"),
-                        result,
+                Ok(UnattendedOutcome::Blocked(decision)) => {
+                    if cancelled {
+                        self.reject_pending(&decision);
+                        Settled::Cancelled
+                    } else {
+                        Settled::Blocked(decision.id)
                     }
                 }
-            }
-            Ok(Ok(UnattendedOutcome::Blocked(decision))) => {
-                if cancelled {
-                    self.reject_pending(&decision);
-                    Settled::Cancelled
-                } else {
-                    Settled::Blocked(decision.id)
-                }
-            }
-            Ok(Ok(UnattendedOutcome::Finished(run))) => {
-                if cancelled {
-                    Settled::Cancelled
-                } else {
-                    match run.stop_reason {
-                        StopReason::Stop => match verdict.unwrap_or(Ok(())) {
-                            Ok(()) => Settled::Succeeded(result),
-                            Err(reason) => Settled::Failed {
-                                error: format!("completion contract not met: {reason}"),
+                Ok(UnattendedOutcome::Finished(run)) => {
+                    if cancelled {
+                        Settled::Cancelled
+                    } else {
+                        match run.stop_reason {
+                            StopReason::Stop => match verdict.unwrap_or(Ok(())) {
+                                Ok(()) => Settled::Succeeded(result),
+                                Err(reason) => Settled::Failed {
+                                    error: format!("completion contract not met: {reason}"),
+                                    result,
+                                },
+                            },
+                            other => Settled::Failed {
+                                error: format!("the run stopped with {other:?}"),
                                 result,
                             },
-                        },
-                        other => Settled::Failed {
-                            error: format!("the run stopped with {other:?}"),
-                            result,
-                        },
+                        }
                     }
                 }
             }
