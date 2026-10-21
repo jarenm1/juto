@@ -341,6 +341,46 @@ fn compaction_entries_without_archive_still_load() {
 }
 
 #[test]
+fn compaction_span_fields_round_trip_and_default_to_none_in_old_journals() {
+    let kind = EntryKind::Compaction {
+        summary: "sum".into(),
+        first_kept_id: Some("kept".into()),
+        span_start_id: Some("start".into()),
+        span_end_id: Some("end".into()),
+        archive: None,
+    };
+    let json = serde_json::to_string(&kind).unwrap();
+    let back: EntryKind = serde_json::from_str(&json).unwrap();
+    let EntryKind::Compaction {
+        summary,
+        first_kept_id,
+        span_start_id,
+        span_end_id,
+        archive,
+    } = back
+    else {
+        panic!("compaction round trip changed the entry kind");
+    };
+    assert_eq!(summary, "sum");
+    assert_eq!(first_kept_id.as_deref(), Some("kept"));
+    assert_eq!(span_start_id.as_deref(), Some("start"));
+    assert_eq!(span_end_id.as_deref(), Some("end"));
+    assert!(archive.is_none());
+
+    let old: EntryKind =
+        serde_json::from_str(r#"{"type":"compaction","summary":"s","first_kept_id":null}"#)
+            .unwrap();
+    assert!(matches!(
+        old,
+        EntryKind::Compaction {
+            span_start_id: None,
+            span_end_id: None,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn old_archive_ignores_removed_truncation_metadata() {
     let archive: Archive =
         serde_json::from_str(r#"{"source":"original text","truncated_chars":0,"frames":[]}"#)
@@ -454,6 +494,62 @@ fn second_compaction_span_starts_at_the_previous_first_kept_message() {
     assert_eq!(span_texts(&s, &ids[4], &ids[4]), ["q5"]);
     assert_eq!(span_texts(&s, &ids[0], &ids[3]), ["q1", "q2", "q3", "q4"]);
     // The second summary plus q8, the only message after its cut.
+    assert_eq!(s.messages().unwrap().len(), 2);
+}
+
+#[test]
+fn compaction_that_keeps_nothing_replaces_the_whole_path_with_its_span() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    for text in ["q1", "q2", "q3"] {
+        s.append(user(text)).unwrap();
+    }
+    let ids = message_ids(&s);
+    s.compact("SPAN-SUMMARY".into(), None, 0).unwrap();
+    assert!(s.path_view().unwrap().visible().is_empty());
+    let messages = s.messages().unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].text().contains("SPAN-SUMMARY"));
+    assert_eq!(
+        latest_span(&s),
+        (Some(ids[0].clone()), Some(ids[2].clone()))
+    );
+    assert_eq!(span_texts(&s, &ids[0], &ids[2]), ["q1", "q2", "q3"]);
+}
+
+#[test]
+fn second_compaction_after_keep_nothing_starts_at_first_visible_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::create(dir.path(), Path::new("/w")).unwrap();
+    for text in ["q1", "q2", "q3"] {
+        s.append(user(text)).unwrap();
+    }
+    s.compact("first".into(), None, 0).unwrap();
+    let first_kept = s
+        .active_entries()
+        .unwrap()
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            EntryKind::Compaction { first_kept_id, .. } => Some(first_kept_id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(first_kept, None);
+    for text in ["q4", "q5"] {
+        s.append(user(text)).unwrap();
+    }
+    let ids = message_ids(&s);
+    s.compact("second".into(), None, 1).unwrap();
+    // The first compaction kept nothing, so the second span starts at q4, the first
+    // visible message.
+    assert_eq!(
+        latest_span(&s),
+        (Some(ids[3].clone()), Some(ids[3].clone()))
+    );
+    assert_eq!(span_texts(&s, &ids[3], &ids[3]), ["q4"]);
+    // The first span (q1 through q3) stays disjoint from the second.
+    assert_eq!(span_texts(&s, &ids[0], &ids[2]), ["q1", "q2", "q3"]);
+    // The second summary plus q5, the only message after its cut.
     assert_eq!(s.messages().unwrap().len(), 2);
 }
 
