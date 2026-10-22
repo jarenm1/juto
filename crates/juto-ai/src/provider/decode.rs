@@ -181,6 +181,7 @@ impl Decoder {
     }
     pub fn feed(
         &mut self,
+        event: Option<&str>,
         payload: &str,
         events: &mut Vec<ProviderEvent>,
     ) -> Result<bool, ProviderError> {
@@ -204,7 +205,7 @@ impl Decoder {
         match self.api {
             Api::Chat => self.chat(&value, events)?,
             Api::Responses | Api::Codex | Api::Azure => self.responses(&value, events)?,
-            Api::Anthropic => self.anthropic(&value, events)?,
+            Api::Anthropic => self.anthropic(event, &value, events)?,
             Api::Gemini => self.gemini(&value, events)?,
             Api::Ollama => self.ollama(&value, events)?,
             // Devin streams Connect frames through devin.rs, never SSE payloads.
@@ -457,12 +458,19 @@ impl Decoder {
     }
     fn anthropic(
         &mut self,
+        event: Option<&str>,
         value: &Value,
         events: &mut Vec<ProviderEvent>,
     ) -> Result<(), ProviderError> {
         let wire = number(value, "index");
         let key = (6, wire, 0);
-        match string(value, "type").unwrap_or_default() {
+        // The SDK routes on the SSE event name, so an `error` frame is an error without a `type`.
+        let kind = if event == Some("error") {
+            "error"
+        } else {
+            string(value, "type").unwrap_or_default()
+        };
+        match kind {
             "message_start" => {
                 if let Some(id) = value.pointer("/message/id").and_then(Value::as_str) {
                     self.output.response_id = Some(id.to_owned());
@@ -879,7 +887,7 @@ mod tests {
             r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
             r#"{"type":"message_stop"}"#,
         ] {
-            decoder.feed(payload, &mut events).unwrap();
+            decoder.feed(None, payload, &mut events).unwrap();
         }
         let message = decoder.finish(&model).unwrap();
         assert_eq!(message.usage.input, 12);
@@ -912,7 +920,7 @@ mod tests {
             r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7,"cache_read_input_tokens":900,"cache_creation_input_tokens":250}}"#,
             r#"{"type":"message_stop"}"#,
         ] {
-            decoder.feed(payload, &mut events).unwrap();
+            decoder.feed(None, payload, &mut events).unwrap();
         }
         let message = decoder.finish(&model).unwrap();
         assert_eq!(message.usage.cache_read, 900);
@@ -963,6 +971,31 @@ data: {"type":"message_stop"}
 
 "#;
 
+    const ERROR_WITHOUT_TYPE: &str = r#"event: error
+data: {"error":{"type":"overloaded_error","message":"Overloaded"}}
+
+"#;
+
+    const NULL_DELTA_USAGE: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_03","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"output_tokens":0,"cache_creation_input_tokens":4,"cache_read_input_tokens":9}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"","citations":null}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"input_tokens":null,"output_tokens":12,"cache_creation_input_tokens":null,"cache_read_input_tokens":null}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
     fn anthropic_model() -> Model {
         serde_json::from_value(json!({
             "id": "claude-test",
@@ -988,7 +1021,7 @@ data: {"type":"message_stop"}
             if frame.data.is_empty() || frame_is_control(Api::Anthropic, frame.event.as_deref()) {
                 continue;
             }
-            if decoder.feed(&frame.data, &mut events)? {
+            if decoder.feed(frame.event.as_deref(), &frame.data, &mut events)? {
                 break;
             }
         }
@@ -1101,6 +1134,13 @@ data: {"type":"message_stop"}
     }
 
     #[test]
+    fn error_frame_without_payload_type_is_routed_by_event_name() {
+        let error = error_of(ERROR_WITHOUT_TYPE);
+        assert!(error.contains("overloaded_error"), "{error}");
+        assert!(error.contains("Overloaded"), "{error}");
+    }
+
+    #[test]
     fn unknown_content_block_type_is_rejected_by_name() {
         assert!(error_of(UNKNOWN_BLOCK).contains("server_tool_use"));
     }
@@ -1121,6 +1161,16 @@ data: {"type":"message_stop"}
     fn context_window_stop_reason_maps_to_length() {
         let (_, message) = run(CONTEXT_WINDOW).expect("stream decodes");
         assert!(matches!(message.stop_reason, StopReason::Length));
+    }
+
+    #[test]
+    fn null_message_delta_usage_keeps_the_previously_seen_values() {
+        let (_, message) = run(NULL_DELTA_USAGE).expect("stream decodes");
+        assert_eq!(message.usage.input, 25);
+        assert_eq!(message.usage.output, 12);
+        assert_eq!(message.usage.cache_read, 9);
+        assert_eq!(message.usage.cache_write, 4);
+        assert!(matches!(message.stop_reason, StopReason::Stop));
     }
 
     #[test]

@@ -132,14 +132,14 @@ impl Provider for HttpProvider {
                 let Some(chunk)=chunk else {break};let chunk=chunk.map_err(transport_error)?;
                 if api==Api::Ollama {
                     for payload in ndjson.feed(&chunk)? {
-                        terminal=decoder.feed(&payload,&mut pending)?;
+                        terminal=decoder.feed(None,&payload,&mut pending)?;
                         for event in pending.drain(..) {yield event;}
                         if terminal {break;}
                     }
                 } else {
                     for frame in sse.feed(&chunk)? {
                         if frame.data.is_empty() || decode::frame_is_control(api, frame.event.as_deref()) {continue;}
-                        terminal=decoder.feed(&frame.data,&mut pending)?;
+                        terminal=decoder.feed(frame.event.as_deref(),&frame.data,&mut pending)?;
                         for event in pending.drain(..) {yield event;}
                         if terminal {break;}
                     }
@@ -147,9 +147,9 @@ impl Provider for HttpProvider {
             }
             if !terminal {
                 if api==Api::Ollama {
-                    for payload in ndjson.finish()? {decoder.feed(&payload,&mut pending)?;}
+                    for payload in ndjson.finish()? {decoder.feed(None,&payload,&mut pending)?;}
                 } else {
-                    for frame in sse.finish()? {if !frame.data.is_empty() && !decode::frame_is_control(api,frame.event.as_deref()) {decoder.feed(&frame.data,&mut pending)?;}}
+                    for frame in sse.finish()? {if !frame.data.is_empty() && !decode::frame_is_control(api,frame.event.as_deref()) {decoder.feed(frame.event.as_deref(),&frame.data,&mut pending)?;}}
                 }
                 for event in pending.drain(..) {yield event;}
             }
