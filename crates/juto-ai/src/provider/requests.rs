@@ -233,6 +233,11 @@ fn anthropic_parts(blocks: &[ContentBlock], signed: bool) -> Vec<Value> {
         _=>None,
     }).collect()
 }
+/// SDK `OutputConfig.effort` accepts only low|medium|high|xhigh|max. Config's
+/// `minimal` maps to `low`, matching the budget table on the enabled-thinking path.
+fn anthropic_effort(effort: &str) -> &str {
+    if effort == "minimal" { "low" } else { effort }
+}
 fn anthropic_messages(model: &Model, context: &Context) -> Vec<Value> {
     let mut messages: Vec<Value> = Vec::new();
     for message in &context.messages {
@@ -366,6 +371,8 @@ pub(super) fn build(
         match api {
             Api::Gemini => body["generationConfig"]["temperature"] = json!(temperature),
             Api::Ollama => body["options"] = json!({"temperature":temperature}),
+            // The SDK's MessageCreateParams has no temperature field.
+            Api::Anthropic => {}
             _ if flag(model, "supportsSamplingParams", true) => {
                 body["temperature"] = json!(temperature)
             }
@@ -412,7 +419,7 @@ pub(super) fn build(
             Api::Anthropic => {
                 if flag(model, "supportsAdaptiveThinking", false) {
                     body["thinking"] = json!({"type":"adaptive"});
-                    body["output_config"] = json!({"effort":effort});
+                    body["output_config"] = json!({"effort":anthropic_effort(effort)});
                 } else {
                     let budget = match effort {
                         "minimal" | "low" => 1024,
@@ -422,7 +429,6 @@ pub(super) fn build(
                     if max_tokens > 1024 {
                         body["thinking"] =
                             json!({"type":"enabled","budget_tokens":budget.min(max_tokens-1)});
-                        body.as_object_mut().expect("object").remove("temperature");
                     }
                 }
             }
@@ -549,8 +555,15 @@ pub(super) fn build(
 
 #[cfg(test)]
 mod tests {
+    //! Anthropic request shapes pinned to `@anthropic-ai/sdk` tag `sdk-v1.1.0`
+    //! (commit 5badc765f17d373405f300ee8e69e7f490b1f172): `MessageCreateParamsBase`,
+    //! `MessageParam`, `TextBlockParam`, `ImageBlockParam` / `Base64ImageSource`,
+    //! `ToolUseBlockParam`, `ToolResultBlockParam`, `ThinkingBlockParam`,
+    //! `RedactedThinkingBlockParam`, `Tool`, `ThinkingConfigEnabled`, `OutputConfig`.
     use super::*;
-    use crate::ToolDefinition;
+    use crate::{
+        AssistantMessage, ContentBlock, Context, Message, StreamOptions, ToolCall, ToolDefinition,
+    };
 
     fn anthropic_model() -> Model {
         serde_json::from_value(json!({
@@ -813,5 +826,355 @@ mod tests {
         let body = anthropic_body(&anthropic_model(), &context, 4096, true);
         assert_eq!(body["system"].as_array().unwrap().len(), 1);
         assert_eq!(markers(&body), vec!["/messages/0/content/0/cache_control"]);
+    }
+
+    const MESSAGE_CREATE_PARAMS: &[&str] = &[
+        "max_tokens",
+        "messages",
+        "model",
+        "cache_control",
+        "container",
+        "diagnostics",
+        "inference_geo",
+        "metadata",
+        "output_config",
+        "service_tier",
+        "speed",
+        "stop_sequences",
+        "stream",
+        "system",
+        "thinking",
+        "tool_choice",
+        "tools",
+    ];
+
+    fn sdk_anthropic_model(compat: Value) -> Model {
+        serde_json::from_value(json!({
+            "id": "claude-test",
+            "name": "Claude test",
+            "api": "anthropic-messages",
+            "provider": "anthropic",
+            "baseUrl": "https://api.anthropic.com/v1",
+            "reasoning": true,
+            "maxTokens": 8192,
+            "compat": compat,
+        }))
+        .expect("valid model row")
+    }
+
+    fn full_context(model: &Model) -> Context {
+        let mut assistant = AssistantMessage::new(model);
+        assistant.content = vec![
+            ContentBlock::Thinking {
+                thinking: "pondering".into(),
+                thinking_signature: Some("sig-1".into()),
+            },
+            ContentBlock::RedactedThinking {
+                data: "opaque".into(),
+            },
+            ContentBlock::Text {
+                text: "reading".into(),
+            },
+            ContentBlock::ToolCall(ToolCall {
+                id: "toolu_1".into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "a.txt"}),
+                thought_signature: None,
+            }),
+        ];
+        Context {
+            system_prompt: vec!["be terse".into()],
+            messages: vec![
+                Message::User {
+                    content: vec![
+                        ContentBlock::Text {
+                            text: "look".into(),
+                        },
+                        ContentBlock::Image {
+                            data: "aGk=".into(),
+                            mime_type: "image/png".into(),
+                        },
+                    ],
+                    timestamp: 0,
+                },
+                Message::Assistant(assistant),
+                Message::ToolResult {
+                    tool_call_id: "toolu_1".into(),
+                    tool_name: "read_file".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "hello".into(),
+                    }],
+                    is_error: false,
+                    details: Value::Null,
+                    timestamp: 0,
+                },
+            ],
+            tools: vec![ToolDefinition {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"],
+                }),
+            }],
+        }
+    }
+
+    fn sdk_anthropic_body_for_test(
+        model: &Model,
+        context: &Context,
+        options: &StreamOptions,
+    ) -> Value {
+        let request = build(
+            &reqwest::Client::new(),
+            Api::Anthropic,
+            model,
+            context,
+            options,
+            None,
+        )
+        .expect("anthropic request builds")
+        .build()
+        .expect("request assembles");
+        let bytes = request
+            .body()
+            .and_then(|body| body.as_bytes())
+            .expect("json body");
+        serde_json::from_slice(bytes).expect("json body parses")
+    }
+
+    /// Every key we send must be declared by the SDK type, and every required key present.
+    fn assert_fields(value: &Value, allowed: &[&str], required: &[&str], shape: &str) {
+        let object = value
+            .as_object()
+            .unwrap_or_else(|| panic!("{shape} must be an object"));
+        for key in object.keys() {
+            assert!(
+                allowed.contains(&key.as_str()),
+                "{shape} sends `{key}`, which the SDK type does not declare"
+            );
+        }
+        for key in required {
+            assert!(
+                object.contains_key(*key),
+                "{shape} lacks SDK-required `{key}`"
+            );
+        }
+    }
+
+    fn assert_block(block: &Value) {
+        match block["type"].as_str() {
+            Some("text") => assert_fields(
+                block,
+                &["type", "text", "cache_control", "citations"],
+                &["type", "text"],
+                "TextBlockParam",
+            ),
+            Some("image") => {
+                assert_fields(
+                    block,
+                    &["type", "source", "cache_control", "transformations"],
+                    &["type", "source"],
+                    "ImageBlockParam",
+                );
+                let source = &block["source"];
+                assert_fields(
+                    source,
+                    &["type", "media_type", "data"],
+                    &["type", "media_type", "data"],
+                    "Base64ImageSource",
+                );
+                assert!(matches!(
+                    source["media_type"].as_str(),
+                    Some("image/jpeg" | "image/png" | "image/gif" | "image/webp")
+                ));
+            }
+            Some("tool_use") => assert_fields(
+                block,
+                &[
+                    "type",
+                    "id",
+                    "name",
+                    "input",
+                    "cache_control",
+                    "caller",
+                    "toolset_name",
+                ],
+                &["type", "id", "name", "input"],
+                "ToolUseBlockParam",
+            ),
+            Some("tool_result") => {
+                assert_fields(
+                    block,
+                    &[
+                        "type",
+                        "tool_use_id",
+                        "content",
+                        "is_error",
+                        "cache_control",
+                    ],
+                    &["type", "tool_use_id"],
+                    "ToolResultBlockParam",
+                );
+                for part in block["content"]
+                    .as_array()
+                    .expect("tool_result content array")
+                {
+                    assert_block(part);
+                }
+            }
+            Some("thinking") => assert_fields(
+                block,
+                &["type", "thinking", "signature"],
+                &["type", "thinking", "signature"],
+                "ThinkingBlockParam",
+            ),
+            Some("redacted_thinking") => assert_fields(
+                block,
+                &["type", "data"],
+                &["type", "data"],
+                "RedactedThinkingBlockParam",
+            ),
+            other => panic!("block type {other:?} is not a SDK content block param"),
+        }
+    }
+
+    #[test]
+    fn top_level_keys_are_sdk_message_create_params() {
+        let model = sdk_anthropic_model(json!({}));
+        let options = StreamOptions {
+            max_tokens: Some(4096),
+            thinking: Some("medium".into()),
+            ..Default::default()
+        };
+        let body = sdk_anthropic_body_for_test(&model, &full_context(&model), &options);
+        assert_fields(
+            &body,
+            MESSAGE_CREATE_PARAMS,
+            &["model", "messages", "max_tokens"],
+            "request body",
+        );
+        assert_eq!(body["stream"], json!(true));
+    }
+
+    #[test]
+    fn message_system_and_tool_shapes_match_sdk_params() {
+        let model = sdk_anthropic_model(json!({}));
+        let options = StreamOptions {
+            max_tokens: Some(4096),
+            ..Default::default()
+        };
+        let body = sdk_anthropic_body_for_test(&model, &full_context(&model), &options);
+        for message in body["messages"].as_array().expect("messages array") {
+            assert_fields(
+                message,
+                &["role", "content"],
+                &["role", "content"],
+                "MessageParam",
+            );
+            assert!(matches!(
+                message["role"].as_str(),
+                Some("user" | "assistant")
+            ));
+            for block in message["content"].as_array().expect("content array") {
+                assert_block(block);
+            }
+        }
+        for block in body["system"].as_array().expect("system array") {
+            assert_block(block);
+        }
+        for tool in body["tools"].as_array().expect("tools array") {
+            assert_fields(
+                tool,
+                &["name", "description", "input_schema"],
+                &["name", "input_schema"],
+                "Tool",
+            );
+            assert_eq!(tool["input_schema"]["type"], "object");
+        }
+    }
+
+    #[test]
+    fn temperature_is_not_sent_to_anthropic() {
+        let model = sdk_anthropic_model(json!({}));
+        let options = StreamOptions {
+            max_tokens: Some(4096),
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        let body = sdk_anthropic_body_for_test(&model, &full_context(&model), &options);
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn temperature_is_omitted_with_enabled_thinking() {
+        let model = sdk_anthropic_model(json!({}));
+        let options = StreamOptions {
+            max_tokens: Some(4096),
+            thinking: Some("high".into()),
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        let body = sdk_anthropic_body_for_test(&model, &full_context(&model), &options);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn temperature_is_omitted_with_adaptive_thinking() {
+        let model = sdk_anthropic_model(json!({"supportsAdaptiveThinking": true}));
+        let options = StreamOptions {
+            max_tokens: Some(4096),
+            thinking: Some("high".into()),
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        let body = sdk_anthropic_body_for_test(&model, &full_context(&model), &options);
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn enabled_thinking_budget_is_below_max_tokens() {
+        let model = sdk_anthropic_model(json!({}));
+        let options = StreamOptions {
+            max_tokens: Some(4096),
+            thinking: Some("high".into()),
+            ..Default::default()
+        };
+        let body = sdk_anthropic_body_for_test(&model, &full_context(&model), &options);
+        assert_fields(
+            &body["thinking"],
+            &["type", "budget_tokens", "display"],
+            &["type", "budget_tokens"],
+            "ThinkingConfigEnabled",
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+        let budget = body["thinking"]["budget_tokens"]
+            .as_u64()
+            .expect("integer budget");
+        assert!((1024..4096).contains(&budget));
+    }
+
+    #[test]
+    fn adaptive_effort_is_an_sdk_output_config_value() {
+        for (configured, sent) in [("minimal", "low"), ("xhigh", "xhigh"), ("max", "max")] {
+            let model = sdk_anthropic_model(json!({"supportsAdaptiveThinking": true}));
+            let options = StreamOptions {
+                max_tokens: Some(4096),
+                thinking: Some(configured.into()),
+                ..Default::default()
+            };
+            let body = sdk_anthropic_body_for_test(&model, &full_context(&model), &options);
+            assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+            assert_fields(
+                &body["output_config"],
+                &["effort", "format"],
+                &[],
+                "OutputConfig",
+            );
+            assert_eq!(body["output_config"]["effort"], sent);
+        }
     }
 }
