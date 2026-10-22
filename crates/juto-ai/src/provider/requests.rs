@@ -271,6 +271,41 @@ fn anthropic_messages(model: &Model, context: &Context) -> Vec<Value> {
     }
     messages
 }
+
+fn ephemeral(block: &mut Value) {
+    block["cache_control"] = json!({"type":"ephemeral"});
+}
+/// Anthropic Messages body with two of the four allowed cache breakpoints: the
+/// last system block (tools precede system in the cached prefix, so it caches
+/// both) and the last block of the final message (caches the conversation).
+/// The OAuth identity block is inserted first, so it never takes the marker
+/// unless it is the only system block.
+fn anthropic_body(model: &Model, context: &Context, max_tokens: u64, oauth: bool) -> Value {
+    let mut system: Vec<Value> = context
+        .system_prompt
+        .iter()
+        .map(|text| json!({"type":"text","text":text}))
+        .collect();
+    if oauth {
+        system.insert(
+            0,
+            json!({"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}),
+        );
+    }
+    if let Some(block) = system.last_mut() {
+        ephemeral(block);
+    }
+    let mut messages = anthropic_messages(model, context);
+    if let Some(block) = messages
+        .last_mut()
+        .and_then(|message| message["content"].as_array_mut())
+        .and_then(|blocks| blocks.last_mut())
+    {
+        ephemeral(block);
+    }
+    json!({"model":model.id,"messages":messages,"system":system,"max_tokens":max_tokens,"stream":true})
+}
+
 fn gemini_parts(model: &Model, message: &Message) -> Vec<Value> {
     let signed = matches!(message,Message::Assistant(assistant) if same_model(model,assistant));
     content(message).iter().filter_map(|block|match block {
@@ -313,9 +348,7 @@ pub(super) fn build(
         Api::Responses | Api::Codex | Api::Azure => {
             json!({"model":model.id,"input":response_input(model,context),"instructions":context.system_prompt.join("\n\n"),"stream":true,"store":false})
         }
-        Api::Anthropic => {
-            json!({"model":model.id,"messages":anthropic_messages(model,context),"system":context.system_prompt.iter().map(|text|json!({"type":"text","text":text})).collect::<Vec<_>>(),"max_tokens":max_tokens,"stream":true})
-        }
+        Api::Anthropic => anthropic_body(model, context, max_tokens, oauth),
         Api::Gemini => {
             json!({"contents":gemini_messages(model,context),"systemInstruction":{"parts":context.system_prompt.iter().map(|text|json!({"text":text})).collect::<Vec<_>>()},"generationConfig":{"maxOutputTokens":max_tokens}})
         }
@@ -433,12 +466,7 @@ pub(super) fn build(
                 .and_then(Value::as_str)
                 .unwrap_or("2025-04-01-preview")
         ),
-        Api::Anthropic => {
-            if oauth {
-                body["system"].as_array_mut().expect("array").insert(0,json!({"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}));
-            }
-            format!("{}/messages", base(model, "https://api.anthropic.com/v1"))
-        }
+        Api::Anthropic => format!("{}/messages", base(model, "https://api.anthropic.com/v1")),
         Api::Gemini => {
             let model_id = model.id.strip_prefix("models/").unwrap_or(&model.id);
             let encoded: String = model_id
@@ -509,4 +537,200 @@ pub(super) fn build(
             .header("originator", "omp");
     }
     Ok(request.json(&body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ToolDefinition;
+
+    fn anthropic_model() -> Model {
+        serde_json::from_value(json!({
+            "id": "claude-test",
+            "name": "Claude Test",
+            "api": "anthropic-messages",
+            "provider": "anthropic",
+            "baseUrl": "https://api.anthropic.com/v1",
+            "reasoning": false,
+            "input": ["text"],
+            "supportsTools": true,
+            "cost": {"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0},
+            "contextWindow": 200000,
+            "maxTokens": 8192,
+            "compat": {}
+        }))
+        .unwrap()
+    }
+
+    fn text_message(text: &str) -> Message {
+        Message::User {
+            content: vec![ContentBlock::Text { text: text.into() }],
+            timestamp: 0,
+        }
+    }
+
+    fn assistant_message(text: &str) -> Message {
+        let mut message = AssistantMessage::new(&anthropic_model());
+        message
+            .content
+            .push(ContentBlock::Text { text: text.into() });
+        Message::Assistant(message)
+    }
+
+    fn read_tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.into(),
+            description: format!("{name} a file"),
+            parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        }
+    }
+
+    /// JSON Pointers of every `cache_control` key in `value`, sorted.
+    fn markers(value: &Value) -> Vec<String> {
+        fn walk(value: &Value, path: &str, out: &mut Vec<String>) {
+            match value {
+                Value::Object(map) => {
+                    for (key, child) in map {
+                        let child_path = format!("{path}/{key}");
+                        if key == "cache_control" {
+                            out.push(child_path.clone());
+                        }
+                        walk(child, &child_path, out);
+                    }
+                }
+                Value::Array(items) => {
+                    for (index, child) in items.iter().enumerate() {
+                        walk(child, &format!("{path}/{index}"), out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(value, "", &mut out);
+        out.sort();
+        out
+    }
+
+    fn without_markers(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .filter(|(key, _)| key.as_str() != "cache_control")
+                    .map(|(key, child)| (key.clone(), without_markers(child)))
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(without_markers).collect()),
+            other => other.clone(),
+        }
+    }
+
+    fn request_body(api: Api, context: &Context) -> Value {
+        let request = build(
+            &reqwest::Client::new(),
+            api,
+            &anthropic_model(),
+            context,
+            &StreamOptions::default(),
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        serde_json::from_slice(request.body().unwrap().as_bytes().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn anthropic_marks_last_system_block_and_final_message_block() {
+        let context = Context {
+            system_prompt: vec!["base".into(), "rules".into()],
+            messages: vec![
+                text_message("first"),
+                assistant_message("reply"),
+                text_message("second"),
+            ],
+            tools: Vec::new(),
+        };
+        let body = anthropic_body(&anthropic_model(), &context, 4096, false);
+        assert_eq!(
+            markers(&body),
+            vec![
+                "/messages/2/content/0/cache_control",
+                "/system/1/cache_control"
+            ]
+        );
+        assert_eq!(
+            body["system"][1]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+    }
+
+    #[test]
+    fn oauth_identity_block_does_not_take_the_system_marker() {
+        let context = Context {
+            system_prompt: vec!["base".into(), "rules".into()],
+            messages: vec![text_message("hi")],
+            tools: Vec::new(),
+        };
+        let body = anthropic_body(&anthropic_model(), &context, 4096, true);
+        assert_eq!(
+            body["system"][0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+        assert_eq!(body["system"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            markers(&body),
+            vec![
+                "/messages/0/content/0/cache_control",
+                "/system/2/cache_control"
+            ]
+        );
+    }
+
+    #[test]
+    fn non_anthropic_bodies_carry_no_cache_control() {
+        let context = Context {
+            system_prompt: vec!["base".into()],
+            messages: vec![text_message("hi"), assistant_message("reply")],
+            tools: vec![read_tool("read")],
+        };
+        for api in [
+            Api::Chat,
+            Api::Responses,
+            Api::Azure,
+            Api::Gemini,
+            Api::Ollama,
+        ] {
+            assert!(markers(&request_body(api, &context)).is_empty());
+        }
+    }
+
+    #[test]
+    fn consecutive_turns_share_byte_identical_tools_and_system() {
+        let tools = vec![read_tool("grep"), read_tool("read")];
+        let turn1 = Context {
+            system_prompt: vec!["base".into(), "rules".into()],
+            messages: vec![text_message("first")],
+            tools: tools.clone(),
+        };
+        let turn2 = Context {
+            system_prompt: vec!["base".into(), "rules".into()],
+            messages: vec![
+                text_message("first"),
+                assistant_message("reply"),
+                text_message("second"),
+            ],
+            tools,
+        };
+        let first = request_body(Api::Anthropic, &turn1);
+        let second = request_body(Api::Anthropic, &turn2);
+        assert_eq!(first["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(first["tools"].to_string(), second["tools"].to_string());
+        assert_eq!(first["system"].to_string(), second["system"].to_string());
+
+        let earlier = without_markers(&first["messages"]);
+        let later = without_markers(&second["messages"]);
+        let (earlier, later) = (earlier.as_array().unwrap(), later.as_array().unwrap());
+        assert_eq!(later[..earlier.len()], earlier[..]);
+    }
 }
