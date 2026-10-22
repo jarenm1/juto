@@ -371,8 +371,6 @@ pub(super) fn build(
         match api {
             Api::Gemini => body["generationConfig"]["temperature"] = json!(temperature),
             Api::Ollama => body["options"] = json!({"temperature":temperature}),
-            // The SDK's MessageCreateParams has no temperature field.
-            Api::Anthropic => {}
             _ if flag(model, "supportsSamplingParams", true) => {
                 body["temperature"] = json!(temperature)
             }
@@ -1096,8 +1094,20 @@ mod tests {
     }
 
     #[test]
-    fn temperature_is_not_sent_to_anthropic() {
+    fn temperature_is_sent_to_anthropic_when_sampling_params_are_allowed() {
         let model = sdk_anthropic_model(json!({}));
+        let options = StreamOptions {
+            max_tokens: Some(4096),
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        let body = sdk_anthropic_body_for_test(&model, &full_context(&model), &options);
+        assert_eq!(body["temperature"], json!(0.2));
+    }
+
+    #[test]
+    fn temperature_is_omitted_when_model_disallows_sampling_params() {
+        let model = sdk_anthropic_model(json!({"supportsSamplingParams": false}));
         let options = StreamOptions {
             max_tokens: Some(4096),
             temperature: Some(0.2),
