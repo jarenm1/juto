@@ -580,6 +580,18 @@ impl Decoder {
                 if let Some(input) = value.pointer("/usage/input_tokens").and_then(Value::as_u64) {
                     self.output.usage.input = input;
                 }
+                if let Some(read) = value
+                    .pointer("/usage/cache_read_input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    self.output.usage.cache_read = read;
+                }
+                if let Some(write) = value
+                    .pointer("/usage/cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    self.output.usage.cache_write = write;
+                }
             }
             "message_stop" => self.terminal = true,
             "error" => return Err(ProviderError::Protocol("Anthropic stream error".into())),
@@ -827,6 +839,38 @@ mod tests {
         assert_eq!(message.usage.input, 12);
         assert_eq!(message.usage.cache_read, 1500);
         assert_eq!(message.usage.cache_write, 300);
+        assert_eq!(message.usage.output, 7);
+    }
+
+    #[test]
+    fn anthropic_message_delta_updates_cache_usage() {
+        let model: Model = serde_json::from_value(json!({
+            "id": "claude-test",
+            "name": "Claude Test",
+            "api": "anthropic-messages",
+            "provider": "anthropic",
+            "baseUrl": "https://api.anthropic.com/v1",
+            "supportsTools": true,
+            "cost": {"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0},
+            "maxTokens": 8192,
+            "compat": {}
+        }))
+        .unwrap();
+        let mut decoder = Decoder::new(Api::Anthropic, &model);
+        let mut events = Vec::new();
+        for payload in [
+            r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":12,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7,"cache_read_input_tokens":900,"cache_creation_input_tokens":250}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            decoder.feed(payload, &mut events).unwrap();
+        }
+        let message = decoder.finish(&model).unwrap();
+        assert_eq!(message.usage.cache_read, 900);
+        assert_eq!(message.usage.cache_write, 250);
         assert_eq!(message.usage.output, 7);
     }
 }

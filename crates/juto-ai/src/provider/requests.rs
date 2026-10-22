@@ -275,9 +275,17 @@ fn anthropic_messages(model: &Model, context: &Context) -> Vec<Value> {
 fn ephemeral(block: &mut Value) {
     block["cache_control"] = json!({"type":"ephemeral"});
 }
+/// Thinking blocks and empty text blocks cannot carry cache_control.
+fn cacheable(block: &Value) -> bool {
+    match block["type"].as_str() {
+        Some("thinking" | "redacted_thinking") => false,
+        Some("text") => block["text"].as_str().is_some_and(|text| !text.is_empty()),
+        _ => true,
+    }
+}
 /// Anthropic Messages body with two of the four allowed cache breakpoints: the
 /// last system block (tools precede system in the cached prefix, so it caches
-/// both) and the last block of the final message (caches the conversation).
+/// both) and the last cacheable block of the final message (caches the conversation).
 /// The OAuth identity block is inserted first, so it never takes the marker
 /// unless it is the only system block.
 fn anthropic_body(model: &Model, context: &Context, max_tokens: u64, oauth: bool) -> Value {
@@ -292,14 +300,14 @@ fn anthropic_body(model: &Model, context: &Context, max_tokens: u64, oauth: bool
             json!({"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}),
         );
     }
-    if let Some(block) = system.last_mut() {
+    if let Some(block) = system.iter_mut().rev().find(|block| cacheable(block)) {
         ephemeral(block);
     }
     let mut messages = anthropic_messages(model, context);
     if let Some(block) = messages
         .last_mut()
         .and_then(|message| message["content"].as_array_mut())
-        .and_then(|blocks| blocks.last_mut())
+        .and_then(|blocks| blocks.iter_mut().rev().find(|block| cacheable(block)))
     {
         ephemeral(block);
     }
@@ -732,5 +740,64 @@ mod tests {
         let later = without_markers(&second["messages"]);
         let (earlier, later) = (earlier.as_array().unwrap(), later.as_array().unwrap());
         assert_eq!(later[..earlier.len()], earlier[..]);
+    }
+
+    #[test]
+    fn final_message_ending_in_signed_thinking_marks_preceding_text() {
+        let mut reply = AssistantMessage::new(&anthropic_model());
+        reply.content.push(ContentBlock::Text {
+            text: "answer".into(),
+        });
+        reply.content.push(ContentBlock::Thinking {
+            thinking: "hmm".into(),
+            thinking_signature: Some("sig".into()),
+        });
+        let context = Context {
+            system_prompt: vec!["base".into()],
+            messages: vec![text_message("hi"), Message::Assistant(reply)],
+            tools: Vec::new(),
+        };
+        let body = anthropic_body(&anthropic_model(), &context, 4096, false);
+        assert_eq!(
+            markers(&body),
+            vec![
+                "/messages/1/content/0/cache_control",
+                "/system/0/cache_control"
+            ]
+        );
+        assert!(
+            body["messages"][1]["content"][1]
+                .get("cache_control")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn final_message_ending_in_empty_text_skips_the_empty_block() {
+        let mut reply = AssistantMessage::new(&anthropic_model());
+        reply.content.push(ContentBlock::Text {
+            text: "answer".into(),
+        });
+        reply.content.push(ContentBlock::Text {
+            text: String::new(),
+        });
+        let context = Context {
+            system_prompt: vec!["base".into()],
+            messages: vec![text_message("hi"), Message::Assistant(reply)],
+            tools: Vec::new(),
+        };
+        let body = anthropic_body(&anthropic_model(), &context, 4096, false);
+        assert_eq!(
+            markers(&body),
+            vec![
+                "/messages/1/content/0/cache_control",
+                "/system/0/cache_control"
+            ]
+        );
+        assert!(
+            body["messages"][1]["content"][1]
+                .get("cache_control")
+                .is_none()
+        );
     }
 }
