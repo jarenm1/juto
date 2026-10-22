@@ -438,6 +438,11 @@ pub(super) fn build(
             _ => {}
         }
     }
+    // Anthropic rejects `temperature` alongside `thinking` before API version 2026-10-21;
+    // the pinned `anthropic-version` is 2023-06-01, so drop it on both thinking paths.
+    if body.get("thinking").is_some() {
+        body.as_object_mut().expect("object").remove("temperature");
+    }
     if let Some(tier) = &options.service_tier
         && matches!(api, Api::Chat | Api::Responses | Api::Codex)
     {
