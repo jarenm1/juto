@@ -284,24 +284,24 @@ fn cacheable(block: &Value) -> bool {
     }
 }
 /// Anthropic Messages body with two of the four allowed cache breakpoints: the
-/// last system block (tools precede system in the cached prefix, so it caches
-/// both) and the last cacheable block of the final message (caches the conversation).
-/// The OAuth identity block is inserted first, so it never takes the marker
-/// unless it is the only system block.
+/// last cacheable caller system block (tools precede system in the cached prefix,
+/// so it caches both) and the last cacheable block of the final message (caches
+/// the conversation). The OAuth identity block is inserted after the markers are
+/// placed, so it never takes one.
 fn anthropic_body(model: &Model, context: &Context, max_tokens: u64, oauth: bool) -> Value {
     let mut system: Vec<Value> = context
         .system_prompt
         .iter()
         .map(|text| json!({"type":"text","text":text}))
         .collect();
+    if let Some(block) = system.iter_mut().rev().find(|block| cacheable(block)) {
+        ephemeral(block);
+    }
     if oauth {
         system.insert(
             0,
             json!({"type":"text","text":"You are Claude Code, Anthropic's official CLI for Claude."}),
         );
-    }
-    if let Some(block) = system.iter_mut().rev().find(|block| cacheable(block)) {
-        ephemeral(block);
     }
     let mut messages = anthropic_messages(model, context);
     if let Some(block) = messages
@@ -770,6 +770,8 @@ mod tests {
                 .get("cache_control")
                 .is_none()
         );
+        assert_eq!(body["messages"][1]["content"][1]["type"], "thinking");
+        assert_eq!(body["messages"][1]["content"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -799,5 +801,17 @@ mod tests {
                 .get("cache_control")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn oauth_identity_block_takes_no_marker_when_caller_prompt_is_empty() {
+        let context = Context {
+            system_prompt: Vec::new(),
+            messages: vec![text_message("hi")],
+            tools: Vec::new(),
+        };
+        let body = anthropic_body(&anthropic_model(), &context, 4096, true);
+        assert_eq!(body["system"].as_array().unwrap().len(), 1);
+        assert_eq!(markers(&body), vec!["/messages/0/content/0/cache_control"]);
     }
 }
