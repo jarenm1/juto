@@ -792,3 +792,41 @@ fn reason_to_stop(reason: &str) -> Result<StopReason, ProviderError> {
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_message_start_reports_cache_read_and_write_tokens() {
+        let model: Model = serde_json::from_value(json!({
+            "id": "claude-test",
+            "name": "Claude Test",
+            "api": "anthropic-messages",
+            "provider": "anthropic",
+            "baseUrl": "https://api.anthropic.com/v1",
+            "supportsTools": true,
+            "cost": {"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0},
+            "maxTokens": 8192,
+            "compat": {}
+        }))
+        .unwrap();
+        let mut decoder = Decoder::new(Api::Anthropic, &model);
+        let mut events = Vec::new();
+        for payload in [
+            r#"{"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":12,"cache_read_input_tokens":1500,"cache_creation_input_tokens":300,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            decoder.feed(payload, &mut events).unwrap();
+        }
+        let message = decoder.finish(&model).unwrap();
+        assert_eq!(message.usage.input, 12);
+        assert_eq!(message.usage.cache_read, 1500);
+        assert_eq!(message.usage.cache_write, 300);
+        assert_eq!(message.usage.output, 7);
+    }
+}
