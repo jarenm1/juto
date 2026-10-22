@@ -1098,11 +1098,11 @@ mod tests {
         let model = sdk_anthropic_model(json!({}));
         let options = StreamOptions {
             max_tokens: Some(4096),
-            temperature: Some(0.2),
+            temperature: Some(0.5),
             ..Default::default()
         };
         let body = sdk_anthropic_body_for_test(&model, &full_context(&model), &options);
-        assert_eq!(body["temperature"], json!(0.2));
+        assert_eq!(body["temperature"], json!(0.5));
     }
 
     #[test]
