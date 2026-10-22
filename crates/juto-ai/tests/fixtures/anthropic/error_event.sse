@@ -1,0 +1,10 @@
+: Mirrors the `error` stream event (ErrorResponse: {"type":"error","error":{"type","message"}})
+: of @anthropic-ai/sdk sdk-v1.1.0, commit 5badc765f17d373405f300ee8e69e7f490b1f172.
+: Hand-written to the SDK types, not captured from the live API.
+
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_05","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"output_tokens":0,"cache_creation_input_tokens":null,"cache_read_input_tokens":null}}}
+
+event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}
+

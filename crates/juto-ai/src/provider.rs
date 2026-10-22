@@ -138,7 +138,7 @@ impl Provider for HttpProvider {
                     }
                 } else {
                     for frame in sse.feed(&chunk)? {
-                        if frame.data.is_empty() {continue;}
+                        if frame.data.is_empty() || decode::frame_is_control(api, frame.event.as_deref()) {continue;}
                         terminal=decoder.feed(&frame.data,&mut pending)?;
                         for event in pending.drain(..) {yield event;}
                         if terminal {break;}
@@ -149,7 +149,7 @@ impl Provider for HttpProvider {
                 if api==Api::Ollama {
                     for payload in ndjson.finish()? {decoder.feed(&payload,&mut pending)?;}
                 } else {
-                    for frame in sse.finish()? {if !frame.data.is_empty() {decoder.feed(&frame.data,&mut pending)?;}}
+                    for frame in sse.finish()? {if !frame.data.is_empty() && !decode::frame_is_control(api,frame.event.as_deref()) {decoder.feed(&frame.data,&mut pending)?;}}
                 }
                 for event in pending.drain(..) {yield event;}
             }
