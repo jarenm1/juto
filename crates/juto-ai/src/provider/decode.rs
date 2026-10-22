@@ -190,7 +190,8 @@ impl Decoder {
         }
         let value: Value = serde_json::from_str(payload)
             .map_err(|error| ProviderError::Protocol(format!("invalid streamed JSON: {error}")))?;
-        if let Some(error) = value.get("error") {
+        // Anthropic error frames are typed events handled in `anthropic`, which keeps their type.
+        if let Some(error) = value.get("error").filter(|_| self.api != Api::Anthropic) {
             return Err(ProviderError::Protocol(
                 error
                     .get("message")
@@ -468,6 +469,7 @@ impl Decoder {
                 }
                 let usage = &value["message"]["usage"];
                 self.output.usage.input = number(usage, "input_tokens");
+                self.output.usage.output = number(usage, "output_tokens");
                 self.output.usage.cache_read = number(usage, "cache_read_input_tokens");
                 self.output.usage.cache_write = number(usage, "cache_creation_input_tokens");
             }
@@ -523,10 +525,11 @@ impl Decoder {
                             self.argument_snapshot(target, &input.to_string());
                         }
                     }
-                    _ => {
-                        return Err(ProviderError::Protocol(
-                            "unsupported Anthropic content block".into(),
-                        ));
+                    other => {
+                        return Err(ProviderError::Protocol(format!(
+                            "unsupported Anthropic content block `{}`",
+                            other.unwrap_or("<missing type>")
+                        )));
                     }
                 }
             }
@@ -558,7 +561,12 @@ impl Decoder {
                             events,
                         );
                     }
-                    _ => {}
+                    other => {
+                        return Err(ProviderError::Protocol(format!(
+                            "unsupported Anthropic content delta `{}`",
+                            other.unwrap_or("<missing type>")
+                        )));
+                    }
                 }
             }
             "content_block_stop" => {
@@ -568,33 +576,34 @@ impl Decoder {
             }
             "message_delta" => {
                 if let Some(reason) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
-                    self.output.stop_reason = reason_to_stop(reason)?;
+                    self.output.stop_reason = anthropic_stop_reason(reason, &value["delta"])?;
                     self.saw_finish = true;
                 }
-                if let Some(output) = value
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64)
-                {
+                // Counters are cumulative: a null or absent field keeps the value already seen.
+                let usage = &value["usage"];
+                if let Some(output) = usage["output_tokens"].as_u64() {
                     self.output.usage.output = output;
                 }
-                if let Some(input) = value.pointer("/usage/input_tokens").and_then(Value::as_u64) {
+                if let Some(input) = usage["input_tokens"].as_u64() {
                     self.output.usage.input = input;
                 }
-                if let Some(read) = value
-                    .pointer("/usage/cache_read_input_tokens")
-                    .and_then(Value::as_u64)
-                {
+                if let Some(read) = usage["cache_read_input_tokens"].as_u64() {
                     self.output.usage.cache_read = read;
                 }
-                if let Some(write) = value
-                    .pointer("/usage/cache_creation_input_tokens")
-                    .and_then(Value::as_u64)
-                {
+                if let Some(write) = usage["cache_creation_input_tokens"].as_u64() {
                     self.output.usage.cache_write = write;
                 }
             }
             "message_stop" => self.terminal = true,
-            "error" => return Err(ProviderError::Protocol("Anthropic stream error".into())),
+            "error" => {
+                let error = &value["error"];
+                return Err(ProviderError::Protocol(format!(
+                    "Anthropic stream error ({}): {}",
+                    string(error, "type").unwrap_or("unknown"),
+                    string(error, "message").unwrap_or("no message"),
+                )));
+            }
+            // `ping` and unknown event types carry no message state and are ignored.
             _ => {}
         }
         Ok(())
@@ -788,6 +797,36 @@ impl Decoder {
         Ok(self.output)
     }
 }
+/// Anthropic `StopReason` values from `@anthropic-ai/sdk` sdk-v1.1.0. Unmapped values are errors,
+/// never silent completions.
+fn anthropic_stop_reason(reason: &str, delta: &Value) -> Result<StopReason, ProviderError> {
+    match reason {
+        "end_turn" | "stop_sequence" => Ok(StopReason::Stop),
+        "max_tokens" | "model_context_window_exceeded" => Ok(StopReason::Length),
+        "tool_use" => Ok(StopReason::ToolUse),
+        "refusal" => {
+            let details = &delta["stop_details"];
+            Err(ProviderError::Protocol(format!(
+                "model refused the request (category: {}): {}",
+                string(details, "category").unwrap_or("none"),
+                string(details, "explanation").unwrap_or("no explanation"),
+            )))
+        }
+        "pause_turn" => Err(ProviderError::Protocol(
+            "Anthropic pause_turn needs server-tool continuation, which juto does not implement"
+                .to_owned(),
+        )),
+        other => Err(ProviderError::Protocol(format!(
+            "unsupported Anthropic stop reason `{other}`"
+        ))),
+    }
+}
+
+/// SSE frames skipped before decoding, as `@anthropic-ai/sdk` streaming does: `ping` and frames
+/// with no event name. Other dialects carry their type in the payload, so they are never skipped.
+pub(super) fn frame_is_control(api: Api, event: Option<&str>) -> bool {
+    api == Api::Anthropic && matches!(event, None | Some("ping"))
+}
 fn string<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
@@ -807,7 +846,14 @@ fn reason_to_stop(reason: &str) -> Result<StopReason, ProviderError> {
 
 #[cfg(test)]
 mod tests {
+    //! Anthropic stream contract, pinned to `@anthropic-ai/sdk` tag `sdk-v1.1.0`
+    //! (commit 5badc765f17d373405f300ee8e69e7f490b1f172): `RawMessageStreamEvent`,
+    //! `RawContentBlockDelta`, `ContentBlock`, `Usage`, `MessageDeltaUsage`, `StopReason`,
+    //! `RefusalStopDetails`. Fixtures under tests/fixtures/anthropic/ are hand-written to those
+    //! types, not captured from the live API.
     use super::*;
+    use crate::sse::SseDecoder;
+    use serde_json::json;
 
     #[test]
     fn anthropic_message_start_reports_cache_read_and_write_tokens() {
@@ -872,5 +918,216 @@ mod tests {
         assert_eq!(message.usage.cache_read, 900);
         assert_eq!(message.usage.cache_write, 250);
         assert_eq!(message.usage.output, 7);
+    }
+
+    const TEXT: &str = include_str!("../../tests/fixtures/anthropic/text_stream.sse");
+    const THINKING: &str = include_str!("../../tests/fixtures/anthropic/thinking_signature.sse");
+    const TOOL: &str = include_str!("../../tests/fixtures/anthropic/tool_input_json.sse");
+    const ERROR: &str = include_str!("../../tests/fixtures/anthropic/error_event.sse");
+
+    const UNKNOWN_BLOCK: &str = r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search","input":{}}}
+
+"#;
+
+    const CITATIONS: &str = r#"event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"","citations":null}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"citations_delta","citation":{"type":"char_location","cited_text":"x","document_index":0,"document_title":null,"start_char_index":0,"end_char_index":1,"file_id":null}}}
+
+"#;
+
+    const REFUSAL: &str = r#"event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"refusal","stop_sequence":null,"stop_details":{"type":"refusal","category":"cyber","explanation":"Blocked by policy"}},"usage":{"input_tokens":null,"output_tokens":3,"cache_creation_input_tokens":null,"cache_read_input_tokens":null}}
+
+"#;
+
+    const CONTEXT_WINDOW: &str = r#"event: message_start
+data: {"type":"message_start","message":{"id":"msg_02","type":"message","role":"assistant","model":"claude-test","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0,"cache_creation_input_tokens":null,"cache_read_input_tokens":null}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":"","citations":null}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Partial"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"model_context_window_exceeded","stop_sequence":null},"usage":{"input_tokens":null,"output_tokens":0,"cache_creation_input_tokens":null,"cache_read_input_tokens":null}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+"#;
+
+    fn anthropic_model() -> Model {
+        serde_json::from_value(json!({
+            "id": "claude-test",
+            "name": "Claude test",
+            "api": "anthropic-messages",
+            "provider": "anthropic",
+            "baseUrl": "https://api.anthropic.com/v1",
+            "reasoning": true,
+            "maxTokens": 8192,
+        }))
+        .expect("valid model row")
+    }
+
+    /// Runs SSE bytes through the transport's frame filter and the Anthropic decoder.
+    fn run(stream: &str) -> Result<(Vec<ProviderEvent>, AssistantMessage), ProviderError> {
+        let model = anthropic_model();
+        let mut sse = SseDecoder::new();
+        let mut decoder = Decoder::new(Api::Anthropic, &model);
+        let mut events = Vec::new();
+        let mut frames = sse.feed(stream.as_bytes())?;
+        frames.extend(sse.finish()?);
+        for frame in frames {
+            if frame.data.is_empty() || frame_is_control(Api::Anthropic, frame.event.as_deref()) {
+                continue;
+            }
+            if decoder.feed(&frame.data, &mut events)? {
+                break;
+            }
+        }
+        decoder.close_blocks(&mut events);
+        let message = decoder.finish(&model)?;
+        Ok((events, message))
+    }
+
+    fn error_of(stream: &str) -> String {
+        match run(stream) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("stream should have been rejected"),
+        }
+    }
+
+    fn kinds(events: &[ProviderEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                ProviderEvent::TextDelta { index, delta } => format!("text[{index}]:{delta}"),
+                ProviderEvent::ThinkingDelta { index, delta } => {
+                    format!("thinking[{index}]:{delta}")
+                }
+                ProviderEvent::ToolCallStart { index, name, .. } => {
+                    format!("tool_start[{index}]:{name}")
+                }
+                ProviderEvent::ToolCallDelta { index, delta } => {
+                    format!("tool_delta[{index}]:{delta}")
+                }
+                ProviderEvent::BlockEnd { index } => format!("end[{index}]"),
+                _ => "other".to_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn text_stream_maps_text_deltas_usage_and_stop() {
+        let (events, message) = run(TEXT).expect("text stream decodes");
+        assert_eq!(
+            kinds(&events),
+            ["text[0]:Hello", "text[0]:, world", "end[0]"]
+        );
+        assert!(matches!(
+            &message.content[..],
+            [ContentBlock::Text { text }] if text == "Hello, world"
+        ));
+        assert_eq!(message.usage.input, 25);
+        assert_eq!(message.usage.output, 12);
+        assert_eq!(message.usage.cache_read, 0);
+        assert_eq!(message.usage.cache_write, 0);
+        assert!(matches!(message.stop_reason, StopReason::Stop));
+    }
+
+    #[test]
+    fn thinking_signature_is_carried_onto_the_block() {
+        let (events, message) = run(THINKING).expect("thinking stream decodes");
+        assert_eq!(
+            kinds(&events),
+            [
+                "thinking[0]:Let me think.",
+                "end[0]",
+                "text[1]:Done.",
+                "end[1]",
+            ]
+        );
+        match &message.content[..] {
+            [
+                ContentBlock::Thinking {
+                    thinking_signature, ..
+                },
+                ContentBlock::Text { .. },
+            ] => {
+                assert_eq!(thinking_signature.as_deref(), Some("EqQBsig"));
+            }
+            _ => panic!("expected thinking then text blocks"),
+        }
+    }
+
+    #[test]
+    fn tool_input_json_deltas_assemble_valid_arguments_and_usage() {
+        let (events, message) = run(TOOL).expect("tool stream decodes");
+        assert_eq!(
+            kinds(&events),
+            [
+                "tool_start[0]:get_weather",
+                "tool_delta[0]:{\"city\":",
+                "tool_delta[0]: \"Paris\"}",
+                "end[0]",
+            ]
+        );
+        match &message.content[..] {
+            [ContentBlock::ToolCall(call)] => {
+                assert_eq!(call.id, "toolu_01A");
+                assert_eq!(call.arguments, json!({"city": "Paris"}));
+            }
+            _ => panic!("expected one tool call"),
+        }
+        assert_eq!(message.usage.input, 30);
+        assert_eq!(message.usage.output, 17);
+        assert_eq!(message.usage.cache_read, 9);
+        assert_eq!(message.usage.cache_write, 4);
+        assert!(matches!(message.stop_reason, StopReason::ToolUse));
+    }
+
+    #[test]
+    fn error_event_surfaces_type_and_message() {
+        let error = error_of(ERROR);
+        assert!(error.contains("overloaded_error"), "{error}");
+        assert!(error.contains("Overloaded"), "{error}");
+    }
+
+    #[test]
+    fn unknown_content_block_type_is_rejected_by_name() {
+        assert!(error_of(UNKNOWN_BLOCK).contains("server_tool_use"));
+    }
+
+    #[test]
+    fn citations_delta_is_rejected_by_name() {
+        assert!(error_of(CITATIONS).contains("citations_delta"));
+    }
+
+    #[test]
+    fn refusal_stop_reason_is_an_error_with_details() {
+        let error = error_of(REFUSAL);
+        assert!(error.contains("cyber"), "{error}");
+        assert!(error.contains("Blocked by policy"), "{error}");
+    }
+
+    #[test]
+    fn context_window_stop_reason_maps_to_length() {
+        let (_, message) = run(CONTEXT_WINDOW).expect("stream decodes");
+        assert!(matches!(message.stop_reason, StopReason::Length));
+    }
+
+    #[test]
+    fn ping_and_unnamed_frames_are_control_frames_for_anthropic_only() {
+        assert!(frame_is_control(Api::Anthropic, Some("ping")));
+        assert!(frame_is_control(Api::Anthropic, None));
+        assert!(!frame_is_control(Api::Anthropic, Some("message_start")));
+        assert!(!frame_is_control(Api::Chat, Some("ping")));
     }
 }
