@@ -778,7 +778,10 @@ impl DesktopEnvironment {
                     });
                 }
                 if let Some(current) = lease.as_ref() {
-                    if current.holder == caller && current.is_human == is_human {
+                    if current.holder == caller
+                        && current.is_human == is_human
+                        && current.expires_at > now_secs()
+                    {
                         // Renewal: same holder keeps its epoch and extends the
                         // deadline, so a heartbeat cannot invalidate its own lease.
                         let renewed = ControlLease {
@@ -1178,6 +1181,12 @@ impl DesktopEnvironment {
                     return Err(DesktopError::StaleLease {
                         expected: current.epoch,
                         received: epoch,
+                    });
+                }
+                if current.expires_at <= now_secs() {
+                    *lease = None;
+                    return Err(DesktopError::ControlLeaseExpired {
+                        environment: self.env_id().to_string(),
                     });
                 }
                 let renewed = ControlLease {

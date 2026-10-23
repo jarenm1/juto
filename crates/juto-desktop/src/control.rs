@@ -319,7 +319,12 @@ fn handle(
             is_human,
         } => match supervisor.get_environment(&env_id) {
             Ok(env) => {
-                match env.set_control(&env.get_status().owner_principal, &action, is_human) {
+                let caller = if is_human {
+                    crate::protocol::HUMAN_VIEWER_PRINCIPAL.to_string()
+                } else {
+                    env.get_status().owner_principal
+                };
+                match env.set_control(&caller, &action, is_human) {
                     Ok(lease) => DesktopResponse::ControlChanged { lease },
                     Err(err) => error_response(&err),
                 }
@@ -333,7 +338,9 @@ fn handle(
             events,
         } => match supervisor.get_environment(&env_id) {
             Ok(env) => {
-                let caller = env.get_status().owner_principal;
+                // Input over this socket is the attached human viewer's. Its lease holder
+                // is the viewer principal, so the caller must match that principal.
+                let caller = crate::protocol::HUMAN_VIEWER_PRINCIPAL.to_string();
                 match env.dispatch_input(&caller, epoch, generation, events) {
                     Ok(watermark) => DesktopResponse::InputAccepted {
                         applied_watermark: watermark,
@@ -465,6 +472,7 @@ fn error_code(err: &crate::DesktopError) -> String {
         AutomationBusy { .. } => "AutomationBusy",
         StaleGeneration { .. } => "StaleGeneration",
         StaleLease { .. } => "StaleLease",
+        ControlLeaseExpired { .. } => "ControlLeaseExpired",
         ObservationTimeout { .. } => "ObservationTimeout",
         TransportUnavailable(_) => "TransportUnavailable",
         EnvironmentFailed(_, _) => "EnvironmentFailed",
@@ -474,6 +482,7 @@ fn error_code(err: &crate::DesktopError) -> String {
         TextUnavailable(_) => "TextUnavailable",
         Io { .. } => "Io",
         Protocol(_) => "Protocol",
+        Rejected { code, .. } => code.as_str(),
         Shm(_) => "Shm",
         Compositor(_) => "Compositor",
     }

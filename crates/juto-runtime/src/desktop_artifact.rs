@@ -21,7 +21,7 @@ use crate::tools::DesktopSessionArtifact;
 
 /// The authenticated principal of the interactive harness session: the local
 /// human who opens desktop artifacts. Agent-created desktops grant it access.
-pub const SESSION_VIEWER_PRINCIPAL: &str = "human:viewer";
+pub const SESSION_VIEWER_PRINCIPAL: &str = juto_desktop::protocol::HUMAN_VIEWER_PRINCIPAL;
 
 /// How often the session grant keepalive runs.
 const GRANT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
