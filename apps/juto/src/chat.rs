@@ -7,12 +7,14 @@ use std::rc::Rc;
 use crate::Quit;
 use crate::auth_modal::{AuthModal, AuthModalEvent};
 use crate::chat_input::{ChatInput, SubmitMessage};
-use crate::focus_view::{FocusEvent, FocusView};
+use crate::focus_thread::{FocusEvent, FocusThread};
 use crate::jobs_panel::{self, JobAction, JobActionHandler};
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::subagent_card;
+use crate::task_card::status_label;
 use crate::theme;
+use crate::vcs_sidebar::VcsSidebar;
 use crate::view_element::{ViewActions, render_view};
 use gpui::{
     AnyElement, App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding,
@@ -157,8 +159,8 @@ pub fn load_messages(timeline: &[TimelineItem]) -> Vec<Message> {
     }))
 }
 
-/// Converts agent messages into transcript rows. Shared by the main transcript
-/// and focus views.
+/// Converts agent messages into transcript rows, for the main thread and focus
+/// threads alike.
 pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec<Message> {
     let mut messages = Vec::new();
     for message in source {
@@ -368,8 +370,9 @@ pub struct ChatView {
     model_picker: Entity<ModelPicker>,
     auth_modal: Entity<AuthModal>,
     sidebar: Entity<Sidebar>,
-    focus: Option<Entity<FocusView>>,
-    _focus_subscription: Option<Subscription>,
+    /// The focus thread the chat surface shows instead of the main thread.
+    focus: Option<Entity<FocusThread>>,
+    _focus_subscriptions: Vec<Subscription>,
     subagents: Vec<SubagentSummary>,
     jobs: Vec<Job>,
     show_sidebar: bool,
@@ -551,7 +554,7 @@ impl ChatView {
             auth_modal,
             sidebar,
             focus: None,
-            _focus_subscription: None,
+            _focus_subscriptions: Vec::new(),
             subagents: Vec::new(),
             jobs: Vec::new(),
             show_sidebar: true,
@@ -646,16 +649,21 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Mounts a viewer for each desktop artifact in the transcript that has no
-    /// live or in-flight canvas yet. Resolution happens in the daemon.
-    fn mount_desktop_canvases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Mounts a viewer for each desktop artifact in the shown transcript that
+    /// has no live or in-flight canvas yet. Resolution happens in the daemon.
+    fn mount_desktop_canvases(
+        &mut self,
+        messages: &[Message],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         mount_canvases(
             cx.entity().downgrade(),
             |view| &mut view.desktop_canvases,
             &mut self.desktop_canvases,
             &self.client,
             &self.tokio_handle,
-            &self.messages,
+            messages,
             window,
             cx,
         );
@@ -738,9 +746,6 @@ impl ChatView {
         }
         if let Some(viewer) = self.expanded_desktop.take() {
             viewer.update(cx, |viewer, cx| viewer.set_expanded(false, cx));
-            if let Some(focus) = &self.focus {
-                focus.update(cx, |_, cx| cx.notify());
-            }
         }
         self.active_modal = ActiveModal::None;
         self.focus_input(window, cx);
@@ -752,7 +757,8 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Opens focus mode for subagent `id`. Any subagent opens here, not only
+    /// Shows subagent `id` in the chat surface: its transcript, live replies,
+    /// and a composer that messages it. Any subagent opens here, not only
     /// focus threads.
     fn enter_focus(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(summary) = self
@@ -765,20 +771,22 @@ impl ChatView {
         };
         let client = self.client.clone();
         let tokio_handle = self.tokio_handle.clone();
-        let focus = cx.new(|cx| FocusView::new(summary, client, tokio_handle, cx));
-        let subscription = cx.subscribe(&focus, |this, _, event: &FocusEvent, cx| match event {
-            FocusEvent::Exit => this.exit_focus(cx),
-            FocusEvent::ExpandDesktop(viewer) => this.expand_desktop(viewer.clone(), cx),
-        });
+        let focus = cx.new(|cx| FocusThread::new(summary, client, tokio_handle, cx));
+        self._focus_subscriptions = vec![
+            cx.observe(&focus, |_, _, cx| cx.notify()),
+            cx.subscribe(&focus, |this, _, event: &FocusEvent, cx| match event {
+                FocusEvent::Archived => this.exit_focus(cx),
+            }),
+        ];
         self.focus = Some(focus);
-        self._focus_subscription = Some(subscription);
         cx.notify();
     }
 
-    /// Leaves focus mode and drops the focus view, including its VCS panel.
+    /// Returns the chat surface to the main thread and drops the focus thread,
+    /// including its VCS panel.
     fn exit_focus(&mut self, cx: &mut Context<Self>) {
         self.focus = None;
-        self._focus_subscription = None;
+        self._focus_subscriptions.clear();
         self.sidebar
             .update(cx, |sidebar, cx| sidebar.clear_selection(cx));
         cx.notify();
@@ -1157,16 +1165,23 @@ impl ChatView {
                 subagent_card::attach_desktop_artifact(&mut self.messages, id, artifact.clone());
                 self.scroll.scroll_to_bottom();
             }
-            // Child deltas are for the focus view; main chat does not render them.
+            // Child deltas reach the focus thread directly; the main transcript skips them.
             SubagentEvent::Agent { .. } => return,
             SubagentEvent::Promoted { .. } | SubagentEvent::ArchiveChanged { .. } => {}
         }
         self.sync_subagents(cx);
         cx.notify();
     }
-    /// Whether a new run may start, ignoring what the composer holds.
+    /// Whether a new turn may start, ignoring what the composer holds. A focus
+    /// thread takes a message while it is not blocked or finished; the main
+    /// thread starts a run only when idle.
     fn can_submit(&self, cx: &App) -> bool {
-        self.connected && !self.is_running && !self.input.read(cx).is_composing()
+        self.connected
+            && !self.input.read(cx).is_composing()
+            && match &self.focus {
+                Some(focus) => focus.read(cx).can_message(),
+                None => !self.is_running,
+            }
     }
 
     fn can_send(&self, cx: &App) -> bool {
@@ -1174,6 +1189,10 @@ impl ChatView {
         self.connected
             && !input.is_composing()
             && (input.has_text() || !self.attachments.is_empty())
+            && self
+                .focus
+                .as_ref()
+                .is_none_or(|focus| focus.read(cx).can_message())
     }
 
     /// Actions for rendered views. A `Button` submits a turn only while one can start.
@@ -1198,7 +1217,11 @@ impl ChatView {
         let text = self.input.update(cx, |input, cx| input.take_text(cx));
         let attachments = std::mem::take(&mut self.attachments);
         let prompt = format_prompt(&text, &attachments);
-        if self.is_running {
+        if let Some(focus) = self.focus.clone() {
+            self.attachment_error = None;
+            focus.update(cx, |focus, cx| focus.send(prompt, cx));
+            self.focus_input(window, cx);
+        } else if self.is_running {
             self.steer(prompt, cx);
             self.focus_input(window, cx);
         } else {
@@ -1209,6 +1232,10 @@ impl ChatView {
     /// Submits a `Button` click: the prompt is shown and sent unchanged.
     fn submit_prompt(&mut self, prompt: String, window: &mut Window, cx: &mut Context<Self>) {
         if !self.can_submit(cx) {
+            return;
+        }
+        if let Some(focus) = self.focus.clone() {
+            focus.update(cx, |focus, cx| focus.send(prompt, cx));
             return;
         }
         let text = SharedString::from(prompt.clone());
@@ -1441,33 +1468,77 @@ impl ChatView {
         }));
     }
 
+    /// The main thread shows its title and session controls; a focus thread
+    /// shows a way back, its title and status, and an archive action.
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus = self.focus.as_ref().map(|focus| {
+            let focus = focus.read(cx);
+            (focus.title(), status_label(focus.status()))
+        });
+        let focused = focus.is_some();
         div()
             .flex()
             .items_center()
             .justify_between()
+            .gap_3()
             .flex_none()
             .h(px(theme::HEADER_HEIGHT))
             .px_6()
             .border_b_1()
             .border_color(rgb(theme::BORDER))
-            .child(div().when(!self.show_sidebar, |title| title.child(app_title())))
+            .child(match focus {
+                Some((title, status)) => div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        header_button("focus-back", false)
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.exit_focus(cx);
+                            }))
+                            .child("← Main"),
+                    )
+                    .child(div().min_w_0().truncate().text_sm().child(title))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(rgb(theme::TEXT_FAINT))
+                            .child(status),
+                    ),
+                None => div().when(!self.show_sidebar, |title| title.child(app_title())),
+            })
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(
-                        header_button("header-model-btn", false)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                if this.active_modal == ActiveModal::ModelPicker {
-                                    this.close_modal(window, cx);
-                                } else {
-                                    this.open_model_picker(window, cx);
-                                }
-                            }))
-                            .child(format!("🤖 {} ▾", self.active_model)),
-                    )
+                    .when(!focused, |row| {
+                        row.child(
+                            header_button("header-model-btn", false)
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    if this.active_modal == ActiveModal::ModelPicker {
+                                        this.close_modal(window, cx);
+                                    } else {
+                                        this.open_model_picker(window, cx);
+                                    }
+                                }))
+                                .child(format!("🤖 {} ▾", self.active_model)),
+                        )
+                    })
+                    .when(focused, |row| {
+                        row.child(
+                            header_button("focus-archive", false)
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    if let Some(focus) = this.focus.clone() {
+                                        focus.update(cx, |focus, cx| focus.archive(cx));
+                                    }
+                                }))
+                                .child("Archive"),
+                        )
+                    })
                     .child(
                         header_button("header-auth-btn", false)
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
@@ -1514,25 +1585,41 @@ impl ChatView {
             .child(div().flex_1().min_h_0().child(self.sidebar.clone()))
     }
 
-    /// The main transcript and composer.
-    fn main_body(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The shown thread's transcript and composer. The jobs strip belongs to
+    /// the main thread's context, so a focus thread does not show it.
+    fn thread_body(
+        &self,
+        messages: Vec<Message>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let focused = self.focus.is_some();
         div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
-            .w_full()
-            .child(self.message_list(cx))
-            .child(jobs_panel::render_strip(
-                &self.jobs,
-                &self.job_action_handler(cx),
-            ))
+            .min_w_0()
+            .h_full()
+            .child(self.message_list(messages, cx))
+            .when(!focused, |body| {
+                body.child(jobs_panel::render_strip(
+                    &self.jobs,
+                    &self.job_action_handler(cx),
+                ))
+            })
             .child(self.composer(window, cx))
     }
 
-    fn message_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let messages = self.messages.clone();
+    fn message_list(&self, messages: Vec<Message>, cx: &mut Context<Self>) -> impl IntoElement {
         let actions = self.view_actions(cx);
+        let (scroll, empty_hint) = match &self.focus {
+            Some(focus) => {
+                let focus = focus.read(cx);
+                (focus.scroll().clone(), Some(focus.empty_hint()))
+            }
+            None => (self.scroll.clone(), None),
+        };
         let mut seen_desktops = HashSet::new();
         div()
             .id("messages")
@@ -1541,7 +1628,7 @@ impl ChatView {
             .w_full()
             .min_w_0()
             .overflow_y_scroll()
-            .track_scroll(&self.scroll)
+            .track_scroll(&scroll)
             .px_6()
             .py_6()
             .child(
@@ -1553,7 +1640,18 @@ impl ChatView {
                     .min_w_0()
                     .max_w(px(800.))
                     .mx_auto()
-                    .when(messages.is_empty(), |view| {
+                    .when_some(empty_hint.filter(|_| messages.is_empty()), |view, hint| {
+                        view.child(
+                            div()
+                                .py_12()
+                                .flex()
+                                .justify_center()
+                                .text_sm()
+                                .text_color(rgb(0xa0a0a0))
+                                .child(hint),
+                        )
+                    })
+                    .when(messages.is_empty() && empty_hint.is_none(), |view| {
                         view.child(
                             div()
                                 .py_12()
@@ -1772,6 +1870,11 @@ impl ChatView {
         let can_send = self.can_send(cx);
         let focused = self.input.read(cx).focus_handle(cx).is_focused(window);
         let menu_open = self.attachment_menu_open;
+        let on_focus_thread = self.focus.is_some();
+        let focus_notice = self
+            .focus
+            .as_ref()
+            .and_then(|focus| focus.read(cx).notice());
 
         let attach_button = div()
             .id("attach")
@@ -1859,6 +1962,9 @@ impl ChatView {
                 .mx_auto()
                 .when_some(self.attachment_error.clone(), |column, error| {
                     column.child(div().text_xs().text_color(rgb(0xb0b0b0)).child(error))
+                })
+                .when_some(focus_notice, |column, notice| {
+                    column.child(div().text_xs().text_color(rgb(0xb0b0b0)).child(notice))
                 })
                 .when_some(self.artifact_notice.clone(), |column, notice| {
                     column.child(
@@ -1979,7 +2085,7 @@ impl ChatView {
                                         )
                                     },
                                 ))
-                                .when(self.is_running, |row| row.child(
+                                .when(self.is_running && !on_focus_thread, |row| row.child(
                                     header_button("cancel-run", false)
                                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx)))
                                         .child("Stop")
@@ -1989,7 +2095,7 @@ impl ChatView {
                                         .flex()
                                         .items_center()
                                         .gap_2()
-                                        .child(background_button)
+                                        .when(!on_focus_thread, |row| row.child(background_button))
                                         .child(send_button),
                                 ),
                         ),
@@ -2364,9 +2470,30 @@ fn header_button(id: &'static str, active: bool) -> Stateful<Div> {
         .hover(|s| s.bg(rgb(theme::BG_HOVER)))
 }
 
+/// A focus thread's workspace changes, beside its transcript.
+fn vcs_panel(vcs: Entity<VcsSidebar>) -> impl IntoElement {
+    div()
+        .w(px(380.))
+        .flex_none()
+        .h_full()
+        .flex()
+        .flex_col()
+        .border_l_1()
+        .border_color(rgb(theme::BORDER))
+        .child(vcs)
+}
+
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.mount_desktop_canvases(window, cx);
+        let messages = match &self.focus {
+            Some(focus) => focus.read(cx).messages(),
+            None => self.messages.clone(),
+        };
+        self.mount_desktop_canvases(&messages, window, cx);
+        let vcs = self
+            .focus
+            .as_ref()
+            .and_then(|focus| focus.read(cx).vcs().cloned());
         div()
             .relative()
             .flex()
@@ -2402,10 +2529,15 @@ impl Render for ChatView {
                     .min_w_0()
                     .h_full()
                     .child(self.header(cx))
-                    .child(match self.focus.clone() {
-                        Some(focus) => focus.into_any_element(),
-                        None => self.main_body(window, cx).into_any_element(),
-                    }),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .child(self.thread_body(messages, window, cx))
+                            .when_some(vcs, |row, vcs| row.child(vcs_panel(vcs))),
+                    ),
             )
             .when_some(self.modal_content(), |view, content| {
                 view.child(self.modal_overlay(content, cx))

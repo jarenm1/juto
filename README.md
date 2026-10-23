@@ -463,7 +463,7 @@ children started by the top-level session reach the main chat; a desktop posted 
 deeper child stays with its manager. A report missed while the chat's event stream lags
 is not replayed, though the desktop keeps running. The main agent can look at a child's
 desktop with `desktop_observe`, which returns the current frame as an image; it cannot
-send input or change the environment. The focus view of a finished child shows the same
+send input or change the environment. An open focus thread of a finished child shows the same
 canvases from its transcript; a running child's desktops appear only in the main chat.
 
 Environments created by the `desktop` tool set no owner timeout, so they outlive the child
@@ -473,13 +473,13 @@ so a canvas mounted hours later still resolves.
 
 **Element trees in tool results.** A tool result may attach a declarative tree under
 `ToolOutput.details` as `{"type":"view","view":{tag, props, children}}`. The model-facing
-`content` is unchanged. The chat and focus views render the tree in its own row after the
+`content` is unchanged. The main thread and focus threads render the tree in its own row after the
 result, using the primitives `Column`, `Row`, `Text`, `Badge`, `Stats` with `Stat` cells, `Timeline` with `Lane` rows of `Bar` segments, `Chart` with `Series` lines drawn as bars, a line, dots (`scatter`), or filled areas (`area`), and `Table` with `TableRow` rows of text cells. Hovering a chart point or a timeline bar shows its values in a tooltip. Any unknown tag renders a
 visible `Unknown element <tag>` box, never silently dropped. Trees are decoded with serde; no
 markup is parsed. The `view` tool lets agents emit a tree. The runtime validates it before the host renders it: allowed tags and props only, `Badge` `tone` one of success, warning, error, or info, `Stat` only inside `Stats`, `Lane` only inside `Timeline`, `Bar` only inside `Lane`, numeric `Timeline` `max` and `tick` in seconds (at most 48 ticks), and bars with `0 <= start < end <= max`. Also at most 8 levels of nesting, 200 elements, and 4096 bytes per string.
 `Chart` `kind` is bar, line, scatter, or area; it takes 1 to 4 `Series` children with equal-length comma-separated finite values (at most 48 points), and `labels`, when present, must match that count.
 `Table` `columns` lists 1 to 8 comma-separated headers, and it takes at most 48 `TableRow` children, each with exactly one text cell per column.
-`Button` takes `label` and `prompt`, both required and non-empty, and an optional `tone` of primary, neutral, or danger; it takes no children. Clicking it submits `prompt` as the next user message. It is disabled while a run is active and inside subagent focus threads.
+`Button` takes `label` and `prompt`, both required and non-empty, and an optional `tone` of primary, neutral, or danger; it takes no children. Clicking it submits `prompt` as the next user message. It is disabled while a main run is active. In a focus thread it messages that thread, and it is disabled while the thread cannot take messages.
 
 ## Development
 

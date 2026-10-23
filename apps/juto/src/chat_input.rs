@@ -93,10 +93,6 @@ impl ChatInput {
         !self.content.trim().is_empty()
     }
 
-    pub fn text(&self) -> SharedString {
-        self.content.clone()
-    }
-
     pub fn is_composing(&self) -> bool {
         self.marked_range.is_some()
     }
