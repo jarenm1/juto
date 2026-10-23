@@ -414,8 +414,8 @@ fn create_popup(
     let popup = TestPopup {
         surface,
         xdg_popup,
-        green: popup_buffer(shm, &qh, 0xFF00_FF00)?,
-        blue: popup_buffer(shm, &qh, 0xFF00_00FF)?,
+        green: solid_buffer(shm, &qh, POPUP_SIZE, POPUP_SIZE, 0xFF00_FF00)?,
+        blue: solid_buffer(shm, &qh, POPUP_SIZE, POPUP_SIZE, 0xFF00_00FF)?,
         shown_blue: false,
         dismissed: false,
     };
@@ -423,21 +423,23 @@ fn create_popup(
     Ok(popup)
 }
 
-/// A `POPUP_SIZE` square ARGB8888 buffer filled with `color`.
-fn popup_buffer(
+/// A `width` x `height` ARGB8888 buffer filled with `color`.
+fn solid_buffer(
     shm: &wl_shm::WlShm,
     qh: &QueueHandle<State>,
+    width: u32,
+    height: u32,
     color: u32,
 ) -> Result<wl_buffer::WlBuffer, Box<dyn std::error::Error + Send + Sync>> {
-    let stride = POPUP_SIZE * 4;
-    let size = (stride * POPUP_SIZE) as usize;
+    let stride = width * 4;
+    let size = (stride * height) as usize;
     let fd = create_shm_fd(size)?;
-    fill(&fd, POPUP_SIZE, POPUP_SIZE, color);
+    fill(&fd, width, height, color);
     let pool = shm.create_pool(fd.as_fd(), size as i32, qh, ());
     Ok(pool.create_buffer(
         0,
-        POPUP_SIZE as i32,
-        POPUP_SIZE as i32,
+        width as i32,
+        height as i32,
         stride as i32,
         wl_shm::Format::Argb8888,
         qh,
@@ -468,7 +470,7 @@ fn fill(fd: &OwnedFd, width: u32, height: u32, color: u32) {
 /// Connects to `socket`, maps one toplevel, paints the two-tone pattern, and
 /// dispatches events for `seconds`. Returns the number of frames presented.
 pub fn run(socket: &str, seconds: u64) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, PopupMode::None, false, None)
+    run_client(socket, seconds, PopupMode::None, false, None, false)
 }
 
 /// Like [`run`], plus a child xdg popup mapped at startup, anchored at
@@ -477,7 +479,7 @@ pub fn run_with_popup(
     socket: &str,
     seconds: u64,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, PopupMode::Mapped, false, None)
+    run_client(socket, seconds, PopupMode::Mapped, false, None, false)
 }
 
 /// Like [`run`], plus a menu popup. The first press over the toplevel creates the
@@ -487,7 +489,7 @@ pub fn run_with_menu(
     socket: &str,
     seconds: u64,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, PopupMode::OnPress, false, None)
+    run_client(socket, seconds, PopupMode::OnPress, false, None, false)
 }
 
 /// Like [`run`], plus a toplevel that maximizes about 1.5 s after its first frame
@@ -497,7 +499,7 @@ pub fn run_with_maximize_cycle(
     socket: &str,
     seconds: u64,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
-    run_client(socket, seconds, PopupMode::None, true, None)
+    run_client(socket, seconds, PopupMode::None, true, None, false)
 }
 
 /// Like [`run`], plus a cursor shape requested on every pointer enter over the toplevel.
@@ -512,6 +514,7 @@ pub fn run_with_cursor(
         PopupMode::None,
         false,
         Some(CursorRequest::Shape(shape)),
+        false,
     )
 }
 
@@ -527,7 +530,18 @@ pub fn run_with_cursor_bitmap(
         PopupMode::None,
         false,
         Some(CursorRequest::Bitmap),
+        false,
     )
+}
+
+/// Like [`run`], but the toplevel is solid `RED` until the first pointer button
+/// press over it, after which it is solid `BLUE`. Used to check that a click
+/// reaches the client and changes the frame it presents.
+pub fn run_click_reactive(
+    socket: &str,
+    seconds: u64,
+) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
+    run_client(socket, seconds, PopupMode::None, false, None, true)
 }
 
 fn run_client(
@@ -536,6 +550,7 @@ fn run_client(
     popup_mode: PopupMode,
     cycle_maximize: bool,
     cursor_request: Option<CursorRequest>,
+    click_to_blue: bool,
 ) -> Result<u32, Box<dyn std::error::Error + Send + Sync>> {
     let stream = UnixStream::connect(socket)?;
     let conn = Connection::from_socket(stream)?;
@@ -595,7 +610,11 @@ fn run_client(
     let stride = WIDTH * 4;
     let size = (stride * HEIGHT) as usize;
     let fd = create_shm_fd(size)?;
-    paint(&fd, WIDTH, HEIGHT);
+    if click_to_blue {
+        fill(&fd, WIDTH, HEIGHT, 0xFFFF_0000);
+    } else {
+        paint(&fd, WIDTH, HEIGHT);
+    }
     let pool = shm.create_pool(fd.as_fd(), size as i32, &qh, ());
     let buffer = pool.create_buffer(
         0,
@@ -606,6 +625,12 @@ fn run_client(
         &qh,
         (),
     );
+    let click_buffer = if click_to_blue {
+        Some(solid_buffer(&shm, &qh, WIDTH, HEIGHT, 0xFF00_00FF)?)
+    } else {
+        None
+    };
+    let mut clicked = false;
 
     surface.attach(Some(&buffer), 0, 0);
     surface.damage(0, 0, WIDTH as i32, HEIGHT as i32);
@@ -663,6 +688,19 @@ fn run_client(
                 Some((&seat, serial)),
             )?);
         }
+        if let Some(blue) = click_buffer.as_ref()
+            && !clicked
+            && state
+                .press
+                .as_ref()
+                .is_some_and(|(_, pressed)| *pressed == surface)
+        {
+            state.press = None;
+            clicked = true;
+            surface.attach(Some(blue), 0, 0);
+            surface.damage(0, 0, WIDTH as i32, HEIGHT as i32);
+            surface.commit();
+        }
         if cycle_maximize && state.frames > 0 {
             let started = *cycle_started.get_or_insert_with(Instant::now);
             match cycle_step {
@@ -679,7 +717,11 @@ fn run_client(
         }
         if state.configured {
             state.configured = false;
-            surface.attach(Some(&buffer), 0, 0);
+            let shown = match (&click_buffer, clicked) {
+                (Some(blue), true) => blue,
+                _ => &buffer,
+            };
+            surface.attach(Some(shown), 0, 0);
             surface.damage(0, 0, WIDTH as i32, HEIGHT as i32);
             surface.commit();
             if let Some(popup) = popup.as_ref().filter(|popup| !popup.dismissed) {
