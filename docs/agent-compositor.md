@@ -165,15 +165,18 @@ never the host graph. The remote stream carries an Opus audio track whose source
 is that sink's monitor (`DesktopEnvironment::audio_source`), and audio and video
 share the environment's total-media ceiling.
 
-Playback and capture through the private sink are **not verified**. On the
-development host, `pw-cat` writing a WAV into `juto-sink` (and into the default
-target) does not complete within 12s: the environment's PipeWire graph does not
-run client streams, and no session manager (WirePlumber) runs inside the
-environment. Capture from `juto-sink.monitor` is likewise unverified. Because
-OpenAL opens a PipeWire playback stream during startup and blocks on it, the
-supervisor sets `ALSOFT_DRIVERS=null` for applications so they can create
-windows. Applications therefore get no OpenAL audio. End-to-end audio flow and
-the local bounded-PCM path to a viewer are not claimed.
+The environment's PipeWire graph runs client streams only with a session manager,
+so the supervisor also starts WirePlumber (`WIREPLUMBER_CONFIG`) between
+`pipewire` and `pipewire-pulse`. Its drop-in disables the `hardware.audio`,
+`hardware.bluetooth`, and `hardware.video-capture` features so the environment
+sees no host cards, Bluetooth adapters, or cameras. On the development host,
+`pw-cat` into `juto-sink` and into the default target both exit 0 with that
+WirePlumber running, and no bluez, v4l2, libcamera, or alsa lines are logged.
+Capture from `juto-sink.monitor` is **not verified**. OpenAL opens a PipeWire
+playback stream during startup and blocks until it runs, so the supervisor still
+sets `ALSOFT_DRIVERS=null` for applications; that setting has not been re-tested
+with WirePlumber running. End-to-end audio flow and the local bounded-PCM path to
+a viewer are not claimed.
 
 Xwayland is implemented (one private X11 server per environment, driven by
 Smithay's X11 WM, with an `MIT-MAGIC-COOKIE-1` `XAUTHORITY` file). The hardware
