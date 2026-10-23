@@ -546,6 +546,151 @@ fn popup_receives_pointer_and_dismisses_on_outside_click() {
 }
 
 #[test]
+fn pointer_click_reaches_client_and_changes_observed_pixel() {
+    const BTN_LEFT: u32 = 0x110;
+    // Each observed state is polled for at most this long.
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    let supervisor = DesktopSupervisor::new();
+    let env = supervisor
+        .create_environment(test_config(&unique_env_id("click")), &unique_env_id("req"))
+        .expect("create environment");
+
+    let socket = env.socket_path().to_string_lossy().to_string();
+    let client = std::thread::spawn(move || common::run_click_reactive(&socket, 20));
+
+    // Wait for the toplevel to map with a real size.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let window = loop {
+        let found = env
+            .get_status()
+            .mapped_windows
+            .into_iter()
+            .find(|window| window.width > 0);
+        if let Some(window) = found {
+            break window;
+        }
+        assert!(Instant::now() < deadline, "client window never mapped");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let inside = |x: i32, y: i32| {
+        x >= window.x
+            && x < window.x + window.width as i32
+            && y >= window.y
+            && y < window.y + window.height as i32
+    };
+    let center = (
+        (window.x + window.width as i32 / 2) as u32,
+        (window.y + window.height as i32 / 2) as u32,
+    );
+    // The bottom-right output pixel must lie outside the window for the negative check.
+    let output = env.output();
+    let outside = (output.width - 1, output.height - 1);
+    assert!(
+        !inside(outside.0 as i32, outside.1 as i32),
+        "outside point overlaps the window"
+    );
+
+    let lease = env
+        .set_control("agent:test", "acquire", false)
+        .expect("acquire control")
+        .expect("lease present");
+    let pool = env.frame_pool();
+
+    let mut seq = 0;
+    let mut send = |events: Vec<InputEvent>| {
+        seq += 1;
+        env.dispatch_input(
+            "agent:test",
+            lease.epoch,
+            env.generation(),
+            InputBatch {
+                seq,
+                client_timestamp_us: 0,
+                events,
+            },
+        )
+        .expect("input accepted");
+    };
+
+    let center_pixel = || {
+        let info = env
+            .observe(Duration::from_secs(2))
+            .unwrap_or_else(|err| panic!("observe failed: {err}"));
+        read_pixel(&pool, info.slot, center.0, center.1, info.width)
+    };
+    // Polls the center pixel until it equals `want`, failing after `PATIENCE`.
+    let await_center = |want: [u8; 4], what: &str| {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let got = center_pixel();
+            if got == want {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{what}: center pixel is {got:?}, expected {want:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    // Baseline: the toplevel is red at its center before any click.
+    await_center(common::RED, "baseline");
+
+    // Negative: a click outside the window reaches no client, so the center must
+    // stay red for the whole bounded window. The lease is renewed while sampling.
+    send(vec![
+        InputEvent::PointerMoveAbs {
+            x: outside.0,
+            y: outside.1,
+        },
+        InputEvent::PointerButton {
+            button: BTN_LEFT,
+            pressed: true,
+        },
+        InputEvent::PointerButton {
+            button: BTN_LEFT,
+            pressed: false,
+        },
+    ]);
+    let until = Instant::now() + PATIENCE;
+    while Instant::now() < until {
+        let got = center_pixel();
+        assert_eq!(
+            got,
+            common::RED,
+            "click outside the window changed the center pixel"
+        );
+        env.heartbeat("lease", Some(lease.epoch))
+            .expect("lease renewed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Positive: move, press, and release over the center in one batch.
+    send(vec![
+        InputEvent::PointerMoveAbs {
+            x: center.0,
+            y: center.1,
+        },
+        InputEvent::PointerButton {
+            button: BTN_LEFT,
+            pressed: true,
+        },
+        InputEvent::PointerButton {
+            button: BTN_LEFT,
+            pressed: false,
+        },
+    ]);
+    await_center(common::BLUE, "click inside the window");
+
+    let frames = client.join().expect("client thread").expect("client run");
+    assert!(frames > 0, "client presented at least one frame");
+
+    env.destroy();
+}
+
+#[test]
 fn application_cursor_shape_is_forwarded_once_per_change() {
     use tokio::sync::broadcast::error::TryRecvError;
     use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
