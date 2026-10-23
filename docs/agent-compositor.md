@@ -77,8 +77,13 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   plus lossless PNG snapshots for observation.
 - `juto-desktop` daemon: length-prefixed JSON control protocol over a private
   Unix socket, including event subscription.
-- Runtime `desktop` tool (`create`, `launch`, `observe`, `input`, `describe`,
-  `destroy`) backed by a process-wide supervisor.
+- Runtime `desktop` tool (`create`, `launch`, `observe`, `input`, `click`,
+  `wait_for_change`, `describe`, `destroy`) backed by a process-wide supervisor.
+  `observe` returns `frameHash`, an FNV-1a 64 digest of the PNG bytes. `click`
+  selects one mapped window by `window_id` or `app_id` and maps window-relative
+  `x`/`y` to physical desktop pixels. `wait_for_change` polls the frame hash until
+  it differs or times out. Text typing is not implemented: it needs a text-focus
+  epoch the compositor does not expose.
 - Same-host embedded viewer in the harness: composes from the sealed pool with no
   codec, letterboxes, maps pointer coordinates to desktop pixels, forwards
   pointer/scroll/keyboard input, and holds a human control lease with a
@@ -210,7 +215,7 @@ at an internal seam, not separate desktops.
 | Different resolutions and FPS caps | Sections 4 and 6: admitted modes, atomic generations, virtual clock |
 | System limits | Sections 3 and 6: process-tree and aggregate admission limits |
 | Agent owns environment and launches apps | Sections 3 and 4: owner capability, argv launch, supervised lifetime |
-| Computer use or other automation | Section 8: snapshots, virtual seat, explicitly granted app interfaces |
+| Computer use or other automation | Section 8. Partial: window-targeted click, frame-hash change waits, and a compositor test that clicks and observes a pixel change. Missing: element/AX targeting, text typing, and explicitly granted app interfaces |
 | Remote streaming and user play | Sections 7–9: WebRTC, input handoff, game scenario |
 | Efficient local streaming | Section 7: shared memory/DMA-BUF, separate from remote codec pipeline |
 | Laptop and phone interaction | Sections 7 and 8: browser interoperability, touch mapping, browser restrictions |
@@ -832,7 +837,7 @@ for viewer work. Do not call compilation or a mocked media track proof of a desk
 | Software headless desktop | Launch without host DISPLAY/input devices; Wayland app frame; 1280×720@30 and 1920×1080@30; no physical monitor |
 | Native and X11 game | Real keyboard/mouse game in both modes; focus, fullscreen, resize, relative mouse; report driver/game versions |
 | Hardware profile | Scoped/locked render-node run; actual frame import/export; unsupported device rejects explicitly |
-| Agent computer use | Snapshot -> authorized click/key -> observable changed application state; stale generation/lease rejection |
+| Agent computer use | Snapshot -> authorized click/key -> observable changed application state; stale generation/lease rejection. Partial: `pointer_click_reaches_client_and_changes_observed_pixel` covers click -> observed change with a held lease. Not covered: key input, stale-generation rejection, and the runtime `click` path against a live window |
 | Alternate automation handoff | Delay an in-flight mutation during takeover; grant only after acknowledged quiescence; failed authority rejects handoff |
 | Same-host baseline | Native viewer consumes SHM without video codec pipeline; plays game; slow consumer cannot grow buffers |
 | Same-host optimization | Actual DMA-BUF import and fence release, mismatch fallback, disconnect with in-flight GPU work; measure copies rather than assert zero-copy |
