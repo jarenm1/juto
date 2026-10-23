@@ -507,7 +507,8 @@ impl ChatView {
                             match result {
                                 Ok(Reply::Session(view)) => this.apply_snapshot(view, cx),
                                 Ok(_) => this.report_error("Unexpected session reply".into(), cx),
-                                Err(error) => this.report_error(error.to_string(), cx),
+                                Err(error) => this
+                                    .report_error(crate::chat_request::describe_error(&error), cx),
                             }
                             this.sync_subagents(cx);
                             this.sync_inbox(cx);
@@ -617,7 +618,9 @@ impl ChatView {
                         this.active_model = selector.into();
                         this.close_modal(window, cx);
                     }
-                    Err(error) => this.report_error(error.to_string(), cx),
+                    Err(error) => {
+                        this.report_error(crate::chat_request::describe_error(&error), cx)
+                    }
                 }
                 cx.notify();
             });
@@ -715,7 +718,9 @@ impl ChatView {
                         this.scroll.scroll_to_bottom();
                     }
                     Ok(_) => this.report_error("Unexpected desktop reply".into(), cx),
-                    Err(error) => this.report_error(error.to_string(), cx),
+                    Err(error) => {
+                        this.report_error(crate::chat_request::describe_error(&error), cx)
+                    }
                 }
                 cx.notify();
             });
@@ -815,7 +820,7 @@ impl ChatView {
                     cx.notify();
                 }
                 Ok(_) => this.report_error("Unexpected subagent reply".into(), cx),
-                Err(error) => this.report_error(error.to_string(), cx),
+                Err(error) => this.report_error(crate::chat_request::describe_error(&error), cx),
             });
         })
         .detach();
@@ -833,7 +838,7 @@ impl ChatView {
                         .update(cx, |sidebar, cx| sidebar.set_inbox(messages, cx));
                 }
                 Ok(_) => this.report_error("Unexpected inbox reply".into(), cx),
-                Err(error) => this.report_error(error.to_string(), cx),
+                Err(error) => this.report_error(crate::chat_request::describe_error(&error), cx),
             });
         })
         .detach();
@@ -855,7 +860,7 @@ impl ChatView {
                     cx.notify();
                 }
                 Ok(_) => this.report_error("Unexpected jobs reply".into(), cx),
-                Err(error) => this.report_error(error.to_string(), cx),
+                Err(error) => this.report_error(crate::chat_request::describe_error(&error), cx),
             });
         })
         .detach();
@@ -903,7 +908,7 @@ impl ChatView {
                     cx.notify();
                 }
                 Ok(_) => this.sync_jobs(cx),
-                Err(error) => this.report_error(error.to_string(), cx),
+                Err(error) => this.report_error(crate::chat_request::describe_error(&error), cx),
             });
         })
         .detach();
@@ -946,7 +951,7 @@ impl ChatView {
                             input.set_text(&text, cx);
                         }
                     });
-                    this.report_error(error.to_string(), cx)
+                    this.report_error(crate::chat_request::describe_error(&error), cx)
                 }
             });
         })
@@ -985,7 +990,9 @@ impl ChatView {
                     return;
                 }
                 Err(error) => {
-                    let _ = this.update(cx, |this, cx| this.report_error(error.to_string(), cx));
+                    let _ = this.update(cx, |this, cx| {
+                        this.report_error(crate::chat_request::describe_error(&error), cx)
+                    });
                     return;
                 }
             };
@@ -999,7 +1006,9 @@ impl ChatView {
                 if let Err(error) =
                     crate::chat_request::call(client.clone(), handle.clone(), command).await
                 {
-                    let _ = this.update(cx, |this, cx| this.report_error(error.to_string(), cx));
+                    let _ = this.update(cx, |this, cx| {
+                        this.report_error(crate::chat_request::describe_error(&error), cx)
+                    });
                     break;
                 }
             }
@@ -1015,7 +1024,7 @@ impl ChatView {
             let result = crate::chat_request::call(client, handle, request).await;
             let _ = this.update(cx, |this, cx| {
                 if let Err(error) = result {
-                    this.report_error(error.to_string(), cx);
+                    this.report_error(crate::chat_request::describe_error(&error), cx);
                 }
             });
         })
@@ -1056,7 +1065,7 @@ impl ChatView {
             let _ = this.update(cx, |this, cx| match result {
                 Ok(Reply::Session(view)) => this.apply_snapshot(view, cx),
                 Ok(_) => this.report_error("Unexpected session reply".into(), cx),
-                Err(error) => this.report_error(error.to_string(), cx),
+                Err(error) => this.report_error(crate::chat_request::describe_error(&error), cx),
             });
         })
         .detach();
@@ -1280,7 +1289,7 @@ impl ChatView {
                     }
                     Err(error) => {
                         this.is_running = false;
-                        this.report_error(error.to_string(), cx);
+                        this.report_error(crate::chat_request::describe_error(&error), cx);
                     }
                 }
                 cx.notify();
@@ -1384,7 +1393,9 @@ impl ChatView {
                         );
                     }
                     Ok(_) => this.report_error("Unexpected approval reply".into(), cx),
-                    Err(error) => this.report_error(error.to_string(), cx),
+                    Err(error) => {
+                        this.report_error(crate::chat_request::describe_error(&error), cx)
+                    }
                 }
                 cx.notify();
             });
