@@ -1731,6 +1731,16 @@ struct DesktopArgs {
     events: Option<Vec<juto_desktop::protocol::InputEvent>>,
     #[serde(default)]
     snapshot_path: Option<String>,
+    #[serde(default)]
+    window_id: Option<u32>,
+    #[serde(default)]
+    x: Option<i64>,
+    #[serde(default)]
+    y: Option<i64>,
+    #[serde(default)]
+    button: Option<u32>,
+    #[serde(default)]
+    baseline_hash: Option<String>,
 }
 
 #[async_trait]
@@ -1739,7 +1749,8 @@ impl Tool for DesktopTool {
         juto_ai::ToolDefinition {
             name: "desktop".to_string(),
             description: "Owns an isolated headless desktop environment: create it, launch \
-                          applications into it, observe lossless snapshots, inject input, and \
+                          applications into it, observe lossless snapshots (each with a frameHash), \
+                          wait_for_change until a frame differs, click a window, inject input, and \
                           destroy it. The desktop has no host display; applications run in a \
                           per-environment systemd scope with enforced CPU/memory/task limits. \
                           A desktop lives until destroyed or the harness exits. After 5 minutes \
@@ -1753,7 +1764,7 @@ impl Tool for DesktopTool {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["create", "launch", "observe", "input", "describe", "attach", "destroy"],
+                        "enum": ["create", "launch", "observe", "wait_for_change", "click", "input", "describe", "attach", "destroy"],
                         "description": "Operation to perform."
                     },
                     "env_id": {
@@ -1770,7 +1781,27 @@ impl Tool for DesktopTool {
                     "scale": { "type": "integer", "description": "create: integer output scale, 1 or 2 (default 1)." },
                     "app_id": {
                         "type": "string",
-                        "description": "launch: identifier for the launched application."
+                        "description": "launch: identifier for the launched application. click: selects the target window by the app_id it reports."
+                    },
+                    "window_id": {
+                        "type": "integer",
+                        "description": "click: window_id from observe's windows list; selects the target window."
+                    },
+                    "x": {
+                        "type": "integer",
+                        "description": "click: x in logical pixels from the window's left edge (default: window center)."
+                    },
+                    "y": {
+                        "type": "integer",
+                        "description": "click: y in logical pixels from the window's top edge (default: window center)."
+                    },
+                    "button": {
+                        "type": "integer",
+                        "description": "click: Linux evdev button code (default 272, the left button)."
+                    },
+                    "baseline_hash": {
+                        "type": "string",
+                        "description": "wait_for_change: frameHash from a prior observe; returns once the frame's hash differs."
                     },
                     "argv": {
                         "type": "array",
@@ -1788,11 +1819,11 @@ impl Tool for DesktopTool {
                     },
                     "timeout_ms": {
                         "type": "integer",
-                        "description": "observe: how long to wait for a fresh frame (default 5000)."
+                        "description": "observe: how long to wait for a fresh frame (default 5000). wait_for_change: how long to wait for the frame to differ from baseline_hash (default 5000)."
                     },
                     "snapshot_path": {
                         "type": "string",
-                        "description": "observe: where to write the lossless PNG snapshot (defaults to the runtime data directory)."
+                        "description": "observe and wait_for_change: where to write the lossless PNG snapshot (defaults to the runtime data directory)."
                     },
                     "events": {
                         "type": "array",
@@ -2098,20 +2129,15 @@ fn run_desktop_action(
             let env = env()?;
             let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(5000).max(1));
             let (info, png) = env.snapshot_png(timeout).map_err(|e| e.to_string())?;
-            let path = match args.snapshot_path.as_ref() {
-                Some(raw) => resolve_path(workspace, raw),
-                None => data_dir.join("desktop-snapshots").join(format!(
-                    "{}-{}.png",
-                    env.env_id(),
-                    info.frame_id
-                )),
-            };
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
-            }
-            std::fs::write(&path, &png)
-                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            let path = write_snapshot(
+                &env,
+                data_dir,
+                workspace,
+                args.snapshot_path.as_deref(),
+                info.frame_id,
+                &png,
+            )?;
+            let hash = frame_hash(&png);
             let status = env.get_status();
             let summary = format!(
                 "Observed frame {} of {} ({}x{}, generation {}); snapshot written to {} ({} bytes).",
@@ -2135,6 +2161,7 @@ fn run_desktop_action(
                     "height": info.height,
                     "snapshotPath": path.to_string_lossy(),
                     "snapshotBytes": png.len(),
+                    "frameHash": hash,
                     "windows": status.mapped_windows,
                     "apps": env.apps(),
                 }),
@@ -2147,34 +2174,114 @@ fn run_desktop_action(
                 .clone()
                 .filter(|e| !e.is_empty())
                 .ok_or_else(|| "events are required for input".to_string())?;
-            let owner = env.get_status().owner_principal;
-            let lease = match env.get_status().active_control_lease {
-                Some(lease) if lease.holder == owner => lease,
-                _ => env
-                    .set_control(&owner, "acquire", false)
-                    .map_err(|e| e.to_string())?
-                    .ok_or_else(|| "failed to acquire control".to_string())?,
-            };
-            let batch = juto_desktop::protocol::InputBatch {
-                seq: 0,
-                client_timestamp_us: 0,
-                events,
-            };
-            let watermark = env
-                .dispatch_input(&owner, lease.epoch, env.generation(), batch)
-                .map_err(|e| e.to_string())?;
+            let (epoch, watermark) = dispatch_events(&env, events)?;
             Ok(output(
                 format!(
                     "Input accepted for {} (lease epoch {}, watermark {}).",
                     env.env_id(),
-                    lease.epoch,
+                    epoch,
                     watermark
                 ),
                 json!({
                     "action": "input",
                     "envId": env.env_id(),
-                    "epoch": lease.epoch,
+                    "epoch": epoch,
                     "appliedWatermark": watermark,
+                }),
+            ))
+        }
+        "click" => {
+            let env = env()?;
+            let status = env.get_status();
+            let app_id = args.app_id.as_deref().filter(|id| !id.trim().is_empty());
+            let window = select_window(&status.mapped_windows, args.window_id, app_id)?;
+            let (x, y) = window_click_point(window, &status.output, args.x, args.y)?;
+            let button = args.button.unwrap_or(BTN_LEFT);
+            let (epoch, watermark) = dispatch_events(
+                &env,
+                vec![
+                    juto_desktop::protocol::InputEvent::PointerMoveAbs { x, y },
+                    juto_desktop::protocol::InputEvent::PointerButton {
+                        button,
+                        pressed: true,
+                    },
+                    juto_desktop::protocol::InputEvent::PointerButton {
+                        button,
+                        pressed: false,
+                    },
+                ],
+            )?;
+            let window_id = window.window_id;
+            Ok(output(
+                format!(
+                    "Clicked button {button} at global pixel ({x}, {y}) in window {window_id} of {} (lease epoch {epoch}, watermark {watermark}).",
+                    env.env_id()
+                ),
+                json!({
+                    "action": "click",
+                    "envId": env.env_id(),
+                    "windowId": window_id,
+                    "globalX": x,
+                    "globalY": y,
+                    "appliedWatermark": watermark,
+                }),
+            ))
+        }
+        "wait_for_change" => {
+            let env = env()?;
+            let baseline = args
+                .baseline_hash
+                .as_deref()
+                .map(|hash| hash.trim().to_ascii_lowercase())
+                .filter(|hash| !hash.is_empty())
+                .ok_or_else(|| "baseline_hash is required for wait_for_change".to_string())?;
+            if baseline.len() != 16 || !baseline.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err(
+                    "baseline_hash must be the 16-digit frameHash returned by observe".to_string(),
+                );
+            }
+            let timeout = Duration::from_millis(args.timeout_ms.unwrap_or(5000).max(1));
+            let watch = poll_frame_change(&baseline, timeout, FRAME_POLL_INTERVAL, |wait| {
+                if cancel.is_cancelled() {
+                    return Err("cancelled".to_string());
+                }
+                match env.snapshot_png(wait) {
+                    Ok(frame) => Ok(Some(frame)),
+                    Err(juto_desktop::DesktopError::ObservationTimeout { .. }) => Ok(None),
+                    Err(e) => Err(e.to_string()),
+                }
+            })?
+            .ok_or_else(|| "no frame was observed before the timeout".to_string())?;
+            let path = write_snapshot(
+                &env,
+                data_dir,
+                workspace,
+                args.snapshot_path.as_deref(),
+                watch.frame.frame_id,
+                &watch.png,
+            )?;
+            let summary = format!(
+                "Environment {} frame {} {} (hash {}); snapshot written to {}.",
+                env.env_id(),
+                watch.frame.frame_id,
+                if watch.changed {
+                    "changed"
+                } else {
+                    "did not change before the timeout"
+                },
+                watch.hash,
+                path.display()
+            );
+            Ok(output(
+                summary,
+                json!({
+                    "action": "wait_for_change",
+                    "envId": env.env_id(),
+                    "changed": watch.changed,
+                    "frameHash": watch.hash,
+                    "frameId": watch.frame.frame_id,
+                    "generation": watch.frame.generation,
+                    "snapshotPath": path.to_string_lossy(),
                 }),
             ))
         }
@@ -2247,6 +2354,179 @@ fn run_desktop_action(
         }
         other => Err(format!("unknown desktop action `{other}`")),
     }
+}
+
+/// Linux evdev code for the primary pointer button (`BTN_LEFT`).
+const BTN_LEFT: u32 = 272;
+
+/// How often `wait_for_change` observes the frame while it waits.
+const FRAME_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// 64-bit FNV-1a over `bytes`, as 16 lowercase hex digits.
+fn frame_hash(bytes: &[u8]) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let hash = bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    });
+    format!("{hash:016x}")
+}
+
+/// Selects the single mapped window that matches every selector given.
+fn select_window<'a>(
+    windows: &'a [juto_desktop::protocol::WindowInfo],
+    window_id: Option<u32>,
+    app_id: Option<&str>,
+) -> Result<&'a juto_desktop::protocol::WindowInfo, String> {
+    if window_id.is_none() && app_id.is_none() {
+        return Err("click requires window_id or app_id to select a window".to_string());
+    }
+    let matches: Vec<_> = windows
+        .iter()
+        .filter(|w| window_id.is_none_or(|id| w.window_id == id))
+        .filter(|w| app_id.is_none_or(|app| w.app_id == app))
+        .collect();
+    match matches.as_slice() {
+        [window] => Ok(*window),
+        [] => Err("no mapped window matches the click selector".to_string()),
+        many => Err(format!(
+            "{} windows match the click selector; pass window_id to choose one",
+            many.len()
+        )),
+    }
+}
+
+/// Maps a window-relative point (default: window center) to global physical
+/// pointer coordinates. Window geometry is logical, and the compositor divides
+/// `PointerMoveAbs` by the output scale, so the event carries logical * scale.
+fn window_click_point(
+    window: &juto_desktop::protocol::WindowInfo,
+    output: &juto_desktop::supervisor::OutputConfig,
+    x: Option<i64>,
+    y: Option<i64>,
+) -> Result<(u32, u32), String> {
+    let local_x = x.unwrap_or(i64::from(window.width / 2));
+    let local_y = y.unwrap_or(i64::from(window.height / 2));
+    if !(0..i64::from(window.width)).contains(&local_x) {
+        return Err(format!(
+            "x {local_x} is outside window {} (width {})",
+            window.window_id, window.width
+        ));
+    }
+    if !(0..i64::from(window.height)).contains(&local_y) {
+        return Err(format!(
+            "y {local_y} is outside window {} (height {})",
+            window.window_id, window.height
+        ));
+    }
+    let scale = i64::from(output.scale.max(1));
+    let global_x = (i64::from(window.x) + local_x) * scale;
+    let global_y = (i64::from(window.y) + local_y) * scale;
+    let (Ok(px), Ok(py)) = (u32::try_from(global_x), u32::try_from(global_y)) else {
+        return Err("click point is outside the desktop output".to_string());
+    };
+    if px >= output.width || py >= output.height {
+        return Err("click point is outside the desktop output".to_string());
+    }
+    Ok((px, py))
+}
+
+/// A frame seen by `poll_frame_change`: the first one that differs from the
+/// baseline, or the last one observed before the timeout.
+struct FrameWatch<F> {
+    changed: bool,
+    frame: F,
+    hash: String,
+    png: Vec<u8>,
+}
+
+/// Observes frames until one hashes differently from `baseline` (lowercase hex)
+/// or `timeout` elapses. `observe` is given how long it may wait for a fresh
+/// frame and returns `None` if none arrived. Returns `None` only when no frame
+/// was observed at all.
+fn poll_frame_change<F>(
+    baseline: &str,
+    timeout: Duration,
+    interval: Duration,
+    mut observe: impl FnMut(Duration) -> Result<Option<(F, Vec<u8>)>, String>,
+) -> Result<Option<FrameWatch<F>>, String> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| "timeout_ms is too large".to_string())?;
+    let mut last = None;
+    loop {
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .max(Duration::from_millis(1));
+        if let Some((frame, png)) = observe(wait)? {
+            let hash = frame_hash(&png);
+            let changed = hash != baseline;
+            last = Some(FrameWatch {
+                changed,
+                frame,
+                hash,
+                png,
+            });
+            if changed {
+                break;
+            }
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        std::thread::sleep(interval.min(remaining));
+    }
+    Ok(last)
+}
+
+/// Sends one input batch as the environment owner, acquiring control first when
+/// the owner does not hold the lease. Returns the lease epoch and applied watermark.
+fn dispatch_events(
+    env: &juto_desktop::DesktopEnvironment,
+    events: Vec<juto_desktop::protocol::InputEvent>,
+) -> Result<(u64, u64), String> {
+    let owner = env.get_status().owner_principal;
+    let lease = match env.get_status().active_control_lease {
+        Some(lease) if lease.holder == owner => lease,
+        _ => env
+            .set_control(&owner, "acquire", false)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "failed to acquire control".to_string())?,
+    };
+    let batch = juto_desktop::protocol::InputBatch {
+        seq: 0,
+        client_timestamp_us: 0,
+        events,
+    };
+    let watermark = env
+        .dispatch_input(&owner, lease.epoch, env.generation(), batch)
+        .map_err(|e| e.to_string())?;
+    Ok((lease.epoch, watermark))
+}
+
+/// Writes a PNG snapshot to `snapshot_path` (relative to the workspace) or, by
+/// default, to the runtime data directory. Returns the path written.
+fn write_snapshot(
+    env: &juto_desktop::DesktopEnvironment,
+    data_dir: &Path,
+    workspace: &Path,
+    snapshot_path: Option<&str>,
+    frame_id: u64,
+    png: &[u8],
+) -> Result<PathBuf, String> {
+    let path = match snapshot_path {
+        Some(raw) => resolve_path(workspace, raw),
+        None => data_dir
+            .join("desktop-snapshots")
+            .join(format!("{}-{frame_id}.png", env.env_id())),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    std::fs::write(&path, png).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// Host identifier used by desktop artifacts and their resolver.
@@ -4637,6 +4917,162 @@ mod tests {
             .decode(data)
             .unwrap();
         assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+
+    fn test_window(
+        window_id: u32,
+        app_id: &str,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    ) -> juto_desktop::protocol::WindowInfo {
+        juto_desktop::protocol::WindowInfo {
+            window_id,
+            title: String::new(),
+            app_id: app_id.to_string(),
+            x,
+            y,
+            width,
+            height,
+            is_focused: false,
+        }
+    }
+
+    fn test_output(width: u32, height: u32, scale: u32) -> juto_desktop::supervisor::OutputConfig {
+        juto_desktop::supervisor::OutputConfig {
+            width,
+            height,
+            scale,
+            fps: 60,
+        }
+    }
+
+    #[test]
+    fn click_selects_the_window_by_id_or_app_id() {
+        let windows = [
+            test_window(1, "terminal", 0, 0, 100, 100),
+            test_window(2, "editor", 0, 0, 100, 100),
+        ];
+        assert_eq!(select_window(&windows, Some(2), None).unwrap().window_id, 2);
+        assert_eq!(
+            select_window(&windows, None, Some("terminal"))
+                .unwrap()
+                .window_id,
+            1
+        );
+        assert_eq!(
+            select_window(&windows, Some(2), Some("editor"))
+                .unwrap()
+                .window_id,
+            2
+        );
+        assert!(select_window(&windows, Some(1), Some("editor")).is_err());
+    }
+
+    #[test]
+    fn click_rejects_zero_or_ambiguous_window_matches() {
+        let windows = [
+            test_window(1, "terminal", 0, 0, 100, 100),
+            test_window(2, "terminal", 0, 0, 100, 100),
+        ];
+        assert!(select_window(&windows, Some(9), None).is_err());
+        assert!(select_window(&windows, None, Some("browser")).is_err());
+        assert!(select_window(&windows, None, Some("terminal")).is_err());
+        assert!(select_window(&windows, None, None).is_err());
+    }
+
+    #[test]
+    fn click_maps_window_points_to_global_physical_pixels() {
+        // Window geometry is logical; the physical pointer position is logical * scale.
+        let window = test_window(7, "app", 100, 50, 400, 300);
+        let scaled = test_output(2560, 1440, 2);
+        assert_eq!(
+            window_click_point(&window, &scaled, None, None),
+            Ok((600, 400))
+        );
+        assert_eq!(
+            window_click_point(&window, &scaled, Some(10), Some(20)),
+            Ok((220, 140))
+        );
+
+        let unscaled = test_output(2560, 1440, 1);
+        assert_eq!(
+            window_click_point(&window, &unscaled, Some(0), Some(0)),
+            Ok((100, 50))
+        );
+    }
+
+    #[test]
+    fn click_rejects_points_outside_the_window_or_output() {
+        let window = test_window(7, "app", 100, 50, 400, 300);
+        let output = test_output(2560, 1440, 2);
+        assert!(window_click_point(&window, &output, Some(400), None).is_err());
+        assert!(window_click_point(&window, &output, Some(-1), None).is_err());
+        assert!(window_click_point(&window, &output, None, Some(300)).is_err());
+
+        let edge = test_window(8, "app", 2400, 0, 400, 300);
+        // (2400 + 300) * 2 = 5400 physical pixels, past the 2560-wide output.
+        assert!(window_click_point(&edge, &output, Some(300), Some(0)).is_err());
+    }
+
+    #[test]
+    fn frame_hash_is_fnv1a_64_over_the_encoded_frame() {
+        assert_eq!(frame_hash(b""), "cbf29ce484222325");
+        assert_eq!(frame_hash(b"a"), "af63dc4c8601ec8c");
+        assert_eq!(frame_hash(b"frame"), frame_hash(b"frame"));
+        assert_ne!(frame_hash(b"frame"), frame_hash(b"framf"));
+    }
+
+    #[test]
+    fn wait_for_change_reports_unchanged_after_the_timeout() {
+        let baseline = frame_hash(&[1, 2, 3]);
+        let started = Instant::now();
+        let watch = poll_frame_change(
+            &baseline,
+            Duration::from_millis(120),
+            Duration::from_millis(10),
+            |_| Ok(Some((7u32, vec![1, 2, 3]))),
+        )
+        .unwrap()
+        .expect("a frame was observed");
+        assert!(!watch.changed);
+        assert_eq!(watch.hash, baseline);
+        assert!(started.elapsed() >= Duration::from_millis(120));
+    }
+
+    #[test]
+    fn wait_for_change_returns_the_first_frame_that_differs() {
+        let baseline = frame_hash(&[1, 2, 3]);
+        let mut calls = 0u32;
+        let watch = poll_frame_change(
+            &baseline,
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+            |_| {
+                calls += 1;
+                let png = if calls < 3 { vec![1, 2, 3] } else { vec![9, 9] };
+                Ok(Some((calls, png)))
+            },
+        )
+        .unwrap()
+        .expect("a frame was observed");
+        assert!(watch.changed);
+        assert_eq!(watch.frame, 3);
+        assert_eq!(watch.hash, frame_hash(&[9, 9]));
+        assert_eq!(watch.png, vec![9, 9]);
+    }
+
+    #[test]
+    fn wait_for_change_reports_no_frame_when_none_arrives() {
+        let watch = poll_frame_change(
+            "0000000000000000",
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            |_| Ok::<Option<(u32, Vec<u8>)>, String>(None),
+        )
+        .unwrap();
+        assert!(watch.is_none());
     }
 
     use crate::broker::{Broker, Priority, Request};
