@@ -41,7 +41,7 @@ pub fn status_label(status: &SubagentStatus) -> &'static str {
         SubagentStatus::Blocked { .. } => "Blocked",
         SubagentStatus::Verifying => "Verifying",
         SubagentStatus::Reviewing => "Reviewing",
-        SubagentStatus::Completed => "Done",
+        SubagentStatus::Completed => "Completed",
         SubagentStatus::Failed => "Failed",
         SubagentStatus::Cancelled => "Cancelled",
     }
@@ -244,8 +244,8 @@ impl TaskCardModel {
     pub fn display_title(&self) -> String {
         if let Some(name) = &self.name {
             name.clone()
-        } else if self.task.len() > 38 {
-            format!("{}…", &self.task[..35])
+        } else if self.task.chars().count() > 38 {
+            format!("{}…", self.task.chars().take(35).collect::<String>())
         } else {
             self.task.clone()
         }
