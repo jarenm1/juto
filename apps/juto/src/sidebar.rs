@@ -18,14 +18,37 @@ use gpui::{
     App, ClickEvent, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Render,
     ScrollHandle, SharedString, Subscription, Window, actions, div, prelude::*, px, rgb,
 };
-use juto_runtime::subagents::{BlockerReason, MainMessage, SubagentStatus, SubagentSummary};
+use juto_runtime::subagents::{
+    BlockerReason, MainMessage, MainMessageKind, SubagentStatus, SubagentSummary,
+};
 use juto_runtime::{ThreadInfo, ThreadStatus};
 
+use crate::subagent_card::fallback_name;
 use crate::task_card::{
     DiffFileModel, DiffHunkModel, DiffLineKind, DiffLineModel, TaskCard, TaskCardEvent,
     TaskCardModel, TokenUsageModel, ToolLogEntry, is_status_active,
 };
 use crate::theme;
+
+/// Inbox row heading: the sender's name, or a readable label built from its id,
+/// then what kind of report it is. Never the raw id or a `Debug` variant name.
+fn inbox_heading(message: &MainMessage) -> String {
+    let who = message
+        .name
+        .clone()
+        .unwrap_or_else(|| fallback_name(&message.from));
+    format!("{who} · {}", inbox_kind_label(&message.kind))
+}
+
+fn inbox_kind_label(kind: &MainMessageKind) -> &'static str {
+    match kind {
+        MainMessageKind::Message => "Message",
+        MainMessageKind::Completed => "Completed",
+        MainMessageKind::Failed => "Failed",
+        MainMessageKind::Cancelled => "Cancelled",
+        MainMessageKind::Desktop => "Desktop",
+    }
+}
 
 actions!(
     sidebar,
@@ -147,7 +170,7 @@ impl Sidebar {
                     .p_2()
                     .border_1()
                     .border_color(rgb(theme::TEXT_FAINT))
-                    .child(format!("{} · {:?}", message.from, message.kind))
+                    .child(inbox_heading(&message))
                     .child(div().text_sm().child(message.body))
                     .child(
                         div()
