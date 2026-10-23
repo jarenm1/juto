@@ -249,6 +249,20 @@ const AUDIO_SINK_CONFIG: &str = r#"context.objects = [
 ]
 "#;
 
+/// WirePlumber drop-in for the environment's session manager.
+///
+/// Without a session manager the environment's PipeWire graph never runs client
+/// streams. The hardware monitors are disabled so the environment cannot see
+/// host audio cards, Bluetooth adapters, or cameras (spec section 7).
+const WIREPLUMBER_CONFIG: &str = r#"wireplumber.profiles = {
+  main = {
+    hardware.audio = disabled
+    hardware.bluetooth = disabled
+    hardware.video-capture = disabled
+  }
+}
+"#;
+
 /// Host-wide admission policy (spec section 6).
 ///
 /// Per-environment ceilings bound one desktop; this bounds the sum of admitted
@@ -1674,13 +1688,30 @@ fn spawn_audio_server(inner: &Arc<InnerEnvironment>) -> Result<(), DesktopError>
         path: config.clone(),
         source,
     })?;
+    let wireplumber_dir = inner
+        .runtime_dir
+        .join("home/.config/wireplumber/wireplumber.conf.d");
+    std::fs::create_dir_all(&wireplumber_dir).map_err(|source| DesktopError::Io {
+        path: wireplumber_dir.clone(),
+        source,
+    })?;
+    let wireplumber_config = wireplumber_dir.join("10-juto.conf");
+    std::fs::write(&wireplumber_config, WIREPLUMBER_CONFIG).map_err(|source| DesktopError::Io {
+        path: wireplumber_config.clone(),
+        source,
+    })?;
 
     let runtime_dir = inner.runtime_dir.display().to_string();
     let config_home = inner.runtime_dir.join("home/.config").display().to_string();
     let home = inner.runtime_dir.join("home").display().to_string();
     let path = std::env::var("PATH").unwrap_or_default();
 
-    for (index, program) in ["pipewire", "pipewire-pulse"].iter().enumerate() {
+    // WirePlumber must run before pipewire-pulse so the pulse endpoint sees a
+    // graph with a session manager that schedules client streams.
+    for (index, program) in ["pipewire", "wireplumber", "pipewire-pulse"]
+        .iter()
+        .enumerate()
+    {
         let mut command = if let Some(slice) = inner.slice.as_ref() {
             let unit = format!(
                 "juto-desktop-{}-audio-{index}.scope",

@@ -76,6 +76,7 @@
           # Each environment runs its own PipeWire instance for private audio.
           audioTools = with pkgs; [
             pipewire
+            wireplumber
           ];
 
           craneLib = inputs.crane.mkLib pkgs;
