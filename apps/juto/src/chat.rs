@@ -26,7 +26,7 @@ use gpui::{
     Subscription, Task, WeakEntity, Window, actions, deferred, div, prelude::*, px, rgb, rgba,
 };
 use juto_agent::{AgentEvent, ToolTier, ViewNode, view_from_details};
-use juto_ai::{Message as AiMessage, ProviderEvent, StopReason, ToolCall};
+use juto_ai::{ContentBlock, Message as AiMessage, ProviderEvent, StopReason, ToolCall};
 use juto_daemon::client::{Client, Notification};
 use juto_daemon::protocol::{
     PendingApproval, Reply, Request, ServerEvent, SessionEvent, SessionView, SubagentCommand,
@@ -173,6 +173,7 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
                 messages.push(Message {
                     role: MessageRole::User,
                     text: message.text().into(),
+                    thinking: SharedString::default(),
                     attachments: Vec::new(),
                     desktop_artifacts: Vec::new(),
                     approval: None,
@@ -181,11 +182,13 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
             }
             AiMessage::Assistant(assistant) => {
                 let text = assistant.text();
+                let thinking = thinking_text(assistant);
                 let desktop_artifacts = extract_desktop_artifacts(message);
-                if !text.is_empty() || !desktop_artifacts.is_empty() {
+                if !text.is_empty() || !thinking.is_empty() || !desktop_artifacts.is_empty() {
                     messages.push(Message {
                         role: MessageRole::Assistant,
                         text: text.into(),
+                        thinking: thinking.into(),
                         attachments: Vec::new(),
                         desktop_artifacts,
                         approval: None,
@@ -204,6 +207,7 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
                         messages.push(Message {
                             role: MessageRole::Assistant,
                             text: MessageText::default(),
+                            thinking: SharedString::default(),
                             attachments: Vec::new(),
                             desktop_artifacts,
                             approval: None,
@@ -221,9 +225,28 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
     messages
 }
 
-/// Applies a streamed event to a transcript. Streamed text goes to the last
-/// assistant message, opening one when none is open. Returns whether the
-/// transcript changed.
+/// The message's reasoning blocks, trimmed and separated by blank lines.
+/// Redacted reasoning is encrypted, so it has nothing to show.
+fn thinking_text(assistant: &juto_ai::AssistantMessage) -> String {
+    let mut thinking = String::new();
+    for block in &assistant.content {
+        if let ContentBlock::Thinking { thinking: part, .. } = block {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if !thinking.is_empty() {
+                thinking.push_str("\n\n");
+            }
+            thinking.push_str(part);
+        }
+    }
+    thinking
+}
+
+/// Applies a streamed event to a transcript. Streamed text and thinking go to
+/// the last assistant message, opening one when none is open. Returns whether
+/// the transcript changed.
 pub fn apply_stream_event(messages: &mut Vec<Message>, event: &AgentEvent) -> bool {
     match event {
         AgentEvent::MessageStart => {
@@ -240,6 +263,22 @@ pub fn apply_stream_event(messages: &mut Vec<Message>, event: &AgentEvent) -> bo
                     last.text = text.into();
                 }
                 _ => messages.push(assistant_message(delta.clone().into())),
+            }
+            true
+        }
+        AgentEvent::MessageUpdate {
+            event: ProviderEvent::ThinkingDelta { delta, .. },
+        } => {
+            match messages.last_mut() {
+                Some(last) if last.role == MessageRole::Assistant => {
+                    let mut thinking = last.thinking.to_string();
+                    thinking.push_str(delta);
+                    last.thinking = thinking.into();
+                }
+                _ => messages.push(Message {
+                    thinking: delta.clone().into(),
+                    ..assistant_message(MessageText::default())
+                }),
             }
             true
         }
@@ -266,6 +305,7 @@ fn assistant_message(text: MessageText) -> Message {
     Message {
         role: MessageRole::Assistant,
         text,
+        thinking: SharedString::default(),
         attachments: Vec::new(),
         desktop_artifacts: Vec::new(),
         approval: None,
@@ -273,11 +313,38 @@ fn assistant_message(text: MessageText) -> Message {
     }
 }
 
+/// Model reasoning: a faint label over muted text with a left rule, so it
+/// reads as secondary to the reply below it.
+fn thinking_block(thinking: SharedString) -> impl IntoElement {
+    div()
+        .mb_3()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::TEXT_FAINT))
+                .child("Thinking"),
+        )
+        .child(
+            div()
+                .w_full()
+                .pl_3()
+                .border_l_2()
+                .border_color(rgb(theme::BORDER_STRONG))
+                .text_sm()
+                .text_color(rgb(theme::TEXT_MUTED))
+                .child(thinking),
+        )
+}
+
 /// Transcript row that shows a tool's view tree in place of text output.
 pub fn view_row(view: ViewNode) -> Message {
     Message {
         role: MessageRole::Assistant,
         text: MessageText::default(),
+        thinking: SharedString::default(),
         attachments: Vec::new(),
         desktop_artifacts: Vec::new(),
         approval: None,
@@ -290,6 +357,7 @@ pub fn desktop_row(artifact: DesktopSessionArtifact) -> Message {
     Message {
         role: MessageRole::Assistant,
         text: MessageText::default(),
+        thinking: SharedString::default(),
         attachments: Vec::new(),
         desktop_artifacts: vec![artifact],
         approval: None,
@@ -317,6 +385,8 @@ fn card_element(view: &ViewNode, actions: &ViewActions, cx: &Context<ChatView>) 
 pub struct Message {
     pub role: MessageRole,
     pub text: MessageText,
+    /// Model reasoning shown above `text`, muted. Empty for most rows.
+    pub thinking: SharedString,
     pub attachments: Vec<Attachment>,
     pub desktop_artifacts: Vec<DesktopSessionArtifact>,
     pub approval: Option<ApprovalCard>,
@@ -790,6 +860,7 @@ impl ChatView {
                         this.messages.push(Message {
                             role: MessageRole::Assistant,
                             text: MessageText::default(),
+                            thinking: SharedString::default(),
                             attachments: Vec::new(),
                             desktop_artifacts: vec![artifact],
                             approval: None,
@@ -1434,6 +1505,7 @@ impl ChatView {
         self.messages.push(Message {
             role: MessageRole::Assistant,
             text: MessageText::default(),
+            thinking: SharedString::default(),
             attachments: Vec::new(),
             desktop_artifacts: Vec::new(),
             approval: Some(card),
@@ -1789,6 +1861,9 @@ impl ChatView {
                                     .text_color(rgb(0xa0a0a0))
                                     .child(author),
                             )
+                            .when(!message.thinking.trim().is_empty(), |row| {
+                                row.child(thinking_block(message.thinking.clone()))
+                            })
                             .when(!message.text.is_empty(), |row| {
                                 let body = match message.role {
                                     MessageRole::User => message.text.shared().into_any_element(),
@@ -2946,5 +3021,79 @@ mod tests {
             messages[0].text.markdown(),
             [markdown::Block::Paragraph(_), markdown::Block::List { .. }]
         ));
+    }
+
+    fn assistant_with(content: Vec<ContentBlock>) -> AiMessage {
+        AiMessage::Assistant(juto_ai::AssistantMessage {
+            content,
+            api: "test".into(),
+            provider: "test".into(),
+            model: "test".into(),
+            usage: juto_ai::Usage::default(),
+            stop_reason: StopReason::Stop,
+            timestamp: 0,
+            response_id: None,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn thinking_only_assistant_message_keeps_a_row() {
+        let rows = view_messages(&[assistant_with(vec![
+            ContentBlock::Thinking {
+                thinking: "\nfirst idea\n".into(),
+                thinking_signature: None,
+            },
+            ContentBlock::RedactedThinking {
+                data: "opaque".into(),
+            },
+            ContentBlock::Thinking {
+                thinking: "second idea".into(),
+                thinking_signature: None,
+            },
+        ])]);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].text.is_empty());
+        assert_eq!(rows[0].thinking.as_ref(), "first idea\n\nsecond idea");
+    }
+
+    #[test]
+    fn redacted_or_blank_thinking_alone_adds_no_row() {
+        let rows = view_messages(&[assistant_with(vec![
+            ContentBlock::RedactedThinking {
+                data: "opaque".into(),
+            },
+            ContentBlock::Thinking {
+                thinking: "  ".into(),
+                thinking_signature: None,
+            },
+        ])]);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn streamed_thinking_and_text_share_the_open_row() {
+        let mut messages = Vec::new();
+        let update = |event| AgentEvent::MessageUpdate { event };
+        apply_stream_event(&mut messages, &AgentEvent::MessageStart);
+        for event in [
+            ProviderEvent::ThinkingDelta {
+                index: 0,
+                delta: "Let me ".into(),
+            },
+            ProviderEvent::ThinkingDelta {
+                index: 0,
+                delta: "check.".into(),
+            },
+            ProviderEvent::TextDelta {
+                index: 1,
+                delta: "Done.".into(),
+            },
+        ] {
+            assert!(apply_stream_event(&mut messages, &update(event)));
+        }
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].thinking.as_ref(), "Let me check.");
+        assert_eq!(messages[0].text.as_ref(), "Done.");
     }
 }

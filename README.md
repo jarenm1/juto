@@ -11,6 +11,8 @@ in a modern composer card with an attachment dropdown (**+**), submit with Enter
 or a circular Send button (**↑**), and view left-aligned messages in a scrollable list.
 Assistant replies render Markdown (headings, emphasis, lists, task lists, quotes, code
 blocks, tables, rules, and http/https/mailto links); user messages stay plain text.
+Model reasoning (thinking blocks, streamed or journaled) appears above the reply under a
+**Thinking** label in muted text; encrypted (redacted) reasoning is not shown.
 Messages and turns are durably journaled to append-only JSONL sessions in the background.
 
 **The UI is wired into the agent runtime.** User prompts and attachments are submitted
