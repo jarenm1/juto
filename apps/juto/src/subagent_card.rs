@@ -44,8 +44,18 @@ fn set_card_status(card: &mut ViewNode, name: Option<&str>, status: &SubagentSta
         .insert("tone".to_owned(), json!(status_tone(status)));
 }
 
+/// Name for a card whose child has no configured name. Ids are UUIDv7 strings:
+/// their head is a timestamp, identical for siblings spawned together, so the
+/// tail is what tells them apart.
+pub(crate) fn fallback_name(id: &str) -> String {
+    let tail: Vec<char> = id.chars().rev().take(6).collect();
+    let tail: String = tail.into_iter().rev().collect();
+    format!("Subagent {tail}")
+}
+
 /// Creates the card for child `id` on first sight, or updates its name and status
-/// in place. A name of `None` keeps the existing name, and a new card uses the id.
+/// in place. A name of `None` keeps the existing name, and a new card without one
+/// is labeled from the tail of its id (see `fallback_name`).
 ///
 /// While a run streams, a new card goes before the streaming assistant row, so the
 /// next `TextDelta` still lands on that row. Otherwise the card is appended.
@@ -71,7 +81,8 @@ pub fn upsert_subagent_card(
         children: Vec::new(),
     };
     card.props.insert("id".to_owned(), json!(id));
-    set_card_status(&mut card, Some(name.unwrap_or(id)), status);
+    let fallback = fallback_name(id);
+    set_card_status(&mut card, Some(name.unwrap_or(&fallback)), status);
 
     let streaming_assistant = streaming
         && messages
@@ -178,12 +189,16 @@ mod tests {
     }
 
     #[test]
-    fn status_change_without_spawn_names_the_card_by_id() {
+    fn unnamed_card_is_labeled_by_id_tail_not_the_full_id() {
+        let id = "0195c2a4-7f3e-7d10-9b8a-3c1e5f2a9d47";
         let mut messages = Vec::new();
-        upsert_subagent_card(&mut messages, "w2", None, &SubagentStatus::Running, false);
+        upsert_subagent_card(&mut messages, id, None, &SubagentStatus::Running, false);
 
         assert_eq!(card_count(&messages), 1);
-        assert_eq!(messages[0].views[0].props.get("name"), Some(&json!("w2")));
+        assert_eq!(
+            messages[0].views[0].props.get("name"),
+            Some(&json!("Subagent 2a9d47"))
+        );
     }
 
     fn desktop(artifact_id: &str) -> DesktopSessionArtifact {
