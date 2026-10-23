@@ -165,11 +165,15 @@ never the host graph. The remote stream carries an Opus audio track whose source
 is that sink's monitor (`DesktopEnvironment::audio_source`), and audio and video
 share the environment's total-media ceiling.
 
-Capture from the sink's monitor is **not verified**: playback into the private
-sink succeeds, but neither GStreamer's `pulsesrc` nor `pw-record` produced
-samples from `juto-sink.monitor` (or PipeWire's automatic `auto_null.monitor`)
-on the development host, so end-to-end audio flow — and the local bounded-PCM
-path to a viewer — is not claimed.
+Playback and capture through the private sink are **not verified**. On the
+development host, `pw-cat` writing a WAV into `juto-sink` (and into the default
+target) does not complete within 12s: the environment's PipeWire graph does not
+run client streams, and no session manager (WirePlumber) runs inside the
+environment. Capture from `juto-sink.monitor` is likewise unverified. Because
+OpenAL opens a PipeWire playback stream during startup and blocks on it, the
+supervisor sets `ALSOFT_DRIVERS=null` for applications so they can create
+windows. Applications therefore get no OpenAL audio. End-to-end audio flow and
+the local bounded-PCM path to a viewer are not claimed.
 
 Xwayland is implemented (one private X11 server per environment, driven by
 Smithay's X11 WM, with an `MIT-MAGIC-COOKIE-1` `XAUTHORITY` file). The hardware
