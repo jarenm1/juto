@@ -130,6 +130,7 @@ mod tests {
         Message {
             role: MessageRole::Assistant,
             text: text.to_owned().into(),
+            thinking: Default::default(),
             attachments: Vec::new(),
             desktop_artifacts: Vec::new(),
             approval: None,
