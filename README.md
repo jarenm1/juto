@@ -8,7 +8,9 @@ capabilities of [oh-my-pi](https://github.com/can1357/oh-my-pi).
 The build includes a pinned Nix development environment, a Cargo workspace,
 the modular Rust agent runtime crates, and a native GPUI chat view. You can type
 in a modern composer card with an attachment dropdown (**+**), submit with Enter
-or a circular Send button (**↑**), and view plain, left-aligned messages in a scrollable list.
+or a circular Send button (**↑**), and view left-aligned messages in a scrollable list.
+Assistant replies render Markdown (headings, emphasis, lists, task lists, quotes, code
+blocks, tables, rules, and http/https/mailto links); user messages stay plain text.
 Messages and turns are durably journaled to append-only JSONL sessions in the background.
 
 **The UI is wired into the agent runtime.** User prompts and attachments are submitted
@@ -614,7 +616,8 @@ fail at inference.
 ### UI-only iteration
 
 `apps/juto/src/main.rs` launches the native window. `chat.rs` owns the chat view,
-plain message rows, attachment dropdown, and Send control; `chat_input.rs` owns
+plain user rows, Markdown assistant rows (`markdown.rs` parses, `markdown_element.rs` renders),
+attachment dropdown, and Send control; `chat_input.rs` owns
 native text editing. UI work stays in this application without changing the agent runtime.
 
 The composer features a modern card with an input field and bottom toolbar row:

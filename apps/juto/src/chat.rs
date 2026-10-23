@@ -3,12 +3,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::{Arc, OnceLock};
+use std::{fmt, ops};
 
 use crate::Quit;
 use crate::auth_modal::{AuthModal, AuthModalEvent};
 use crate::chat_input::{ChatInput, SubmitMessage};
 use crate::focus_thread::{FocusEvent, FocusThread};
 use crate::jobs_panel::{self, JobAction, JobActionHandler};
+use crate::markdown;
+use crate::markdown_element;
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::subagent_card;
@@ -199,7 +203,7 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
                     } else {
                         messages.push(Message {
                             role: MessageRole::Assistant,
-                            text: SharedString::default(),
+                            text: MessageText::default(),
                             attachments: Vec::new(),
                             desktop_artifacts,
                             approval: None,
@@ -223,7 +227,7 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
 pub fn apply_stream_event(messages: &mut Vec<Message>, event: &AgentEvent) -> bool {
     match event {
         AgentEvent::MessageStart => {
-            messages.push(assistant_message(SharedString::default()));
+            messages.push(assistant_message(MessageText::default()));
             true
         }
         AgentEvent::MessageUpdate {
@@ -258,7 +262,7 @@ pub fn apply_stream_event(messages: &mut Vec<Message>, event: &AgentEvent) -> bo
     }
 }
 
-fn assistant_message(text: SharedString) -> Message {
+fn assistant_message(text: MessageText) -> Message {
     Message {
         role: MessageRole::Assistant,
         text,
@@ -273,7 +277,7 @@ fn assistant_message(text: SharedString) -> Message {
 pub fn view_row(view: ViewNode) -> Message {
     Message {
         role: MessageRole::Assistant,
-        text: SharedString::default(),
+        text: MessageText::default(),
         attachments: Vec::new(),
         desktop_artifacts: Vec::new(),
         approval: None,
@@ -285,7 +289,7 @@ pub fn view_row(view: ViewNode) -> Message {
 pub fn desktop_row(artifact: DesktopSessionArtifact) -> Message {
     Message {
         role: MessageRole::Assistant,
-        text: SharedString::default(),
+        text: MessageText::default(),
         attachments: Vec::new(),
         desktop_artifacts: vec![artifact],
         approval: None,
@@ -312,11 +316,87 @@ fn card_element(view: &ViewNode, actions: &ViewActions, cx: &Context<ChatView>) 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: MessageRole,
-    pub text: SharedString,
+    pub text: MessageText,
     pub attachments: Vec<Attachment>,
     pub desktop_artifacts: Vec<DesktopSessionArtifact>,
     pub approval: Option<ApprovalCard>,
     pub views: Vec<ViewNode>,
+}
+
+/// A message's text. Assistant rows render it as Markdown. The parse runs on
+/// first render and is shared by every clone; the transcript is cloned each
+/// frame, so this keeps each text to one parse. Replacing the text starts a
+/// fresh, unparsed value.
+#[derive(Clone, Default)]
+pub struct MessageText {
+    text: SharedString,
+    markdown: Arc<OnceLock<Vec<markdown::Block>>>,
+}
+
+impl MessageText {
+    pub fn shared(&self) -> SharedString {
+        self.text.clone()
+    }
+
+    /// The text parsed as Markdown, computed on the first call.
+    pub fn markdown(&self) -> &[markdown::Block] {
+        self.markdown.get_or_init(|| markdown::parse(&self.text))
+    }
+}
+
+impl ops::Deref for MessageText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl AsRef<str> for MessageText {
+    fn as_ref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl fmt::Display for MessageText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl fmt::Debug for MessageText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&*self.text, f)
+    }
+}
+
+impl PartialEq for MessageText {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for MessageText {}
+
+impl From<SharedString> for MessageText {
+    fn from(text: SharedString) -> Self {
+        Self {
+            text,
+            markdown: Arc::default(),
+        }
+    }
+}
+
+impl From<String> for MessageText {
+    fn from(text: String) -> Self {
+        SharedString::from(text).into()
+    }
+}
+
+impl From<&str> for MessageText {
+    fn from(text: &str) -> Self {
+        SharedString::from(text.to_owned()).into()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -709,7 +789,7 @@ impl ChatView {
                             .insert(artifact.artifact_id.clone(), DesktopCanvas::Live(viewer));
                         this.messages.push(Message {
                             role: MessageRole::Assistant,
-                            text: SharedString::default(),
+                            text: MessageText::default(),
                             attachments: Vec::new(),
                             desktop_artifacts: vec![artifact],
                             approval: None,
@@ -1353,7 +1433,7 @@ impl ChatView {
         self.pending_approvals.insert(id, request);
         self.messages.push(Message {
             role: MessageRole::Assistant,
-            text: SharedString::default(),
+            text: MessageText::default(),
             attachments: Vec::new(),
             desktop_artifacts: Vec::new(),
             approval: Some(card),
@@ -1612,7 +1692,7 @@ impl ChatView {
             .min_h_0()
             .min_w_0()
             .h_full()
-            .child(self.message_list(messages, cx))
+            .child(self.message_list(messages, window, cx))
             .when(!focused, |body| {
                 body.child(jobs_panel::render_strip(
                     &self.jobs,
@@ -1622,7 +1702,12 @@ impl ChatView {
             .child(self.composer(window, cx))
     }
 
-    fn message_list(&self, messages: Vec<Message>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn message_list(
+        &self,
+        messages: Vec<Message>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let actions = self.view_actions(cx);
         let (scroll, empty_hint) = match &self.focus {
             Some(focus) => {
@@ -1705,12 +1790,13 @@ impl ChatView {
                                     .child(author),
                             )
                             .when(!message.text.is_empty(), |row| {
-                                row.child(
-                                    div()
-                                        .w_full()
-                                        .text_size(px(15.))
-                                        .child(message.text.clone()),
-                                )
+                                let body = match message.role {
+                                    MessageRole::User => message.text.shared().into_any_element(),
+                                    MessageRole::Assistant => {
+                                        markdown_element::render(message.text.markdown(), window)
+                                    }
+                                };
+                                row.child(div().w_full().text_size(px(15.)).child(body))
                             })
                             .when_some(message.approval.clone(), |row, card| {
                                 row.child(self.approval_card(&card, cx))
@@ -2828,5 +2914,37 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, MessageRole::User);
         assert_eq!(messages[0].text.as_ref(), "Plan the release");
+    }
+
+    #[test]
+    fn message_text_clones_share_one_parse() {
+        let text = MessageText::from("# Title");
+        // The transcript is cloned before each render, so a clone taken
+        // before the first parse must still see the parse its sibling made.
+        let frame_copy = text.clone();
+        let parsed = frame_copy.markdown();
+        assert!(std::ptr::eq(parsed, text.markdown()));
+    }
+
+    #[test]
+    fn streamed_delta_reparses_the_new_text() {
+        let mut messages = Vec::new();
+        apply_stream_event(&mut messages, &AgentEvent::MessageStart);
+        let delta = |text: &str| AgentEvent::MessageUpdate {
+            event: ProviderEvent::TextDelta {
+                index: 0,
+                delta: text.to_owned(),
+            },
+        };
+        apply_stream_event(&mut messages, &delta("plain"));
+        assert!(matches!(
+            messages[0].text.markdown(),
+            [markdown::Block::Paragraph(_)]
+        ));
+        apply_stream_event(&mut messages, &delta("\n\n- item"));
+        assert!(matches!(
+            messages[0].text.markdown(),
+            [markdown::Block::Paragraph(_), markdown::Block::List { .. }]
+        ));
     }
 }
