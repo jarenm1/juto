@@ -71,6 +71,7 @@ pub enum SidebarEvent {
     ResumeTask { id: String, resolution: String },
     AbortTask(String),
     SteerTask { id: String, guidance: String },
+    ArchiveFinished,
     DismissInbox(MainMessage),
     Close,
 }
@@ -310,14 +311,19 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Focus threads and blocked workers are visible. Once a worker has been
-    /// shown, keep updating its card so resolving a blocker clears the prompt.
+    /// Focus threads and blocked workers are visible, and a running worker stays
+    /// visible until it finishes. Archived threads and finished workers leave the
+    /// inbox on the next sync, so the inbox stays bounded.
     pub fn apply_summaries(&mut self, summaries: &[SubagentSummary]) {
+        self.tasks.retain(|task| {
+            summaries
+                .iter()
+                .find(|summary| summary.id == task.id)
+                .is_some_and(|summary| Self::inbox_visible(summary, true))
+        });
         for summary in summaries {
-            if !summary.focus
-                && !summary.status.is_blocked()
-                && !self.tasks.iter().any(|task| task.id == summary.id)
-            {
+            let shown = self.tasks.iter().any(|task| task.id == summary.id);
+            if !Self::inbox_visible(summary, shown) {
                 continue;
             }
             let workspace = summary
@@ -364,6 +370,15 @@ impl Sidebar {
                 self.tasks.push(card);
             }
         }
+    }
+
+    /// Whether a summary belongs in the inbox. `shown` is whether its card is
+    /// already on screen; a shown worker stays until it reaches a terminal state.
+    fn inbox_visible(summary: &SubagentSummary, shown: bool) -> bool {
+        if summary.archived {
+            return false;
+        }
+        summary.focus || summary.status.is_blocked() || (shown && !summary.status.is_terminal())
     }
 
     pub fn set_tasks(&mut self, tasks: Vec<TaskCardModel>, cx: &mut Context<Self>) {
@@ -589,6 +604,20 @@ impl Sidebar {
                         .child(self.filter_tab(TaskFilter::Active, active, cx))
                         .child(self.filter_tab(TaskFilter::Blocked, blocked, cx))
                         .child(self.filter_tab(TaskFilter::Done, done, cx)),
+                )
+            })
+            .when(done > 0, |hdr| {
+                hdr.child(
+                    div()
+                        .id("archive-finished-btn")
+                        .text_xs()
+                        .cursor_pointer()
+                        .text_color(rgb(theme::TEXT_MUTED))
+                        .hover(|s| s.text_color(rgb(theme::TEXT)))
+                        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                            cx.emit(SidebarEvent::ArchiveFinished);
+                        }))
+                        .child(format!("Archive {done} finished")),
                 )
             })
             .when_some(self.error_message.clone(), |hdr, err| {
@@ -898,6 +927,7 @@ mod tests {
             focus: true,
             workspace: None,
             released: false,
+            archived: false,
         };
         sidebar.apply_summaries(&[summary1]);
         assert_eq!(sidebar.tasks().len(), 1);
@@ -915,6 +945,7 @@ mod tests {
             focus: true,
             workspace: None,
             released: false,
+            archived: false,
         };
         sidebar.apply_summaries(&[summary2]);
         assert_eq!(sidebar.filter_counts(), (1, 1, 0, 0));
@@ -934,6 +965,7 @@ mod tests {
             focus: true,
             workspace: None,
             released: false,
+            archived: false,
         };
         sidebar.apply_summaries(&[summary3]);
         assert_eq!(sidebar.filter_counts(), (1, 0, 1, 0));
@@ -951,6 +983,7 @@ mod tests {
             focus: true,
             workspace: None,
             released: false,
+            archived: false,
         };
         sidebar.apply_summaries(&[summary4]);
         assert_eq!(sidebar.filter_counts(), (1, 1, 0, 0));
@@ -967,6 +1000,7 @@ mod tests {
             focus: true,
             workspace: None,
             released: false,
+            archived: false,
         };
         sidebar.apply_summaries(&[summary5]);
         assert_eq!(sidebar.filter_counts(), (1, 1, 0, 0));
@@ -983,6 +1017,7 @@ mod tests {
             focus: true,
             workspace: None,
             released: false,
+            archived: false,
         };
         sidebar.apply_summaries(&[summary6]);
         assert_eq!(sidebar.filter_counts(), (1, 0, 0, 1));
@@ -1040,6 +1075,7 @@ mod tests {
             focus,
             workspace: None,
             released: false,
+            archived: false,
         };
 
         sidebar.apply_summaries(&[summary("worker-1", false), summary("focus-1", true)]);
@@ -1052,11 +1088,68 @@ mod tests {
             reason: BlockerReason::UserInput,
             prompt: "Choose a target".into(),
         };
-        sidebar.apply_summaries(&[worker.clone()]);
+        sidebar.apply_summaries(&[summary("focus-1", true), worker.clone()]);
         assert!(sidebar.tasks()[1].status.is_blocked());
         worker.status = SubagentStatus::Running;
-        sidebar.apply_summaries(&[worker]);
+        sidebar.apply_summaries(&[summary("focus-1", true), worker]);
         assert!(!sidebar.tasks()[1].status.is_blocked());
+    }
+
+    #[test]
+    fn inbox_drops_archived_threads_and_finished_workers() {
+        let mut sidebar = Sidebar {
+            focus_handle: None,
+            scroll_handle: ScrollHandle::new(),
+            tasks: Vec::new(),
+            selected_task: None,
+            filter: TaskFilter::All,
+            search_query: String::new(),
+            error_message: None,
+            cards: HashMap::new(),
+            threads: ThreadList::default(),
+            inbox: Vec::new(),
+        };
+        let summary = |id: &str, focus: bool| SubagentSummary {
+            id: id.into(),
+            name: None,
+            task: "task".into(),
+            status: SubagentStatus::Running,
+            stop_reason: None,
+            usage: None,
+            error: None,
+            focus,
+            workspace: None,
+            released: false,
+            archived: false,
+        };
+        let ids = |sidebar: &Sidebar| -> Vec<String> {
+            sidebar.tasks().iter().map(|t| t.id.clone()).collect()
+        };
+
+        let mut focus = summary("focus-1", true);
+        let mut worker = summary("worker-1", false);
+        worker.status = SubagentStatus::Blocked {
+            reason: BlockerReason::UserInput,
+            prompt: "Choose a target".into(),
+        };
+        sidebar.apply_summaries(&[focus.clone(), worker.clone()]);
+        assert_eq!(ids(&sidebar), vec!["focus-1", "worker-1"]);
+
+        worker.status = SubagentStatus::Running;
+        sidebar.apply_summaries(&[focus.clone(), worker.clone()]);
+        assert_eq!(
+            ids(&sidebar),
+            vec!["focus-1", "worker-1"],
+            "a shown worker stays while running"
+        );
+
+        worker.status = SubagentStatus::Completed;
+        sidebar.apply_summaries(&[focus.clone(), worker.clone()]);
+        assert_eq!(ids(&sidebar), vec!["focus-1"], "finished workers leave");
+
+        focus.archived = true;
+        sidebar.apply_summaries(&[focus, worker]);
+        assert!(ids(&sidebar).is_empty(), "archived threads leave");
     }
 
     #[test]
@@ -1086,6 +1179,7 @@ mod tests {
             focus: true,
             workspace: Some(PathBuf::from("/tmp/juto-focus-1")),
             released: false,
+            archived: false,
         };
 
         sidebar.apply_summaries(&[summary]);

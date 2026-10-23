@@ -435,8 +435,9 @@ only be spawned by the main thread". Spawning a focus spec forces
 `SubagentManager::list` reports `focus` plus the child's `workspace` path so the
 UI can surface the thread's working directory.
 
-A follow-up the user types makes any subagent a focus thread: the runtime sets its
-`focus` flag, so the sidebar lists it. Main-started follow-ups do not promote.
+A message the user sends to any subagent with `SubagentManager::send_from_user` makes
+it a focus thread: the runtime sets its `focus` flag, so the sidebar lists it. Main-started
+follow-ups do not promote.
 
 Follow-up turns: `SubagentManager::follow_up(id, prompt)` resumes a `Completed`
 child by reopening its recorded session and reusing its isolated workspace without
@@ -530,6 +531,19 @@ also appear as task cards with their blocker prompt and resume controls.
 
 Limitation: a failed cleanup restores the recorded workspace, so follow-ups are accepted
 again until a release succeeds, even if the directory was partly removed.
+
+PR7 adds live focus threads. The runtime relays every child `AgentEvent` to subscribers
+as `SubagentEvent::Agent`, so the focus view streams the reply as it is generated; it
+supersedes the PR5 limitations above. `SubagentCommand::Send` carries the user's message:
+a queued, running, or verifying child is steered and promoted, and a completed child takes
+a user-origin follow-up. The composer is disabled only for blocked threads (answer the
+request first), failed, cancelled, and released threads. The focus view shows the in-flight
+reply above the committed transcript. A status change or a broadcast lag reloads the
+transcript, which replaces the in-flight reply. `SubagentCommand::SetArchived` hides a focus
+thread from the inbox. It keeps the workspace and transcript, unlike the jobs panel archive,
+which reclaims forks, and it does not stop a running child. The inbox is rebuilt on every
+sync: archived threads and non-focus workers that reached a terminal state leave it.
+"Archive finished" archives every finished focus thread.
 
 ---
 

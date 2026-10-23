@@ -215,6 +215,58 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
     messages
 }
 
+/// Applies a streamed event to a transcript. Streamed text goes to the last
+/// assistant message, opening one when none is open. Returns whether the
+/// transcript changed.
+pub fn apply_stream_event(messages: &mut Vec<Message>, event: &AgentEvent) -> bool {
+    match event {
+        AgentEvent::MessageStart => {
+            messages.push(assistant_message(SharedString::default()));
+            true
+        }
+        AgentEvent::MessageUpdate {
+            event: ProviderEvent::TextDelta { delta, .. },
+        } => {
+            match messages.last_mut() {
+                Some(last) if last.role == MessageRole::Assistant => {
+                    let mut text = last.text.to_string();
+                    text.push_str(delta);
+                    last.text = text.into();
+                }
+                _ => messages.push(assistant_message(delta.clone().into())),
+            }
+            true
+        }
+        AgentEvent::Error { error } => {
+            let error_text = format!("Error: {error}");
+            match messages.last_mut() {
+                Some(last) if last.role == MessageRole::Assistant && last.text.is_empty() => {
+                    last.text = error_text.into();
+                }
+                Some(last) if last.role == MessageRole::Assistant => {
+                    let mut text = last.text.to_string();
+                    text.push_str(&format!("\n\n{error_text}"));
+                    last.text = text.into();
+                }
+                _ => messages.push(assistant_message(error_text.into())),
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn assistant_message(text: SharedString) -> Message {
+    Message {
+        role: MessageRole::Assistant,
+        text,
+        attachments: Vec::new(),
+        desktop_artifacts: Vec::new(),
+        approval: None,
+        views: Vec::new(),
+    }
+}
+
 /// Transcript row that shows a tool's view tree in place of text output.
 pub fn view_row(view: ViewNode) -> Message {
     Message {
@@ -425,6 +477,7 @@ impl ChatView {
                 },
                 cx,
             ),
+            SidebarEvent::ArchiveFinished => this.archive_finished(cx),
             SidebarEvent::DismissInbox(message) => this.dismiss_inbox(message.clone(), cx),
         });
 
@@ -906,6 +959,47 @@ impl ChatView {
         self.send_request(Request::SubagentCommand { id, command }, cx);
     }
 
+    /// Archives every finished focus thread the daemon reports. Each one leaves
+    /// the inbox on the re-sync that follows.
+    fn archive_finished(&mut self, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let listed =
+                crate::chat_request::call(client.clone(), handle.clone(), Request::ListSubagents)
+                    .await;
+            let summaries = match listed {
+                Ok(Reply::Subagents(summaries)) => summaries,
+                Ok(_) => {
+                    let _ = this.update(cx, |this, cx| {
+                        this.report_error("Unexpected subagent reply".into(), cx)
+                    });
+                    return;
+                }
+                Err(error) => {
+                    let _ = this.update(cx, |this, cx| this.report_error(error.to_string(), cx));
+                    return;
+                }
+            };
+            for summary in summaries.iter().filter(|summary| {
+                summary.focus && summary.status.is_terminal() && !summary.archived
+            }) {
+                let command = Request::SubagentCommand {
+                    id: summary.id.clone(),
+                    command: SubagentCommand::SetArchived { archived: true },
+                };
+                if let Err(error) =
+                    crate::chat_request::call(client.clone(), handle.clone(), command).await
+                {
+                    let _ = this.update(cx, |this, cx| this.report_error(error.to_string(), cx));
+                    break;
+                }
+            }
+            let _ = this.update(cx, |this, cx| this.sync_subagents(cx));
+        })
+        .detach();
+    }
+
     fn send_request(&mut self, request: Request, cx: &mut Context<Self>) {
         let client = self.client.clone();
         let handle = self.tokio_handle.clone();
@@ -1063,6 +1157,9 @@ impl ChatView {
                 subagent_card::attach_desktop_artifact(&mut self.messages, id, artifact.clone());
                 self.scroll.scroll_to_bottom();
             }
+            // Child deltas are for the focus view; main chat does not render them.
+            SubagentEvent::Agent { .. } => return,
+            SubagentEvent::Promoted { .. } | SubagentEvent::ArchiveChanged { .. } => {}
         }
         self.sync_subagents(cx);
         cx.notify();
@@ -1186,71 +1283,20 @@ impl ChatView {
     }
 
     fn handle_agent_event(&mut self, event: AgentEvent, cx: &mut Context<Self>) {
+        if matches!(event, AgentEvent::MessageStart) {
+            self.streaming_row = Some(self.messages.len());
+        }
         match event {
-            AgentEvent::MessageStart => {
-                self.streaming_row = Some(self.messages.len());
-                self.messages.push(Message {
-                    role: MessageRole::Assistant,
-                    text: SharedString::default(),
-                    attachments: Vec::new(),
-                    desktop_artifacts: Vec::new(),
-                    approval: None,
-                    views: Vec::new(),
-                });
-                self.scroll.scroll_to_bottom();
-                cx.notify();
+            // Tool results enter the transcript only through MessageCommitted.
+            AgentEvent::ToolExecutionStart { .. } | AgentEvent::ToolExecutionEnd { .. } => {
+                self.sync_subagents(cx);
             }
-            AgentEvent::MessageUpdate {
-                event: ProviderEvent::TextDelta { delta, .. },
-            } => {
-                if let Some(last) = self.messages.last_mut()
-                    && last.role == MessageRole::Assistant
-                {
-                    let mut text = last.text.to_string();
-                    text.push_str(&delta);
-                    last.text = text.into();
+            event => {
+                if apply_stream_event(&mut self.messages, &event) {
                     self.scroll.scroll_to_bottom();
                     cx.notify();
                 }
             }
-            AgentEvent::Error { error } => {
-                let error_text = format!("Error: {error}");
-                if let Some(last) = self.messages.last_mut() {
-                    if last.role == MessageRole::Assistant && last.text.is_empty() {
-                        last.text = error_text.into();
-                    } else if last.role == MessageRole::Assistant {
-                        let mut text = last.text.to_string();
-                        text.push_str(&format!("\n\n{error_text}"));
-                        last.text = text.into();
-                    } else {
-                        self.messages.push(Message {
-                            role: MessageRole::Assistant,
-                            text: error_text.into(),
-                            attachments: Vec::new(),
-                            desktop_artifacts: Vec::new(),
-                            approval: None,
-                            views: Vec::new(),
-                        });
-                    }
-                } else {
-                    self.messages.push(Message {
-                        role: MessageRole::Assistant,
-                        text: error_text.into(),
-                        attachments: Vec::new(),
-                        desktop_artifacts: Vec::new(),
-                        approval: None,
-                        views: Vec::new(),
-                    });
-                }
-                self.scroll.scroll_to_bottom();
-                cx.notify();
-            }
-            AgentEvent::ToolExecutionStart { .. } => {
-                self.sync_subagents(cx);
-            }
-            // Tool results enter the transcript only through MessageCommitted.
-            AgentEvent::ToolExecutionEnd { .. } => self.sync_subagents(cx),
-            _ => {}
         }
     }
 

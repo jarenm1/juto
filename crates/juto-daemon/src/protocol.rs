@@ -306,13 +306,15 @@ pub enum SubagentCommand {
         resolution: String,
     },
     Release,
-    /// Sends a message to the child as a steer.
+    /// Sends a message from the user to the child. A queued or running child
+    /// takes it as a steer and becomes a focus thread; a completed child starts
+    /// a user follow-up.
     Send {
         text: String,
     },
-    /// Sends a user follow-up to the child.
-    FollowUp {
-        text: String,
+    /// Hides a focus thread from the inbox (`true`) or shows it again.
+    SetArchived {
+        archived: bool,
     },
 }
 

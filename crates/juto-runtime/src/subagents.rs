@@ -218,6 +218,9 @@ pub struct SubagentSummary {
     pub workspace: Option<PathBuf>,
     /// `true` once the main agent released this focus thread's workspace.
     pub released: bool,
+    /// `true` once the user archived this focus thread: it leaves the inbox,
+    /// but its workspace and transcript are kept.
+    pub archived: bool,
 }
 
 /// A delegated child's settled outcome, reported by the run that started it.
@@ -271,6 +274,8 @@ pub enum SubagentError {
     WorkspaceReleased(String),
     /// Removing the child's workspace failed; the workspace stays recorded.
     WorkspaceRelease(String),
+    /// The child is not a focus thread; only focus threads can be archived.
+    NotFocus(String),
 }
 
 impl fmt::Display for SubagentError {
@@ -300,6 +305,7 @@ impl fmt::Display for SubagentError {
             Self::WorkspaceRelease(err) => {
                 write!(f, "failed to release subagent workspace: {err}")
             }
+            Self::NotFocus(id) => write!(f, "subagent {id} is not a focus thread"),
         }
     }
 }
@@ -406,6 +412,22 @@ pub enum SubagentEvent {
     DesktopReported {
         id: String,
         artifact: DesktopSessionArtifact,
+    },
+    /// One streaming event of a child turn, in order, as the child produced it.
+    /// A receiver that lags misses deltas; it should reload the transcript when
+    /// the turn finishes.
+    Agent {
+        id: String,
+        event: AgentEvent,
+    },
+    /// A focus thread was archived or restored. Inboxes drop or re-add it.
+    ArchiveChanged {
+        id: String,
+        archived: bool,
+    },
+    /// A worker became a focus thread because the user messaged it.
+    Promoted {
+        id: String,
     },
 }
 
@@ -908,6 +930,8 @@ struct Child {
     /// `true` for orchestration-started focus threads; set once the user
     /// follows up on any subagent.
     focus: AtomicBool,
+    /// Hidden from the focus inbox by the user; the child itself is unchanged.
+    archived: AtomicBool,
     workspace: Mutex<WorkspaceState>,
     /// Replaced per turn: a fresh turn gets a fresh control so a cancelled or
     /// paused first turn cannot poison a follow-up. Always lock it before
@@ -1110,6 +1134,7 @@ impl SubagentManager {
             id: id.clone(),
             spec,
             focus: AtomicBool::new(focus),
+            archived: AtomicBool::new(false),
             workspace: Mutex::new(match workspace {
                 Some(path) => WorkspaceState::Live(path),
                 None => WorkspaceState::Unprovisioned,
@@ -1215,6 +1240,32 @@ impl SubagentManager {
         Ok(())
     }
 
+    /// Message a child from the focus view. A queued or running child takes it
+    /// as a user steer and becomes a focus thread, so the thread stays in the
+    /// inbox. A completed child starts a user follow-up instead.
+    pub fn send_from_user(&self, id: &str, message: String) -> Result<(), SubagentError> {
+        let child = self.child(id)?;
+        let status = child.state.borrow().status.clone();
+        if status == SubagentStatus::Completed {
+            return self.follow_up_from_user(id, message);
+        }
+        if status.is_terminal() {
+            return Err(SubagentError::Terminal(status));
+        }
+        if !child.focus.swap(true, Ordering::AcqRel) {
+            let _ = self
+                .inner
+                .events
+                .send(SubagentEvent::Promoted { id: id.to_string() });
+        }
+        child
+            .control
+            .lock()
+            .expect("mutex poisoned")
+            .steer(Message::user(format!("{USER_TURN_PREFACE}\n\n{message}")));
+        Ok(())
+    }
+
     /// Start a follow-up turn on a completed child, as main requested through
     /// `agent_send`. Its terminal state also pushes a completion notice to the
     /// main inbox.
@@ -1228,6 +1279,21 @@ impl SubagentManager {
     pub fn follow_up_from_user(&self, id: &str, prompt: String) -> Result<(), SubagentError> {
         let prompt = format!("{USER_TURN_PREFACE}\n\n{prompt}");
         self.start_follow_up(id, prompt, TurnOrigin::User)
+    }
+
+    /// Hides a focus thread from the inbox, or shows it again. Only the
+    /// listing changes: the workspace, transcript, and follow-up state stay.
+    pub fn set_archived(&self, id: &str, archived: bool) -> Result<(), SubagentError> {
+        let child = self.child(id)?;
+        if !child.focus.load(Ordering::Acquire) {
+            return Err(SubagentError::NotFocus(id.to_string()));
+        }
+        child.archived.store(archived, Ordering::Release);
+        let _ = self.inner.events.send(SubagentEvent::ArchiveChanged {
+            id: id.to_string(),
+            archived,
+        });
+        Ok(())
     }
 
     /// Start a follow-up turn on a completed child. The child moves back to
@@ -1332,6 +1398,7 @@ impl SubagentManager {
                     focus: child.focus.load(Ordering::Acquire),
                     workspace: child.workspace_path(),
                     released: child.workspace_released(),
+                    archived: child.archived.load(Ordering::Acquire),
                     error,
                 }
             })
@@ -1890,7 +1957,7 @@ async fn run_turn<F, Fut>(
     });
 
     let (events_tx, events_rx) = mpsc::unbounded_channel();
-    let reporter = tokio::spawn(report_desktops(
+    let reporter = tokio::spawn(relay_turn_events(
         child.id.clone(),
         events_rx,
         inner.events.clone(),
@@ -2009,17 +2076,22 @@ fn finish(
     });
 }
 
-/// Watches one child turn's events for successful desktop artifact posts. Each
-/// one becomes a `Desktop` main inbox notice and a `DesktopReported` event. The
-/// notice is pushed first, so an observer woken by it already sees the notice.
-/// Ends when the turn drops its event sender.
-async fn report_desktops(
+/// Relays one child turn's events to observers as they happen, and reports
+/// successful desktop artifact posts. Each one becomes a `Desktop` main inbox
+/// notice and a `DesktopReported` event; the notice is pushed first, so an
+/// observer woken by it already sees the notice. Ends when the turn drops its
+/// event sender.
+async fn relay_turn_events(
     child_id: String,
     mut events: mpsc::UnboundedReceiver<AgentEvent>,
     observers: broadcast::Sender<SubagentEvent>,
     main_inbox: MainInbox,
 ) {
     while let Some(event) = events.recv().await {
+        let _ = observers.send(SubagentEvent::Agent {
+            id: child_id.clone(),
+            event: event.clone(),
+        });
         let AgentEvent::ToolExecutionEnd { result, .. } = event else {
             continue;
         };
@@ -3222,6 +3294,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn steering_a_running_worker_from_the_user_promotes_it() {
+        let (gate, gate_rx) = gate();
+        let running = Arc::new(AtomicUsize::new(0));
+        let manager = manager(
+            gate_factory(
+                gate_rx,
+                running.clone(),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                None,
+            ),
+            1,
+            CancellationToken::new(),
+        );
+        let mut events = manager.subscribe_events();
+        let worker = manager.spawn(spec("hold")).unwrap();
+        until_running(&running, 1).await;
+        assert!(!summary_of(&manager, &worker).focus);
+
+        manager
+            .send_from_user(&worker, "what changed?".into())
+            .expect("user steer");
+        assert!(summary_of(&manager, &worker).focus);
+
+        gate.send(true).unwrap();
+        manager.wait(&worker).await.expect("run");
+        assert!(summary_of(&manager, &worker).focus);
+
+        let promoted: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                SubagentEvent::Promoted { id } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(promoted, vec![worker]);
+    }
+
+    #[tokio::test]
     async fn credential_unblock_skips_steering_plaintext() {
         struct SecretSteeringInspector {
             manager_holder: Arc<Mutex<Option<Arc<SubagentManager>>>>,
@@ -3665,6 +3775,91 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Factory whose one run streams two text deltas before it finishes.
+    struct StreamingFactory;
+
+    #[async_trait]
+    impl SubagentFactory for StreamingFactory {
+        async fn run(
+            &self,
+            id: &str,
+            _spec: TaskSpec,
+            _control: RunControl,
+            events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<SubagentResult, String> {
+            for delta in ["Hel", "lo"] {
+                let _ = events.send(AgentEvent::MessageUpdate {
+                    event: juto_ai::ProviderEvent::TextDelta {
+                        index: 0,
+                        delta: delta.into(),
+                    },
+                });
+            }
+            Ok(SubagentResult {
+                id: id.to_string(),
+                output: "Hello".into(),
+                data: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                session_path: PathBuf::new(),
+                change_id: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn child_turn_events_stream_to_observers_in_order() {
+        let manager = manager(Arc::new(StreamingFactory), 1, CancellationToken::new());
+        let mut events = manager.subscribe_events();
+        let id = manager.spawn(spec("chat")).unwrap();
+        manager.wait(&id).await.expect("run");
+
+        let mut deltas = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let SubagentEvent::Agent {
+                id: from,
+                event:
+                    AgentEvent::MessageUpdate {
+                        event: juto_ai::ProviderEvent::TextDelta { delta, .. },
+                    },
+            } = event
+            {
+                assert_eq!(from, id);
+                deltas.push(delta);
+            }
+        }
+        assert_eq!(deltas, ["Hel", "lo"]);
+    }
+
+    #[tokio::test]
+    async fn archiving_hides_focus_threads_and_refuses_workers() {
+        let manager = manager(Arc::new(StreamingFactory), 2, CancellationToken::new());
+        let mut events = manager.subscribe_events();
+        let focus = manager.spawn(focus_spec("build")).unwrap();
+        let worker = manager.spawn(spec("scan")).unwrap();
+        manager.wait(&focus).await.expect("focus run");
+        manager.wait(&worker).await.expect("worker run");
+
+        manager.set_archived(&focus, true).unwrap();
+        assert!(summary_of(&manager, &focus).archived);
+        assert_eq!(
+            manager.set_archived(&worker, true),
+            Err(SubagentError::NotFocus(worker.clone()))
+        );
+        assert!(!summary_of(&manager, &worker).archived);
+
+        manager.set_archived(&focus, false).unwrap();
+        assert!(!summary_of(&manager, &focus).archived);
+
+        let archive_events: Vec<(String, bool)> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                SubagentEvent::ArchiveChanged { id, archived } => Some((id, archived)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(archive_events, vec![(focus.clone(), true), (focus, false)]);
     }
 
     #[test]

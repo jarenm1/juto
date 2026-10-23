@@ -17,8 +17,8 @@ pub(crate) async fn subagent_transcript(d: &Daemon, id: String) -> Result<Reply,
         .map_err(subagent_error)
 }
 
-/// `FollowUp` is a user-typed turn that reports only to the focus view. `Send`
-/// steers a running child, or starts a follow-up turn on a completed one.
+/// `Send` is a user-typed message: it steers a live child and promotes it to a
+/// focus thread, or starts a user follow-up on a completed one.
 pub(crate) async fn subagent_command(
     d: &Daemon,
     id: String,
@@ -31,8 +31,8 @@ pub(crate) async fn subagent_command(
         SubagentCommand::Cancel => manager.cancel(&id),
         SubagentCommand::Unblock { resolution } => manager.unblock(&id, resolution),
         SubagentCommand::Release => manager.release(&id).await,
-        SubagentCommand::Send { text } => manager.send(&id, text),
-        SubagentCommand::FollowUp { text } => manager.follow_up_from_user(&id, text),
+        SubagentCommand::Send { text } => manager.send_from_user(&id, text),
+        SubagentCommand::SetArchived { archived } => manager.set_archived(&id, archived),
     };
     result.map_err(subagent_error)?;
     Ok(Reply::Ok)
