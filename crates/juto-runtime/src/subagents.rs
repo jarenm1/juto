@@ -1240,7 +1240,7 @@ impl SubagentManager {
         Ok(())
     }
 
-    /// Message a child from the focus view. A queued or running child takes it
+    /// Message a child from its focus thread. A queued or running child takes it
     /// as a user steer and becomes a focus thread, so the thread stays in the
     /// inbox. A completed child starts a user follow-up instead.
     pub fn send_from_user(&self, id: &str, message: String) -> Result<(), SubagentError> {
@@ -1274,7 +1274,7 @@ impl SubagentManager {
     }
 
     /// Start a follow-up turn the user typed into any subagent. The turn gets
-    /// `USER_TURN_PREFACE` first, reports only to the focus view, and makes the
+    /// `USER_TURN_PREFACE` first, reports only to the user's focus thread, and makes the
     /// child a focus thread.
     pub fn follow_up_from_user(&self, id: &str, prompt: String) -> Result<(), SubagentError> {
         let prompt = format!("{USER_TURN_PREFACE}\n\n{prompt}");
@@ -2015,11 +2015,11 @@ async fn run_turn<F, Fut>(
 
 /// Prepended to follow-ups the user types in a focus thread. The contract main
 /// gave at spawn stays in the session history, so the thread keeps it.
-const USER_TURN_PREFACE: &str = "The user is chatting with you directly in your focus thread. Answer them. Your contract from main still applies, including what to report to main and when.";
+pub const USER_TURN_PREFACE: &str = "The user is chatting with you directly in your focus thread. Answer them. Your contract from main still applies, including what to report to main and when.";
 
 /// Who started a turn. Main-started turns (the first run and main's follow-ups)
 /// push a completion notice to the main inbox. User-started focus turns do not:
-/// the user reads their result in the focus view.
+/// the user reads their result in the focus thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnOrigin {
     Main,

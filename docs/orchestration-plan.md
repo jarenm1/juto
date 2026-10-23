@@ -533,17 +533,26 @@ Limitation: a failed cleanup restores the recorded workspace, so follow-ups are 
 again until a release succeeds, even if the directory was partly removed.
 
 PR7 adds live focus threads. The runtime relays every child `AgentEvent` to subscribers
-as `SubagentEvent::Agent`, so the focus view streams the reply as it is generated; it
-supersedes the PR5 limitations above. `SubagentCommand::Send` carries the user's message:
-a queued, running, or verifying child is steered and promoted, and a completed child takes
-a user-origin follow-up. The composer is disabled only for blocked threads (answer the
-request first), failed, cancelled, and released threads. The focus view shows the in-flight
-reply above the committed transcript. A status change or a broadcast lag reloads the
-transcript, which replaces the in-flight reply. `SubagentCommand::SetArchived` hides a focus
-thread from the inbox. It keeps the workspace and transcript, unlike the jobs panel archive,
-which reclaims forks, and it does not stop a running child. The inbox is rebuilt on every
-sync: archived threads and non-focus workers that reached a terminal state leave it.
-"Archive finished" archives every finished focus thread.
+as `SubagentEvent::Agent`, so an open focus thread streams the reply as it is generated;
+it supersedes the PR5 limitations above. `SubagentCommand::Send` carries the user's
+message: a queued, running, or verifying child is steered and promoted, and a completed
+child takes a user-origin follow-up. The composer is disabled only for blocked threads
+(answer the request first), failed, cancelled, and released threads.
+`SubagentCommand::SetArchived` hides a focus thread from the inbox. It keeps the workspace
+and transcript, unlike the jobs panel archive, which reclaims forks, and it does not stop a
+running child. The inbox is rebuilt on every sync: archived threads and non-focus workers
+that reached a terminal state leave it. "Archive finished" archives every finished focus
+thread.
+
+PR8 makes an open focus thread use the main chat surface, as omp does when it focuses a
+subagent: the same message rows, desktop canvases, view cards, and composer, with the
+thread's VCS panel beside them. Only the send target differs: the main thread starts or
+steers a run, a focus thread takes `SubagentCommand::Send`. The header shows ← Main, the
+thread's title and status, and Archive. Controls that belong to main's context (the model
+picker, the jobs strip, Background, and Stop) are hidden. The daemon serves a child's
+transcript only once it settles, so a working thread keeps its committed rows and appends
+the live turn; the settled reload replaces both. User rows show the typed message, not the
+`USER_TURN_PREFACE` the runtime adds for the model.
 
 ---
 

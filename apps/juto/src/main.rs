@@ -7,7 +7,7 @@ mod chat_input;
 mod chat_request;
 mod desktop_stream;
 mod desktop_viewer;
-mod focus_view;
+mod focus_thread;
 mod jobs_panel;
 mod model_picker;
 mod sidebar;

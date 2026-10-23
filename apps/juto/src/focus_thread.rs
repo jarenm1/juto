@@ -1,26 +1,17 @@
-//! Focus mode for a focus thread: its transcript, a message composer, and the
-//! VCS panel rooted at its workspace.
-
-use std::collections::{HashMap, HashSet};
+//! A focus thread opened in the chat view. The chat view renders its
+//! transcript and composer with the same surface as the main thread; this
+//! controller owns the thread's state, live stream, and daemon commands.
 
 use crate::chat_request::call;
-use gpui::{
-    ClickEvent, Context, Entity, EventEmitter, IntoElement, Render, ScrollHandle, SharedString,
-    Subscription, Task, Window, div, prelude::*, px, rgb,
-};
+use gpui::{AppContext, Context, Entity, EventEmitter, ScrollHandle, SharedString, Task};
 use juto_agent::AgentEvent;
 use juto_daemon::client::{Client, Notification};
 use juto_daemon::protocol::{Reply, Request, ServerEvent, SubagentCommand};
-use juto_runtime::subagents::{SubagentEvent, SubagentStatus, SubagentSummary};
+use juto_runtime::subagents::{SubagentEvent, SubagentStatus, SubagentSummary, USER_TURN_PREFACE};
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::chat::{
-    DesktopCanvas, Message, MessageRole, apply_stream_event, canvas_body, desktop_artifact_card,
-    mount_canvases, view_messages,
-};
-use crate::chat_input::{ChatInput, SubmitMessage};
+use crate::chat::{Message, MessageRole, apply_stream_event, view_messages};
 use crate::vcs_sidebar::VcsSidebar;
-use crate::view_element::{ViewActions, render_view};
 
 /// Why the composer is disabled for `status`, or `None` when a message can be
 /// sent. A message to a working thread steers it and makes it a focus thread.
@@ -112,13 +103,9 @@ impl<V> FocusState<V> {
         self.message_unavailable().is_none()
     }
 
-    /// Drops the VCS panel handle. The thread itself keeps running.
-    pub fn exit(&mut self) {
-        self.vcs = None;
-    }
-
-    /// Records a status update. A change invalidates the transcript so the next
-    /// summary read reloads it, and any read still in flight is ignored.
+    /// Records a status update. A change invalidates the transcript so a
+    /// settled thread reloads it, and any read still in flight is ignored. The
+    /// committed rows stay on screen meanwhile.
     pub fn set_status(&mut self, status: SubagentStatus) {
         if status != self.status {
             self.invalidate_transcript();
@@ -133,11 +120,12 @@ impl<V> FocusState<V> {
         self.pending_load = None;
     }
 
-    /// Returns a load token when a transcript read is due: the transcript is not
-    /// fresh and no read is pending. Running threads load too, so their history
-    /// shows before the live turn arrives.
+    /// Returns a load token when a transcript read is due: the thread has
+    /// settled, the transcript is not fresh, and no read is pending. The daemon
+    /// serves a child's transcript only once it settles, so a working thread
+    /// keeps its committed rows and shows the live turn from the stream.
     pub fn begin_transcript_load(&mut self) -> Option<u64> {
-        if self.transcript_fresh || self.pending_load.is_some() {
+        if !self.status.is_terminal() || self.transcript_fresh || self.pending_load.is_some() {
             return None;
         }
         self.next_load += 1;
@@ -179,7 +167,9 @@ impl<V> FocusState<V> {
                     self.tail.pop();
                     self.streaming = false;
                 }
-                self.tail.extend(view_messages(std::iter::once(message)));
+                let mut committed = view_messages(std::iter::once(message));
+                strip_user_preface(&mut committed);
+                self.tail.extend(committed);
                 true
             }
             event => {
@@ -192,28 +182,43 @@ impl<V> FocusState<V> {
     }
 }
 
-/// Emitted when the user leaves focus mode.
-pub enum FocusEvent {
-    Exit,
-    ExpandDesktop(Entity<crate::desktop_viewer::DesktopViewer>),
+/// Shows user turns as typed. The runtime frames each message the user sends
+/// a thread with `USER_TURN_PREFACE` for the model; the row omits it.
+pub fn strip_user_preface(messages: &mut [Message]) {
+    for message in messages {
+        if message.role != MessageRole::User {
+            continue;
+        }
+        if let Some(typed) = message
+            .text
+            .strip_prefix(USER_TURN_PREFACE)
+            .and_then(|rest| rest.strip_prefix("\n\n"))
+        {
+            message.text = typed.to_owned().into();
+        }
+    }
 }
 
-pub struct FocusView {
+/// Emitted when the thread should leave focus.
+pub enum FocusEvent {
+    /// The daemon archived the thread, so it left the inbox.
+    Archived,
+}
+
+pub struct FocusThread {
     state: FocusState<Entity<VcsSidebar>>,
     title: SharedString,
     client: Client,
     tokio_handle: tokio::runtime::Handle,
-    desktop_canvases: HashMap<String, DesktopCanvas>,
-    input: Entity<ChatInput>,
-    transcript_scroll: ScrollHandle,
+    scroll: ScrollHandle,
+    /// The last rejected send or archive.
     error: Option<SharedString>,
-    _input_subscription: Subscription,
     _updates: Task<()>,
 }
 
-impl EventEmitter<FocusEvent> for FocusView {}
+impl EventEmitter<FocusEvent> for FocusThread {}
 
-impl FocusView {
+impl FocusThread {
     /// Subscribes to daemon state changes; reconnects reload the authoritative list.
     pub fn new(
         summary: SubagentSummary,
@@ -226,10 +231,6 @@ impl FocusView {
             .workspace
             .clone()
             .map(|workspace| cx.new(|cx| VcsSidebar::new(workspace, tokio_handle.clone(), cx)));
-        let input = cx.new(ChatInput::new);
-        let input_subscription = cx.subscribe(&input, |this, _, _: &SubmitMessage, cx| {
-            this.submit_message(cx);
-        });
         let mut notifications = client.subscribe();
         let updates_client = client.clone();
         let updates_handle = tokio_handle.clone();
@@ -289,12 +290,59 @@ impl FocusView {
             title: summary.name.unwrap_or(summary.task).into(),
             client,
             tokio_handle,
-            desktop_canvases: HashMap::new(),
-            input,
-            transcript_scroll: ScrollHandle::new(),
+            scroll: ScrollHandle::new(),
             error: None,
-            _input_subscription: input_subscription,
             _updates: updates_task,
+        }
+    }
+
+    pub fn title(&self) -> SharedString {
+        self.title.clone()
+    }
+
+    pub fn status(&self) -> &SubagentStatus {
+        self.state.status()
+    }
+
+    pub fn vcs(&self) -> Option<&Entity<VcsSidebar>> {
+        self.state.vcs()
+    }
+
+    pub fn scroll(&self) -> &ScrollHandle {
+        &self.scroll
+    }
+
+    /// The committed transcript followed by live rows.
+    pub fn messages(&self) -> Vec<Message> {
+        let committed = self.state.transcript().as_deref().unwrap_or_default();
+        committed.iter().chain(self.state.tail()).cloned().collect()
+    }
+
+    pub fn can_message(&self) -> bool {
+        self.state.can_message()
+    }
+
+    /// What to show above the composer: a rejected command, a failed
+    /// transcript read, or why the thread cannot take messages.
+    pub fn notice(&self) -> Option<SharedString> {
+        self.error
+            .clone()
+            .or_else(|| {
+                self.state
+                    .transcript()
+                    .as_ref()
+                    .err()
+                    .map(|e| e.clone().into())
+            })
+            .or_else(|| self.state.message_unavailable().map(SharedString::from))
+    }
+
+    /// Shown in place of an empty transcript.
+    pub fn empty_hint(&self) -> &'static str {
+        if self.state.status().is_terminal() {
+            "No transcript messages."
+        } else {
+            "No messages yet. Replies stream in here while this thread works."
         }
     }
 
@@ -310,7 +358,7 @@ impl FocusView {
     /// Shows one live event from the child, scrolling only when the view changed.
     fn apply_live_event(&mut self, event: &AgentEvent, cx: &mut Context<Self>) {
         if self.state.apply_live(event) {
-            self.transcript_scroll.scroll_to_bottom();
+            self.scroll.scroll_to_bottom();
             cx.notify();
         }
     }
@@ -334,9 +382,13 @@ impl FocusView {
                 Err(error) => Err(error.to_string()),
             };
             this.update(cx, |this, cx| {
-                let transcript = transcript.map(|messages| view_messages(&messages));
+                let transcript = transcript.map(|messages| {
+                    let mut rows = view_messages(&messages);
+                    strip_user_preface(&mut rows);
+                    rows
+                });
                 if this.state.apply_transcript(token, transcript) {
-                    this.transcript_scroll.scroll_to_bottom();
+                    this.scroll.scroll_to_bottom();
                 }
                 cx.notify();
             })
@@ -345,30 +397,25 @@ impl FocusView {
         .detach();
     }
 
-    fn submit_message(&mut self, cx: &mut Context<Self>) {
-        if !self.state.can_message() || !self.input.read(cx).has_text() {
+    /// Sends `text` to the thread: a running thread is steered and promoted to
+    /// focus, a completed one takes a follow-up turn.
+    pub fn send(&mut self, text: String, cx: &mut Context<Self>) {
+        if !self.state.can_message() {
             return;
         }
-        let prompt = self.input.read(cx).text();
         let client = self.client.clone();
         let handle = self.tokio_handle.clone();
         let request = Request::SubagentCommand {
             id: self.state.thread_id().to_owned(),
-            command: SubagentCommand::Send {
-                text: prompt.to_string(),
-            },
+            command: SubagentCommand::Send { text },
         };
+        self.error = None;
+        self.scroll.scroll_to_bottom();
         cx.spawn(async move |this, cx| {
             let result = call(client, handle, request).await;
             this.update(cx, |this, cx| {
-                match result {
-                    Ok(_) => {
-                        this.input.update(cx, |input, cx| {
-                            input.take_text(cx);
-                        });
-                        this.error = None;
-                    }
-                    Err(error) => this.error = Some(format!("Message rejected: {error}").into()),
+                if let Err(error) = result {
+                    this.error = Some(format!("Message rejected: {error}").into());
                 }
                 cx.notify();
             })
@@ -378,14 +425,9 @@ impl FocusView {
         cx.notify();
     }
 
-    fn exit(&mut self, cx: &mut Context<Self>) {
-        self.state.exit();
-        cx.emit(FocusEvent::Exit);
-    }
-
     /// Hides this thread from the inbox. The daemon keeps its workspace and
     /// transcript, and focus closes once the archive is confirmed.
-    fn archive(&mut self, cx: &mut Context<Self>) {
+    pub fn archive(&mut self, cx: &mut Context<Self>) {
         let client = self.client.clone();
         let handle = self.tokio_handle.clone();
         let request = Request::SubagentCommand {
@@ -395,7 +437,7 @@ impl FocusView {
         cx.spawn(async move |this, cx| {
             let result = call(client, handle, request).await;
             this.update(cx, |this, cx| match result {
-                Ok(_) => this.exit(cx),
+                Ok(_) => cx.emit(FocusEvent::Archived),
                 Err(error) => {
                     this.error = Some(format!("Archive failed: {error}").into());
                     cx.notify();
@@ -405,263 +447,10 @@ impl FocusView {
         })
         .detach();
     }
-
-    fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .flex()
-            .items_center()
-            .gap_3()
-            .px_6()
-            .py_3()
-            .border_b_1()
-            .border_color(rgb(0x27272a))
-            .child(
-                div()
-                    .id("focus-back")
-                    .px_3()
-                    .py_1p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(0x3f3f46))
-                    .bg(rgb(0x27272a))
-                    .text_xs()
-                    .text_color(rgb(0xd4d4d8))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x3f3f46)).text_color(rgb(0xffffff)))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.exit(cx)))
-                    .child("← Main"),
-            )
-            .child(div().flex_1().min_w_0().text_sm().child(self.title.clone()))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(0x9ca3af))
-                    .child(status_label(self.state.status())),
-            )
-            .child(
-                div()
-                    .id("focus-archive")
-                    .px_3()
-                    .py_1p5()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(0x3f3f46))
-                    .bg(rgb(0x27272a))
-                    .text_xs()
-                    .text_color(rgb(0xd4d4d8))
-                    .cursor_pointer()
-                    .hover(|s| s.bg(rgb(0x3f3f46)).text_color(rgb(0xffffff)))
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.archive(cx)))
-                    .child("Archive"),
-            )
-    }
-
-    /// Mounts a canvas for each desktop artifact in the loaded transcript, so a
-    /// finished child's desktop shows in its focus view.
-    fn mount_desktop_canvases(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let committed: &[Message] = match self.state.transcript() {
-            Ok(messages) => messages,
-            Err(_) => &[],
-        };
-        for messages in [committed, self.state.tail()] {
-            mount_canvases(
-                cx.entity().downgrade(),
-                |view| &mut view.desktop_canvases,
-                &mut self.desktop_canvases,
-                &self.client,
-                &self.tokio_handle,
-                messages,
-                window,
-                cx,
-            );
-        }
-    }
-
-    fn transcript_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut seen_desktops = HashSet::new();
-        let tail = self.state.tail();
-        let body = match self.state.transcript() {
-            Ok(messages) if messages.is_empty() && tail.is_empty() => div()
-                .text_sm()
-                .text_color(rgb(0x9ca3af))
-                .child(empty_transcript_hint(self.state.status())),
-            Ok(messages) => {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .children(messages.iter().chain(tail).map(|message| {
-                        render_message(message, &self.desktop_canvases, &mut seen_desktops, cx)
-                    }))
-            }
-            Err(err) => div().text_sm().text_color(rgb(0xf87171)).child(err.clone()),
-        };
-        div()
-            .id("focus-transcript")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .track_scroll(&self.transcript_scroll)
-            .px_6()
-            .py_6()
-            .child(body)
-    }
-
-    fn composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let footer = match self.state.message_unavailable() {
-            Some(reason) => div()
-                .text_sm()
-                .text_color(rgb(0x9ca3af))
-                .child(reason)
-                .into_any_element(),
-            None => div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().flex_1().min_w_0().child(self.input.clone()))
-                .child(
-                    div()
-                        .id("focus-send")
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(rgb(0x2563eb))
-                        .text_sm()
-                        .text_color(rgb(0xffffff))
-                        .cursor_pointer()
-                        .hover(|s| s.bg(rgb(0x1d4ed8)))
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.submit_message(cx);
-                        }))
-                        .child("Send"),
-                )
-                .into_any_element(),
-        };
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .px_6()
-            .py_4()
-            .border_t_1()
-            .border_color(rgb(0x27272a))
-            .when_some(self.error.clone(), |view, error| {
-                view.child(div().text_sm().text_color(rgb(0xf87171)).child(error))
-            })
-            .child(footer)
-    }
-
-    fn vcs_panel(&self) -> impl IntoElement {
-        let panel = match self.state.vcs() {
-            Some(vcs) => vcs.clone().into_any_element(),
-            None => div()
-                .p_4()
-                .text_sm()
-                .text_color(rgb(0x9ca3af))
-                .child("This thread has no workspace.")
-                .into_any_element(),
-        };
-        div()
-            .w(px(380.0))
-            .flex_none()
-            .h_full()
-            .flex()
-            .flex_col()
-            .bg(rgb(0x18181b))
-            .border_l_1()
-            .border_color(rgb(0x27272a))
-            .child(panel)
-    }
-}
-
-impl Render for FocusView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.mount_desktop_canvases(window, cx);
-        div()
-            .flex()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(self.header(cx))
-                    .child(self.transcript_panel(cx))
-                    .child(self.composer(cx)),
-            )
-            .child(self.vcs_panel())
-    }
-}
-
-fn status_label(status: &SubagentStatus) -> String {
-    match status {
-        SubagentStatus::Queued => "Queued".to_owned(),
-        SubagentStatus::Running => "Running".to_owned(),
-        SubagentStatus::Verifying => "Verifying".to_owned(),
-        SubagentStatus::Reviewing => "Reviewing".to_owned(),
-        SubagentStatus::Blocked { prompt, .. } => format!("Blocked: {prompt}"),
-        SubagentStatus::Completed => "Completed".to_owned(),
-        SubagentStatus::Failed => "Failed".to_owned(),
-        SubagentStatus::Cancelled => "Cancelled".to_owned(),
-    }
-}
-
-fn empty_transcript_hint(status: &SubagentStatus) -> &'static str {
-    if status.is_terminal() {
-        "No transcript messages."
-    } else {
-        "No messages yet. Replies stream in here while this thread works."
-    }
-}
-
-fn render_message(
-    message: &Message,
-    canvases: &HashMap<String, DesktopCanvas>,
-    seen_desktops: &mut HashSet<String>,
-    cx: &mut Context<FocusView>,
-) -> gpui::Div {
-    let author = match message.role {
-        MessageRole::User => "You",
-        MessageRole::Assistant => "Assistant",
-    };
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(div().text_xs().text_color(rgb(0x9ca3af)).child(author))
-        .child(div().text_sm().child(message.text.clone()))
-        .children(message.desktop_artifacts.iter().map(|artifact| {
-            let id = artifact.artifact_id.clone();
-            let body = canvas_body(
-                canvases,
-                artifact,
-                seen_desktops,
-                cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    if let Some(DesktopCanvas::Live(viewer)) = this.desktop_canvases.get(&id) {
-                        cx.emit(FocusEvent::ExpandDesktop(viewer.clone()));
-                        cx.notify();
-                    }
-                }),
-                cx,
-            );
-            desktop_artifact_card(artifact, body)
-        }))
-        .children(
-            message
-                .views
-                .iter()
-                .map(|view| render_view(view, &ViewActions::none())),
-        )
 }
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
     use juto_runtime::subagents::BlockerReason;
 
     use super::*;
@@ -703,18 +492,6 @@ mod tests {
     }
 
     #[test]
-    fn exit_releases_the_vcs_handle() {
-        let handle = Rc::new(());
-        let weak = Rc::downgrade(&handle);
-        let mut state =
-            FocusState::enter("t".into(), SubagentStatus::Completed, Some(handle), false);
-        assert!(state.vcs().is_some());
-        state.exit();
-        assert!(state.vcs().is_none());
-        assert!(weak.upgrade().is_none());
-    }
-
-    #[test]
     fn transcript_loads_once_per_terminal_state() {
         let mut state: FocusState<()> =
             FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
@@ -733,22 +510,22 @@ mod tests {
     }
 
     #[test]
-    fn running_thread_loads_its_history() {
-        let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Running, None, false);
-        assert!(state.begin_transcript_load().is_some());
-    }
-
-    #[test]
-    fn resumed_thread_reloads_its_transcript() {
+    fn working_thread_keeps_its_history_until_it_settles() {
         let mut state: FocusState<()> =
             FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
-        let first = state.begin_transcript_load().expect("first load");
-        assert!(state.apply_transcript(first, Ok(Vec::new())));
+        let first = state.begin_transcript_load().expect("settled thread loads");
+        let history = view_messages(&[juto_ai::Message::user("task")]);
+        assert!(state.apply_transcript(first, Ok(history)));
         state.set_status(SubagentStatus::Running);
         assert!(
+            state.begin_transcript_load().is_none(),
+            "the daemon has no transcript for a working thread"
+        );
+        assert_eq!(state.transcript().as_ref().map(Vec::len), Ok(1));
+        state.set_status(SubagentStatus::Completed);
+        assert!(
             state.begin_transcript_load().is_some(),
-            "reload after the thread resumes"
+            "reload once the turn settles"
         );
     }
 
@@ -812,13 +589,28 @@ mod tests {
 
     #[test]
     fn transcript_read_keeps_the_reply_in_flight() {
+        // A send can start a turn before the summary reports it, so a read begun
+        // while the thread looked settled lands mid-stream.
         let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Running, None, false);
-        let token = state.begin_transcript_load().expect("running thread loads");
+            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
+        let token = state.begin_transcript_load().expect("settled thread loads");
         state.apply_live(&AgentEvent::MessageStart);
         state.apply_live(&delta("Hi"));
         assert!(state.apply_transcript(token, Ok(Vec::new())));
         assert_eq!(state.tail().len(), 1);
         assert_eq!(state.tail()[0].text.to_string(), "Hi");
+    }
+
+    #[test]
+    fn user_rows_show_the_typed_message() {
+        let framed = format!("{USER_TURN_PREFACE}\n\nhello thread");
+        let mut rows = view_messages(&[
+            juto_ai::Message::user(framed.as_str()),
+            juto_ai::Message::user("plain"),
+            assistant(&framed),
+        ]);
+        strip_user_preface(&mut rows);
+        let texts: Vec<String> = rows.iter().map(|row| row.text.to_string()).collect();
+        assert_eq!(texts, ["hello thread", "plain", framed.as_str()]);
     }
 }
