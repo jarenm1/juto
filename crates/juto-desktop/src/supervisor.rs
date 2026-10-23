@@ -960,6 +960,11 @@ impl DesktopEnvironment {
                 self.inner.runtime_dir.join("pulse/native").display()
             ),
         ));
+        // OpenAL (used by Blender) opens a PipeWire playback stream during
+        // startup and blocks until the environment's graph runs it; the graph
+        // does not schedule streams, so the app never reaches window creation.
+        // Disable the OpenAL backend; apps keep the Pulse socket above.
+        app_env.push(("ALSOFT_DRIVERS".to_string(), "null".to_string()));
         // X11 applications reach the environment's private Xwayland instance
         // with the environment's own authorization cookie.
         if let Some(display_number) = x11_display {
