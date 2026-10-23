@@ -486,10 +486,10 @@ fn viewer_attaches_over_scm_rights_and_reads_composed_frames() {
     let header = verified.expect("the viewer never saw the client's two-tone frame");
     assert_eq!(header.generation, 1);
 
-    // Human control requires a live grant for the environment owner principal.
+    // Human control requires a live grant for the viewer principal.
     match daemon.call(DesktopCommand::Grant {
         env_id: env_id.clone(),
-        principal: "agent:test".to_string(),
+        principal: juto_desktop::protocol::HUMAN_VIEWER_PRINCIPAL.to_string(),
         roles: vec![GrantRole::Owner, GrantRole::Control],
         audience: "session".to_string(),
         expiry_seconds: 60,
@@ -521,7 +521,11 @@ fn viewer_attaches_over_scm_rights_and_reads_composed_frames() {
     });
     match described {
         DesktopResponse::Description(status) => {
-            assert!(status.active_control_lease.is_some());
+            let holder = status
+                .active_control_lease
+                .as_ref()
+                .map(|lease| lease.holder.as_str());
+            assert_eq!(holder, Some(juto_desktop::protocol::HUMAN_VIEWER_PRINCIPAL));
         }
         other => panic!("unexpected describe response: {other:?}"),
     }
@@ -540,6 +544,130 @@ fn viewer_attaches_over_scm_rights_and_reads_composed_frames() {
     );
 
     let _ = client.join();
+}
+
+/// A fresh environment id for one test case.
+fn new_env_id() -> String {
+    format!("v-{}", &uuid::Uuid::now_v7().to_string()[24..])
+}
+
+/// Creates an environment with a live test client and attaches a viewer to it.
+fn attach_viewer(daemon: &Daemon, env_id: &str) -> ViewerClient {
+    let created = daemon.call(DesktopCommand::Create {
+        spec: serde_json::from_value(environment_config(env_id)).expect("config"),
+        request_id: "create".to_string(),
+    });
+    assert!(
+        matches!(created, DesktopResponse::Created { .. }),
+        "create failed: {created:?}"
+    );
+    let socket = daemon
+        .runtime_root
+        .join("juto-desktop")
+        .join(env_id)
+        .join("wayland-0")
+        .to_string_lossy()
+        .to_string();
+    // The client keeps the environment's surface alive for the whole test.
+    std::thread::spawn(move || common::run(&socket, 60));
+    ViewerClient::attach(&daemon.socket, env_id).expect("attach viewer")
+}
+
+/// Grants the viewer principal the control role on `env_id`.
+fn grant_human_control(daemon: &Daemon, env_id: &str) {
+    let granted = daemon.call(DesktopCommand::Grant {
+        env_id: env_id.to_string(),
+        principal: juto_desktop::protocol::HUMAN_VIEWER_PRINCIPAL.to_string(),
+        roles: vec![GrantRole::Control],
+        audience: "session".to_string(),
+        expiry_seconds: 60,
+    });
+    assert!(
+        matches!(granted, DesktopResponse::GrantIssued(_)),
+        "grant failed: {granted:?}"
+    );
+}
+
+#[test]
+fn human_control_survives_past_the_lease_ttl_while_renewed() {
+    let daemon = Daemon::start();
+    let env_id = new_env_id();
+    let mut viewer = attach_viewer(&daemon, &env_id);
+    grant_human_control(&daemon, &env_id);
+    viewer.take_control().expect("take control");
+
+    // The environment's lease TTL is 6s; renewing every 100ms holds control for 8s.
+    let until = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < until {
+        viewer.keep_control_alive().expect("renew control lease");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    viewer
+        .send_input(
+            1,
+            vec![juto_desktop::protocol::InputEvent::PointerMoveAbs { x: 5, y: 5 }],
+        )
+        .expect("input after the lease TTL");
+
+    let described = daemon.call(DesktopCommand::Describe {
+        env_id: env_id.clone(),
+        after_event_seq: None,
+    });
+    match described {
+        DesktopResponse::Description(status) => {
+            let holder = status
+                .active_control_lease
+                .as_ref()
+                .map(|lease| lease.holder.as_str());
+            assert_eq!(holder, Some(juto_desktop::protocol::HUMAN_VIEWER_PRINCIPAL));
+        }
+        other => panic!("unexpected describe response: {other:?}"),
+    }
+}
+
+#[test]
+fn control_ends_when_the_viewer_stops_renewing() {
+    let daemon = Daemon::start();
+    let env_id = new_env_id();
+    let mut viewer = attach_viewer(&daemon, &env_id);
+    grant_human_control(&daemon, &env_id);
+    viewer.take_control().expect("take control");
+
+    // No renewal for longer than the 6s lease TTL.
+    std::thread::sleep(Duration::from_secs(8));
+    let err = viewer
+        .send_input(
+            1,
+            vec![juto_desktop::protocol::InputEvent::PointerMoveAbs { x: 5, y: 5 }],
+        )
+        .expect_err("input after the lease expired must be refused");
+    assert!(
+        matches!(err, juto_desktop::DesktopError::ControlLeaseExpired { .. }),
+        "unexpected error: {err:?}"
+    );
+
+    // After expiry the viewer can take control again.
+    viewer
+        .take_control()
+        .expect("take control again after expiry");
+}
+
+#[test]
+fn agent_cannot_take_control_while_the_human_holds_it() {
+    let daemon = Daemon::start();
+    let env_id = new_env_id();
+    let mut viewer = attach_viewer(&daemon, &env_id);
+    grant_human_control(&daemon, &env_id);
+    viewer.take_control().expect("take control");
+
+    match daemon.call(DesktopCommand::Control {
+        env_id: env_id.clone(),
+        action: "acquire".to_string(),
+        is_human: false,
+    }) {
+        DesktopResponse::Error { code, .. } => assert_eq!(code, "ControlBusy"),
+        other => panic!("agent acquired control held by the viewer: {other:?}"),
+    }
 }
 
 #[test]

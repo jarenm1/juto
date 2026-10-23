@@ -13,7 +13,7 @@ use std::net::Shutdown;
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::DesktopError;
 use crate::protocol::{
@@ -46,8 +46,13 @@ pub struct ViewerClient {
     info: AttachInfo,
     env_id: String,
     epoch: Option<u64>,
+    lease_renewed_at: Option<Instant>,
     seq: u64,
 }
+
+/// How often a viewer holding control renews its lease. Well under the daemon's
+/// lease TTL (6s in the Juto runtime), so one missed renewal does not drop control.
+const LEASE_RENEW_INTERVAL: Duration = Duration::from_secs(2);
 
 impl ViewerClient {
     /// Attaches to `env_id` on the daemon listening at `socket`.
@@ -101,7 +106,7 @@ impl ViewerClient {
                 pool_bytes,
             },
             DesktopResponse::Error { code, message } => {
-                return Err(DesktopError::Protocol(format!("{code}: {message}")));
+                return Err(DesktopError::Rejected { code, message });
             }
             other => {
                 return Err(DesktopError::Protocol(format!(
@@ -123,6 +128,7 @@ impl ViewerClient {
             info,
             env_id: env_id.to_string(),
             epoch: None,
+            lease_renewed_at: None,
             seq: 0,
         })
     }
@@ -195,7 +201,7 @@ impl ViewerClient {
         match self.read_response()? {
             DesktopResponse::GeometryAcknowledged { .. } => Ok(()),
             DesktopResponse::Error { code, message } => {
-                Err(DesktopError::Protocol(format!("{code}: {message}")))
+                Err(DesktopError::Rejected { code, message })
             }
             other => Err(DesktopError::Protocol(format!(
                 "unexpected geometry-ready response: {other:?}"
@@ -216,6 +222,7 @@ impl ViewerClient {
         match self.read_response()? {
             DesktopResponse::ControlChanged { lease: Some(lease) } => {
                 self.epoch = Some(lease.epoch);
+                self.lease_renewed_at = Some(Instant::now());
                 Ok(lease.epoch)
             }
             DesktopResponse::ControlChanged { lease: None } => Err(DesktopError::ControlBusy {
@@ -223,7 +230,7 @@ impl ViewerClient {
                 epoch: 0,
             }),
             DesktopResponse::Error { code, message } => {
-                Err(DesktopError::Protocol(format!("{code}: {message}")))
+                Err(DesktopError::Rejected { code, message })
             }
             other => Err(DesktopError::Protocol(format!(
                 "unexpected control response: {other:?}"
@@ -244,10 +251,11 @@ impl ViewerClient {
         match self.read_response()? {
             DesktopResponse::ControlChanged { .. } => {
                 self.epoch = None;
+                self.lease_renewed_at = None;
                 Ok(())
             }
             DesktopResponse::Error { code, message } => {
-                Err(DesktopError::Protocol(format!("{code}: {message}")))
+                Err(DesktopError::Rejected { code, message })
             }
             other => Err(DesktopError::Protocol(format!(
                 "unexpected control response: {other:?}"
@@ -269,7 +277,7 @@ impl ViewerClient {
         match self.read_response()? {
             DesktopResponse::HeartbeatExtended { .. } => Ok(()),
             DesktopResponse::Error { code, message } => {
-                Err(DesktopError::Protocol(format!("{code}: {message}")))
+                Err(DesktopError::Rejected { code, message })
             }
             other => Err(DesktopError::Protocol(format!(
                 "unexpected heartbeat response: {other:?}"
@@ -294,6 +302,36 @@ impl ViewerClient {
         match self.call(command)? {
             DesktopResponse::HeartbeatExtended { .. } => Ok(()),
             other => Err(unexpected("heartbeat", other)),
+        }
+    }
+
+    /// Renews the held control lease when it is due. The daemon ends a lease that
+    /// is not renewed within its TTL, so a holder must call this at least every
+    /// `LEASE_RENEW_INTERVAL`. `send_input` calls it too. A failed renewal means the
+    /// daemon no longer holds the lease for this viewer; the viewer drops its epoch
+    /// and reports `ControlLeaseExpired`.
+    pub fn keep_control_alive(&mut self) -> Result<(), DesktopError> {
+        if self.epoch.is_none() {
+            return Ok(());
+        }
+        if self
+            .lease_renewed_at
+            .is_some_and(|at| at.elapsed() < LEASE_RENEW_INTERVAL)
+        {
+            return Ok(());
+        }
+        match self.heartbeat_lease() {
+            Ok(()) => {
+                self.lease_renewed_at = Some(Instant::now());
+                Ok(())
+            }
+            Err(_) => {
+                self.epoch = None;
+                self.lease_renewed_at = None;
+                Err(DesktopError::ControlLeaseExpired {
+                    environment: self.env_id.clone(),
+                })
+            }
         }
     }
 
@@ -370,7 +408,7 @@ impl ViewerClient {
         write_frame(&self.stream, &payload)?;
         match self.read_response()? {
             DesktopResponse::Error { code, message } => {
-                Err(DesktopError::Protocol(format!("{code}: {message}")))
+                Err(DesktopError::Rejected { code, message })
             }
             response => Ok(response),
         }
@@ -382,6 +420,7 @@ impl ViewerClient {
         generation: u64,
         events: Vec<InputEvent>,
     ) -> Result<(), DesktopError> {
+        self.keep_control_alive()?;
         let epoch = self.epoch.ok_or_else(|| DesktopError::Unauthorized {
             caller: self.info.viewer_id.clone(),
             role: "Control".to_string(),
@@ -404,7 +443,7 @@ impl ViewerClient {
         match self.read_response()? {
             DesktopResponse::InputAccepted { .. } => Ok(()),
             DesktopResponse::Error { code, message } => {
-                Err(DesktopError::Protocol(format!("{code}: {message}")))
+                Err(DesktopError::Rejected { code, message })
             }
             other => Err(DesktopError::Protocol(format!(
                 "unexpected input response: {other:?}"

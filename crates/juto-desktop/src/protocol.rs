@@ -4,6 +4,10 @@ use std::path::PathBuf;
 /// Monotonic geometry generation counter. Incremented on every desktop resize/scale change.
 pub type GeometryGeneration = u64;
 
+/// Principal that an attached human viewer acts as over the control socket. Human
+/// control and input are attributed to it, and grants for human control are issued to it.
+pub const HUMAN_VIEWER_PRINCIPAL: &str = "human:viewer";
+
 /// Roles granted to a caller principal on an environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

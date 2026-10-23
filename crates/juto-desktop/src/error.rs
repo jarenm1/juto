@@ -39,6 +39,9 @@ pub enum DesktopError {
     #[error("stale control lease: expected epoch {expected}, received {received}")]
     StaleLease { expected: u64, received: u64 },
 
+    #[error("control lease for environment `{environment}` expired; take control again")]
+    ControlLeaseExpired { environment: String },
+
     #[error("observation timeout: no new frame produced within {timeout_ms}ms")]
     ObservationTimeout { timeout_ms: u64 },
 
@@ -57,6 +60,10 @@ pub enum DesktopError {
 
     #[error("IPC protocol error: {0}")]
     Protocol(String),
+
+    /// The daemon rejected a request; `message` is its text, shown unprefixed.
+    #[error("{message}")]
+    Rejected { code: String, message: String },
 
     #[error("SHM buffer error: {0}")]
     Shm(String),

@@ -716,6 +716,7 @@ read-only. Lease heartbeat: 2 seconds, expiry: 6 seconds; disconnect/blur trigge
 immediate release. Human release/expiry returns to **no controller**, not automatic
 agent replay; the owner must acquire a fresh agent lease. This makes disconnect
 safe. The administrative stop/revoke route remains available outside the seat.
+The human viewer holds control as principal `human:viewer` and renews its lease every 2 seconds; an expired lease is never renewed, so the next input is refused with `ControlLeaseExpired` until control is acquired again.
 
 Input includes sequence, lease epoch, geometry generation, physical key code
 (Linux evdev mapping negotiated from browser `KeyboardEvent.code`), key/button
