@@ -31,6 +31,7 @@ image = { version = "0.25", default-features = false }
 jsonschema = { version = "0.33", default-features = false }
 object = { version = "0.39", default-features = false, features = ["read_core", "elf", "std"] }
 parking_lot = "0.12"
+pulldown-cmark = { version = "0.13", default-features = false }
 png = "0.18"
 libc = "=0.2.186"
 rand = "0.9"

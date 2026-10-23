@@ -9,6 +9,8 @@ mod desktop_stream;
 mod desktop_viewer;
 mod focus_thread;
 mod jobs_panel;
+mod markdown;
+mod markdown_element;
 mod model_picker;
 mod sidebar;
 mod subagent_card;
