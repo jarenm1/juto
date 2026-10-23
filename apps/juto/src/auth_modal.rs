@@ -850,7 +850,7 @@ impl AuthModal {
                 return;
             }
             Err(error) => {
-                self.fail_oauth(&error.to_string(), cx);
+                self.fail_oauth(&crate::chat_request::describe_error(&error), cx);
                 return;
             }
         };

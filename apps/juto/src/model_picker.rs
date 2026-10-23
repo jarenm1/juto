@@ -273,12 +273,12 @@ async fn load_picker(
     let config = match call(client.clone(), tokio_handle.clone(), Request::GetConfig).await {
         Ok(Reply::Config(config)) => config,
         Ok(_) => return Err("Unexpected daemon reply to config request".into()),
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(crate::chat_request::describe_error(&error)),
     };
     let catalog = match call(client.clone(), tokio_handle.clone(), Request::ListModels).await {
         Ok(Reply::Models(catalog)) => catalog,
         Ok(_) => return Err("Unexpected daemon reply to model list".into()),
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(crate::chat_request::describe_error(&error)),
     };
     let providers: Vec<String> = catalog
         .iter()
@@ -295,7 +295,7 @@ async fn load_picker(
     {
         Ok(Reply::Credentials(status)) => status.available.into_iter().collect(),
         Ok(_) => return Err("Unexpected daemon reply to credential status".into()),
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(crate::chat_request::describe_error(&error)),
     };
     Ok(PickerLoad {
         config,
