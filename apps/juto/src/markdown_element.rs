@@ -191,13 +191,15 @@ fn table_row(
     }
     for (index, cell) in cells.iter().enumerate() {
         let align = aligns.get(index).copied().unwrap_or(Align::None);
-        let mut cell_el = div().flex_1().min_w_0().flex().px_3().py_1p5();
+        let mut cell_el = div().flex_1().min_w_0().px_3().py_1p5();
         if index > 0 {
             cell_el = cell_el.border_l_1().border_color(rgb(theme::BORDER));
         }
+        // Block cell, not a flex row: a flex child sizes to its max-content width
+        // and never wraps. Alignment is inherited text style, which StyledText paints with.
         cell_el = match align {
-            Align::Center => cell_el.justify_center(),
-            Align::Right => cell_el.justify_end(),
+            Align::Center => cell_el.text_center(),
+            Align::Right => cell_el.text_right(),
             Align::Left | Align::None => cell_el,
         };
         row = row.child(cell_el.child(inline_element(cell, base, links)));
