@@ -16,10 +16,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Window, canvas, div, fill, point, prelude::*, px,
     relative, rgb, size,
 };
-use juto_agent::{
-    MAX_TIMELINE_TICKS, ViewChild, ViewNode, parse_chart_labels, parse_chart_values,
-    parse_table_columns,
-};
+use juto_agent::{MAX_TIMELINE_TICKS, ViewChild, ViewNode, parse_chart_labels, parse_chart_values};
 
 use crate::theme;
 
@@ -104,7 +101,6 @@ pub fn render_view(node: &ViewNode, actions: &ViewActions) -> AnyElement {
         "Stat" => stat(prop(node, "label"), prop(node, "value")),
         "Timeline" => timeline(node),
         "Chart" => chart(node),
-        "Table" => table(node),
         "Subagent" => subagent_list(vec![node]),
         unknown => fallback(format!("Unknown element <{unknown}>")),
     }
@@ -364,71 +360,6 @@ fn stat(label: &str, value: &str) -> AnyElement {
                 .child(SharedString::from(label.to_uppercase())),
         )
         .into_any_element()
-}
-
-/// Striped table: a muted header row over `TableRow` cells. Columns share one
-/// width and every cell is centered; odd body rows sit on a raised band.
-fn table(node: &ViewNode) -> AnyElement {
-    let columns = parse_table_columns(prop(node, "columns"));
-    let rows: Vec<&ViewNode> = node.children.iter().filter_map(node_child).collect();
-    if rows.iter().any(|row| row.children.len() != columns.len()) {
-        return fallback("Invalid <Table>: every <TableRow> needs one cell per column".into());
-    }
-    let mut grid = div()
-        .flex()
-        .flex_col()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(theme::BORDER))
-        .overflow_hidden()
-        .child(table_line(columns, true, None));
-    for (index, row) in rows.iter().enumerate() {
-        let shade = (index % 2 == 1).then_some(theme::BG_HOVER);
-        let cells = row
-            .children
-            .iter()
-            .map(|child| match child {
-                ViewChild::Text(text) => text.clone(),
-                ViewChild::Node(_) => String::new(),
-            })
-            .collect();
-        grid = grid.child(table_line(cells, false, shade));
-    }
-    grid.into_any_element()
-}
-
-/// One table row: equal-width centered cells over an optional background.
-fn table_line(cells: Vec<String>, header: bool, background: Option<u32>) -> Div {
-    let mut line = div().flex().flex_row().w_full();
-    if let Some(color) = background {
-        line = line.bg(rgb(color));
-    }
-    if header {
-        line = line.border_b_1().border_color(rgb(theme::BORDER));
-    }
-    for cell in cells {
-        let text = if header {
-            div()
-                .text_xs()
-                .text_color(rgb(theme::TEXT_MUTED))
-                .child(SharedString::from(cell.to_uppercase()))
-        } else {
-            div()
-                .text_sm()
-                .text_color(rgb(theme::TEXT))
-                .child(SharedString::from(cell))
-        };
-        line = line.child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .px_4()
-                .py_2()
-                .text_center()
-                .child(text),
-        );
-    }
-    line
 }
 
 /// A positive seconds prop, or `None` when it is missing, malformed, or not above zero.
