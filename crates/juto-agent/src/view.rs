@@ -56,6 +56,8 @@ pub const VIEW_TAGS: &[(&str, &[&str])] = &[
     ("Chart", &["kind", "title", "labels"]),
     ("Series", &["name", "values"]),
     ("Button", &["label", "prompt", "tone"]),
+    ("Quiz", &["question", "prompt"]),
+    ("Choice", &["correct"]),
 ];
 
 /// Tones a `Badge` accepts. The renderer shows any other tone as neutral, so the
@@ -82,6 +84,12 @@ pub const MAX_CHART_POINTS: usize = 48;
 /// Kinds a `Chart` accepts.
 pub const CHART_KINDS: &[&str] = &["bar", "line", "scatter", "area"];
 
+/// Fewest and most `Choice` options a `Quiz` may offer.
+const MIN_QUIZ_CHOICES: usize = 2;
+const MAX_QUIZ_CHOICES: usize = 5;
+/// Option texts that make a quiz answer obvious, compared case-insensitively.
+const BANNED_QUIZ_OPTIONS: &[&str] = &["all of the above", "none of the above"];
+
 /// Tags that exist only inside another tag, as `(parent, child)` pairs. A parent
 /// accepts only that child, and the child must sit directly under the parent.
 const NESTING: &[(&str, &str)] = &[
@@ -89,6 +97,7 @@ const NESTING: &[(&str, &str)] = &[
     ("Timeline", "Lane"),
     ("Lane", "Bar"),
     ("Chart", "Series"),
+    ("Quiz", "Choice"),
 ];
 
 /// Checks a tree before the host renders it. Errors name the offending tag or prop
@@ -149,6 +158,8 @@ fn validate_node(
         "Chart" => check_chart(node)?,
         "Series" => check_series(node)?,
         "Button" => check_button(node)?,
+        "Quiz" => check_quiz(node)?,
+        "Choice" => check_choice(node)?,
         _ => {}
     }
     if matches!(node.tag.as_str(), "Stat" | "Bar" | "Series" | "Button")
@@ -241,6 +252,58 @@ fn check_button(node: &ViewNode) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn check_quiz(node: &ViewNode) -> Result<(), String> {
+    for key in ["question", "prompt"] {
+        if required_text(node, key)?.trim().is_empty() {
+            return Err(format!("<Quiz> prop `{key}` must not be empty"));
+        }
+    }
+    let choices: Vec<&ViewNode> = node.children.iter().filter_map(child_node).collect();
+    if !(MIN_QUIZ_CHOICES..=MAX_QUIZ_CHOICES).contains(&choices.len()) {
+        return Err(format!(
+            "<Quiz> needs {MIN_QUIZ_CHOICES} to {MAX_QUIZ_CHOICES} <Choice> children"
+        ));
+    }
+    let correct = choices
+        .iter()
+        .filter(|choice| choice.props.get("correct").and_then(Value::as_str) == Some("true"))
+        .count();
+    if correct != 1 {
+        return Err("<Quiz> needs exactly one <Choice> with correct=\"true\"".into());
+    }
+    let mut seen: Vec<String> = Vec::new();
+    for text in choices.iter().filter_map(|choice| choice_text(choice)) {
+        let normalized = text.to_lowercase();
+        if BANNED_QUIZ_OPTIONS.contains(&normalized.as_str()) {
+            return Err(format!("<Quiz> option \"{text}\" makes the answer obvious"));
+        }
+        if seen.contains(&normalized) {
+            return Err(format!("<Quiz> options must differ; \"{text}\" repeats"));
+        }
+        seen.push(normalized);
+    }
+    Ok(())
+}
+
+fn check_choice(node: &ViewNode) -> Result<(), String> {
+    match required_text(node, "correct")? {
+        "true" | "false" => {}
+        _ => return Err("<Choice> prop `correct` must be \"true\" or \"false\"".into()),
+    }
+    if choice_text(node).is_none() {
+        return Err("<Choice> needs exactly one non-empty text child".into());
+    }
+    Ok(())
+}
+
+/// A `Choice`'s text, when it holds exactly one non-blank text child.
+fn choice_text(node: &ViewNode) -> Option<&str> {
+    match node.children.as_slice() {
+        [ViewChild::Text(text)] if !text.trim().is_empty() => Some(text.trim()),
+        _ => None,
+    }
 }
 
 /// Parses a `Series` `values` prop: comma-separated finite numbers, or `None`.
@@ -709,5 +772,161 @@ mod tests {
             |len: usize| with_props("Button", json!({"label": "Run", "prompt": "x".repeat(len)}));
         assert_eq!(validate_view(&button(MAX_VIEW_TEXT_BYTES)), Ok(()));
         assert!(validate_view(&button(MAX_VIEW_TEXT_BYTES + 1)).is_err());
+    }
+
+    fn choice(text: &str, correct: &str) -> ViewNode {
+        ViewNode {
+            tag: "Choice".into(),
+            props: json!({"correct": correct}).as_object().unwrap().clone(),
+            children: vec![ViewChild::Text(text.into())],
+        }
+    }
+
+    fn quiz(choices: Vec<ViewNode>) -> ViewNode {
+        ViewNode {
+            tag: "Quiz".into(),
+            props: json!({"question": "Which step?", "prompt": "Quiz: step"})
+                .as_object()
+                .unwrap()
+                .clone(),
+            children: choices.into_iter().map(ViewChild::Node).collect(),
+        }
+    }
+
+    fn three_way() -> Vec<ViewNode> {
+        vec![
+            choice("alpha", "false"),
+            choice("beta", "true"),
+            choice("gamma", "false"),
+        ]
+    }
+
+    fn options(count: usize) -> Vec<ViewNode> {
+        (0..count)
+            .map(|index| {
+                let correct = if index == 0 { "true" } else { "false" };
+                choice(&format!("option {index}"), correct)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn quiz_with_one_correct_choice_is_valid() {
+        assert_eq!(validate_view(&quiz(three_way())), Ok(()));
+    }
+
+    #[test]
+    fn quiz_option_count_is_bounded() {
+        assert_eq!(validate_view(&quiz(options(2))), Ok(()));
+        assert_eq!(validate_view(&quiz(options(5))), Ok(()));
+        assert!(
+            validate_view(&quiz(options(1)))
+                .unwrap_err()
+                .contains("2 to 5")
+        );
+        assert!(
+            validate_view(&quiz(options(6)))
+                .unwrap_err()
+                .contains("2 to 5")
+        );
+    }
+
+    #[test]
+    fn quiz_needs_exactly_one_correct_choice() {
+        let none = vec![choice("alpha", "false"), choice("beta", "false")];
+        let two = vec![choice("alpha", "true"), choice("beta", "true")];
+        assert!(
+            validate_view(&quiz(none))
+                .unwrap_err()
+                .contains("exactly one")
+        );
+        assert!(
+            validate_view(&quiz(two))
+                .unwrap_err()
+                .contains("exactly one")
+        );
+    }
+
+    #[test]
+    fn quiz_rejects_repeated_option_text_ignoring_case_and_space() {
+        let repeated = vec![choice("Yes", "true"), choice(" yes ", "false")];
+        assert!(
+            validate_view(&quiz(repeated))
+                .unwrap_err()
+                .contains("repeats")
+        );
+    }
+
+    #[test]
+    fn quiz_rejects_answers_that_are_obvious() {
+        let all = vec![choice("alpha", "false"), choice("All of the above", "true")];
+        assert!(validate_view(&quiz(all)).unwrap_err().contains("obvious"));
+    }
+
+    #[test]
+    fn quiz_needs_a_question_and_a_prompt() {
+        let mut blank_question = quiz(three_way());
+        blank_question.props.insert("question".into(), json!("   "));
+        assert!(validate_view(&blank_question).is_err());
+
+        let mut missing_prompt = quiz(three_way());
+        missing_prompt.props.remove("prompt");
+        assert!(validate_view(&missing_prompt).is_err());
+    }
+
+    #[test]
+    fn quiz_accepts_only_choice_children() {
+        let mut with_text = quiz(three_way());
+        with_text.children.push(ViewChild::Text("hint".into()));
+        assert!(
+            validate_view(&with_text)
+                .unwrap_err()
+                .contains("accepts only <Choice>")
+        );
+    }
+
+    #[test]
+    fn choice_must_sit_directly_inside_quiz() {
+        assert!(
+            validate_view(&choice("alpha", "true"))
+                .unwrap_err()
+                .contains("inside <Quiz>")
+        );
+        let column = ViewNode {
+            tag: "Column".into(),
+            props: Map::new(),
+            children: vec![ViewChild::Node(choice("alpha", "true"))],
+        };
+        assert!(validate_view(&column).is_err());
+    }
+
+    #[test]
+    fn choice_flag_must_be_true_or_false() {
+        let mut options = three_way();
+        options[0].props.insert("correct".into(), json!("yes"));
+        assert!(
+            validate_view(&quiz(options))
+                .unwrap_err()
+                .contains("\"true\" or \"false\"")
+        );
+    }
+
+    #[test]
+    fn choice_needs_exactly_one_text_child() {
+        let mut empty = three_way();
+        empty[0].children.clear();
+        assert!(
+            validate_view(&quiz(empty))
+                .unwrap_err()
+                .contains("one non-empty text child")
+        );
+
+        let mut nested_child = three_way();
+        nested_child[0].children = vec![ViewChild::Node(leaf("Text"))];
+        assert!(
+            validate_view(&quiz(nested_child))
+                .unwrap_err()
+                .contains("one non-empty text child")
+        );
     }
 }
