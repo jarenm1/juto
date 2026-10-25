@@ -1,15 +1,18 @@
-//! Left sidebar listing the main session's internal threads and its focus
-//! threads (subagents that own an orchestrated task).
+//! Left sidebar: the main session's internal threads, then every task the
+//! user may care about, grouped by what it needs from them.
 //!
 //! - Internal threads: one row per thread with its label and whether it is the
 //!   current, an active, or a dormant thread.
-//! - One row per focus thread: title, status, and lifecycle stage bar (see
-//!   `task_card`). Clicking a row selects it and opens focus mode.
-//! - Direct integration with `juto_runtime::subagents::{BlockerReason, SubagentStatus, SubagentSummary}`.
-//! - Filter tabs: All, Active, Blocked, Done.
-//! - Search/filter over title, task, agent, workspace, and id.
-//! - Blocked rows always expose their prompt and a resume field; expanding a
-//!   row reveals steering (Pause, Steer, Abort), usage, step log, and diffs.
+//! - Tasks: every subagent main started and every background job, in three
+//!   sections. **Needs you** holds blocked subagents (waiting on the user's
+//!   answer) and jobs waiting on a decision; **Running** holds queued and
+//!   working ones; **Done** holds finished ones until the user archives them.
+//! - Subagent rows are `task_card` rows: title, status, and lifecycle stage
+//!   bar. Clicking one opens it in the chat surface. Blocked rows always expose
+//!   their prompt and an answer field; expanding a row reveals steering (Pause,
+//!   Steer, Abort), usage, step log, and diffs.
+//! - Job rows show their status, prompt, result, and the actions `jobs_panel`
+//!   offers (approve, deny, follow up, archive).
 //! - Error banner surfaced with visible failure reason on rejected steering or unblock.
 
 use std::collections::HashMap;
@@ -18,70 +21,59 @@ use gpui::{
     App, ClickEvent, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Render,
     ScrollHandle, SharedString, Subscription, Window, actions, div, prelude::*, px, rgb,
 };
-use juto_runtime::subagents::{
-    BlockerReason, MainMessage, MainMessageKind, SubagentStatus, SubagentSummary,
-};
+use juto_runtime::jobs::{Job, JobStatus};
+use juto_runtime::subagents::{BlockerReason, SubagentStatus, SubagentSummary};
 use juto_runtime::{ThreadInfo, ThreadStatus};
 
-use crate::subagent_card::fallback_name;
+use crate::jobs_panel::{self, JobActionHandler};
 use crate::task_card::{
     DiffFileModel, DiffHunkModel, DiffLineKind, DiffLineModel, TaskCard, TaskCardEvent,
-    TaskCardModel, TokenUsageModel, ToolLogEntry, is_status_active,
+    TaskCardModel, TokenUsageModel, ToolLogEntry,
 };
 use crate::theme;
 
-/// Inbox row heading: the sender's name, or a readable label built from its id,
-/// then what kind of report it is. Never the raw id or a `Debug` variant name.
-fn inbox_heading(message: &MainMessage) -> String {
-    let who = message
-        .name
-        .clone()
-        .unwrap_or_else(|| fallback_name(&message.from));
-    format!("{who} · {}", inbox_kind_label(&message.kind))
-}
-
-fn inbox_kind_label(kind: &MainMessageKind) -> &'static str {
-    match kind {
-        MainMessageKind::Message => "Message",
-        MainMessageKind::Completed => "Completed",
-        MainMessageKind::Failed => "Failed",
-        MainMessageKind::Cancelled => "Cancelled",
-        MainMessageKind::Desktop => "Desktop",
-    }
-}
-
-actions!(
-    sidebar,
-    [
-        CloseSidebar,
-        FilterAllTasks,
-        FilterActiveTasks,
-        FilterBlockedTasks,
-        FilterCompletedTasks,
-    ]
-);
+actions!(sidebar, [CloseSidebar]);
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("escape", CloseSidebar, Some("Sidebar"))]);
 }
 
-/// Filter tab for the task list.
+/// Sidebar section a task belongs to, in display order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TaskFilter {
-    All,
-    Active,
-    Blocked,
+pub enum Section {
+    NeedsYou,
+    Running,
     Done,
 }
 
-impl TaskFilter {
-    #[allow(dead_code)]
-    pub fn label(&self) -> &'static str {
+impl Section {
+    pub fn label(self) -> &'static str {
         match self {
-            Self::All => "All",
-            Self::Active => "Active",
-            Self::Blocked => "Blocked",
+            Self::NeedsYou => "Needs you",
+            Self::Running => "Running",
             Self::Done => "Done",
+        }
+    }
+
+    /// A blocked subagent waits on the user; a finished one is done.
+    pub fn of_subagent(status: &SubagentStatus) -> Self {
+        if status.is_blocked() {
+            Self::NeedsYou
+        } else if status.is_terminal() {
+            Self::Done
+        } else {
+            Self::Running
+        }
+    }
+
+    /// A blocked job waits on the user's decision; a finished one is done.
+    pub fn of_job(job: &Job) -> Self {
+        if job.status == JobStatus::Blocked {
+            Self::NeedsYou
+        } else if job.status.is_terminal() {
+            Self::Done
+        } else {
+            Self::Running
         }
     }
 }
@@ -95,23 +87,24 @@ pub enum SidebarEvent {
     AbortTask(String),
     SteerTask { id: String, guidance: String },
     ArchiveFinished,
-    DismissInbox(MainMessage),
     Close,
 }
 
-/// Left sidebar listing focus threads.
+/// Left sidebar listing the session's threads and its tasks.
 pub struct Sidebar {
     focus_handle: Option<FocusHandle>,
     scroll_handle: ScrollHandle,
     tasks: Vec<TaskCardModel>,
     selected_task: Option<String>,
-    filter: TaskFilter,
     search_query: String,
     error_message: Option<SharedString>,
     /// Live row views by task id, with the subscription forwarding their events.
     cards: HashMap<String, (Entity<TaskCard>, Subscription)>,
     threads: ThreadList,
-    inbox: Vec<MainMessage>,
+    /// Background jobs as the daemon last reported them, archived ones included.
+    jobs: Vec<Job>,
+    /// Routes job row clicks to the chat view, which owns the daemon requests.
+    job_actions: Option<JobActionHandler>,
 }
 
 /// The main session's internal threads, in creation order.
@@ -132,57 +125,28 @@ impl Sidebar {
             scroll_handle: ScrollHandle::new(),
             tasks: Vec::new(),
             selected_task: None,
-            filter: TaskFilter::All,
             search_query: String::new(),
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
-            inbox: Vec::new(),
+            jobs: Vec::new(),
+            job_actions: None,
         }
     }
 
-    /// Shows the session inbox as the daemon last reported it.
-    pub fn set_inbox(&mut self, inbox: Vec<MainMessage>, cx: &mut Context<Self>) {
-        self.inbox = inbox;
+    /// Shows `jobs` in the task sections; `actions` runs their row buttons.
+    pub fn set_jobs(&mut self, jobs: Vec<Job>, actions: JobActionHandler, cx: &mut Context<Self>) {
+        self.jobs = jobs;
+        self.job_actions = Some(actions);
         cx.notify();
     }
 
-    fn render_inbox(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let messages = self.inbox.clone();
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .child(format!("Inbox · {}", messages.len()))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::TEXT_FAINT))
-                    .child("Dismissal does not remove the agent’s copy."),
-            )
-            .children(messages.into_iter().enumerate().map(|(index, message)| {
-                let dismiss = message.clone();
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .p_2()
-                    .border_1()
-                    .border_color(rgb(theme::TEXT_FAINT))
-                    .child(inbox_heading(&message))
-                    .child(div().text_sm().child(message.body))
-                    .child(
-                        div()
-                            .id(("dismiss-inbox", index))
-                            .cursor_pointer()
-                            .text_xs()
-                            .child("Dismiss")
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(SidebarEvent::DismissInbox(dismiss.clone()));
-                            })),
-                    )
-            }))
+    /// Jobs shown in `section`, newest first. Archived jobs are hidden.
+    fn jobs_in(&self, section: Section) -> Vec<&Job> {
+        jobs_panel::visible(&self.jobs)
+            .into_iter()
+            .filter(|job| Section::of_job(job) == section)
+            .collect()
     }
 
     /// Sample tasks demonstrating all lifecycle states and Zed live diff cards.
@@ -334,19 +298,16 @@ impl Sidebar {
         cx.notify();
     }
 
-    /// Focus threads and blocked workers are visible, and a running worker stays
-    /// visible until it finishes. Archived threads and finished workers leave the
-    /// inbox on the next sync, so the inbox stays bounded.
+    /// Every subagent main started is listed until the user archives it.
+    /// Nested children belong to their parent's run and never reach this list.
     pub fn apply_summaries(&mut self, summaries: &[SubagentSummary]) {
         self.tasks.retain(|task| {
             summaries
                 .iter()
-                .find(|summary| summary.id == task.id)
-                .is_some_and(|summary| Self::inbox_visible(summary, true))
+                .any(|summary| summary.id == task.id && !summary.archived)
         });
         for summary in summaries {
-            let shown = self.tasks.iter().any(|task| task.id == summary.id);
-            if !Self::inbox_visible(summary, shown) {
+            if summary.archived {
                 continue;
             }
             let workspace = summary
@@ -393,15 +354,6 @@ impl Sidebar {
                 self.tasks.push(card);
             }
         }
-    }
-
-    /// Whether a summary belongs in the inbox. `shown` is whether its card is
-    /// already on screen; a shown worker stays until it reaches a terminal state.
-    fn inbox_visible(summary: &SubagentSummary, shown: bool) -> bool {
-        if summary.archived {
-            return false;
-        }
-        summary.focus || summary.status.is_blocked() || (shown && !summary.status.is_terminal())
     }
 
     pub fn set_tasks(&mut self, tasks: Vec<TaskCardModel>, cx: &mut Context<Self>) {
@@ -452,11 +404,6 @@ impl Sidebar {
             .and_then(|id| self.tasks.iter().find(|t| &t.id == id))
     }
 
-    pub fn set_filter(&mut self, filter: TaskFilter, cx: &mut Context<Self>) {
-        self.filter = filter;
-        cx.notify();
-    }
-
     pub fn set_search_query(&mut self, query: impl Into<String>, cx: &mut Context<Self>) {
         self.search_query = query.into();
         cx.notify();
@@ -480,24 +427,27 @@ impl Sidebar {
         cx.notify();
     }
 
-    // Counts for filter pills
-    pub fn filter_counts(&self) -> (usize, usize, usize, usize) {
-        let mut total = 0;
-        let mut active = 0;
-        let mut blocked = 0;
-        let mut done = 0;
-
-        for t in &self.tasks {
-            total += 1;
-            if t.status.is_blocked() {
-                blocked += 1;
-            } else if is_status_active(&t.status) {
-                active += 1;
-            } else if t.status.is_terminal() {
-                done += 1;
-            }
+    /// How many subagents and jobs each section holds, in [`Section`] order.
+    pub fn section_counts(&self) -> [usize; 3] {
+        let mut counts = [0; 3];
+        let sections = self
+            .tasks
+            .iter()
+            .map(|task| Section::of_subagent(&task.status))
+            .chain(
+                jobs_panel::visible(&self.jobs)
+                    .into_iter()
+                    .map(Section::of_job),
+            );
+        for section in sections {
+            counts[section as usize] += 1;
         }
-        (total, active, blocked, done)
+        counts
+    }
+
+    /// Subagents and jobs waiting on the user.
+    pub fn needs_you_count(&self) -> usize {
+        self.section_counts()[Section::NeedsYou as usize]
     }
 
     // Aggregate statistics across all subagents
@@ -514,15 +464,6 @@ impl Sidebar {
         }
 
         (total_tokens, total_adds, total_dels)
-    }
-
-    fn matches_filter(&self, task: &TaskCardModel) -> bool {
-        match self.filter {
-            TaskFilter::All => true,
-            TaskFilter::Active => is_status_active(&task.status),
-            TaskFilter::Blocked => task.status.is_blocked(),
-            TaskFilter::Done => task.status.is_terminal(),
-        }
     }
 
     fn matches_search(&self, task: &TaskCardModel) -> bool {
@@ -602,7 +543,7 @@ impl Sidebar {
             }))
     }
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (total, active, blocked, done) = self.filter_counts();
+        let done = self.section_counts()[Section::Done as usize];
 
         div()
             .flex()
@@ -613,36 +554,31 @@ impl Sidebar {
             .pb_2()
             .child(
                 div()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgb(theme::TEXT_MUTED))
-                    .child("FOCUS THREADS"),
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgb(theme::TEXT_MUTED))
+                            .child("TASKS"),
+                    )
+                    .when(done > 0, |row| {
+                        row.child(
+                            div()
+                                .id("archive-finished-btn")
+                                .text_xs()
+                                .cursor_pointer()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .hover(|s| s.text_color(rgb(theme::TEXT)))
+                                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                    cx.emit(SidebarEvent::ArchiveFinished);
+                                }))
+                                .child(format!("Archive {done} done")),
+                        )
+                    }),
             )
-            .when(total > 0, |hdr| {
-                hdr.child(
-                    div()
-                        .flex()
-                        .gap_3()
-                        .child(self.filter_tab(TaskFilter::All, total, cx))
-                        .child(self.filter_tab(TaskFilter::Active, active, cx))
-                        .child(self.filter_tab(TaskFilter::Blocked, blocked, cx))
-                        .child(self.filter_tab(TaskFilter::Done, done, cx)),
-                )
-            })
-            .when(done > 0, |hdr| {
-                hdr.child(
-                    div()
-                        .id("archive-finished-btn")
-                        .text_xs()
-                        .cursor_pointer()
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .hover(|s| s.text_color(rgb(theme::TEXT)))
-                        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                            cx.emit(SidebarEvent::ArchiveFinished);
-                        }))
-                        .child(format!("Archive {done} finished")),
-                )
-            })
             .when_some(self.error_message.clone(), |hdr, err| {
                 hdr.child(
                     div()
@@ -674,39 +610,41 @@ impl Sidebar {
             })
     }
 
-    fn filter_tab(
-        &self,
-        filter: TaskFilter,
-        count: usize,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let is_active = self.filter == filter;
-
+    /// A section heading with its count. "Needs you" is drawn in the warning
+    /// color so it stands out from the work the agents own.
+    fn render_section_heading(section: Section, count: usize) -> impl IntoElement {
+        let color = match section {
+            Section::NeedsYou => theme::WARNING,
+            Section::Running | Section::Done => theme::TEXT_FAINT,
+        };
         div()
-            .id(SharedString::from(format!("filter-pill-{:?}", filter)))
             .flex()
-            .gap_1()
-            .cursor_pointer()
+            .items_center()
+            .gap_1p5()
+            .px_5()
+            .pt_3()
+            .pb_1()
             .text_xs()
-            .text_color(if is_active {
-                rgb(theme::TEXT)
-            } else {
-                rgb(theme::TEXT_FAINT)
-            })
-            .hover(|s| s.text_color(rgb(theme::TEXT)))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                this.set_filter(filter, cx);
-            }))
-            .child(filter.label())
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(rgb(color))
+            .child(section.label())
             .child(
                 div()
-                    .text_color(if is_active {
-                        rgb(theme::ACCENT)
-                    } else {
-                        rgb(theme::TEXT_FAINT)
-                    })
+                    .text_color(rgb(theme::TEXT_FAINT))
                     .child(count.to_string()),
             )
+    }
+
+    /// The job rows of `section`, inset to line up with the subagent rows.
+    fn render_job_rows(&self, section: Section) -> Option<impl IntoElement> {
+        let handler = self.job_actions.as_ref()?;
+        let jobs = self.jobs_in(section);
+        (!jobs.is_empty()).then(|| {
+            div().flex().flex_col().gap_1().px_3().py_1().children(
+                jobs.into_iter()
+                    .map(|job| jobs_panel::job_row(job, handler)),
+            )
+        })
     }
 
     fn render_summary_footer(&self) -> impl IntoElement {
@@ -752,13 +690,13 @@ impl Sidebar {
                 div()
                     .text_sm()
                     .text_color(rgb(theme::TEXT_MUTED))
-                    .child("No focus threads"),
+                    .child("No tasks"),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(rgb(theme::TEXT_FAINT))
-                    .child("Threads the agent starts for orchestrated tasks appear here."),
+                    .child("Work the agent hands off and background jobs appear here."),
             )
     }
 }
@@ -826,19 +764,25 @@ impl Render for Sidebar {
         self.cards
             .retain(|id, _| tasks.iter().any(|task| &task.id == id));
 
-        let matching_tasks: Vec<TaskCardModel> = self
-            .tasks
-            .iter()
-            .filter(|t| self.matches_filter(t) && self.matches_search(t))
-            .cloned()
-            .collect();
-        let cards: Vec<Entity<TaskCard>> = matching_tasks
-            .into_iter()
-            .map(|task| {
-                let is_selected = self.selected_task.as_deref() == Some(task.id.as_str());
-                self.card_for(task, is_selected, cx)
-            })
-            .collect();
+        let mut sections: Vec<(Section, Vec<Entity<TaskCard>>)> = Vec::new();
+        for section in [Section::NeedsYou, Section::Running, Section::Done] {
+            let matching: Vec<TaskCardModel> = self
+                .tasks
+                .iter()
+                .filter(|t| Section::of_subagent(&t.status) == section && self.matches_search(t))
+                .cloned()
+                .collect();
+            let cards = matching
+                .into_iter()
+                .map(|task| {
+                    let is_selected = self.selected_task.as_deref() == Some(task.id.as_str());
+                    self.card_for(task, is_selected, cx)
+                })
+                .collect();
+            sections.push((section, cards));
+        }
+        let counts = self.section_counts();
+        let empty = counts.iter().all(|count| *count == 0);
 
         div()
             .id("sidebar-mission-control")
@@ -857,16 +801,23 @@ impl Render for Sidebar {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
-                    .child(self.render_inbox(cx))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_0p5()
-                            .when(cards.is_empty(), |list| {
-                                list.child(self.render_empty_state())
-                            })
-                            .children(cards),
+                    .when(empty, |list| list.child(self.render_empty_state()))
+                    .children(
+                        sections
+                            .into_iter()
+                            .filter(|(section, _)| counts[*section as usize] > 0)
+                            .map(|(section, cards)| {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(Self::render_section_heading(
+                                        section,
+                                        counts[section as usize],
+                                    ))
+                                    .children(cards)
+                                    .children(self.render_job_rows(section))
+                            }),
                     ),
             )
             .when(!self.tasks.is_empty(), |sidebar| {
@@ -877,336 +828,140 @@ impl Render for Sidebar {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use crate::jobs_panel::test_job;
+    use juto_runtime::jobs::InboxState;
 
-    #[test]
-    fn filter_counts_and_matching() {
-        let tasks = Sidebar::sample_tasks();
-        assert_eq!(tasks.len(), 3);
-
-        let mut sidebar = Sidebar {
+    fn sidebar(tasks: Vec<TaskCardModel>) -> Sidebar {
+        Sidebar {
             focus_handle: None,
             scroll_handle: ScrollHandle::new(),
             tasks,
             selected_task: None,
-            filter: TaskFilter::All,
             search_query: String::new(),
             error_message: None,
             cards: HashMap::new(),
             threads: ThreadList::default(),
-            inbox: Vec::new(),
-        };
+            jobs: Vec::new(),
+            job_actions: None,
+        }
+    }
 
-        let (total, active, blocked, done) = sidebar.filter_counts();
-        assert_eq!(total, 3);
-        assert_eq!(active, 1);
-        assert_eq!(blocked, 1);
-        assert_eq!(done, 1);
+    fn summary(id: &str, status: SubagentStatus) -> SubagentSummary {
+        SubagentSummary {
+            id: id.into(),
+            name: None,
+            task: "task".into(),
+            status,
+            stop_reason: None,
+            usage: None,
+            error: None,
+            focus: false,
+            workspace: None,
+            released: false,
+            archived: false,
+        }
+    }
 
-        // Test search
+    fn blocked() -> SubagentStatus {
+        SubagentStatus::Blocked {
+            reason: BlockerReason::UserInput,
+            prompt: "Merge now?".into(),
+        }
+    }
+
+    fn ids(sidebar: &Sidebar) -> Vec<&str> {
+        sidebar.tasks().iter().map(|t| t.id.as_str()).collect()
+    }
+
+    #[test]
+    fn sample_tasks_fill_each_section_and_search_narrows_rows() {
+        let mut sidebar = sidebar(Sidebar::sample_tasks());
+        assert_eq!(sidebar.section_counts(), [1, 1, 1]);
+
         sidebar.search_query = "auth".into();
-        let matches: Vec<_> = sidebar
+        let matches = sidebar
             .tasks
             .iter()
             .filter(|t| sidebar.matches_search(t))
-            .collect();
-        assert_eq!(matches.len(), 2);
+            .count();
+        assert_eq!(matches, 2);
 
-        // Test aggregate stats
         let (_tokens, adds, dels) = sidebar.aggregate_stats();
-        assert_eq!(adds, 38);
-        assert_eq!(dels, 9);
+        assert_eq!((adds, dels), (38, 9));
     }
 
     #[test]
-    fn runtime_summary_synchronization_and_status_transitions() {
-        let mut sidebar = Sidebar {
-            focus_handle: None,
-            scroll_handle: ScrollHandle::new(),
-            tasks: Vec::new(),
-            selected_task: None,
-            filter: TaskFilter::All,
-            search_query: String::new(),
-            error_message: None,
-            cards: HashMap::new(),
-            threads: ThreadList::default(),
-            inbox: Vec::new(),
-        };
-
-        // Truthful initial empty state
-        assert_eq!(sidebar.tasks().len(), 0);
-        let (total, active, blocked, done) = sidebar.filter_counts();
-        assert_eq!((total, active, blocked, done), (0, 0, 0, 0));
-
-        // Step 1: Subagent queued
-        let summary1 = SubagentSummary {
-            id: "child-42".into(),
-            name: Some("#42 Refactor".into()),
-            task: "Refactor session store".into(),
-            status: SubagentStatus::Queued,
-            stop_reason: None,
-            usage: None,
-            error: None,
-            focus: true,
-            workspace: None,
-            released: false,
-            archived: false,
-        };
-        sidebar.apply_summaries(&[summary1]);
-        assert_eq!(sidebar.tasks().len(), 1);
-        assert_eq!(sidebar.filter_counts(), (1, 0, 0, 0));
-
-        // Step 2: Transitions to Running
-        let summary2 = SubagentSummary {
-            id: "child-42".into(),
-            name: Some("#42 Refactor".into()),
-            task: "Refactor session store".into(),
-            status: SubagentStatus::Running,
-            stop_reason: None,
-            usage: None,
-            error: None,
-            focus: true,
-            workspace: None,
-            released: false,
-            archived: false,
-        };
-        sidebar.apply_summaries(&[summary2]);
-        assert_eq!(sidebar.filter_counts(), (1, 1, 0, 0));
-
-        // Step 3: Transitions to Blocked (UserInput)
-        let summary3 = SubagentSummary {
-            id: "child-42".into(),
-            name: Some("#42 Refactor".into()),
-            task: "Refactor session store".into(),
-            status: SubagentStatus::Blocked {
-                reason: BlockerReason::UserInput,
-                prompt: "Confirm schema change".into(),
-            },
-            stop_reason: None,
-            usage: None,
-            error: None,
-            focus: true,
-            workspace: None,
-            released: false,
-            archived: false,
-        };
-        sidebar.apply_summaries(&[summary3]);
-        assert_eq!(sidebar.filter_counts(), (1, 0, 1, 0));
-        assert!(sidebar.tasks()[0].status.is_blocked());
-
-        // Step 4: Transitions to Verifying after unblock
-        let summary4 = SubagentSummary {
-            id: "child-42".into(),
-            name: Some("#42 Refactor".into()),
-            task: "Refactor session store".into(),
-            status: SubagentStatus::Verifying,
-            stop_reason: None,
-            usage: None,
-            error: None,
-            focus: true,
-            workspace: None,
-            released: false,
-            archived: false,
-        };
-        sidebar.apply_summaries(&[summary4]);
-        assert_eq!(sidebar.filter_counts(), (1, 1, 0, 0));
-
-        // Step 5: Transitions to Reviewing
-        let summary5 = SubagentSummary {
-            id: "child-42".into(),
-            name: Some("#42 Refactor".into()),
-            task: "Refactor session store".into(),
-            status: SubagentStatus::Reviewing,
-            stop_reason: None,
-            usage: None,
-            error: None,
-            focus: true,
-            workspace: None,
-            released: false,
-            archived: false,
-        };
-        sidebar.apply_summaries(&[summary5]);
-        assert_eq!(sidebar.filter_counts(), (1, 1, 0, 0));
-
-        // Step 6: Completed
-        let summary6 = SubagentSummary {
-            id: "child-42".into(),
-            name: Some("#42 Refactor".into()),
-            task: "Refactor session store".into(),
-            status: SubagentStatus::Completed,
-            stop_reason: None,
-            usage: None,
-            error: None,
-            focus: true,
-            workspace: None,
-            released: false,
-            archived: false,
-        };
-        sidebar.apply_summaries(&[summary6]);
-        assert_eq!(sidebar.filter_counts(), (1, 0, 0, 1));
-        assert!(sidebar.tasks()[0].status.is_terminal());
+    fn a_task_moves_between_sections_as_its_status_changes() {
+        let mut sidebar = sidebar(Vec::new());
+        let steps = [
+            (SubagentStatus::Queued, [0, 1, 0]),
+            (SubagentStatus::Running, [0, 1, 0]),
+            (blocked(), [1, 0, 0]),
+            (SubagentStatus::Verifying, [0, 1, 0]),
+            (SubagentStatus::Reviewing, [0, 1, 0]),
+            (SubagentStatus::Completed, [0, 0, 1]),
+        ];
+        for (status, counts) in steps {
+            sidebar.apply_summaries(&[summary("child-42", status.clone())]);
+            assert_eq!(ids(&sidebar), ["child-42"], "one row through {status:?}");
+            assert_eq!(sidebar.section_counts(), counts, "sections for {status:?}");
+        }
+        assert_eq!(sidebar.needs_you_count(), 0);
     }
 
     #[test]
-    fn error_banner_management() {
-        let mut sidebar = Sidebar {
-            focus_handle: None,
-            scroll_handle: ScrollHandle::new(),
-            tasks: Vec::new(),
-            selected_task: None,
-            filter: TaskFilter::All,
-            search_query: String::new(),
-            error_message: None,
-            cards: HashMap::new(),
-            threads: ThreadList::default(),
-            inbox: Vec::new(),
-        };
-
-        assert!(sidebar.error_message.is_none());
-        sidebar.set_error_message(Some("Steer rejected: child already completed".into()));
-        assert_eq!(
-            sidebar.error_message.as_ref().map(|s| s.as_ref()),
-            Some("Steer rejected: child already completed")
-        );
-
-        sidebar.set_error_message(None);
-        assert!(sidebar.error_message.is_none());
-    }
-
-    #[test]
-    fn focus_and_blocked_worker_summaries_become_cards() {
-        let mut sidebar = Sidebar {
-            focus_handle: None,
-            scroll_handle: ScrollHandle::new(),
-            tasks: Vec::new(),
-            selected_task: None,
-            filter: TaskFilter::All,
-            search_query: String::new(),
-            error_message: None,
-            cards: HashMap::new(),
-            threads: ThreadList::default(),
-            inbox: Vec::new(),
-        };
-        let summary = |id: &str, focus: bool| SubagentSummary {
-            id: id.into(),
-            name: None,
-            task: "task".into(),
-            status: SubagentStatus::Running,
-            stop_reason: None,
-            usage: None,
-            error: None,
-            focus,
-            workspace: None,
-            released: false,
-            archived: false,
-        };
-
-        sidebar.apply_summaries(&[summary("worker-1", false), summary("focus-1", true)]);
-
-        let ids: Vec<&str> = sidebar.tasks().iter().map(|t| t.id.as_str()).collect();
-        assert_eq!(ids, vec!["focus-1"]);
-
-        let mut worker = summary("worker-1", false);
-        worker.status = SubagentStatus::Blocked {
-            reason: BlockerReason::UserInput,
-            prompt: "Choose a target".into(),
-        };
-        sidebar.apply_summaries(&[summary("focus-1", true), worker.clone()]);
-        assert!(sidebar.tasks()[1].status.is_blocked());
-        worker.status = SubagentStatus::Running;
-        sidebar.apply_summaries(&[summary("focus-1", true), worker]);
-        assert!(!sidebar.tasks()[1].status.is_blocked());
-    }
-
-    #[test]
-    fn inbox_drops_archived_threads_and_finished_workers() {
-        let mut sidebar = Sidebar {
-            focus_handle: None,
-            scroll_handle: ScrollHandle::new(),
-            tasks: Vec::new(),
-            selected_task: None,
-            filter: TaskFilter::All,
-            search_query: String::new(),
-            error_message: None,
-            cards: HashMap::new(),
-            threads: ThreadList::default(),
-            inbox: Vec::new(),
-        };
-        let summary = |id: &str, focus: bool| SubagentSummary {
-            id: id.into(),
-            name: None,
-            task: "task".into(),
-            status: SubagentStatus::Running,
-            stop_reason: None,
-            usage: None,
-            error: None,
-            focus,
-            workspace: None,
-            released: false,
-            archived: false,
-        };
-        let ids = |sidebar: &Sidebar| -> Vec<String> {
-            sidebar.tasks().iter().map(|t| t.id.clone()).collect()
-        };
-
-        let mut focus = summary("focus-1", true);
-        let mut worker = summary("worker-1", false);
-        worker.status = SubagentStatus::Blocked {
-            reason: BlockerReason::UserInput,
-            prompt: "Choose a target".into(),
-        };
-        sidebar.apply_summaries(&[focus.clone(), worker.clone()]);
-        assert_eq!(ids(&sidebar), vec!["focus-1", "worker-1"]);
-
-        worker.status = SubagentStatus::Running;
+    fn every_task_is_listed_until_archived() {
+        let mut sidebar = sidebar(Vec::new());
+        let mut focus = summary("focus-1", SubagentStatus::Running);
+        focus.focus = true;
+        let mut worker = summary("worker-1", SubagentStatus::Completed);
         sidebar.apply_summaries(&[focus.clone(), worker.clone()]);
         assert_eq!(
             ids(&sidebar),
-            vec!["focus-1", "worker-1"],
-            "a shown worker stays while running"
+            ["focus-1", "worker-1"],
+            "workers are tasks too, and finished ones stay until archived"
         );
 
-        worker.status = SubagentStatus::Completed;
-        sidebar.apply_summaries(&[focus.clone(), worker.clone()]);
-        assert_eq!(ids(&sidebar), vec!["focus-1"], "finished workers leave");
-
-        focus.archived = true;
+        worker.archived = true;
         sidebar.apply_summaries(&[focus, worker]);
-        assert!(ids(&sidebar).is_empty(), "archived threads leave");
+        assert_eq!(ids(&sidebar), ["focus-1"]);
     }
 
     #[test]
-    fn focus_summary_workspace_is_carried_into_card() {
-        use std::path::PathBuf;
+    fn blocked_tasks_and_jobs_awaiting_a_decision_need_the_user() {
+        let mut sidebar = sidebar(Vec::new());
+        sidebar.apply_summaries(&[
+            summary("asking", blocked()),
+            summary("working", SubagentStatus::Running),
+        ]);
+        let mut decision = test_job("pr-7", JobStatus::Blocked, InboxState::Unread);
+        decision.decision_id = Some("d1".into());
+        sidebar.jobs = vec![
+            decision,
+            test_job("scan", JobStatus::Running, InboxState::Unread),
+            test_job("old", JobStatus::Succeeded, InboxState::Archived),
+            test_job("new", JobStatus::Succeeded, InboxState::Unread),
+        ];
 
-        let mut sidebar = Sidebar {
-            focus_handle: None,
-            scroll_handle: ScrollHandle::new(),
-            tasks: Vec::new(),
-            selected_task: None,
-            filter: TaskFilter::All,
-            search_query: String::new(),
-            error_message: None,
-            cards: HashMap::new(),
-            threads: ThreadList::default(),
-            inbox: Vec::new(),
-        };
-        let summary = SubagentSummary {
-            id: "focus-1".into(),
-            name: None,
-            task: "task".into(),
-            status: SubagentStatus::Running,
-            stop_reason: None,
-            usage: None,
-            error: None,
-            focus: true,
-            workspace: Some(PathBuf::from("/tmp/juto-focus-1")),
-            released: false,
-            archived: false,
-        };
+        assert_eq!(sidebar.section_counts(), [2, 2, 1]);
+        assert_eq!(sidebar.needs_you_count(), 2);
+        let needs_you: Vec<&str> = sidebar
+            .jobs_in(Section::NeedsYou)
+            .into_iter()
+            .map(|job| job.id.as_str())
+            .collect();
+        assert_eq!(needs_you, ["pr-7"]);
+    }
 
-        sidebar.apply_summaries(&[summary]);
-
+    #[test]
+    fn summary_workspace_is_carried_into_card() {
+        let mut sidebar = sidebar(Vec::new());
+        let mut task = summary("focus-1", SubagentStatus::Running);
+        task.workspace = Some(PathBuf::from("/tmp/juto-focus-1"));
+        sidebar.apply_summaries(&[task]);
         assert_eq!(
             sidebar.tasks()[0].workspace.as_deref(),
             Some("/tmp/juto-focus-1")

@@ -32,7 +32,7 @@ use juto_daemon::protocol::{
     PendingApproval, Reply, Request, ServerEvent, SessionEvent, SessionView, SubagentCommand,
 };
 use juto_runtime::jobs::Job;
-use juto_runtime::subagents::{MainMessage, SubagentEvent};
+use juto_runtime::subagents::SubagentEvent;
 use juto_runtime::{DesktopSessionArtifact, SubagentSummary, TimelineItem};
 use tokio::sync::broadcast::{self, error::RecvError};
 
@@ -631,7 +631,6 @@ impl ChatView {
                 cx,
             ),
             SidebarEvent::ArchiveFinished => this.archive_finished(cx),
-            SidebarEvent::DismissInbox(message) => this.dismiss_inbox(message.clone(), cx),
         });
 
         let messages = load_messages(&session.timeline);
@@ -661,7 +660,6 @@ impl ChatView {
                                     .report_error(crate::chat_request::describe_error(&error), cx),
                             }
                             this.sync_subagents(cx);
-                            this.sync_inbox(cx);
                             this.sync_jobs(cx);
                         })
                         .is_err()
@@ -977,28 +975,6 @@ impl ChatView {
         .detach();
     }
 
-    /// Refreshes the sidebar inbox from the daemon.
-    pub fn sync_inbox(&mut self, cx: &mut Context<Self>) {
-        let client = self.client.clone();
-        let handle = self.tokio_handle.clone();
-        cx.spawn(async move |this, cx| {
-            let result = crate::chat_request::call(client, handle, Request::InboxMessages).await;
-            let _ = this.update(cx, |this, cx| match result {
-                Ok(Reply::InboxMessages { messages }) => {
-                    this.sidebar
-                        .update(cx, |sidebar, cx| sidebar.set_inbox(messages, cx));
-                }
-                Ok(_) => this.report_error("Unexpected inbox reply".into(), cx),
-                Err(error) => this.report_error(crate::chat_request::describe_error(&error), cx),
-            });
-        })
-        .detach();
-    }
-
-    fn dismiss_inbox(&mut self, message: MainMessage, cx: &mut Context<Self>) {
-        self.send_request(Request::InboxDismiss { message }, cx);
-    }
-
     /// Re-reads every background job from the daemon.
     fn sync_jobs(&mut self, cx: &mut Context<Self>) {
         let client = self.client.clone();
@@ -1008,7 +984,7 @@ impl ChatView {
             let _ = this.update(cx, |this, cx| match result {
                 Ok(Reply::Jobs(jobs)) => {
                     this.jobs = jobs;
-                    cx.notify();
+                    this.publish_jobs(cx);
                 }
                 Ok(_) => this.report_error("Unexpected jobs reply".into(), cx),
                 Err(error) => this.report_error(crate::chat_request::describe_error(&error), cx),
@@ -1017,12 +993,22 @@ impl ChatView {
         .detach();
     }
 
-    /// Puts `job` in the strip, replacing any earlier copy of it.
-    fn upsert_job(&mut self, job: Job) {
+    /// Puts `job` in the task sidebar, replacing any earlier copy of it.
+    fn upsert_job(&mut self, job: Job, cx: &mut Context<Self>) {
         match self.jobs.iter_mut().find(|known| known.id == job.id) {
             Some(known) => *known = job,
             None => self.jobs.push(job),
         }
+        self.publish_jobs(cx);
+    }
+
+    /// Shows the current jobs in the sidebar's task sections.
+    fn publish_jobs(&mut self, cx: &mut Context<Self>) {
+        let jobs = self.jobs.clone();
+        let actions = self.job_action_handler(cx);
+        self.sidebar
+            .update(cx, |sidebar, cx| sidebar.set_jobs(jobs, actions, cx));
+        cx.notify();
     }
 
     /// Runs a strip action. Follow-up seeds the composer; the rest send one daemon request.
@@ -1054,10 +1040,7 @@ impl ChatView {
         cx.spawn(async move |this, cx| {
             let result = crate::chat_request::call(client, handle, request).await;
             let _ = this.update(cx, |this, cx| match result {
-                Ok(Reply::Job(job)) => {
-                    this.upsert_job(job);
-                    cx.notify();
-                }
+                Ok(Reply::Job(job)) => this.upsert_job(job, cx),
                 Ok(_) => this.sync_jobs(cx),
                 Err(error) => this.report_error(crate::chat_request::describe_error(&error), cx),
             });
@@ -1086,13 +1069,12 @@ impl ChatView {
                 Ok(Reply::Job(job)) => {
                     this.artifact_notice = Some(
                         format!(
-                            "Started background job {}. Its result will appear above the composer.",
+                            "Started background job {}. It is listed under Tasks in the sidebar.",
                             job.id
                         )
                         .into(),
                     );
-                    this.upsert_job(job);
-                    cx.notify();
+                    this.upsert_job(job, cx);
                 }
                 Ok(_) => this.report_error("Unexpected job reply".into(), cx),
                 Err(error) => {
@@ -1109,7 +1091,7 @@ impl ChatView {
         .detach();
     }
 
-    /// Routes strip clicks back to this view.
+    /// Routes job row clicks in the sidebar back to this view.
     fn job_action_handler(&self, cx: &mut Context<Self>) -> JobActionHandler {
         let chat = cx.weak_entity();
         Rc::new(
@@ -1123,9 +1105,17 @@ impl ChatView {
         self.send_request(Request::SubagentCommand { id, command }, cx);
     }
 
-    /// Archives every finished focus thread the daemon reports. Each one leaves
-    /// the inbox on the re-sync that follows.
+    /// Archives every finished subagent and job the daemon reports. Each one
+    /// leaves the sidebar on the re-sync that follows.
     fn archive_finished(&mut self, cx: &mut Context<Self>) {
+        let archive_jobs: Vec<Request> = jobs_panel::visible(&self.jobs)
+            .into_iter()
+            .filter(|job| job.status.is_terminal())
+            .filter_map(|job| jobs_panel::action_request(JobAction::Archive, job))
+            .collect();
+        for request in archive_jobs {
+            self.job_request(request, cx);
+        }
         let client = self.client.clone();
         let handle = self.tokio_handle.clone();
         cx.spawn(async move |this, cx| {
@@ -1147,9 +1137,10 @@ impl ChatView {
                     return;
                 }
             };
-            for summary in summaries.iter().filter(|summary| {
-                summary.focus && summary.status.is_terminal() && !summary.archived
-            }) {
+            for summary in summaries
+                .iter()
+                .filter(|summary| summary.status.is_terminal() && !summary.archived)
+            {
                 let command = Request::SubagentCommand {
                     id: summary.id.clone(),
                     command: SubagentCommand::SetArchived { archived: true },
@@ -1286,8 +1277,7 @@ impl ChatView {
                 }
             }
             ServerEvent::Subagent { event } => self.handle_subagent_event(event, cx),
-            ServerEvent::Inbox => self.sync_inbox(cx),
-            ServerEvent::Job { job } => self.upsert_job(*job),
+            ServerEvent::Job { job } => self.upsert_job(*job, cx),
             _ => {}
         }
         self.scroll.scroll_to_bottom();
@@ -1632,13 +1622,20 @@ impl ChatView {
     }
 
     /// The main thread shows its title and session controls; a focus thread
-    /// shows a way back, its title and status, and an archive action.
+    /// shows a way back, its title and status, and, once it has finished, an
+    /// archive action.
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let focus = self.focus.as_ref().map(|focus| {
             let focus = focus.read(cx);
-            (focus.title(), status_label(focus.status()))
+            (
+                focus.title(),
+                status_label(focus.status()),
+                focus.status().is_terminal(),
+            )
         });
         let focused = focus.is_some();
+        let archivable = focus.as_ref().is_some_and(|(_, _, finished)| *finished);
+        let needs_you = self.sidebar.read(cx).needs_you_count();
         div()
             .flex()
             .items_center()
@@ -1650,7 +1647,7 @@ impl ChatView {
             .border_b_1()
             .border_color(rgb(theme::BORDER))
             .child(match focus {
-                Some((title, status)) => div()
+                Some((title, status, _)) => div()
                     .flex()
                     .flex_1()
                     .min_w_0()
@@ -1691,7 +1688,7 @@ impl ChatView {
                                 .child(format!("🤖 {} ▾", self.active_model)),
                         )
                     })
-                    .when(focused, |row| {
+                    .when(archivable, |row| {
                         row.child(
                             header_button("focus-archive", false)
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
@@ -1718,7 +1715,11 @@ impl ChatView {
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.toggle_sidebar(cx);
                             }))
-                            .child("Threads"),
+                            .child(if needs_you > 0 {
+                                format!("Tasks · {needs_you} need you")
+                            } else {
+                                "Tasks".to_owned()
+                            }),
                     ),
             )
     }
@@ -1748,15 +1749,13 @@ impl ChatView {
             .child(div().flex_1().min_h_0().child(self.sidebar.clone()))
     }
 
-    /// The shown thread's transcript and composer. The jobs strip belongs to
-    /// the main thread's context, so a focus thread does not show it.
+    /// The shown thread's transcript and composer.
     fn thread_body(
         &self,
         messages: Vec<Message>,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let focused = self.focus.is_some();
         div()
             .flex()
             .flex_col()
@@ -1765,12 +1764,6 @@ impl ChatView {
             .min_w_0()
             .h_full()
             .child(self.message_list(messages, window, cx))
-            .when(!focused, |body| {
-                body.child(jobs_panel::render_strip(
-                    &self.jobs,
-                    &self.job_action_handler(cx),
-                ))
-            })
             .child(self.composer(window, cx))
     }
 
@@ -2047,6 +2040,10 @@ impl ChatView {
             .focus
             .as_ref()
             .and_then(|focus| focus.read(cx).notice());
+        let focus_question = self
+            .focus
+            .as_ref()
+            .and_then(|focus| focus.read(cx).question());
 
         let attach_button = div()
             .id("attach")
@@ -2137,6 +2134,29 @@ impl ChatView {
                 })
                 .when_some(focus_notice, |column, notice| {
                     column.child(div().text_xs().text_color(rgb(0xb0b0b0)).child(notice))
+                })
+                .when_some(focus_question, |column, question| {
+                    column.child(
+                        div()
+                            .id("focus-question")
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .border_l_2()
+                            .border_color(rgb(theme::WARNING))
+                            .bg(rgb(theme::BG_RAISED))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgb(theme::WARNING))
+                                    .child("Needs you · reply below to answer"),
+                            )
+                            .child(div().text_sm().text_color(rgb(theme::TEXT)).child(question)),
+                    )
                 })
                 .when_some(self.artifact_notice.clone(), |column, notice| {
                     column.child(

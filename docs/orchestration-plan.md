@@ -457,8 +457,8 @@ idle main UI without stealing the runtime forwarder's notification. The main thr
 drains the inbox with `agent_inbox`, returning `from`, `name`, `kind`, `digest_of`,
 and `body`, and clearing the inbox. Reading `agent://main` fails with
 `PeerError::WriteOnly`, so model acknowledgment happens only through `agent_inbox`.
-Children cannot author arbitrary user UI; their messages and notices are displayed
-as host-rendered sidebar inbox entries. The
+Children cannot author arbitrary user UI; the user sees their work as rows in the
+sidebar's task list (PR9, below), not as copies of these notices. The
 inbox is persisted under `data_dir/inbox/<main-session-id>.json` once `Runtime::open_main_inbox`
 binds it to the main session (the desktop app and CLI do this after opening the session). Each
 undrained message keeps its `origin`, the top-level session it is addressed to, so each thread
@@ -467,8 +467,6 @@ digest finishes drops them. A file that cannot be read fails the bind instead of
 Main-started turns (the first run and an `agent_send` to a completed child) push a notice on every terminal publication. A
 turn the user types in any subagent pushes none; its result reaches the user through
 the focus view.
-
-The desktop sidebar's Inbox section lists the notices the user has not dismissed. Reading it never drains the model's queue. Its Dismiss button removes only the user's copy, so the model still receives that message through `agent_inbox`. The user's copies and the model's queue persist in the same file, and dismissals survive a restart.
 
 Run ownership: the registry, concurrency limit, and inbox are shared by the process, but
 `Runtime::subagent_manager(&control)` returns a handle that owns only the children it spawns, scoped
@@ -522,12 +520,7 @@ cleanup keeps the workspace recorded and returns `WorkspaceRelease`, so the rele
 be retried. After release, `follow_up` and `transcript` both return `WorkspaceReleased`.
 The focus view treats a missing workspace as no VCS panel and a released thread as
 follow-up disabled. A focus view already open at release time is not updated; its next
-send is refused and shows the error. The sidebar Inbox renders child messages and
-completion notices independently of model delivery. Reading is non-destructive;
-Dismiss removes only the user's copy, while `agent_inbox` drains only the model's
-copy. Both queues persist in the session inbox file, so model wake-ups cannot hide
-notices before the user sees them, and dismissals survive restart. Blocked workers
-also appear as task cards with their blocker prompt and resume controls.
+send is refused and shows the error.
 
 Limitation: a failed cleanup restores the recorded workspace, so follow-ups are accepted
 again until a release succeeds, even if the directory was partly removed.
@@ -536,23 +529,46 @@ PR7 adds live focus threads. The runtime relays every child `AgentEvent` to subs
 as `SubagentEvent::Agent`, so an open focus thread streams the reply as it is generated;
 it supersedes the PR5 limitations above. `SubagentCommand::Send` carries the user's
 message: a queued, running, or verifying child is steered and promoted, and a completed
-child takes a user-origin follow-up. The composer is disabled only for blocked threads
-(answer the request first), failed, cancelled, and released threads.
-`SubagentCommand::SetArchived` hides a focus thread from the inbox. It keeps the workspace
-and transcript, unlike the jobs panel archive, which reclaims forks, and it does not stop a
-running child. The inbox is rebuilt on every sync: archived threads and non-focus workers
-that reached a terminal state leave it. "Archive finished" archives every finished focus
-thread.
+child takes a user-origin follow-up. `SubagentCommand::SetArchived` hides a finished child
+from the task list. It keeps the workspace and transcript, unlike the jobs archive, which
+reclaims forks.
 
 PR8 makes an open focus thread use the main chat surface, as omp does when it focuses a
 subagent: the same message rows, desktop canvases, view cards, and composer, with the
 thread's VCS panel beside them. Only the send target differs: the main thread starts or
 steers a run, a focus thread takes `SubagentCommand::Send`. The header shows ← Main, the
 thread's title and status, and Archive. Controls that belong to main's context (the model
-picker, the jobs strip, Background, and Stop) are hidden. The daemon serves a child's
+picker, Background, and Stop) are hidden. The daemon serves a child's
 transcript only once it settles, so a working thread keeps its committed rows and appends
 the live turn; the settled reload replaces both. User rows show the typed message, not the
 `USER_TURN_PREFACE` the runtime adds for the model.
+
+PR9 turns the sidebar into the user's task list and lets a child ask the user. The
+lifecycle it serves: the user asks main for work, main hands it to a child that owns it
+in the background, the child pulls the user in only when it needs them, and the result
+goes back to main.
+
+* **Task list.** The sidebar lists every subagent main started (nested children belong to
+  their parent's run and are never listed) and every background job, in three sections.
+  *Needs you* holds blocked subagents and jobs waiting on an operator decision. *Running*
+  holds queued and working ones. *Done* holds finished ones until the user archives them;
+  "Archive N done" archives every finished subagent and job. `set_archived` accepts any
+  terminal child and refuses a working one with `NotTerminal`. The header toggle reads
+  "Tasks · N need you" while anything waits on the user. The jobs strip above the
+  composer and the sidebar Inbox of child notices are gone; the main inbox is the
+  model's queue only.
+* **`ask_user`.** A child run with a person behind it (any attended tree; never an
+  unattended job tree) gets the `ask_user` tool, subject to its role's tool scope, so
+  `task` and `builder` children have it and read-only roles do not. The call blocks the
+  child on `BlockerReason::UserInput` with the question as its prompt, gives the turn's
+  desk back while it waits, and returns the user's answer as the tool result. The manager
+  hands each turn a `UserAsk` through `TaskSpec.ask`; it is never serialized or
+  model-supplied.
+* **Answering.** Opening a blocked task shows its question above the composer; sending a
+  message answers it (`send_from_user` unblocks a blocked child) and promotes the child to
+  a focus thread. The sidebar row's answer field does the same through `Unblock`.
+  `unblock` delivers the answer only to the waiter. It no longer also steers it into the
+  transcript, so the child reads it once.
 
 ---
 

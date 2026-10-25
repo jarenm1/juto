@@ -72,7 +72,10 @@ the child instead of silently using another model. `@smol` without a `modelRoles
 inherits the default model. A `<role>.md` file in
 `.juto/agents/` in the working directory or an ancestor, or in the runtime data directory's
 `agents/`, replaces the built-in of the same name, and the nearest file wins. Children receive
-delegation tools only below `max_recursion_depth` (default 2).
+delegation tools only below `max_recursion_depth` (default 2). Children whose role allows it
+(`builder`, `task`) also get `ask_user` outside unattended job trees: the call blocks the child
+on the user's answer, lists it under **Needs you** in the GUI sidebar, and returns the reply
+as the tool result.
 
 Delegation runs through the Exec-tier `task` tool, so it requires `juto-cli --yes`
 (`ApprovalMode::Allow`) or an installed `ApprovalHandler`; in Ask mode with neither, `task` fails.
@@ -630,23 +633,29 @@ composer grows to eight rows, then scrolls vertically. Sent messages wrap natura
 
 Surfaces are neutral grays—backgrounds, borders, hover states, focus borders,
 caret, selection, and disabled states—with one blue accent (`#7aa2f7`) for
-selection, active toggles, and primary actions, amber for blocked threads, and
+selection, active toggles, and primary actions, amber for tasks that need the user, and
 red for failures and destructive actions. `apps/juto/src/theme.rs` holds the
 shell and sidebar palette. Messages have no bubble backgrounds or borders.
 
 The window is a full-height left sidebar beside the chat column. The sidebar
-(`sidebar.rs`, rows in `task_card.rs`) lists **focus threads** only; the main
-chat is not a row. Each row shows the thread title, its status, and a thin bar
-marking its lifecycle stage (queued → running → verifying → reviewing → done).
-The bar is a stage indicator, not a completion percentage: the runtime reports
-no progress measure. Clicking a row selects it and opens focus mode, with the
-sidebar still visible; leaving focus clears the selection. Blocked rows always
-show the blocker prompt with a resume field. A row's chevron reveals its agent,
-duration, workspace, current step, Pause/Steer/Abort, token usage, step log,
-and diffs. Filter tabs (All, Active, Blocked, Done) sit under the heading. The
-chat header keeps the model picker, **Providers**, and the **Threads** sidebar
-toggle at the top right; with the sidebar hidden, the header shows the app
-title. The transcript and composer stay capped at 800 px wide.
+(`sidebar.rs`, rows in `task_card.rs` and `jobs_panel.rs`) is the task list:
+every subagent main started and every background job, grouped into **Needs
+you** (a subagent blocked on the user's answer, or a job waiting on a
+decision), **Running**, and **Done**. The main chat is not a row. Each
+subagent row shows its title, its status, and a thin bar marking its
+lifecycle stage (queued → running → verifying → reviewing → done). The bar is
+a stage indicator, not a completion percentage: the runtime reports no
+progress measure. Clicking a row opens the task in the chat surface, with the
+sidebar still visible; leaving it clears the selection. Blocked rows always
+show the question with an answer field, and an open blocked task shows the
+question above the composer, so a reply answers it. A row's chevron reveals
+its agent, duration, workspace, current step, Pause/Steer/Abort, token usage,
+step log, and diffs. Job rows carry their approve, deny, follow-up, and
+archive actions. **Archive N done** clears finished tasks. The chat header
+keeps the model picker, **Providers**, and the **Tasks** sidebar toggle at the
+top right; the toggle reads "Tasks · N need you" while anything waits on the
+user. With the sidebar hidden, the header shows the app title. The transcript
+and composer stay capped at 800 px wide.
 
 The input component adapts [GPUI 0.2.2's input example](https://docs.rs/crate/gpui/0.2.2/source/examples/input.rs);
 its upstream Apache-2.0 license is retained in
