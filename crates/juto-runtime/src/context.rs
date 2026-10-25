@@ -194,9 +194,29 @@ pub fn discover_skills(cwd: &Path, global_dir: &Path) -> Result<Vec<Skill>> {
     Ok(skills.into_values().collect())
 }
 
-/// Install Juto's bundled repository-setup skill in the runtime data directory.
-/// The complete file is linked into place atomically; existing user content wins.
+/// Skills Juto ships, as `(directory name, SKILL.md bytes)`. Each directory name
+/// must equal the skill's frontmatter `name`, as the Agent Skills spec requires.
+const BUNDLED_SKILLS: &[(&str, &[u8])] = &[
+    (
+        "juto-repo-setup",
+        include_bytes!("../skills/juto-repo-setup/SKILL.md"),
+    ),
+    (
+        "juto-learn",
+        include_bytes!("../skills/juto-learn/SKILL.md"),
+    ),
+];
+
+/// Install Juto's bundled skills in the runtime data directory. Each complete
+/// file is linked into place atomically; existing user content wins.
 pub fn install_bundled_skills(global_dir: &Path) -> Result<()> {
+    for (name, bytes) in BUNDLED_SKILLS {
+        install_bundled_skill(global_dir, name, bytes)?;
+    }
+    Ok(())
+}
+
+fn install_bundled_skill(global_dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     use std::{
         io::Write as _,
         sync::atomic::{AtomicU64, Ordering},
@@ -204,7 +224,7 @@ pub fn install_bundled_skills(global_dir: &Path) -> Result<()> {
 
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-    let directory = global_dir.join("bundled-skills/juto-repo-setup");
+    let directory = global_dir.join("bundled-skills").join(name);
     std::fs::create_dir_all(&directory).map_err(io_err(&directory))?;
     let path = directory.join("SKILL.md");
     let (temporary, mut file) = loop {
@@ -221,9 +241,7 @@ pub fn install_bundled_skills(global_dir: &Path) -> Result<()> {
             Err(error) => return Err(io_err(&temporary)(error)),
         }
     };
-    let write_result = file
-        .write_all(include_bytes!("../skills/juto-repo-setup/SKILL.md"))
-        .and_then(|()| file.sync_all());
+    let write_result = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
     if let Err(error) = write_result {
         let _ = std::fs::remove_file(&temporary);
@@ -299,6 +317,42 @@ mod bundled_skill_tests {
             std::fs::read_to_string(skill.path).unwrap().lines().last(),
             Some("custom")
         );
+    }
+
+    #[test]
+    fn every_bundled_skill_meets_the_agent_skills_spec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global = tmp.path().join("global");
+        install_bundled_skills(&global).unwrap();
+
+        let skills = discover_skills(tmp.path(), &global).unwrap();
+        for (directory, _) in BUNDLED_SKILLS {
+            let skill = skills
+                .iter()
+                .find(|skill| skill.name == *directory)
+                .unwrap_or_else(|| panic!("bundled skill {directory} was not discovered"));
+            assert_eq!(
+                skill.path.parent().unwrap().file_name().unwrap(),
+                *directory,
+                "frontmatter name must match the directory name"
+            );
+            let name = skill.name.as_str();
+            assert!(
+                (1..=64).contains(&name.len())
+                    && name.bytes().all(|byte| byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'-')
+                    && !name.starts_with('-')
+                    && !name.ends_with('-')
+                    && !name.contains("--"),
+                "invalid skill name {name:?}"
+            );
+            let description_chars = skill.description.chars().count();
+            assert!(
+                (1..=1024).contains(&description_chars),
+                "description of {directory} must be 1-1024 characters, got {description_chars}"
+            );
+        }
     }
 }
 
