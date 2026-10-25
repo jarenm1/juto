@@ -496,6 +496,49 @@ fn restart_marks_only_unpaired_runs_as_interrupted() {
     assert_eq!(interrupted[0]["run_id"], "run-a");
 }
 
+async fn open_latest(daemon: &Arc<Daemon>) -> SessionView {
+    match daemon
+        .request(Request::OpenLatestSession)
+        .await
+        .expect("open latest session")
+    {
+        Reply::Session(view) => view,
+        _ => panic!("expected a session reply"),
+    }
+}
+
+#[tokio::test]
+async fn a_window_reopens_the_last_active_conversation_across_restarts() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon(root.path(), ScriptedProvider::new(false));
+
+    // A workspace with no sessions gets a new one.
+    let worked_in = open_latest(&daemon).await;
+    let newer = create_session(&daemon).await;
+    assert_ne!(worked_in.info.id, newer.info.id);
+
+    // Working in the older session makes it the latest.
+    let mut rx = attach(&daemon);
+    start_run(&daemon, &worked_in.info.id, "remember the release date").await;
+    next_session_event(&mut rx, |e| matches!(e, SessionEvent::RunFinished { .. })).await;
+    assert_eq!(open_latest(&daemon).await.info.id, worked_in.info.id);
+
+    // A fresh daemon (a restart or a new build) loads journals from disk and
+    // reopens the same conversation with its history.
+    drop(daemon);
+    let restarted = self::daemon(root.path(), ScriptedProvider::new(false));
+    let workspace = root.path().join("workspace").canonicalize().unwrap();
+    for entry in std::fs::read_dir(root.path().join("data/sessions")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|ext| ext == "jsonl") {
+            load_session(&restarted, &path, &workspace).unwrap();
+        }
+    }
+    let reopened = open_latest(&restarted).await;
+    assert_eq!(reopened.info.id, worked_in.info.id);
+    assert_eq!(reopened.committed, 2);
+}
+
 #[tokio::test]
 async fn child_completion_starts_a_run_while_no_client_is_prompting() {
     let root = tempfile::tempdir().unwrap();

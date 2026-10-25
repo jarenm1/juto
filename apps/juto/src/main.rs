@@ -36,12 +36,14 @@ actions!(juto, [Quit]);
 
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4-5";
 
-const USAGE: &str = "Usage: juto [--version] [--help] [--session <path>] [--model <model>]
+const USAGE: &str = "Usage: juto [--version] [--help] [--session <path> | --new] [--model <model>]
             juto --desktop <command> [args...]
-Opens the Juto chat window, connected to this workspace's daemon.
+Opens the Juto chat window, connected to this workspace's daemon. Without
+--session or --new, the window continues the workspace's most recent session.
 
 Options:
   --session <path>  Open an existing session journal
+  --new             Start a new session
   --model <model>   Select a model (e.g. anthropic/claude-sonnet-4-5)
   --desktop <cmd>   Create a headless desktop, launch <cmd> into it, and open
                     the embedded viewer (developer mode)
@@ -60,11 +62,19 @@ struct Startup {
     default_model: String,
 }
 
+/// Which session the window opens.
+enum SessionChoice {
+    /// The workspace's most recently active session (a new one if it has none).
+    Latest,
+    New,
+    Path(PathBuf),
+}
+
 /// Connects to the workspace daemon and opens (or creates) the session the
 /// window shows. Failures are returned so the window can report them.
 async fn start_workspace(
     cwd: &Path,
-    session_path: Option<PathBuf>,
+    choice: SessionChoice,
     model: Option<String>,
 ) -> anyhow::Result<Startup> {
     let client = Client::connect(cwd)
@@ -87,9 +97,10 @@ async fn start_workspace(
         default_model
     };
 
-    let request = match session_path {
-        Some(path) => Request::OpenSessionPath { path },
-        None => Request::CreateSession,
+    let request = match choice {
+        SessionChoice::Latest => Request::OpenLatestSession,
+        SessionChoice::New => Request::CreateSession,
+        SessionChoice::Path(path) => Request::OpenSessionPath { path },
     };
     let Reply::Session(mut session) = client
         .request(request)
@@ -132,7 +143,7 @@ fn window_options(cx: &mut App) -> WindowOptions {
 }
 
 fn run() -> ExitCode {
-    let mut session_path = None;
+    let mut session_choice = SessionChoice::Latest;
     let mut model_arg = None;
     let mut desktop_argv: Option<Vec<String>> = None;
     let mut args = env::args().skip(1);
@@ -147,12 +158,13 @@ fn run() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "--session" => match args.next() {
-                Some(path) => session_path = Some(PathBuf::from(path)),
+                Some(path) => session_choice = SessionChoice::Path(PathBuf::from(path)),
                 None => {
                     eprintln!("error: `--session` requires a path argument\n\n{USAGE}");
                     return ExitCode::from(2);
                 }
             },
+            "--new" => session_choice = SessionChoice::New,
             "--model" => match args.next() {
                 Some(model) => model_arg = Some(model),
                 None => {
@@ -195,7 +207,7 @@ fn run() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let startup = tokio_runtime.block_on(start_workspace(&cwd, session_path, model_arg));
+    let startup = tokio_runtime.block_on(start_workspace(&cwd, session_choice, model_arg));
 
     Application::new().run(move |cx: &mut App| {
         chat::init(cx);
