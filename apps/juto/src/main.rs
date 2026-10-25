@@ -12,6 +12,7 @@ mod jobs_panel;
 mod markdown;
 mod markdown_element;
 mod model_picker;
+mod side_pane;
 mod sidebar;
 mod subagent_card;
 mod task_card;

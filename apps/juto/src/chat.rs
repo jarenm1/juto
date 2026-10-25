@@ -15,6 +15,7 @@ use crate::jobs_panel::{self, JobAction, JobActionHandler};
 use crate::markdown;
 use crate::markdown_element;
 use crate::model_picker::{ModelPicker, ModelPickerEvent};
+use crate::side_pane::SidePane;
 use crate::sidebar::{Sidebar, SidebarEvent};
 use crate::subagent_card;
 use crate::task_card::status_label;
@@ -22,10 +23,9 @@ use crate::theme;
 use crate::vcs_sidebar::VcsSidebar;
 use crate::view_element::{ViewActions, render_view};
 use gpui::{
-    AnyElement, App, ClickEvent, Context, Div, DragMoveEvent, EmptyView, Entity, Focusable,
-    IntoElement, KeyBinding, MouseButton, MouseDownEvent, PathPromptOptions, Render, ScrollHandle,
-    SharedString, Stateful, Subscription, Task, WeakEntity, Window, actions, deferred, div,
-    prelude::*, px, relative, rgb, rgba,
+    AnyElement, App, ClickEvent, Context, Div, Entity, Focusable, IntoElement, KeyBinding,
+    MouseButton, MouseDownEvent, PathPromptOptions, Render, ScrollHandle, SharedString, Stateful,
+    Subscription, Task, WeakEntity, Window, actions, deferred, div, prelude::*, px, rgb, rgba,
 };
 use juto_agent::{AgentEvent, ToolTier, ViewNode, view_from_details};
 use juto_ai::{ContentBlock, Message as AiMessage, ProviderEvent, StopReason, ToolCall};
@@ -64,21 +64,16 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
-/// Share of the chat area the split desktop pane takes when it opens.
-const SPLIT_DEFAULT_FRACTION: f32 = 0.5;
-/// Dragging the divider keeps both the chat and the desktop at least this share.
-const SPLIT_MIN_FRACTION: f32 = 0.2;
+/// Which thread view a [`ThreadSurface`] belongs to: `None` for the main
+/// thread, the thread id for a focus thread.
+type SurfaceKey = Option<String>;
 
-/// Drag payload of the divider between the chat and the split desktop pane.
-struct SplitDivider;
-
-/// The split pane's share of a row `row_width` wide whose divider is dragged to
-/// `pointer_x` from the row's left edge, kept within the drag limits.
-fn split_fraction_at(pointer_x: f32, row_width: f32) -> f32 {
-    if row_width <= 0.0 {
-        return SPLIT_DEFAULT_FRACTION;
-    }
-    (1.0 - pointer_x / row_width).clamp(SPLIT_MIN_FRACTION, 1.0 - SPLIT_MIN_FRACTION)
+/// What one thread view owns beside its transcript: the desktop canvases
+/// mounted for it and its side pane. Views never share either, so a desktop
+/// split beside a focus thread does not appear beside the main thread.
+struct ThreadSurface {
+    canvases: HashMap<String, DesktopCanvas>,
+    side_pane: Entity<SidePane>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -561,12 +556,9 @@ pub struct ChatView {
     is_running: bool,
     connected: bool,
     artifact_notice: Option<SharedString>,
-    desktop_canvases: HashMap<String, DesktopCanvas>,
+    /// Per-thread-view canvases and side panes, created when a view first shows.
+    surfaces: HashMap<SurfaceKey, ThreadSurface>,
     expanded_desktop: Option<Entity<DesktopViewer>>,
-    /// The desktop shown in the pane right of the chat, if any.
-    split_desktop: Option<Entity<DesktopViewer>>,
-    /// Share of the chat area the split pane takes.
-    split_fraction: f32,
     pending_approvals: HashMap<u64, PendingApproval>,
     _subscriptions: Vec<Subscription>,
     _daemon_events: Task<()>,
@@ -737,10 +729,8 @@ impl ChatView {
             menu_just_dismissed: false,
             attachment_error: None,
             artifact_notice: None,
-            desktop_canvases: HashMap::new(),
+            surfaces: HashMap::new(),
             expanded_desktop: None,
-            split_desktop: None,
-            split_fraction: SPLIT_DEFAULT_FRACTION,
             picker: None,
             scroll: ScrollHandle::new(),
             client,
@@ -827,19 +817,30 @@ impl ChatView {
     }
 
     /// Mounts a viewer for each desktop artifact in the shown transcript that
-    /// has no live or in-flight canvas yet. Resolution happens in the daemon.
+    /// has no live or in-flight canvas in the shown view yet. Resolution happens
+    /// in the daemon.
     fn mount_desktop_canvases(
         &mut self,
         messages: &[Message],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let key = self.surface_key(cx);
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        let stored_key = key.clone();
+        let canvases = &mut self.surface(key, cx).canvases;
         mount_canvases(
             cx.entity().downgrade(),
-            |view| &mut view.desktop_canvases,
-            &mut self.desktop_canvases,
-            &self.client,
-            &self.tokio_handle,
+            move |this: &mut Self, id, canvas| {
+                // A surface is never removed, so the view that asked still exists.
+                if let Some(surface) = this.surfaces.get_mut(&stored_key) {
+                    surface.canvases.insert(id, canvas);
+                }
+            },
+            canvases,
+            &client,
+            &handle,
             messages,
             window,
             cx,
@@ -879,7 +880,8 @@ impl ChatView {
                                 cx,
                             )
                         });
-                        this.desktop_canvases
+                        this.surface(None, cx)
+                            .canvases
                             .insert(artifact.artifact_id.clone(), DesktopCanvas::Live(viewer));
                         this.messages.push(Message {
                             role: MessageRole::Assistant,
@@ -907,8 +909,13 @@ impl ChatView {
         if self.active_modal == ActiveModal::AuthModal {
             self.auth_modal.update(cx, |modal, cx| modal.dismiss(cx));
         }
-        if self.split_desktop.as_ref() == Some(&viewer) {
-            self.split_desktop = None;
+        // A viewer leaves its side pane before it moves into the overlay.
+        for surface in self.surfaces.values() {
+            surface.side_pane.update(cx, |pane, cx| {
+                if pane.holds(viewer.entity_id()) {
+                    pane.close(cx);
+                }
+            });
         }
         if let Some(previous) = self.expanded_desktop.take() {
             previous.update(cx, |viewer, cx| viewer.set_placement(Placement::Inline, cx));
@@ -921,8 +928,8 @@ impl ChatView {
         cx.notify();
     }
 
-    /// Shows `viewer` in a full-height pane right of the chat. A desktop
-    /// already there returns to its card; an expanded one leaves the overlay.
+    /// Opens `viewer` in the shown thread's side pane. An expanded viewer
+    /// leaves the overlay first.
     fn split_desktop_right(
         &mut self,
         viewer: Entity<DesktopViewer>,
@@ -932,22 +939,42 @@ impl ChatView {
         if self.expanded_desktop.as_ref() == Some(&viewer) {
             self.close_modal(window, cx);
         }
-        if let Some(previous) = self.split_desktop.take()
-            && previous != viewer
-        {
-            previous.update(cx, |viewer, cx| viewer.set_placement(Placement::Inline, cx));
-        }
-        viewer.update(cx, |viewer, cx| viewer.set_placement(Placement::Split, cx));
-        self.split_desktop = Some(viewer);
-        cx.notify();
+        let key = self.surface_key(cx);
+        let pane = self.surface(key, cx).side_pane.clone();
+        pane.update(cx, |pane, cx| pane.open(viewer, cx));
     }
 
-    /// Returns the split desktop to its card and gives the chat the full width.
-    fn close_split(&mut self, cx: &mut Context<Self>) {
-        if let Some(viewer) = self.split_desktop.take() {
-            viewer.update(cx, |viewer, cx| viewer.set_placement(Placement::Inline, cx));
+    /// The key of the thread view the chat surface shows.
+    fn surface_key(&self, cx: &App) -> SurfaceKey {
+        self.focus
+            .as_ref()
+            .map(|focus| focus.read(cx).thread_id().to_string())
+    }
+
+    /// The surface for `key`, created on first use. The chat re-renders when
+    /// its side pane opens, closes, or resizes.
+    fn surface(&mut self, key: SurfaceKey, cx: &mut Context<Self>) -> &mut ThreadSurface {
+        self.surfaces.entry(key).or_insert_with(|| {
+            let side_pane = cx.new(|_| SidePane::new());
+            cx.observe(&side_pane, |_, _, cx| cx.notify()).detach();
+            ThreadSurface {
+                canvases: HashMap::new(),
+                side_pane,
+            }
+        })
+    }
+
+    /// The live viewer for `artifact_id` in the shown thread view.
+    fn shown_viewer(&self, artifact_id: &str, cx: &App) -> Option<Entity<DesktopViewer>> {
+        match self
+            .surfaces
+            .get(&self.surface_key(cx))?
+            .canvases
+            .get(artifact_id)?
+        {
+            DesktopCanvas::Live(viewer) => Some(viewer.clone()),
+            _ => None,
         }
-        cx.notify();
     }
 
     pub fn close_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1883,6 +1910,11 @@ impl ChatView {
             None => (self.scroll.clone(), None),
         };
         let mut seen_desktops = HashSet::new();
+        let no_canvases = HashMap::new();
+        let canvases = self
+            .surfaces
+            .get(&self.surface_key(cx))
+            .map_or(&no_canvases, |surface| &surface.canvases);
         div()
             .id("messages")
             .flex_1()
@@ -1986,27 +2018,23 @@ impl ChatView {
                                         let expand_id = artifact.artifact_id.clone();
                                         let split_id = artifact.artifact_id.clone();
                                         let body = canvas_body(
-                                            &self.desktop_canvases,
+                                            canvases,
                                             &artifact,
                                             &mut seen_desktops,
                                             cx.listener(
                                                 move |this, _: &ClickEvent, _window, cx| {
-                                                    if let Some(DesktopCanvas::Live(viewer)) =
-                                                        this.desktop_canvases.get(&expand_id)
+                                                    if let Some(viewer) =
+                                                        this.shown_viewer(&expand_id, cx)
                                                     {
-                                                        this.expand_desktop(viewer.clone(), cx);
+                                                        this.expand_desktop(viewer, cx);
                                                     }
                                                 },
                                             ),
                                             cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                                if let Some(DesktopCanvas::Live(viewer)) =
-                                                    this.desktop_canvases.get(&split_id)
+                                                if let Some(viewer) =
+                                                    this.shown_viewer(&split_id, cx)
                                                 {
-                                                    this.split_desktop_right(
-                                                        viewer.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
+                                                    this.split_desktop_right(viewer, window, cx);
                                                 }
                                             }),
                                             cx,
@@ -2457,39 +2485,6 @@ impl ChatView {
         )
     }
 
-    /// The full-height pane right of the chat holding the split desktop.
-    fn split_pane(
-        &self,
-        viewer: Entity<DesktopViewer>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .id("desktop-split-pane")
-            .flex_none()
-            .w(relative(self.split_fraction))
-            .h_full()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_3()
-            .bg(rgb(0x202124))
-            .child(
-                div().flex().justify_end().child(
-                    div()
-                        .id("desktop-close-split")
-                        .px_3()
-                        .py_1()
-                        .cursor_pointer()
-                        .child("Close split")
-                        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                            this.close_split(cx);
-                        })),
-                ),
-            )
-            .child(div().flex_1().min_h_0().child(viewer))
-    }
-
     /// The active modal's content, if any. Rendered by `modal_overlay` as a
     /// deferred layer so the chat view stays visible behind it.
     fn modal_content(&self) -> Option<gpui::AnyView> {
@@ -2628,13 +2623,13 @@ fn distinct_desktop_artifacts(
 }
 
 /// Mounts an inline canvas for each artifact that has no canvas yet. Resolution
-/// runs in the daemon and lands through `canvases_of` when it finishes. An
+/// runs in the daemon and lands through `store` when it finishes. An
 /// artifact is marked `Resolving` first so it is requested once, and a settled
 /// outcome (live or unavailable) is kept rather than re-requested.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mount_canvases<T: 'static>(
     view: WeakEntity<T>,
-    canvases_of: fn(&mut T) -> &mut HashMap<String, DesktopCanvas>,
+    store: impl Fn(&mut T, String, DesktopCanvas) + Clone + 'static,
     canvases: &mut HashMap<String, DesktopCanvas>,
     client: &Client,
     handle: &tokio::runtime::Handle,
@@ -2655,6 +2650,7 @@ pub(crate) fn mount_canvases<T: 'static>(
         let viewer_client = client.clone();
         let handle = handle.clone();
         let view = view.clone();
+        let store = store.clone();
         cx.spawn_in(window, async move |_, cx| {
             let result = crate::chat_request::call(call_client, handle, request).await;
             let _ = view.update_in(cx, |this, window, cx| {
@@ -2690,7 +2686,7 @@ pub(crate) fn mount_canvases<T: 'static>(
                         format!("Desktop '{}' cannot be opened: {error}", artifact.title).into(),
                     ),
                 };
-                canvases_of(this).insert(artifact.artifact_id.clone(), canvas);
+                store(this, artifact.artifact_id.clone(), canvas);
                 cx.notify();
             });
         })
@@ -2744,7 +2740,7 @@ pub(crate) fn canvas_body(
                 .child("Desktop is open in the expanded viewer.")
                 .into_any_element()
         }
-        Some(DesktopCanvas::Live(viewer)) if viewer.read(cx).placement() == Placement::Split => {
+        Some(DesktopCanvas::Live(viewer)) if viewer.read(cx).placement() == Placement::Docked => {
             div()
                 .text_sm()
                 .child("Desktop is open in the split pane.")
@@ -2886,19 +2882,6 @@ fn vcs_panel(vcs: Entity<VcsSidebar>) -> impl IntoElement {
         .child(vcs)
 }
 
-/// The bar between the chat and the split desktop; dragging it resizes both.
-fn split_divider() -> impl IntoElement {
-    div()
-        .id("desktop-split-divider")
-        .flex_none()
-        .w(px(6.))
-        .h_full()
-        .bg(rgb(theme::BORDER))
-        .hover(|style| style.bg(rgb(theme::ACCENT)))
-        .cursor_col_resize()
-        .on_drag(SplitDivider, |_, _, _, cx| cx.new(|_| EmptyView))
-}
-
 impl Render for ChatView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let messages = match &self.focus {
@@ -2906,6 +2889,12 @@ impl Render for ChatView {
             None => self.messages.clone(),
         };
         self.mount_desktop_canvases(&messages, window, cx);
+        // Only the shown thread's side pane renders; other views keep theirs.
+        let side_pane = self
+            .surfaces
+            .get(&self.surface_key(cx))
+            .map(|surface| surface.side_pane.clone())
+            .filter(|pane| pane.read(cx).is_open());
         let vcs = self
             .focus
             .as_ref()
@@ -2951,22 +2940,9 @@ impl Render for ChatView {
                             .flex_1()
                             .min_h_0()
                             .w_full()
-                            .on_drag_move(cx.listener(
-                                |this, event: &DragMoveEvent<SplitDivider>, _window, cx| {
-                                    let row = event.bounds;
-                                    this.split_fraction = split_fraction_at(
-                                        f32::from(event.event.position.x - row.origin.x),
-                                        f32::from(row.size.width),
-                                    );
-                                    cx.notify();
-                                },
-                            ))
                             .child(self.thread_body(messages, window, cx))
                             .when_some(vcs, |row, vcs| row.child(vcs_panel(vcs)))
-                            .when_some(self.split_desktop.clone(), |row, viewer| {
-                                row.child(split_divider())
-                                    .child(self.split_pane(viewer, cx))
-                            }),
+                            .when_some(side_pane, |row, pane| row.child(pane)),
                     ),
             )
             .when_some(self.modal_content(), |view, content| {

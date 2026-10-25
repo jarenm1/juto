@@ -299,6 +299,10 @@ impl FocusThread {
         self.title.clone()
     }
 
+    pub fn thread_id(&self) -> &str {
+        self.state.thread_id()
+    }
+
     pub fn status(&self) -> &SubagentStatus {
         self.state.status()
     }

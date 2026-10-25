@@ -25,6 +25,7 @@ use juto_desktop::supervisor::OutputConfig;
 use juto_desktop::{DesktopError, ViewerClient, viewer::EventStream};
 
 use crate::desktop_stream;
+use crate::side_pane::SidePaneItem;
 
 /// Control lease renewal interval (spec section 8: heartbeat 2s, expiry 6s).
 const LEASE_HEARTBEAT: Duration = Duration::from_secs(2);
@@ -33,7 +34,7 @@ const LEASE_HEARTBEAT: Duration = Duration::from_secs(2);
 const AWAKE_DEADLINE_SECS: u64 = 6;
 /// How often the viewer drains cursor events from the listener thread.
 const CURSOR_POLL: Duration = Duration::from_millis(33);
-/// How long the split pane's size must hold before the desktop is resized to
+/// How long the side pane's size must hold before the desktop is resized to
 /// it, so dragging the divider or the window does not reconfigure every frame.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
 /// Height of the canvas row while the viewer sits inline in a chat card.
@@ -136,9 +137,20 @@ pub enum Placement {
     Inline,
     /// In the window-sized overlay.
     Expanded,
-    /// In the pane right of the chat. The desktop's resolution follows the
-    /// pane while the viewer is live and may control the desktop.
-    Split,
+    /// In its thread's side pane. The desktop's resolution follows the pane
+    /// while the viewer is live and may control the desktop.
+    Docked,
+}
+
+impl SidePaneItem for DesktopViewer {
+    fn set_docked(&mut self, docked: bool, cx: &mut Context<Self>) {
+        let placement = if docked {
+            Placement::Docked
+        } else {
+            Placement::Inline
+        };
+        self.set_placement(placement, cx);
+    }
 }
 
 /// Client cursor bitmap drawn over the canvas at the local pointer.
@@ -181,7 +193,7 @@ pub struct DesktopViewer {
     /// Newest geometry generation this viewer's connection acknowledged. After
     /// a resize the desktop gates input until every viewer acknowledges.
     acknowledged_generation: Option<u64>,
-    /// Debounced resize to the split pane's size.
+    /// Debounced resize to the side pane's size.
     resize_task: Option<Task<()>>,
     frame_task: Option<Task<()>>,
     heartbeat_task: Option<Task<()>>,
@@ -317,7 +329,7 @@ impl DesktopViewer {
     }
 
     /// Moves the viewer; the frame feed, pause state and lease are kept. The
-    /// split pane resizes the desktop to fit it; leaving it keeps the size.
+    /// side pane resizes the desktop to fit it; leaving it keeps the size.
     pub fn set_placement(&mut self, placement: Placement, cx: &mut Context<Self>) {
         self.placement = placement;
         self.schedule_resize(cx);
@@ -325,9 +337,9 @@ impl DesktopViewer {
     }
 
     /// Whether the desktop's resolution should follow the canvas now: in the
-    /// split pane, live, attached, and allowed to control the desktop.
+    /// side pane, live, attached, and allowed to control the desktop.
     fn follows_canvas(&self) -> bool {
-        self.placement == Placement::Split
+        self.placement == Placement::Docked
             && !self.paused
             && self.can_control
             && self.client.is_some()
