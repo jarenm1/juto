@@ -105,11 +105,9 @@ them in with `subagent_join` or discards them with `subagent_drop`. Nothing is j
 On the top-level thread, `task` does not block. It returns `queued` ids immediately, and each
 child's terminal result (completed, failed, or cancelled) reaches the running main turn as a
 steered user message headed `[subagent <id> <kind>]`. Each report is addressed to the session
-whose run spawned the child tree, so a main session's internal thread receives only its own
-children's reports; a report that lands while that thread has no active run is delivered at the
-start of its next run. Waking an idle session when a child finishes is the host's job: the
-workspace daemon starts a run on the main session that owns the spawning thread, with the
-reports as its prompt, and routes it like any request. Lifecycle events (`spawned`,
+whose run spawned the child tree; a report that lands while that session has no active run is
+delivered at the start of its next run. Waking an idle session when a child finishes is the host's
+job: the workspace daemon starts a run on the main session, with the reports as its prompt. Lifecycle events (`spawned`,
 `status_changed`, `finished`) are available from `SubagentManager::subscribe_events`. Child agents
 that call `task` still wait for their own children.
 
@@ -117,42 +115,33 @@ Each run owns the children it starts. The subagent registry, concurrency limit, 
 shared process-wide, but cancelling a run, or ending it, cancels only the children that run still
 has open; children started by other runs are unaffected.
 
-**Internal main threads.** The GUI and `juto-cli run` talk to a *main session* that holds no
-conversation of its own. `Runtime::send` routes each request to one of the session's internal
-threads, each an append-only session journal under `<main-session>/threads/`, so a request runs
-with only its topic's history and each thread's prompt prefix stays stable for provider caching.
-Routing works like this:
+**Main: one conversation with a memory tree.** The GUI and `juto-cli run` talk to a *main
+session*: one conversation that never ends, run in its journal. Its design follows
+[UniiChat](https://github.com/VictorTaelin/uniichat)'s `Memory.ts`; subagents keep OMP-style
+orchestration and are where work goes that deserves its own context.
 
-- The first request starts a thread without consulting a judge.
-- Later requests go to the judge (`Runtime::judge`): it chooses one of the *active* threads by
-  label, a new thread, or, when dormant threads exist, a history lookup. Without a `judge` role
-  or TypeSafe/OpenRouter credentials, the judge is a `TextJudge` on the `@tiny` model chain
-  (`tiny → smol → default`). A choice below 0.5 confidence is also checked against history.
-- A lookup asks `@tiny` for keywords and scores every thread's label and messages against them
-  (a label hit counts fully, a message hit half). A thread matching at least half the keywords
-  is resumed; otherwise a new thread starts.
-- After a completed turn, `@tiny` relabels the thread from its latest exchange. Past
-  `maxActiveThreads` (default 6), the least recently routed thread goes dormant; the judge never
-  sees dormant threads, which keeps its option list bounded.
-- If the judge is unavailable or fails, the request continues the most recent active thread and
-  the route carries a `note` saying why. Cancelling during routing records nothing.
+- **Tree.** Leaf `(0, i)` is message `i` (`role: text`); node `(l, i)` merges `(l-1, 2i)` and
+  `(l-1, 2i+1)`, covering messages `i·2^l .. (i+1)·2^l`. A node whose source fits in 512 bytes is
+  its source; any other is one line written by the compactor (`compactor`, else `@tiny`) and
+  appended to `<main>/memory/nodes.jsonl`. Nodes build in the background as messages arrive,
+  oldest first, four at a time. A compactor that fails or overruns falls back to a clipped line, so
+  no turn waits forever.
+- **View.** Each request sees `<chat>`, one `id+n|text` line per node covering the whole
+  conversation, then the current turn in full. New messages append leaves. Past
+  `min(memoryViewBytes, half the context budget)` (`memoryViewBytes` defaults to 128000), the most
+  due sibling pairs (oldest and lowest first) merge into their built parent down to half, so
+  detail fades with age and old lines change once per batch, keeping the prompt prefix cacheable.
+  A request waits until every line is built. The view is kept in `<main>/memory/view.json`, so a
+  restart shows the same lines.
+- **Zoom.** `zoom {"id", "n"}` opens line `id+n` into its two halves, down to the original message
+  (`n` = 1, paged with `at`). `recall` lists and reads originals by the same ids.
+- **Mid-turn.** A turn that outgrows the context budget goes on from the view: its messages join
+  the tree and the request restarts from `<chat>` plus a note.
 
-A thread runs with only its own history, but it can still see the rest of the conversation. A
-new thread starts with a developer message snapshotting the conversation so far (every thread's
-messages, newest first within about 12 KB), written once so its prompt prefix stays stable. In a
-thread, `recall` and children's snapshots read the merged conversation of every thread, not just
-the thread's own journal. The seeded snapshot is context, not conversation: the timeline and
-`recall` leave it out.
-
-The main journal records `thread_created`, `thread_routed`, `thread_labeled`, and
-`thread_status` entries; reopening it restores threads, labels, and dormancy. A session from
-before threads (messages in its own journal) is copied into a thread on its next request, and
-its history shows those messages once. `Runtime::send` streams `MainEvent`s: the routing
-decision (`thread_routed`), then the thread's agent events, then any `thread_updated` or
-`thread_label_failed` events. The GUI marks each exchange with its thread and lists threads in
-the sidebar as current, active, or dormant. `juto-cli history <session>` prints the merged
-history, and `juto-cli threads <session>` lists threads. `juto-cli compact` takes a thread's
-journal path. Threads do not yet see one another's labels.
+Main sessions do not use session compaction. Sessions written while main routed requests into
+topic threads keep those journals under `<main>/threads/`; their messages are read back, merged in
+time order, as the start of the conversation, and new messages go to the main journal.
+`juto-cli history <session>` prints the conversation.
 
 The GUI opens the workspace's most recently active main session (`OpenLatestSession`; the session
 whose journal was written last), so the conversation continues across window launches and daemon

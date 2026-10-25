@@ -9,8 +9,8 @@ use fs2::FileExt;
 use juto_agent::{AgentEvent, RunControl};
 use juto_runtime::jobs::{JobError, JobStatus};
 use juto_runtime::{
-    ApprovalRequest, ChannelApprovalHandler, Decision, EntryKind, MainEvent, MainSession, Runtime,
-    RuntimeConfig, Session, SubagentEvent, TimelineItem, UnattendedOutcome,
+    ApprovalRequest, ChannelApprovalHandler, Decision, EntryKind, MainSession, Runtime,
+    RuntimeConfig, Session, SubagentEvent, UnattendedOutcome,
 };
 use std::{
     collections::HashMap,
@@ -143,33 +143,24 @@ fn session_event(state: &mut State, session_id: &str, event: SessionEvent) {
         },
     );
 }
-/// Committed messages on a main session's timeline. Stream indexes count these.
+/// Committed messages in a main session's conversation. Stream indexes count these.
 fn message_count(main: &MainSession) -> Result<u64> {
-    Ok(message_total(&main.timeline()?))
+    Ok(main.timeline()?.len() as u64)
 }
 
 /// The main session a report addressed to `origin` wakes: `origin` itself when it
-/// is a main session, else the main session one of whose internal threads it is.
-/// The run is routed like any prompt, so it may land in another thread; the
-/// reports travel in its prompt either way.
+/// is a main session, else the main session one of whose legacy topic threads it
+/// is (a child spawned there before main became one conversation).
 fn owning_session(sessions: &HashMap<String, PathBuf>, origin: &str) -> Option<String> {
     if sessions.contains_key(origin) {
         return Some(origin.to_owned());
     }
     sessions.iter().find_map(|(id, path)| {
         let main = MainSession::open(path).ok()?;
-        main.threads()
-            .iter()
-            .any(|thread| thread.id == origin)
+        main.legacy_threads()
+            .any(|(thread, _)| thread == origin)
             .then(|| id.clone())
     })
-}
-
-fn message_total(timeline: &[TimelineItem]) -> u64 {
-    timeline
-        .iter()
-        .filter(|item| matches!(item, TimelineItem::Message { .. }))
-        .count() as u64
 }
 fn marker(session: &mut Session, kind: &str, run_id: &str) -> Result<()> {
     session.append(EntryKind::Custom {
@@ -180,8 +171,9 @@ fn marker(session: &mut Session, kind: &str, run_id: &str) -> Result<()> {
 }
 
 /// Repairs interrupted runs before accepting clients, including unpaired tool calls.
-/// A run's messages live in a thread journal, and the journal does not record which
-/// thread ran, so every thread in `threads` is repaired alongside the main journal.
+/// A run from before main became one conversation wrote its messages to a legacy
+/// thread journal, and the journal does not record which, so every journal in
+/// `threads` is repaired alongside the main journal.
 fn recover(session: &mut Session, threads: &[PathBuf]) -> Result<()> {
     let mut pending = HashMap::new();
     for entry in session.active_entries()? {
@@ -357,7 +349,7 @@ impl Daemon {
         let timeline = main.timeline().map_err(failed)?;
         Ok(Reply::Session(SessionView {
             info: self.info(&session, &state),
-            committed: message_total(&timeline),
+            committed: timeline.len() as u64,
             timeline,
             pending_approvals: state
                 .approvals
@@ -514,41 +506,24 @@ impl Daemon {
                 while let Some(event) = rx.recv().await {
                     let mut state = pump_daemon.state.lock().unwrap();
                     match event {
-                        MainEvent::Thread(event) => publish(
-                            &mut state,
-                            ServerEvent::Thread {
-                                session_id: pump_session.clone(),
-                                event,
-                            },
-                        ),
-                        MainEvent::Agent(AgentEvent::MessageEnd { message }) => {
+                        AgentEvent::MessageEnd { message } => {
                             let event = SessionEvent::MessageCommitted { index, message };
                             index += 1;
                             session_event(&mut state, &pump_session, event);
                         }
-                        MainEvent::Agent(event) => {
+                        event => {
                             session_event(&mut state, &pump_session, SessionEvent::Agent { event });
                         }
                     }
                 }
             });
             let outcome = if unattended {
-                // Unattended runs stand alone and never route into a thread. Their
-                // events still reach the pump through a relay.
-                let (agent_tx, mut agent_rx) = mpsc::unbounded_channel::<AgentEvent>();
-                let relay = tokio::spawn(async move {
-                    while let Some(event) = agent_rx.recv().await {
-                        if tx.send(MainEvent::Agent(event)).is_err() {
-                            break;
-                        }
-                    }
-                });
-                let outcome = daemon
+                daemon
                     .runtime
                     .run_unattended(
                         &mut session,
                         text,
-                        agent_tx,
+                        tx,
                         control,
                         None,
                         juto_runtime::JobLimits::default(),
@@ -558,13 +533,11 @@ impl Daemon {
                     .map(|outcome| match outcome {
                         UnattendedOutcome::Finished(run) => (Some(run.stop_reason), None),
                         UnattendedOutcome::Blocked(decision) => (None, Some(decision)),
-                    });
-                let _ = relay.await;
-                outcome
+                    })
             } else {
                 daemon
                     .runtime
-                    .send(&mut main, None, text, tx, control)
+                    .send(&mut main, text, tx, control)
                     .await
                     .map(|run| (Some(run.stop_reason), None))
             };
@@ -1104,9 +1077,8 @@ fn load_session(daemon: &Daemon, path: &Path, workspace: &Path) -> Result<()> {
     let mut session = Session::open(path).with_context(|| format!("opening {}", path.display()))?;
     if session.header().cwd == workspace {
         let threads: Vec<PathBuf> = MainSession::open(path)?
-            .threads()
-            .iter()
-            .map(|thread| thread.session_path.clone())
+            .legacy_threads()
+            .map(|(_, thread)| thread.to_path_buf())
             .collect();
         recover(&mut session, &threads)?;
         daemon.register(&session).map_err(anyhow::Error::new)?;

@@ -173,20 +173,25 @@ message, and `at` pages its body by byte offset. When `from` or `count` is given
 `id` and `at` are ignored and the reply says so (models that fill every optional
 field still get a listing). Responses are bounded to about 16 KB with
 continuation hints; images are MIME placeholders. Indices are stable across
-compaction, but branch switches select a different path. For a main session with
-internal threads, `recall` numbers the merged conversation of every thread in
-time order, leaving out the snapshot seeded into each new thread; `zoom` cites
-indices in that numbering.
+compaction, but branch switches select a different path. A main session with
+legacy topic threads is numbered over their merged conversation in time order.
+`recall` ids match the main memory's leaf ids, so `<chat>` line `id+1` is
+`recall {"id": id}`.
+
+The main conversation does not compact. Its requests see the memory tree's view
+instead (README, "Main: one conversation with a memory tree"), and its `zoom`
+takes `{"id", "n"}` to open a view line into the two it was made from. The
+compaction `zoom` below applies to other top-level runs, such as unattended jobs.
 
 Each compaction entry records `span_start_id` and `span_end_id`: the first and last message it replaced, inclusive, on the active path. Journals written before spans omit both fields; `Session::entries_in_span` reads a span back as message entries.
 
-The compaction summary marker names its entry id: `[Earlier conversation summary id=<id> — originals: recall]`. Main-thread `zoom {"id": "<id>"}` reads that compaction's span back as original messages in order. `offset` and `limit` page within the span, and each page is bounded to about 50 KB with a `more: zoom` hint. Unknown ids, non-compaction entries, and compactions that recorded no span are tool errors. Zoom returns originals only and does not expand summaries of summaries. Only the main thread registers `zoom`. A message longer than a page is cut, and its remainder is read with `recall {"id": N, "at": B}`.
+The compaction summary marker names its entry id: `[Earlier conversation summary id=<id> — originals: recall]`. For a top-level run that is not the main conversation, `zoom {"id": "<id>"}` reads that compaction's span back as original messages in order. `offset` and `limit` page within the span, and each page is bounded to about 50 KB with a `more: zoom` hint. Unknown ids, non-compaction entries, and compactions that recorded no span are tool errors. Zoom returns originals only and does not expand summaries of summaries. Children never get `zoom`. A message longer than a page is cut, and its remainder is read with `recall {"id": N, "at": B}`.
 
 Compaction nodes: a compaction entry summarizes one span of original path messages and carries `level` (0 for raw messages, 1 for summaries of summaries). The active view is the node summaries in order followed by the raw tail. Background summaries apply only at the next run start. At most four nodes are kept; the adjacent pair with the lowest maximum level merges into one node at that level plus one. Journals written before `level` load as level-0 nodes.
 
 Each `task` call captures one immutable developer-message snapshot shared by all
 siblings, including nested children: the latest main compaction summary (clipped
-if necessary) and the newest visible main messages as index lines, within 12 KB.
+if necessary) and the newest main messages as index lines, within 12 KB.
 The snapshot is context only; explicit `context` and task instructions still
 define the assignment. Follow-up turns reuse the journal without another snapshot.
 Children's read-only `recall` always targets the main journal, not their own.
