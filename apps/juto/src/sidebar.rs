@@ -316,6 +316,8 @@ impl Sidebar {
                 .map(|workspace| workspace.display().to_string());
             if let Some(existing) = self.tasks.iter_mut().find(|t| t.id == summary.id) {
                 existing.status = summary.status.clone();
+                existing.focus = summary.focus;
+                existing.summary = summary.summary.clone();
                 if let Some(name) = &summary.name {
                     existing.name = Some(name.clone());
                 }
@@ -335,6 +337,8 @@ impl Sidebar {
                 let mut card =
                     TaskCardModel::new(summary.id.clone(), summary.task.clone(), "builder")
                         .with_status(summary.status.clone());
+                card.focus = summary.focus;
+                card.summary = summary.summary.clone();
 
                 if let Some(name) = &summary.name {
                     card.name = Some(name.clone());
@@ -766,12 +770,14 @@ impl Render for Sidebar {
 
         let mut sections: Vec<(Section, Vec<Entity<TaskCard>>)> = Vec::new();
         for section in [Section::NeedsYou, Section::Running, Section::Done] {
-            let matching: Vec<TaskCardModel> = self
+            // Focus threads, the ones the user is working with, lead their section.
+            let mut matching: Vec<TaskCardModel> = self
                 .tasks
                 .iter()
                 .filter(|t| Section::of_subagent(&t.status) == section && self.matches_search(t))
                 .cloned()
                 .collect();
+            matching.sort_by_key(|task| !task.focus);
             let cards = matching
                 .into_iter()
                 .map(|task| {
@@ -859,6 +865,7 @@ mod tests {
             usage: None,
             error: None,
             focus: false,
+            summary: None,
             workspace: None,
             released: false,
             archived: false,

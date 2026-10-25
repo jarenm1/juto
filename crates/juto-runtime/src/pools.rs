@@ -8,7 +8,7 @@
 //! - [`Desks`] reserves memory for each agent turn through the resource broker. A
 //!   desk is small, so agents share the same budget ledger as commands and are
 //!   never capped by a fixed agent count; heavy work queues behind them instead.
-//! - `review_wip` bounds focus threads, the only agents that hold a review slot.
+//! - `review_wip` bounds isolated children, the only agents that hold a review slot.
 //!
 //! Ordinary agents therefore run without a count limit. Their model requests and
 //! memory are admitted, and nothing else.

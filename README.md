@@ -642,16 +642,20 @@ The window is a full-height left sidebar beside the chat column. The sidebar
 (`sidebar.rs`, rows in `task_card.rs` and `jobs_panel.rs`) is the task list:
 every subagent main started and every background job, grouped into **Needs
 you** (a subagent blocked on the user's answer, or a job waiting on a
-decision), **Running**, and **Done**. The main chat is not a row. Each
-subagent row shows its title, its status, and a thin bar marking its
-lifecycle stage (queued → running → verifying → reviewing → done). The bar is
-a stage indicator, not a completion percentage: the runtime reports no
-progress measure. Clicking a row opens the task in the chat surface, with the
-sidebar still visible; leaving it clears the selection. Blocked rows always
-show the question with an answer field, and an open blocked task shows the
-question above the composer, so a reply answers it. A row's chevron reveals
-its agent, duration, workspace, current step, Pause/Steer/Abort, token usage,
-step log, and diffs. Job rows carry their approve, deny, follow-up, and
+decision), **Running**, and **Done**. The main chat is not a row. A subagent
+you have not messaged is a task: one compact line with its title and status,
+plus its question when it is blocked. A subagent you have messaged is a focus
+thread and renders as a card: title, status, a thin bar marking its lifecycle
+stage (queued → running → verifying → reviewing → done), and a one- or
+two-line summary of where its work stands, rewritten by the `@tiny` model
+after each of its turns. The bar is a stage indicator, not a completion
+percentage. Focus cards lead their section. Clicking a row opens the
+subagent in the chat surface, with the sidebar still visible; leaving it
+clears the selection. A blocked focus card shows the question with an answer
+field, and an open blocked subagent shows the question above the composer, so
+a reply answers it. A card's chevron reveals its agent, duration, workspace,
+current step, Pause/Steer/Abort, token usage, step log, and diffs. Job rows
+carry their approve, deny, follow-up, and
 archive actions. **Archive N done** clears finished tasks. The chat header
 keeps the model picker, **Providers**, and the **Tasks** sidebar toggle at the
 top right; the toggle reads "Tasks · N need you" while anything waits on the

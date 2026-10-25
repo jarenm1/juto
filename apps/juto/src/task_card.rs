@@ -1,10 +1,13 @@
-//! Focus-thread row for the sidebar.
+//! Task row for the sidebar, in two shapes.
 //!
-//! Collapsed, a row shows the thread title, its status, and a thin lifecycle
-//! stage bar. Blocked threads always show their blocker prompt and a resume
-//! field. Expanding a row reveals metadata, steering controls (Pause, Steer,
-//! Abort), token usage, the step log, and attached diffs. Clicking the row
-//! selects the thread.
+//! - A task (a subagent the user has not messaged) is one compact line: title
+//!   and status. A blocked task adds its question on a second line. Clicking
+//!   the row opens the task.
+//! - A focus thread (a subagent the user has messaged) is a card: title,
+//!   status, lifecycle stage bar, and the summary written after its latest
+//!   turn. A blocked card shows its question with an answer field. Expanding a
+//!   card reveals metadata, steering controls (Pause, Steer, Abort), token
+//!   usage, the step log, and attached diffs.
 
 use gpui::{
     App, ClickEvent, Context, Div, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Render,
@@ -166,6 +169,10 @@ pub struct TaskCardModel {
     pub cost_estimate: Option<f64>,
     pub diffs: Vec<DiffFileModel>,
     pub logs: Vec<ToolLogEntry>,
+    /// The user has messaged this subagent, so it renders as a card.
+    pub focus: bool,
+    /// Where a focus thread's work stands after its latest turn.
+    pub summary: Option<String>,
     pub expanded: bool,
     pub resolution_input: String,
     pub steer_input: String,
@@ -189,6 +196,8 @@ impl TaskCardModel {
             cost_estimate: None,
             diffs: Vec::new(),
             logs: Vec::new(),
+            focus: false,
+            summary: None,
             expanded: false,
             resolution_input: String::new(),
             steer_input: String::new(),
@@ -388,6 +397,62 @@ impl TaskCard {
     pub fn toggle_steer_box(&mut self, cx: &mut Context<Self>) {
         self.model.show_steer_box = !self.model.show_steer_box;
         cx.notify();
+    }
+
+    /// One line for a task: title and status, plus a blocked task's question.
+    /// Clicking it opens the task.
+    fn render_compact(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let status = &self.model.status;
+        let question = match status {
+            SubagentStatus::Blocked { prompt, .. } => Some(prompt.clone()),
+            _ => None,
+        };
+        div()
+            .id(SharedString::from(format!("task-row-{}", self.model.id)))
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.select(cx)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(status_color(status)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_sm()
+                            .text_color(rgb(theme::TEXT))
+                            .child(self.model.display_title()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(status_color(status))
+                            .child(status_label(status)),
+                    ),
+            )
+            .when_some(question, |row, question| {
+                row.child(
+                    div()
+                        .pl_4()
+                        .truncate()
+                        .text_xs()
+                        .text_color(rgb(theme::WARNING))
+                        .child(question),
+                )
+            })
     }
 
     /// Title, status, and stage bar. Clicking anywhere here selects the thread.
@@ -885,7 +950,6 @@ impl Render for TaskCard {
             .flex_col()
             .pl_5()
             .pr_4()
-            .py_3()
             .when(is_selected, |row| {
                 row.bg(rgb(theme::BG_RAISED)).child(
                     div()
@@ -900,10 +964,25 @@ impl Render for TaskCard {
             .when(!is_selected, |row| {
                 row.hover(|s| s.bg(rgb(theme::BG_HOVER)))
             })
-            .child(self.render_summary(cx))
-            .child(self.render_blocker_callout(cx))
-            .when(self.model.expanded, |row| {
-                row.child(self.render_expanded(cx))
+            .when(!self.model.focus, |row| {
+                row.py_2().child(self.render_compact(cx))
+            })
+            .when(self.model.focus, |row| {
+                row.py_3()
+                    .child(self.render_summary(cx))
+                    .when_some(self.model.summary.clone(), |row, summary| {
+                        row.child(
+                            div()
+                                .mt_2()
+                                .text_xs()
+                                .text_color(rgb(theme::TEXT_MUTED))
+                                .child(summary),
+                        )
+                    })
+                    .child(self.render_blocker_callout(cx))
+                    .when(self.model.expanded, |row| {
+                        row.child(self.render_expanded(cx))
+                    })
             })
     }
 }
