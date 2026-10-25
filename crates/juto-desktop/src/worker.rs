@@ -113,11 +113,13 @@ pub fn run_worker(args: WorkerArgs) -> Result<(), DesktopError> {
     })?));
 
     // The worker owns the producer mapping and seals the pool before anyone else
-    // can map it.
+    // can map it. The pool is sized for the largest admitted mode, so a resize
+    // never outgrows the mapping viewers already hold.
+    let admitted = args.render_profile.admitted_profile();
     let pool = Arc::new(ShmFramePool::create_unsealed(
         format!("{}-primary", args.env_id),
-        args.width,
-        args.height,
+        admitted.max_width,
+        admitted.max_height,
     )?);
     pool.seal()?;
 

@@ -22,7 +22,7 @@ use crate::protocol::{
 };
 use crate::scm;
 use crate::shm::{FrameWait, ShmReader, ShmSlotHeader};
-use crate::supervisor::EnvironmentStatus;
+use crate::supervisor::{EnvironmentStatus, OutputConfig};
 
 /// Negotiated attachment metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,6 +392,29 @@ impl ViewerClient {
         match self.call(command)? {
             DesktopResponse::GrantIssued(grant) => Ok(grant),
             other => Err(unexpected("grant", other)),
+        }
+    }
+
+    /// Changes the environment's output mode. `expected_generation` must be the
+    /// current geometry generation. Returns the new generation and the applied
+    /// mode. Input stays gated until every viewer acknowledges a frame of the
+    /// new generation with [`ViewerClient::geometry_ready`].
+    pub fn configure_output(
+        &mut self,
+        expected_generation: u64,
+        mode: OutputConfig,
+    ) -> Result<(u64, OutputConfig), DesktopError> {
+        let command = DesktopCommand::ConfigureOutput {
+            env_id: self.env_id.clone(),
+            expected_generation,
+            mode,
+        };
+        match self.call(command)? {
+            DesktopResponse::OutputConfigured {
+                generation,
+                effective_output,
+            } => Ok((generation, effective_output)),
+            other => Err(unexpected("configure-output", other)),
         }
     }
 
