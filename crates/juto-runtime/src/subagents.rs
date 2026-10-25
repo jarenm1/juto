@@ -1,6 +1,6 @@
 //! Bounded subagent orchestration.
 //!
-//! [`SubagentManager`] runs child turns: each turn holds a memory desk, and focus threads also hold a review slot.
+//! [`SubagentManager`] runs child turns: each turn holds a memory desk, and isolated children also hold a review slot.
 //! propagates the parent cancellation token to every child [`RunControl`], and keeps
 //! terminal results so any number of `wait`/`output` callers observe them.
 //! The runtime owns the production factory: child agents inherit its model,
@@ -63,10 +63,6 @@ pub struct TaskSpec {
     /// Open-endedness / problem-solving guidance for the child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub solution_space: Option<String>,
-    /// A focus thread owns one orchestration-started task. It is always
-    /// isolated and may only be spawned by the main thread.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub focus: bool,
     /// Session id of the top-level run whose tree spawned this child. Child
     /// reports to `agent://main` return to that session; never model-supplied.
     #[serde(skip)]
@@ -133,10 +129,6 @@ impl UserAsk {
     }
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 /// Policy for enforcing a task's declared structured-output schema.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -160,7 +152,6 @@ impl TaskSpec {
             read_only: false,
             isolated_workspace: false,
             solution_space: None,
-            focus: false,
             origin: None,
             main_session: None,
             main_snapshot: None,
@@ -259,13 +250,17 @@ pub struct SubagentSummary {
     pub usage: Option<Usage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// `true` for a focus thread: an orchestration-started task, or a subagent
-    /// the user followed up.
+    /// `true` for a focus thread: a subagent the user has messaged (steered,
+    /// answered, or followed up). Focus threads get a summary after each turn.
     pub focus: bool,
+    /// One or two lines on where a focus thread's work stands, written after
+    /// its latest turn. `None` until the first summary, and for non-focus children.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     /// The child's dedicated workspace path, when it runs isolated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workspace: Option<PathBuf>,
-    /// `true` once the main agent released this focus thread's workspace.
+    /// `true` once the main agent released this child's workspace.
     pub released: bool,
     /// `true` once the user archived this finished child: it leaves the task
     /// list, but its workspace and transcript are kept.
@@ -413,6 +408,17 @@ pub trait SubagentFactory: Send + Sync {
     ) -> Result<String, String> {
         Err("digest not supported by this factory".into())
     }
+
+    /// One or two lines on where the child's work stands, read from the
+    /// session journal at `session_path` after a completed turn of a focus
+    /// thread. The default has no model, so focus threads keep no summary.
+    async fn summarize(
+        &self,
+        _session_path: &Path,
+        _cancel: CancellationToken,
+    ) -> Result<String, String> {
+        Err("summary not supported by this factory".into())
+    }
 }
 
 /// Snapshot a child exposes to waiters; the watch channel guarantees every
@@ -432,12 +438,11 @@ pub struct ChildState {
 pub enum SubagentEvent {
     /// A bounded report is now readable in the shared main inbox.
     MainInboxReady,
-    /// A child was queued. `focus` children always run isolated.
+    /// A child was queued.
     Spawned {
         id: String,
         name: Option<String>,
         status: SubagentStatus,
-        focus: bool,
     },
     StatusChanged {
         id: String,
@@ -463,14 +468,19 @@ pub enum SubagentEvent {
         id: String,
         event: AgentEvent,
     },
-    /// A focus thread was archived or restored. Inboxes drop or re-add it.
+    /// A finished child was archived or restored. Task lists drop or re-add it.
     ArchiveChanged {
         id: String,
         archived: bool,
     },
-    /// A worker became a focus thread because the user messaged it.
+    /// A child became a focus thread because the user messaged it.
     Promoted {
         id: String,
+    },
+    /// A focus thread's summary was rewritten after a turn.
+    Summarized {
+        id: String,
+        summary: String,
     },
 }
 
@@ -921,10 +931,11 @@ enum WorkspaceState {
 struct Child {
     id: String,
     spec: TaskSpec,
-    /// `true` for orchestration-started focus threads; set once the user
-    /// follows up on any subagent.
+    /// Set once the user messages the child; never cleared.
     focus: AtomicBool,
-    /// Hidden from the focus inbox by the user; the child itself is unchanged.
+    /// Latest turn summary; written only while `focus` is set.
+    summary: Mutex<Option<String>>,
+    /// Hidden from the task list by the user; the child itself is unchanged.
     archived: AtomicBool,
     workspace: Mutex<WorkspaceState>,
     /// Replaced per turn: a fresh turn gets a fresh control so a cancelled or
@@ -1094,12 +1105,6 @@ impl SubagentManager {
     /// Queue a child run. Returns the generated child id immediately; the
     /// desk wait, run, and terminal-state publication are asynchronous.
     pub fn spawn(&self, mut spec: TaskSpec) -> Result<String, SubagentError> {
-        if spec.focus {
-            // A focus thread tracks one task through its own VCS view, so it
-            // always needs a dedicated workspace regardless of what the
-            // caller requested.
-            spec.isolated_workspace = true;
-        }
         if let Some(origin) = &self.inner.origin {
             spec.origin = Some(origin.clone());
         }
@@ -1122,12 +1127,12 @@ impl SubagentManager {
             outcome: None,
         });
         let (status_tx, _) = watch::channel(SubagentStatus::Queued);
-        let focus = spec.focus;
         let workspace = self.inner.factory.workspace_path(&id, &spec);
         let child = Arc::new(Child {
             id: id.clone(),
             spec,
-            focus: AtomicBool::new(focus),
+            focus: AtomicBool::new(false),
+            summary: Mutex::new(None),
             archived: AtomicBool::new(false),
             workspace: Mutex::new(match workspace {
                 Some(path) => WorkspaceState::Live(path),
@@ -1150,7 +1155,6 @@ impl SubagentManager {
             id: id.clone(),
             name: child.spec.name.clone(),
             status: SubagentStatus::Queued,
-            focus,
         });
 
         let inner = Arc::clone(&self.inner);
@@ -1406,6 +1410,7 @@ impl SubagentManager {
                     stop_reason,
                     usage,
                     focus: child.focus.load(Ordering::Acquire),
+                    summary: child.summary.lock().expect("mutex poisoned").clone(),
                     workspace: child.workspace_path(),
                     released: child.workspace_released(),
                     archived: child.archived.load(Ordering::Acquire),
@@ -1784,7 +1789,8 @@ struct Seats {
 /// Admission for one turn, shared by first and follow-up turns; publishes the
 /// terminal state itself when a wait is cancelled or a desk cannot be reserved.
 /// Every turn holds a desk for its whole run: its memory, admitted by the broker
-/// (queued when the budget is full). Focus threads also take a review slot.
+/// (queued when the budget is full). Isolated children also take a review slot:
+/// each one produces a change set to review, and the slot caps how many are open.
 /// The outer `None` means the turn must not run.
 async fn acquire_seats(
     inner: &Inner,
@@ -1812,7 +1818,7 @@ async fn acquire_seats(
             }
         },
     };
-    let review = if child.spec.focus {
+    let review = if child.spec.isolated_workspace {
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
@@ -1879,6 +1885,7 @@ async fn run_child(
             move |events| async move { factory.run(&task_id, spec, task_control, events).await },
         ))
         .await;
+    spawn_summary(inner, child, owner);
 }
 
 /// One additional turn on a completed child: same session journal, same
@@ -1931,6 +1938,32 @@ async fn run_follow_up(
             },
         ))
         .await;
+    spawn_summary(inner, child, owner);
+}
+
+/// Rewrites a focus thread's summary from its latest completed turn, off the
+/// turn's admission: the terminal state is already published and the desk and
+/// review slot go back first. A failed summary keeps the previous one.
+fn spawn_summary(inner: Arc<Inner>, child: Arc<Child>, owner: CancellationToken) {
+    if !child.focus.load(Ordering::Acquire) {
+        return;
+    }
+    let session_path = match &child.state.borrow().outcome {
+        Some(Ok(result)) => result.session_path.clone(),
+        _ => return,
+    };
+    tokio::spawn(async move {
+        match inner.factory.summarize(&session_path, owner).await {
+            Ok(summary) => {
+                *child.summary.lock().expect("mutex poisoned") = Some(summary.clone());
+                let _ = inner.events.send(SubagentEvent::Summarized {
+                    id: child.id.clone(),
+                    summary,
+                });
+            }
+            Err(error) => eprintln!("juto: summary for subagent {} failed: {error}", child.id),
+        }
+    });
 }
 
 /// Run one factory turn and publish exactly one terminal state: parent
@@ -2217,7 +2250,6 @@ mod tests {
             read_only: false,
             isolated_workspace: false,
             solution_space: None,
-            focus: false,
             origin: None,
             main_session: None,
             main_snapshot: None,
@@ -2226,9 +2258,10 @@ mod tests {
         }
     }
 
-    fn focus_spec(task: &str) -> TaskSpec {
+    /// An isolated child: it holds a review slot for each turn.
+    fn isolated_spec(task: &str) -> TaskSpec {
         TaskSpec {
-            focus: true,
+            isolated_workspace: true,
             ..spec(task)
         }
     }
@@ -2390,7 +2423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focus_children_are_bounded_by_the_review_limit() {
+    async fn isolated_children_are_bounded_by_the_review_limit() {
         let (gate, gate_rx) = gate();
         let running = Arc::new(AtomicUsize::new(0));
         let max_running = Arc::new(AtomicUsize::new(0));
@@ -2401,7 +2434,7 @@ mod tests {
         );
         let mut ids = Vec::new();
         for n in 0..5 {
-            ids.push(manager.spawn(focus_spec(&format!("task-{n}"))).unwrap());
+            ids.push(manager.spawn(isolated_spec(&format!("task-{n}"))).unwrap());
         }
         // Closed gate: only the review limit may be running.
         until_running(&running, 2).await;
@@ -2420,7 +2453,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focus_child_waits_for_review_slot() {
+    async fn isolated_child_waits_for_review_slot() {
         let (gate, gate_rx) = gate();
         let running = Arc::new(AtomicUsize::new(0));
         let manager = manager(
@@ -2434,8 +2467,8 @@ mod tests {
             1,
             CancellationToken::new(),
         );
-        let a = manager.spawn(focus_spec("a")).unwrap();
-        let b = manager.spawn(focus_spec("b")).unwrap();
+        let a = manager.spawn(isolated_spec("a")).unwrap();
+        let b = manager.spawn(isolated_spec("b")).unwrap();
         until_running(&running, 1).await;
         assert_eq!(manager.status(&b), Some(SubagentStatus::Queued));
         gate.send(true).unwrap();
@@ -2479,7 +2512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_queued_focus_child_never_takes_review_slot() {
+    async fn cancel_queued_isolated_child_never_takes_review_slot() {
         let (gate, gate_rx) = gate();
         let running = Arc::new(AtomicUsize::new(0));
         let manager = manager(
@@ -2493,9 +2526,9 @@ mod tests {
             1,
             CancellationToken::new(),
         );
-        let first = manager.spawn(focus_spec("first")).unwrap();
+        let first = manager.spawn(isolated_spec("first")).unwrap();
         until_running(&running, 1).await;
-        let second = manager.spawn(focus_spec("second")).unwrap();
+        let second = manager.spawn(isolated_spec("second")).unwrap();
         manager.cancel(&second).unwrap();
         assert!(matches!(
             manager.wait(&second).await,
@@ -2768,8 +2801,8 @@ mod tests {
             1,
             owner.clone(),
         );
-        let first = manager.spawn(focus_spec("running")).unwrap();
-        let second = manager.spawn(focus_spec("queued")).unwrap();
+        let first = manager.spawn(isolated_spec("running")).unwrap();
+        let second = manager.spawn(isolated_spec("queued")).unwrap();
         until_running(&running, 1).await;
         owner.cancel();
         assert!(matches!(
@@ -2803,7 +2836,7 @@ mod tests {
             owner.clone(),
         );
         let ids: Vec<String> = (0..3)
-            .map(|n| manager.spawn(focus_spec(&format!("c{n}"))).unwrap())
+            .map(|n| manager.spawn(isolated_spec(&format!("c{n}"))).unwrap())
             .collect();
         until_running(&running, 1).await;
         owner.cancel();
@@ -3149,8 +3182,8 @@ mod tests {
             1,
             CancellationToken::new(),
         );
-        let first = manager.spawn(focus_spec("first")).unwrap();
-        let queued = manager.spawn(focus_spec("queued")).unwrap();
+        let first = manager.spawn(isolated_spec("first")).unwrap();
+        let queued = manager.spawn(isolated_spec("queued")).unwrap();
 
         until_running(&running, 1).await;
         let err = manager
@@ -3499,7 +3532,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focus_spawn_forces_isolation_and_reports_workspace() {
+    async fn isolated_spawn_reports_its_workspace() {
         let base = PathBuf::from("/data");
         let isolated = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let factory = Arc::new(WorkspaceFactory {
@@ -3508,36 +3541,34 @@ mod tests {
         });
         let manager = manager(factory, 1, CancellationToken::new());
 
-        let mut focus = spec("focus task");
-        focus.focus = true;
-        let id = manager.spawn(focus).unwrap();
+        let mut child_spec = spec("isolated task");
+        child_spec.isolated_workspace = true;
+        let id = manager.spawn(child_spec).unwrap();
         let summary = manager
             .list()
             .into_iter()
             .find(|summary| summary.id == id)
             .expect("spawned child listed");
-        assert!(summary.focus);
         assert_eq!(summary.workspace, Some(base.join(&id)));
 
-        // The factory must observe the forced isolation.
+        // The factory must observe the requested isolation.
         manager.wait(&id).await.unwrap();
         assert_eq!(*isolated.lock(), vec![true]);
 
-        // A non-focus spec keeps its declared flags and reports no workspace.
+        // A plain spec reports no workspace.
         let id = manager.spawn(spec("plain task")).unwrap();
         let summary = manager
             .list()
             .into_iter()
             .find(|summary| summary.id == id)
             .expect("spawned child listed");
-        assert!(!summary.focus);
         assert_eq!(summary.workspace, None);
         manager.wait(&id).await.unwrap();
         assert_eq!(*isolated.lock(), vec![true, false]);
     }
 
     #[tokio::test]
-    async fn non_focus_spawn_uses_default_workspace_path() {
+    async fn default_workspace_path_reports_no_workspace() {
         // A factory that leaves `workspace_path` at its default yields no
         // workspace in the summary even for isolated specs.
         let (gate, gate_rx) = gate();
@@ -3557,7 +3588,6 @@ mod tests {
             .into_iter()
             .find(|summary| summary.id == id)
             .expect("spawned child listed");
-        assert!(!summary.focus);
         assert_eq!(summary.workspace, None);
         manager.wait(&id).await.unwrap();
     }
@@ -4123,16 +4153,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn follow_up_runs_again_on_a_focus_child() {
+    async fn follow_up_runs_again_in_an_isolated_child_workspace() {
         let (first, first_rx) = gate();
         let (second, second_rx) = gate();
         let workspace_calls = Arc::new(AtomicUsize::new(0));
         let factory = follow_up_factory(first_rx, second_rx, workspace_calls.clone());
         let manager = manager(factory, 1, CancellationToken::new());
 
-        let mut focus = spec("focus task");
-        focus.focus = true;
-        let id = manager.spawn(focus).unwrap();
+        let mut isolated = spec("isolated task");
+        isolated.isolated_workspace = true;
+        let id = manager.spawn(isolated).unwrap();
         first.send(true).unwrap();
         manager.wait(&id).await.expect("first turn");
 
@@ -4148,7 +4178,6 @@ mod tests {
             .into_iter()
             .find(|summary| summary.id == id)
             .expect("spawned child listed");
-        assert!(summary.focus);
         assert_eq!(summary.workspace, Some(PathBuf::from("/data").join(&id)));
         assert_eq!(workspace_calls.load(Ordering::SeqCst), 1);
     }
@@ -4487,10 +4516,73 @@ mod tests {
                 change_id: None,
             })
         }
+
+        /// Summarizes as the journal's last message, so a test can tell which
+        /// turn a summary came from.
+        async fn summarize(
+            &self,
+            session_path: &Path,
+            _cancel: CancellationToken,
+        ) -> Result<String, String> {
+            let session = Session::open(session_path).map_err(|err| err.to_string())?;
+            let messages = session.messages().map_err(|err| err.to_string())?;
+            let last = messages.last().map(Message::text).unwrap_or_default();
+            Ok(format!("summary:{last}"))
+        }
+    }
+
+    /// Waits for the next `Summarized` event for `id`, or fails after the timeout.
+    async fn next_summary(events: &mut broadcast::Receiver<SubagentEvent>, id: &str) -> String {
+        timeout(WAIT_TIMEOUT, async {
+            loop {
+                if let Ok(SubagentEvent::Summarized { id: from, summary }) = events.recv().await
+                    && from == id
+                {
+                    return summary;
+                }
+            }
+        })
+        .await
+        .expect("a summary within the timeout")
     }
 
     #[tokio::test]
-    async fn completed_focus_child_returns_persisted_transcript() {
+    async fn only_focus_threads_get_a_summary_after_each_turn() {
+        let dir = std::env::temp_dir().join(format!("juto-summary-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = manager(
+            Arc::new(TranscriptFactory { dir: dir.clone() }),
+            1,
+            CancellationToken::new(),
+        );
+        let mut events = manager.subscribe_events();
+
+        let id = manager.spawn(spec("plain task")).unwrap();
+        manager.wait(&id).await.unwrap();
+        // A main follow-up keeps the child a task: still no summary.
+        manager.follow_up(&id, "from main".into()).unwrap();
+        manager.wait(&id).await.unwrap();
+        assert_eq!(summary_of(&manager, &id).summary, None);
+
+        manager
+            .follow_up_from_user(&id, "first ask".into())
+            .unwrap();
+        assert!(next_summary(&mut events, &id).await.ends_with("first ask"));
+        manager.follow_up(&id, "from main again".into()).unwrap();
+        assert_eq!(
+            next_summary(&mut events, &id).await,
+            "summary:from main again",
+            "a focus thread is summarized after main's turns too"
+        );
+        assert_eq!(
+            summary_of(&manager, &id).summary.as_deref(),
+            Some("summary:from main again")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn completed_child_returns_persisted_transcript() {
         let dir = std::env::temp_dir().join(format!("juto-transcript-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let manager = manager(
@@ -4500,7 +4592,7 @@ mod tests {
         );
 
         let mut focus = spec("focus task");
-        focus.focus = true;
+        focus.isolated_workspace = true;
         let focus_id = manager.spawn(focus).unwrap();
         manager.wait(&focus_id).await.unwrap();
         let texts: Vec<String> = manager
@@ -4552,7 +4644,7 @@ mod tests {
         );
 
         let mut focus = spec("focus task");
-        focus.focus = true;
+        focus.isolated_workspace = true;
         let focus_id = manager.spawn(focus).unwrap();
         assert!(manager.wait(&focus_id).await.is_err());
         assert_eq!(
@@ -4708,20 +4800,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_removes_focus_workspace_and_clears_summary() {
+    async fn release_removes_the_workspace_and_clears_summary() {
         let root = tempfile::tempdir().unwrap();
         let factory = release_factory(root.path(), None);
         let manager = manager(factory.clone(), 1, CancellationToken::new());
 
         let mut focus = spec("focus task");
-        focus.focus = true;
+        focus.isolated_workspace = true;
         let id = manager.spawn(focus).unwrap();
         manager.wait(&id).await.unwrap();
         let dir = root.path().join(&id);
         assert_eq!(summary_of(&manager, &id).workspace, Some(dir.clone()));
 
         manager.release(&id).await.unwrap();
-        assert!(!dir.exists(), "release removes the focus workspace");
+        assert!(!dir.exists(), "release removes the workspace");
         let summary = summary_of(&manager, &id);
         assert_eq!(summary.workspace, None);
         assert!(summary.released);
@@ -4736,7 +4828,7 @@ mod tests {
         let manager = manager(factory.clone(), 1, CancellationToken::new());
 
         let mut focus = spec("focus task");
-        focus.focus = true;
+        focus.isolated_workspace = true;
         let id = manager.spawn(focus).unwrap();
         until_running(&factory.started, 1).await;
         let dir = root.path().join(&id);
@@ -4762,7 +4854,7 @@ mod tests {
         let manager = manager(factory.clone(), 1, CancellationToken::new());
 
         let mut focus = spec("focus task");
-        focus.focus = true;
+        focus.isolated_workspace = true;
         let id = manager.spawn(focus).unwrap();
         manager.wait(&id).await.unwrap();
 
@@ -4773,13 +4865,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn released_focus_refuses_follow_up_and_transcript() {
+    async fn released_child_refuses_follow_up_and_transcript() {
         let root = tempfile::tempdir().unwrap();
         let factory = release_factory(root.path(), None);
         let manager = manager(factory.clone(), 1, CancellationToken::new());
 
         let mut focus = spec("focus task");
-        focus.focus = true;
+        focus.isolated_workspace = true;
         let id = manager.spawn(focus).unwrap();
         manager.wait(&id).await.unwrap();
         manager.release(&id).await.unwrap();
@@ -4816,7 +4908,7 @@ mod tests {
         let manager = manager(factory.clone(), 1, CancellationToken::new());
 
         let mut focus = spec("focus task");
-        focus.focus = true;
+        focus.isolated_workspace = true;
         let id = manager.spawn(focus).unwrap();
         manager.wait(&id).await.unwrap();
         let dir = root.path().join(&id);

@@ -188,8 +188,8 @@ Agents are not capped by a fixed count. Each run tree shares three pools
 - Provider pool: model requests. The limit starts at `max_concurrency`, halves on
   HTTP 429 (never below one), and grows by one per accepted stream, up to
   `max_concurrency`. A request holds its slot until its stream ends or is dropped.
-- Review limit: focus threads (`focus: true`) hold one review slot each, at most
-  `max_concurrency` at a time. Ordinary children take no review slot.
+- Review limit: isolated children (`isolated_workspace: true`) hold one review slot each,
+  at most `max_concurrency` at a time. Other children take no review slot.
 
 A child waiting for a desk or review slot is `queued`. Cancelling it, or cancelling
 its parent, removes it from the queue at once and it never runs.

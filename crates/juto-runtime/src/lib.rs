@@ -1705,6 +1705,18 @@ impl subagents::SubagentFactory for ChildFactory {
             .map_err(|error| format!("{error:#}"))
     }
 
+    async fn summarize(
+        &self,
+        session_path: &Path,
+        cancel: CancellationToken,
+    ) -> Result<String, String> {
+        let session = Session::open(session_path).map_err(|error| format!("{error:#}"))?;
+        self.runtime
+            .summarize_subagent(&session, &cancel)
+            .await
+            .map_err(|error| format!("{error:#}"))
+    }
+
     async fn run(
         &self,
         id: &str,
@@ -1917,7 +1929,6 @@ fn register_agent_tools(
     registry.register(Arc::new(TaskTool {
         manager: manager.clone(),
         catalog,
-        allow_focus: main,
         async_results: main,
         main_session,
         run_tier,
@@ -1944,8 +1955,6 @@ struct TaskTool {
     manager: Arc<SubagentManager>,
     /// Roles a `task` entry may name, keyed by role name.
     catalog: Arc<BTreeMap<String, AgentRole>>,
-    /// `task` entries may request `focus` only on the main thread.
-    allow_focus: bool,
     /// Main-thread calls return once their children are queued; results reach
     /// the main inbox. Child calls wait, because a child's completions never
     /// reach the main inbox.
@@ -1968,7 +1977,7 @@ impl Tool for TaskTool {
                     "This call waits for all children."
                 }
             ),
-            parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"agent":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"schema_mode":{"type":"string","enum":["strict","permissive"]},"read_only":{"type":"boolean"},"isolated_workspace":{"type":"boolean"},"focus":{"type":"boolean"},"solution_space":{"type":"string"},"tier":{"type":"string","enum":["untrusted","workspace","attended"]}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false}),
+            parameters: json!({"type":"object","properties":{"context":{"type":"string"},"tasks":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"name":{"type":"string"},"agent":{"type":"string"},"task":{"type":"string"},"model":{"type":"string"},"output_schema":{"type":"object"},"schema_mode":{"type":"string","enum":["strict","permissive"]},"read_only":{"type":"boolean"},"isolated_workspace":{"type":"boolean"},"solution_space":{"type":"string"},"tier":{"type":"string","enum":["untrusted","workspace","attended"]}},"required":["task"],"additionalProperties":false}}},"required":["tasks"],"additionalProperties":false}),
         }
     }
     fn tier(&self) -> ToolTier {
@@ -2001,10 +2010,7 @@ impl Tool for TaskTool {
             spec.origin = Some(ctx.session_id.clone());
             spec.main_snapshot = snapshot.clone();
         }
-        let queued: Vec<(Option<String>, bool)> = specs
-            .iter()
-            .map(|spec| (spec.name.clone(), spec.focus))
-            .collect();
+        let names: Vec<Option<String>> = specs.iter().map(|spec| spec.name.clone()).collect();
         let mut ids = Vec::with_capacity(specs.len());
         for spec in specs {
             match self.manager.spawn(spec) {
@@ -2020,11 +2026,7 @@ impl Tool for TaskTool {
         if !self.async_results {
             return collect_agents(&self.manager, ids, &ctx.cancel).await;
         }
-        let children = ids
-            .into_iter()
-            .zip(queued)
-            .map(|(id, (name, focus))| (id, name, focus))
-            .collect();
+        let children = ids.into_iter().zip(names).collect();
         Ok(queued_output(children))
     }
 }
@@ -2057,10 +2059,6 @@ impl TaskTool {
             }
             Some(_) => return Err("agent must be a string".into()),
         };
-        let focus = value.get("focus").and_then(Value::as_bool).unwrap_or(false);
-        if focus && !self.allow_focus {
-            return Err("focus threads may only be spawned by the main thread".into());
-        }
         let isolated_workspace = value
             .get("isolated_workspace")
             .and_then(Value::as_bool)
@@ -2071,12 +2069,7 @@ impl TaskTool {
             .map(serde_json::from_value::<ExecutionTier>)
             .transpose()
             .map_err(|error| format!("invalid tier: {error}"))?;
-        // A focus thread is always isolated, so it defaults the same way.
-        let tier = ExecutionTier::resolve_child(
-            self.run_tier,
-            requested_tier,
-            isolated_workspace || focus,
-        )?;
+        let tier = ExecutionTier::resolve_child(self.run_tier, requested_tier, isolated_workspace)?;
         Ok(TaskSpec {
             name: value.get("name").and_then(Value::as_str).map(str::to_owned),
             main_session: self.main_session.clone(),
@@ -2108,7 +2101,6 @@ impl TaskTool {
                 .get("solution_space")
                 .and_then(Value::as_str)
                 .map(str::to_owned),
-            focus,
             tier: Some(tier),
             origin: None,
             ask: None,
@@ -2215,13 +2207,11 @@ async fn collect_agents(
 /// terminal results arrive later in the main inbox. They belong to the run that
 /// started them: they keep running when that run's turn ends, and only stopping
 /// the run cancels them.
-fn queued_output(children: Vec<(String, Option<String>, bool)>) -> ToolOutput {
+fn queued_output(children: Vec<(String, Option<String>)>) -> ToolOutput {
     let count = children.len();
     let entries: Vec<Value> = children
         .into_iter()
-        .map(
-            |(id, name, focus)| json!({"id": id, "name": name, "status": "queued", "focus": focus}),
-        )
+        .map(|(id, name)| json!({"id": id, "name": name, "status": "queued"}))
         .collect();
     let listing = serde_json::to_string(&entries).unwrap_or_default();
     ToolOutput {
@@ -2535,7 +2525,6 @@ mod tests {
         let tool = TaskTool {
             manager: manager.clone(),
             catalog: Arc::new(roles::load(&repo, &data).unwrap()),
-            allow_focus: true,
             async_results: false,
             main_session: Some(main.path().to_path_buf()),
             run_tier: ExecutionTier::Attended,
@@ -2621,8 +2610,8 @@ mod tests {
     #[test]
     fn queued_task_result_shows_the_model_every_child_id() {
         let output = queued_output(vec![
-            ("agent-a".into(), Some("builder".into()), false),
-            ("agent-b".into(), None, true),
+            ("agent-a".into(), Some("builder".into())),
+            ("agent-b".into(), None),
         ]);
         let ContentBlock::Text { text } = &output.content[0] else {
             panic!("queued output must be text");
@@ -4474,8 +4463,8 @@ mod tests {
 
         let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new("begin the thread");
-        spec.focus = true;
-        let id = manager.spawn(spec).expect("spawn focus child");
+        spec.isolated_workspace = true;
+        let id = manager.spawn(spec).expect("spawn isolated child");
         let first = manager.wait(&id).await.expect("first turn");
         assert_eq!(first.output, "reply-0");
 
@@ -4501,14 +4490,14 @@ mod tests {
         // Same fork: the follow-up ran in the recorded workspace instead of
         // provisioning a new one.
         let workspace_dir = data_dir.join("workspaces").join(&id);
-        assert!(workspace_dir.exists(), "the focus fork must still exist");
+        assert!(workspace_dir.exists(), "the fork must still exist");
         let prompts = provider.prompts.lock();
         assert_eq!(prompts.len(), 3, "task plus both committed prompts");
         assert_eq!(prompts[2], "continue the thread");
     }
 
     #[tokio::test]
-    async fn main_releases_focus_workspace_and_refuses_later_use() {
+    async fn main_releases_an_isolated_workspace_and_refuses_later_use() {
         let root = tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         native_repo(&repo);
@@ -4521,21 +4510,18 @@ mod tests {
 
         let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new("begin the thread");
-        spec.focus = true;
-        let id = manager.spawn(spec).expect("spawn focus child");
+        spec.isolated_workspace = true;
+        let id = manager.spawn(spec).expect("spawn isolated child");
         manager.wait(&id).await.expect("first turn");
 
         let workspace_dir = data_dir.join("workspaces").join(&id);
-        assert!(
-            workspace_dir.exists(),
-            "the focus fork exists before release"
-        );
+        assert!(workspace_dir.exists(), "the fork exists before release");
 
         manager
             .release(&id)
             .await
-            .expect("release a completed focus child");
-        assert!(!workspace_dir.exists(), "release removes the focus fork");
+            .expect("release a completed isolated child");
+        assert!(!workspace_dir.exists(), "release removes the fork");
         let summary = manager
             .list()
             .into_iter()
@@ -4564,7 +4550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn focus_children_never_advertise_subagent_release() {
+    async fn children_never_advertise_subagent_release() {
         let root = tempdir().expect("tempdir");
         let repo = root.path().join("repo");
         native_repo(&repo);
@@ -4574,8 +4560,8 @@ mod tests {
 
         let manager = runtime.subagent_manager();
         let mut spec = TaskSpec::new("work");
-        spec.focus = true;
-        let id = manager.spawn(spec).expect("spawn focus child");
+        spec.isolated_workspace = true;
+        let id = manager.spawn(spec).expect("spawn isolated child");
         manager.wait(&id).await.expect("child run");
 
         let requests = provider.requests();
@@ -5194,7 +5180,6 @@ mod tests {
         let tool = TaskTool {
             manager: manager.clone(),
             catalog: Arc::new(roles::load(&repo, &data_dir).expect("roles")),
-            allow_focus: false,
             async_results: false,
             run_tier: ExecutionTier::Attended,
             main_session: None,
@@ -5286,7 +5271,6 @@ mod tests {
                 let tool = TaskTool {
                     manager: nested,
                     catalog: Arc::new(BTreeMap::new()),
-                    allow_focus: false,
                     async_results: false,
                     main_session: None,
                     run_tier: ExecutionTier::Attended,
@@ -5340,80 +5324,6 @@ mod tests {
             .expect(
                 "parents and their children all finish: waiting parents must not hold every desk",
             );
-    }
-
-    #[tokio::test]
-    async fn task_focus_is_main_thread_only() {
-        struct InstantFactory;
-
-        #[async_trait]
-        impl subagents::SubagentFactory for InstantFactory {
-            async fn run(
-                &self,
-                id: &str,
-                _spec: TaskSpec,
-                _control: RunControl,
-                _events: mpsc::UnboundedSender<AgentEvent>,
-            ) -> Result<SubagentResult, String> {
-                Ok(SubagentResult {
-                    id: id.to_string(),
-                    output: "done".to_string(),
-                    data: None,
-                    usage: Usage::default(),
-                    stop_reason: StopReason::Stop,
-                    session_path: PathBuf::from("/tmp/child.jsonl"),
-                    change_id: None,
-                })
-            }
-        }
-
-        let context = ToolContext {
-            cwd: PathBuf::from("/repo"),
-            session_id: "test".to_string(),
-            cancel: CancellationToken::new(),
-        };
-        let arguments = json!({"tasks": [{"task": "work", "focus": true}]});
-
-        // Below the main thread, focus tasks are rejected before spawning.
-        let manager = Arc::new(SubagentManager::new(
-            Arc::new(InstantFactory),
-            pools::Admission::unmetered(1),
-            CancellationToken::new(),
-            subagents::MainInbox::default(),
-        ));
-        let tool = TaskTool {
-            manager: manager.clone(),
-            catalog: Arc::new(BTreeMap::new()),
-            allow_focus: false,
-            async_results: false,
-            run_tier: ExecutionTier::Attended,
-            main_session: None,
-        };
-        let error = tool
-            .execute(arguments.clone(), context.clone())
-            .await
-            .expect_err("child threads cannot spawn focus tasks");
-        assert_eq!(
-            error,
-            "focus threads may only be spawned by the main thread"
-        );
-        assert!(manager.list().is_empty(), "rejected batch starts no child");
-
-        // The main thread may spawn them.
-        let tool = TaskTool {
-            manager,
-            catalog: Arc::new(BTreeMap::new()),
-            allow_focus: true,
-            async_results: false,
-            run_tier: ExecutionTier::Attended,
-            main_session: None,
-        };
-        tool.execute(arguments, context)
-            .await
-            .expect("main thread spawns focus tasks");
-        let summaries = tool.manager.list();
-        assert_eq!(summaries.len(), 1);
-        assert!(summaries[0].focus);
     }
 
     #[tokio::test]

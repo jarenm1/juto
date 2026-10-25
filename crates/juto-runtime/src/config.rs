@@ -137,7 +137,7 @@ pub struct RuntimeConfig {
     pub max_tokens: Option<u64>,
     pub approval_mode: ApprovalMode,
     /// Ceiling for concurrent model requests across the whole run tree, and for
-    /// concurrent focus threads (the review limit). The provider pool starts at
+    /// concurrent isolated children (the review limit). The provider pool starts at
     /// this ceiling, halves on rate limits, and grows back on accepted streams.
     /// Ordinary children are not capped by it; each turn waits for a memory desk.
     pub max_concurrency: usize,

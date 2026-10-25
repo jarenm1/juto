@@ -56,6 +56,8 @@ const MATCH_THRESHOLD: f64 = 0.5;
 pub(crate) const LABEL_SYSTEM: &str = "You name conversation threads. Reply with one label of at most eight words naming the thread's current topic. No quotes, no trailing punctuation, nothing else.";
 /// System prompt for the `@tiny` call that writes a history search query.
 pub(crate) const QUERY_SYSTEM: &str = "You write search queries over earlier conversation threads. Given a user's request, reply with three to twelve keywords that would find the earlier thread it refers to. Reply with the keywords only.";
+/// System prompt for the `@tiny` call that summarizes a focus thread's progress.
+pub(crate) const SUMMARY_SYSTEM: &str = "You summarize a coding agent's progress for a one-glance status card. Reply with one or two short plain sentences, under 160 characters in total, saying what is done and what is next or blocking. No preamble, no markdown, nothing else.";
 
 /// Whether the router may offer a thread to the judge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -749,6 +751,36 @@ impl Runtime {
         let (text, usage) = self.tiny_text(LABEL_SYSTEM, input, 32, cancel).await?;
         let label = clean_label(&text).context("label model returned no label")?;
         Ok((label, usage))
+    }
+
+    /// One or two lines on where a subagent's work stands, from its task and
+    /// its latest reply.
+    pub(crate) async fn summarize_subagent(
+        &self,
+        session: &Session,
+        cancel: &CancellationToken,
+    ) -> Result<String> {
+        let messages = session.messages()?;
+        let task = messages
+            .iter()
+            .find(|message| matches!(message, Message::User { .. }))
+            .map(Message::text)
+            .unwrap_or_default();
+        let reply = messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message, Message::Assistant(_)))
+            .map(Message::text)
+            .unwrap_or_default();
+        let input = format!(
+            "Task:\n{}\n\nLatest reply:\n{}",
+            excerpt(&task, 1500),
+            excerpt(&reply, 3000),
+        );
+        let (text, _usage) = self.tiny_text(SUMMARY_SYSTEM, input, 80, cancel).await?;
+        let summary = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        anyhow::ensure!(!summary.is_empty(), "summary model returned no text");
+        Ok(excerpt(&summary, 200))
     }
 
     /// One short tool-free completion on the `@tiny` model chain.

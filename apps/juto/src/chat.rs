@@ -1317,7 +1317,9 @@ impl ChatView {
             }
             // Child deltas reach the focus thread directly; the main transcript skips them.
             SubagentEvent::Agent { .. } => return,
-            SubagentEvent::Promoted { .. } | SubagentEvent::ArchiveChanged { .. } => {}
+            SubagentEvent::Promoted { .. }
+            | SubagentEvent::ArchiveChanged { .. }
+            | SubagentEvent::Summarized { .. } => {}
         }
         self.sync_subagents(cx);
         cx.notify();

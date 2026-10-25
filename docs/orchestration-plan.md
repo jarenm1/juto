@@ -427,17 +427,21 @@ never replicated.
 
 ### 5.4 Focus Threads *(shipped)*
 
-A focus thread is a subagent that owns exactly one orchestration-started task.
-`TaskSpec.focus` marks it; only the main thread (`depth == 0`) may request it —
-the `task` tool rejects `focus: true` from child threads with "focus threads may
-only be spawned by the main thread". Spawning a focus spec forces
-`isolated_workspace`, since a per-thread VCS view needs its own workspace, and
-`SubagentManager::list` reports `focus` plus the child's `workspace` path so the
-UI can surface the thread's working directory.
+A focus thread is a subagent the user has messaged: steered while it runs, answered
+while it is blocked, or followed up after it completes (`SubagentManager::send_from_user`).
+The runtime sets the child's `focus` flag and emits `SubagentEvent::Promoted`; the flag is
+never cleared. Main's own messages (`agent_send`) never promote. Every other subagent is a
+task. Main cannot spawn a focus thread; a child it wants in its own workspace sets
+`isolated_workspace`.
 
-A message the user sends to any subagent with `SubagentManager::send_from_user` makes
-it a focus thread: the runtime sets its `focus` flag, so the sidebar lists it. Main-started
-follow-ups do not promote.
+After each completed turn of a focus thread, including turns main starts, the runtime asks
+`@tiny` for one or two lines on where the work stands (`SubagentFactory::summarize`, from
+the task and the latest reply). The text is stored on the child, reported as
+`SubagentSummary.summary`, and announced with `SubagentEvent::Summarized`. It runs after the
+terminal state is published and after the turn's desk and review slot are released; a
+failed summary keeps the previous one. Tasks get no summary, so the cost is one `@tiny` call
+per turn of a thread the user is working with. The summary call's usage is not added to the
+child's usage.
 
 Follow-up turns: `SubagentManager::follow_up(id, prompt)` resumes a `Completed`
 child by reopening its recorded session and reusing its isolated workspace without
@@ -568,9 +572,19 @@ goes back to main.
   model-supplied.
 * **Answering.** Opening a blocked task shows its question above the composer; sending a
   message answers it (`send_from_user` unblocks a blocked child) and promotes the child to
-  a focus thread. The sidebar row's answer field does the same through `Unblock`.
+  a focus thread. The sidebar row's answer field answers through `Unblock`, which does
+  not promote.
   `unblock` delivers the answer only to the waiter. It no longer also steers it into the
   transcript, so the child reads it once.
+
+PR10 makes focus a user choice and gives it a different look. `TaskSpec.focus` and the
+`task` tool's `focus` field are removed (section 5.4): focus is set only by the user
+messaging a subagent. The review limit, which `focus` used to grant, now applies to every
+isolated child (`isolated_workspace: true`), the children that produce a change set to
+review. In the sidebar a task is one compact line, title and status, plus its question
+when it is blocked; clicking it opens the task. A focus thread is a card: title, status,
+the stage bar, its latest summary, the question and answer field when blocked, and the
+expandable details. Focus cards lead their section.
 
 ---
 
