@@ -135,6 +135,56 @@ impl RenderProfile {
     }
 }
 
+/// Shortest side, in pixels, [`OutputProfile::fit`] proposes.
+const MIN_FIT_SIDE: u32 = 64;
+
+impl OutputProfile {
+    /// Rejects modes this profile cannot run: zero sides or fps, sides past
+    /// the maximum (the frame pool is sized for it), or too high a pixel rate.
+    pub fn admit(&self, mode: &OutputConfig) -> Result<(), DesktopError> {
+        let reject = |reason: String| DesktopError::InvalidOutputMode {
+            width: mode.width,
+            height: mode.height,
+            reason,
+        };
+        if mode.width == 0 || mode.height == 0 || mode.fps == 0 {
+            return Err(reject(
+                "width, height, and fps must be non-zero".to_string(),
+            ));
+        }
+        if mode.width > self.max_width || mode.height > self.max_height {
+            return Err(reject(format!(
+                "exceeds admitted size {}x{}",
+                self.max_width, self.max_height
+            )));
+        }
+        let pixel_rate = (mode.width as u64) * (mode.height as u64) * (mode.fps as u64);
+        if pixel_rate > self.max_pixel_rate {
+            return Err(reject(format!(
+                "requested pixel rate {pixel_rate} px/s exceeds admitted limit {} px/s",
+                self.max_pixel_rate
+            )));
+        }
+        Ok(())
+    }
+
+    /// The largest size within `width`x`height` this profile admits at `fps`.
+    /// A size over the pixel rate shrinks on both axes, keeping its aspect
+    /// ratio. Sides are even and at least [`MIN_FIT_SIDE`].
+    pub fn fit(&self, width: u32, height: u32, fps: u32) -> (u32, u32) {
+        let mut width = width.clamp(MIN_FIT_SIDE, self.max_width) as f64;
+        let mut height = height.clamp(MIN_FIT_SIDE, self.max_height) as f64;
+        let rate = width * height * fps.max(1) as f64;
+        if rate > self.max_pixel_rate as f64 {
+            let shrink = (self.max_pixel_rate as f64 / rate).sqrt();
+            width *= shrink;
+            height *= shrink;
+        }
+        let even = |side: f64| ((side.floor() as u32) & !1).max(MIN_FIT_SIDE);
+        (even(width), even(height))
+    }
+}
+
 /// Resource constraints enforced on the environment process tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -353,6 +403,8 @@ pub struct EnvironmentStatus {
     pub env_id: String,
     pub owner_principal: String,
     pub output: OutputConfig,
+    /// Largest modes the environment admits; a resize must fit them.
+    pub output_profile: OutputProfile,
     pub generation: GeometryGeneration,
     pub is_ready: bool,
     pub active_control_lease: Option<ControlLease>,
@@ -438,26 +490,7 @@ impl Drop for AwakeHold {
 impl DesktopEnvironment {
     pub fn new(config: EnvironmentConfig) -> Result<Self, DesktopError> {
         let admitted = config.render_profile.admitted_profile();
-        let pixel_rate = (config.output.width as u64)
-            * (config.output.height as u64)
-            * (config.output.fps as u64);
-        if pixel_rate > admitted.max_pixel_rate {
-            return Err(DesktopError::InvalidOutputMode {
-                width: config.output.width,
-                height: config.output.height,
-                reason: format!(
-                    "requested pixel rate {} px/s exceeds admitted limit {} px/s for {:?}",
-                    pixel_rate, admitted.max_pixel_rate, config.render_profile
-                ),
-            });
-        }
-        if config.output.width == 0 || config.output.height == 0 || config.output.fps == 0 {
-            return Err(DesktopError::InvalidOutputMode {
-                width: config.output.width,
-                height: config.output.height,
-                reason: "width, height, and fps must be non-zero".to_string(),
-            });
-        }
+        admitted.admit(&config.output)?;
 
         // A hardware environment serializes on the repository's shared advisory
         // GPU lock for its whole lifetime, including its encoder (spec section 6).
@@ -530,10 +563,12 @@ impl DesktopEnvironment {
                 }
             }
             CompositorMode::InProcess => {
+                // Sized for the largest admitted mode, so a resize never
+                // outgrows the pool viewers already mapped.
                 let pool = match ShmFramePool::create(
                     format!("{}-primary", config.env_id),
-                    config.output.width,
-                    config.output.height,
+                    admitted.max_width,
+                    admitted.max_height,
                 ) {
                     Ok(pool) => Arc::new(pool),
                     Err(err) => {
@@ -1376,15 +1411,11 @@ impl DesktopEnvironment {
                 received: expected_generation,
             });
         }
-        let admitted = self.inner.config.render_profile.admitted_profile();
-        let pixel_rate = (new_mode.width as u64) * (new_mode.height as u64) * (new_mode.fps as u64);
-        if pixel_rate > admitted.max_pixel_rate {
-            return Err(DesktopError::InvalidOutputMode {
-                width: new_mode.width,
-                height: new_mode.height,
-                reason: format!("exceeds admitted rate {}", admitted.max_pixel_rate),
-            });
-        }
+        self.inner
+            .config
+            .render_profile
+            .admitted_profile()
+            .admit(&new_mode)?;
 
         let new_gen = current_gen + 1;
         self.wake()?;
@@ -1428,6 +1459,7 @@ impl DesktopEnvironment {
             env_id: self.env_id().to_string(),
             owner_principal: self.inner.config.owner_principal.clone(),
             output: self.output(),
+            output_profile: self.inner.config.render_profile.admitted_profile(),
             generation: self.generation(),
             is_ready: *self.inner.is_ready.lock(),
             active_control_lease: lease,

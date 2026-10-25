@@ -89,6 +89,40 @@ fn environment_lifecycle_admission_and_generation() {
     // Stale generation is rejected.
     assert!(env.configure_output(1, valid).is_err());
 
+    // Sides past the profile maximum are rejected even at a low frame rate.
+    let oversized = OutputConfig {
+        width: 3842,
+        height: 480,
+        scale: 1,
+        fps: 1,
+    };
+    assert!(env.configure_output(2, oversized).is_err());
+
+    // Growing well past the creation size still publishes whole frames: the
+    // pool is sized for the largest admitted mode, not the initial one.
+    let grown = OutputConfig {
+        width: 1920,
+        height: 1080,
+        scale: 1,
+        fps: 30,
+    };
+    assert_eq!(env.configure_output(2, grown).expect("grow"), 3);
+    let pool = env.frame_pool();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let header = loop {
+        let info = env.observe(Duration::from_secs(2)).expect("observe");
+        pool.acquire_slot(info.slot);
+        let read = pool.read_slot(info.slot, pool.slot_size());
+        pool.release_slot(info.slot);
+        let (header, pixels) = read.expect("read slot");
+        if header.generation == 3 {
+            assert_eq!(pixels.len(), 1920 * 1080 * 4);
+            break header;
+        }
+        assert!(Instant::now() < deadline, "no frame of the grown mode");
+    };
+    assert_eq!((header.width, header.height), (1920, 1080));
+
     env.destroy();
     assert!(!env.runtime_dir().exists(), "runtime dir must be removed");
 }
