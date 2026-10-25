@@ -1,6 +1,9 @@
-//! Read-only access to the main thread's original messages.
+//! Read-only access to the main conversation's original messages.
 //!
-//! Numbers come from [`Session::path_view`]: every message on the active path,
+//! A main session with threads is numbered over its merged conversation
+//! ([`MainSession::history`]): every thread's messages in time order, so a
+//! thread can read what the user said in any other. Any other session is
+//! numbered by [`Session::path_view`]: every message on the active path,
 //! counted from the root. A compaction hides the prefix from the model but
 //! never renumbers it, so a number cited before a compaction still names the
 //! same message afterward.
@@ -13,7 +16,10 @@ use juto_ai::{ContentBlock, Message, ToolCall, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::session::{CompactionMark, PathMessage, PathView, Session};
+use crate::{
+    session::{CompactionMark, PathMessage, PathView, Session},
+    threads::MainSession,
+};
 
 /// Byte budget of one page of list lines, and of one page of a message body.
 const PAGE_BYTES: usize = 16 * 1024;
@@ -22,7 +28,7 @@ const LINE_CHARS: usize = 160;
 /// Character budget of a tool call's arguments on one list line.
 const ARGS_CHARS: usize = 80;
 
-const DESCRIPTION: &str = "Read the main thread's original messages, including those hidden by compaction. Without `id`, lists messages from `from` (default 0), limited by `count` and about 16 KB; follow the `more:` hint. With `id`, returns that message in full; `at` continues a long message by byte offset. Numbers stay stable across compaction, but refer to the current branch.";
+const DESCRIPTION: &str = "Read the main conversation's original messages, every thread's, including compacted ones. Without `id`, lists from `from` (default 0), up to `count` and about 16 KB; follow `more:`. With `id` alone, returns that message whole; `at` continues it by byte offset.";
 
 /// Arguments of one `recall` call. Every field is optional.
 #[derive(Debug, Default, Deserialize)]
@@ -81,36 +87,83 @@ impl Tool for RecallTool {
     }
 }
 
+/// The messages `recall` numbers.
+pub(crate) enum History {
+    /// A main session's conversation, merged across its threads.
+    Threads(Vec<(String, Message)>),
+    /// Any other session's own active path.
+    Journal(Box<Session>),
+}
+
+impl History {
+    pub(crate) fn open(path: &Path) -> anyhow::Result<Self> {
+        let main = MainSession::open(path)?;
+        Ok(if main.threads().is_empty() {
+            Self::Journal(Box::new(main.into_journal()))
+        } else {
+            Self::Threads(main.history()?)
+        })
+    }
+
+    pub(crate) fn view(&self) -> anyhow::Result<PathView<'_>> {
+        Ok(match self {
+            Self::Threads(messages) => PathView {
+                messages: messages
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (id, message))| PathMessage { index, id, message })
+                    .collect(),
+                nodes: Vec::new(),
+                compaction: None,
+            },
+            Self::Journal(session) => session.path_view()?,
+        })
+    }
+}
+
 /// Answers one `recall` call from the session at `path`. Mistakes in the call
 /// are tool errors; only a session that cannot be read is an `Err`.
 fn read(path: &Path, args: Args) -> Result<ToolOutput, String> {
-    if args.at.is_some() && args.index.is_none() {
+    // Models that fill every optional field send `id` and `at` alongside
+    // `from`/`count`; paging the list is the request that still makes sense.
+    let listing = args.from.is_some() || args.count.is_some();
+    let ignored = listing && (args.index.is_some() || args.at.is_some());
+    let (index, at) = if listing {
+        (None, None)
+    } else {
+        (args.index, args.at)
+    };
+    if at.is_some() && index.is_none() {
         return Ok(ToolOutput::error(
             "`at` pages one message, so it needs `id`",
-        ));
-    }
-    if args.index.is_some() && (args.from.is_some() || args.count.is_some()) {
-        return Ok(ToolOutput::error(
-            "`id` returns one message; `from` and `count` only page the list",
         ));
     }
     if args.count == Some(0) {
         return Ok(ToolOutput::error("`count` must be at least 1"));
     }
-    let session = Session::open(path).map_err(|error| error.to_string())?;
-    let view = session.path_view().map_err(|error| error.to_string())?;
+    let history = History::open(path).map_err(|error| format!("{error:#}"))?;
+    let view = history.view().map_err(|error| format!("{error:#}"))?;
     let total = view.messages.len();
     if total == 0 {
         return Ok(ToolOutput::error("the main thread has no messages yet"));
     }
-    Ok(match args.index {
+    let mut output = match index {
         Some(index) if index >= total => ToolOutput::error(format!(
             "index {index} is out of range; the main thread has messages 0..={}",
             total - 1
         )),
-        Some(index) => detail(&view, index, args.at.unwrap_or(0)),
+        Some(index) => detail(&view, index, at.unwrap_or(0)),
         None => list(&view, args.from.unwrap_or(0), args.count),
-    })
+    };
+    if ignored {
+        output.content.insert(
+            0,
+            ContentBlock::Text {
+                text: "(`id` and `at` ignored: `from`/`count` list messages)\n".into(),
+            },
+        );
+    }
+    Ok(output)
 }
 
 /// Index lines from `from`, stopping at the page budget or after `count` lines.
@@ -294,14 +347,33 @@ fn clip_chars(text: &str, max: usize) -> String {
     clipped
 }
 
+/// Header of the snapshot a child starts with.
+const CHILD_HEADER: &str = "Main thread snapshot (context only — do your task, not the user's last message)\nOriginal messages: recall {\"id\": N}; indices refer to the current main branch.\n";
+/// Header of the snapshot a new main thread starts with.
+const THREAD_HEADER: &str = "Earlier in this conversation (other topics; context only — the user's new request follows)\nOriginal messages: recall {} lists them; recall {\"id\": N} reads one.\n";
+
 /// Capture once per task call, not once per child: siblings share exact bytes.
 pub(crate) fn snapshot(path: &Path) -> anyhow::Result<String> {
+    let history = History::open(path)?;
+    Ok(render_snapshot(CHILD_HEADER, &history.view()?))
+}
+
+/// What a new thread of `main` starts knowing: the conversation so far,
+/// across every thread. `None` before the conversation has any messages.
+pub(crate) fn thread_context(main: &MainSession) -> anyhow::Result<Option<String>> {
+    let history = History::Threads(main.history()?);
+    let view = history.view()?;
+    if view.messages.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(render_snapshot(THREAD_HEADER, &view)))
+}
+
+/// `header`, then the view's summaries and its newest visible messages, in
+/// about 12 KB.
+fn render_snapshot(header: &str, view: &PathView<'_>) -> String {
     const BUDGET: usize = 12 * 1024;
-    let session = Session::open(path)?;
-    let view = session.path_view()?;
-    let mut out = String::from(
-        "Main thread snapshot (context only — do your task, not the user's last message)\nOriginal messages: recall {\"id\": N}; indices refer to the current main branch.\n",
-    );
+    let mut out = String::from(header);
     let per_node = BUDGET / 2 / view.nodes.len().max(1);
     for node in &view.nodes {
         out.push_str("[Earlier conversation summary]\n");
@@ -331,7 +403,7 @@ pub(crate) fn snapshot(path: &Path) -> anyhow::Result<String> {
         out.push_str(line);
         out.push('\n');
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]

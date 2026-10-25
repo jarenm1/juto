@@ -25,6 +25,10 @@ struct Script {
     queries: Mutex<VecDeque<String>>,
     judge_prompts: Mutex<Vec<String>>,
     turns: Mutex<Vec<Vec<String>>>,
+    /// Developer texts each agent turn was given as context.
+    notes: Mutex<Vec<Vec<String>>>,
+    /// Text of each `recall` result an agent turn received.
+    recalled: Mutex<Vec<String>>,
 }
 
 impl Script {
@@ -37,6 +41,14 @@ impl Script {
     /// User texts the most recent agent turn was given as context.
     fn last_turn(&self) -> Vec<String> {
         self.turns
+            .lock()
+            .last()
+            .cloned()
+            .expect("an agent turn ran")
+    }
+    /// Developer texts the most recent agent turn was given as context.
+    fn last_notes(&self) -> Vec<String> {
+        self.notes
             .lock()
             .last()
             .cloned()
@@ -85,12 +97,44 @@ impl Provider for Script {
             let request = user_texts.last().cloned().unwrap_or_default();
             let after_tool = matches!(context.messages.last(), Some(Message::ToolResult { .. }));
             self.turns.lock().push(user_texts);
+            self.notes.lock().push(
+                context
+                    .messages
+                    .iter()
+                    .filter(|message| matches!(message, Message::Developer { .. }))
+                    .map(Message::text)
+                    .collect(),
+            );
+            if let Some(Message::ToolResult {
+                tool_name, content, ..
+            }) = context.messages.last()
+                && tool_name == "recall"
+            {
+                let text = content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect();
+                self.recalled.lock().push(text);
+            }
             if request == SPAWN_REQUEST && !after_tool {
                 // Queue one child through the main thread's non-blocking `task`.
                 let call = ContentBlock::ToolCall(ToolCall {
                     id: "call-task".into(),
                     name: "task".into(),
                     arguments: serde_json::json!({"tasks": [{"task": "child job"}]}),
+                    thought_signature: None,
+                });
+                return Ok(reply_stream(vec![call], StopReason::ToolUse));
+            }
+            if request == RECALL_REQUEST && !after_tool {
+                // Every optional field filled, as some models send them.
+                let call = ContentBlock::ToolCall(ToolCall {
+                    id: "call-recall".into(),
+                    name: "recall".into(),
+                    arguments: serde_json::json!({"from": 0, "count": 10, "id": 0, "at": 0}),
                     thought_signature: None,
                 });
                 return Ok(reply_stream(vec![call], StopReason::ToolUse));
@@ -106,6 +150,8 @@ impl Provider for Script {
 
 /// A request the script answers by spawning one subagent.
 const SPAWN_REQUEST: &str = "spawn a child";
+/// A request the script answers by calling `recall`.
+const RECALL_REQUEST: &str = "what is the earliest message you can see";
 
 fn reply_stream(content: Vec<ContentBlock>, stop_reason: StopReason) -> ProviderStream {
     let message = AssistantMessage {
@@ -270,6 +316,63 @@ async fn each_thread_runs_with_only_its_own_history() {
     // Threads, labels, and routing times survive reopening the journal.
     let reopened = MainSession::open(main.path()).expect("reopen");
     assert_eq!(reopened.threads(), main.threads());
+}
+
+#[tokio::test]
+async fn a_new_thread_can_see_the_whole_conversation() {
+    let Harness {
+        _dir,
+        runtime,
+        script,
+    } = harness(6);
+    let mut main = runtime.new_main_session().expect("main session");
+    send(&runtime, &mut main, "Fix the flaky auth test").await;
+
+    script.judge(&decision("new"));
+    let (meta, _, _) = send(&runtime, &mut main, RECALL_REQUEST).await;
+    assert_eq!(meta.kind, RouteKind::New);
+
+    // The new thread starts with the conversation so far as context.
+    let notes = script.last_notes();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("Fix the flaky auth test")
+                && note.contains("done: Fix the flaky auth test")),
+        "{notes:?}"
+    );
+
+    // `recall` from inside the new thread lists every thread's messages, even
+    // when the call fills `id` and `at` next to `from`/`count`.
+    let recalled = script.recalled.lock().last().cloned().expect("recall ran");
+    assert!(
+        recalled.contains("0|user: Fix the flaky auth test"),
+        "{recalled}"
+    );
+    assert!(recalled.contains("1|assistant: done: Fix the flaky auth test"));
+    assert!(recalled.contains(&format!("2|user: {RECALL_REQUEST}")));
+
+    // The seeded context is not conversation: neither the timeline nor
+    // recall shows it.
+    assert!(!recalled.contains("Earlier in this conversation"));
+    assert!(
+        !main
+            .timeline()
+            .expect("timeline")
+            .iter()
+            .any(|item| matches!(
+                item,
+                TimelineItem::Message {
+                    message: Message::Developer { .. },
+                    ..
+                }
+            ))
+    );
+
+    // Continuing the thread later does not re-seed it.
+    script.judge(&decision("thread-1"));
+    send(&runtime, &mut main, "thanks").await;
+    assert_eq!(script.last_notes().len(), 1);
 }
 
 #[tokio::test]

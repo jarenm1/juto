@@ -205,14 +205,16 @@ fn misuse_is_a_tool_error_not_an_empty_page() {
         })
         .is_error
     );
-    assert!(
-        call(Args {
-            index: Some(0),
-            from: Some(0),
-            ..Args::default()
-        })
-        .is_error
-    );
+    // `from`/`count` win over `id` and `at`, which the reply says it ignored.
+    let listed = call(Args {
+        index: Some(0),
+        at: Some(5),
+        from: Some(0),
+        ..Args::default()
+    });
+    assert!(!listed.is_error);
+    assert_eq!(listed_indices(&text_of(&listed)), [0]);
+    assert!(text_of(&listed).contains("`id` and `at` ignored"));
     assert!(
         call(Args {
             count: Some(0),

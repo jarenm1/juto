@@ -603,7 +603,22 @@ impl Runtime {
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
     ) -> Result<RunOutcome> {
-        let main_session = session.path().to_path_buf();
+        let history = session.path().to_path_buf();
+        self.run_with_history(session, &history, prompt.into(), events, control)
+            .await
+    }
+
+    /// [`Runtime::run`], with `recall` and children's snapshots reading
+    /// `history` instead of `session`: a main session's thread reads the whole
+    /// main conversation.
+    pub(crate) async fn run_with_history(
+        &self,
+        session: &mut Session,
+        history: &Path,
+        prompt: String,
+        events: mpsc::UnboundedSender<AgentEvent>,
+        control: RunControl,
+    ) -> Result<RunOutcome> {
         let placement = RunPlacement {
             depth: 0,
             role: roles::MAIN_ROLE,
@@ -612,7 +627,7 @@ impl Runtime {
             sender: None,
             ask: None,
             yielded: None,
-            main_session: Some(&main_session),
+            main_session: Some(history),
             unattended: None,
             limits: JobLimits::default(),
         };
@@ -632,7 +647,7 @@ impl Runtime {
             run_children.clone(),
         ));
         let outcome = self
-            .run_depth(session, prompt.into(), events, control, placement, manager)
+            .run_depth(session, prompt, events, control, placement, manager)
             .await;
         forwarder.abort();
         stop_children.abort();
@@ -803,8 +818,12 @@ impl Runtime {
                 main_session.to_path_buf(),
             )))?;
             // Only the main thread zooms: `all`-scoped child roles would inherit it.
+            // Zoom expands this session's own compactions.
             if depth == 0 {
-                registry.register(Arc::new(zoom::ZoomTool::new(main_session.to_path_buf())))?;
+                registry.register(Arc::new(zoom::ZoomTool::new(
+                    session.path().to_path_buf(),
+                    main_session.to_path_buf(),
+                )))?;
             }
         }
         // Main and every child can reach their peers, even a child too deep to
