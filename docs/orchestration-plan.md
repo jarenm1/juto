@@ -586,6 +586,25 @@ when it is blocked; clicking it opens the task. A focus thread is a card: title,
 the stage bar, its latest summary, the question and answer field when blocked, and the
 expandable details. Focus cards lead their section.
 
+PR11 moves agent communication toward OMP's peer model (section 3.5 of `omp-runtime.md`).
+
+* **Ownership.** Main gets `agent_list`: every child the user has not archived, with id,
+  name, status, task, focus, and summary. Its role prompt says a child owns its task until
+  archived, so updates, fixes, and follow-ups go to the owner with `agent_send`.
+* **Reading peers.** `agent_read` exposes the existing `PeerBus::read`: `agent://<id>`,
+  `agent://{a, b}`, and `agent://all` return status, task, summary, and a completed
+  agent's result; `history://<id>` returns the last messages of a completed agent's
+  transcript (default 20, at most 200, each clipped to 4000 characters). It is in the
+  read-only tool set, so a reviewer can read the builder it reviews.
+* **Tree-wide addressing.** Every child is registered in a directory that rides on the
+  tree's `MainInbox`, so a child can message and read its siblings and their descendants,
+  not only its own children. A nested manager reaches only children of its own top-level
+  session (`origin`); jobs have their own inbox, so separate trees never reach each other.
+  `agent://all` sends to every working agent except the sender and skips finished ones,
+  so a broadcast never restarts them. A child's message is headed `[message from agent
+  <id>]`. `agent_send` and `agent_read` are registered for every child, including one
+  too deep to delegate.
+
 ---
 
 ## 6. Future Extensibility: Headless Daemon, Mobile & Automations

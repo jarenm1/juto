@@ -554,6 +554,19 @@ pub struct MainInbox {
     event_senders: Arc<Mutex<Vec<broadcast::WeakSender<SubagentEvent>>>>,
     /// Backing file, set once by `bind`.
     store: Arc<OnceLock<PathBuf>>,
+    /// Every child spawned anywhere in this run tree, by id, so peers can
+    /// address one another and not only their own children. The inbox is the
+    /// handle every manager in a tree already shares, so the directory rides on it.
+    directory: Arc<Mutex<HashMap<String, PeerEntry>>>,
+}
+
+/// Where a child spawned in this tree lives: its manager's registry, the token
+/// that owns its turns, and the top-level session its tree reports to.
+#[derive(Clone)]
+struct PeerEntry {
+    inner: Weak<Inner>,
+    owner: CancellationToken,
+    origin: Option<String>,
 }
 
 /// One queued message and the top-level session it is addressed to.
@@ -1151,6 +1164,23 @@ impl SubagentManager {
             .lock()
             .expect("subagent registry poisoned")
             .insert(id.clone(), Arc::clone(&child));
+        {
+            let mut directory = self
+                .inner
+                .main_inbox
+                .directory
+                .lock()
+                .expect("peer directory poisoned");
+            directory.retain(|_, entry| entry.inner.strong_count() > 0);
+            directory.insert(
+                id.clone(),
+                PeerEntry {
+                    inner: Arc::downgrade(&self.inner),
+                    owner: self.owner.clone(),
+                    origin: child.spec.origin.clone(),
+                },
+            );
+        }
         let _ = self.inner.events.send(SubagentEvent::Spawned {
             id: id.clone(),
             name: child.spec.name.clone(),
@@ -1205,6 +1235,82 @@ impl SubagentManager {
                 SubagentError::Failed("child terminated without publishing a result".into())
             })?;
         }
+    }
+
+    /// The handle that owns `id` among this manager's peers: this manager for
+    /// its own children, otherwise any child spawned in the same tree. A nested
+    /// manager reaches only children of its own top-level session (`origin`),
+    /// so separate trees never address each other.
+    fn peer(&self, id: &str) -> Result<SubagentManager, SubagentError> {
+        if self.child(id).is_ok() {
+            return Ok(self.scoped(self.owner.clone()));
+        }
+        let entry = self
+            .inner
+            .main_inbox
+            .directory
+            .lock()
+            .expect("peer directory poisoned")
+            .get(id)
+            .cloned()
+            .filter(|entry| self.inner.origin.is_none() || entry.origin == self.inner.origin)
+            .ok_or_else(|| SubagentError::Unknown(id.to_string()))?;
+        let inner = entry
+            .inner
+            .upgrade()
+            .ok_or_else(|| SubagentError::Unknown(id.to_string()))?;
+        Ok(SubagentManager {
+            inner,
+            owner: entry.owner,
+        })
+    }
+
+    /// Ids of every child this manager can address: its own children and the
+    /// rest of its tree, as [`SubagentManager::peer`] scopes them. With
+    /// `working_only`, finished children are left out.
+    pub fn peer_ids(&self, working_only: bool) -> Vec<String> {
+        let mut ids: Vec<String> = self.list().into_iter().map(|summary| summary.id).collect();
+        let entries: Vec<(String, PeerEntry)> = self
+            .inner
+            .main_inbox
+            .directory
+            .lock()
+            .expect("peer directory poisoned")
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.clone()))
+            .collect();
+        for (id, entry) in entries {
+            let in_scope = self.inner.origin.is_none() || entry.origin == self.inner.origin;
+            if in_scope && entry.inner.strong_count() > 0 && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        if working_only {
+            ids.retain(|id| {
+                self.peer_summary(id)
+                    .is_ok_and(|summary| !summary.status.is_terminal())
+            });
+        }
+        ids
+    }
+
+    /// Message any child this manager can address; see [`SubagentManager::send`].
+    pub fn send_peer(&self, id: &str, message: String) -> Result<(), SubagentError> {
+        self.peer(id)?.send(id, message)
+    }
+
+    /// Status snapshot of any child this manager can address.
+    pub fn peer_summary(&self, id: &str) -> Result<SubagentSummary, SubagentError> {
+        self.peer(id)?
+            .list()
+            .into_iter()
+            .find(|summary| summary.id == id)
+            .ok_or_else(|| SubagentError::Unknown(id.to_string()))
+    }
+
+    /// Completed result of any child this manager can address.
+    pub fn peer_output(&self, id: &str) -> Result<Option<SubagentResult>, SubagentError> {
+        self.peer(id)?.output(id)
     }
 
     /// Cancel a queued or running child. Idempotent for terminal children.
