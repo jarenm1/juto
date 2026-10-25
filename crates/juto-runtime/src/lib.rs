@@ -610,6 +610,7 @@ impl Runtime {
             tier: self.config().execution_tier,
             sender: None,
             ask: None,
+            yielded: None,
             main_session: Some(&main_session),
             unattended: None,
             limits: JobLimits::default(),
@@ -677,6 +678,7 @@ impl Runtime {
             tier: job_run_tier(limits.tier, self.config().execution_tier),
             sender: None,
             ask: None,
+            yielded: None,
             main_session: Some(&main_session),
             unattended: Some(&scope),
             limits,
@@ -746,6 +748,7 @@ impl Runtime {
             tier,
             sender,
             ask,
+            yielded,
             main_session,
             unattended,
             limits: job_limits,
@@ -829,6 +832,9 @@ impl Runtime {
         // tree stops for operator decisions instead.
         if let Some(ask) = ask.filter(|_| unattended.is_none()) {
             registry.register(Arc::new(AskUserTool { ask: ask.clone() }))?;
+        }
+        if let Some(slot) = yielded {
+            registry.register(Arc::new(YieldTool { slot: slot.clone() }))?;
         }
         // The browser launches host processes and reads and writes host files
         // outside the bash sandbox, so sandboxed tiers do not get it.
@@ -1348,6 +1354,8 @@ struct RunPlacement<'a> {
     sender: Option<&'a str>,
     /// The child's line to the user, for `ask_user`. `None` for the main thread.
     ask: Option<&'a subagents::UserAsk>,
+    /// Where the child's `yield` tool records its result. `None` for the main thread.
+    yielded: Option<&'a YieldSlot>,
     /// The main thread's session file, which `recall` reads. Children carry
     /// it from the `task` call that spawned them.
     main_session: Option<&'a Path>,
@@ -1738,6 +1746,7 @@ impl subagents::SubagentFactory for ChildFactory {
         } else {
             (self.runtime.clone(), None)
         };
+        let yielded = YieldSlot::default();
         let result: Result<SubagentResult> = async {
             let mut session = Session::create(&runtime.inner.data_dir.join("sessions/subagents"), &runtime.inner.cwd)?;
             if let Some(snapshot) = &spec.main_snapshot {
@@ -1787,6 +1796,7 @@ impl subagents::SubagentFactory for ChildFactory {
                         tier: spec.tier.unwrap_or(ExecutionTier::Workspace),
                         sender: Some(id),
                         ask: spec.ask.as_ref(),
+                        yielded: Some(&yielded),
                         unattended: self.unattended.as_ref(),
                         limits: JobLimits::default(),
                         main_session: spec.main_session.as_deref(),
@@ -1794,7 +1804,7 @@ impl subagents::SubagentFactory for ChildFactory {
                     manager,
                 )
                 .await?;
-            turn_result(id, &session, outcome)
+            turn_result(id, &session, outcome, &yielded)
         }.await;
         // The child runtime and session are dropped above; only then may the
         // fork be reclaimed. A completed turn keeps its fork for follow-up turns
@@ -1824,6 +1834,7 @@ impl subagents::SubagentFactory for ChildFactory {
             repo_root: self.runtime.inner.cwd.clone(),
             subagent_id: id.to_owned(),
         });
+        let yielded = YieldSlot::default();
         let result: Result<SubagentResult> = async {
             let runtime = match &workspace {
                 Some(workspace) => self.runtime_at(workspace.path.clone()).await?,
@@ -1850,6 +1861,7 @@ impl subagents::SubagentFactory for ChildFactory {
                         tier: spec.tier.unwrap_or(ExecutionTier::Workspace),
                         sender: Some(id),
                         ask: spec.ask.as_ref(),
+                        yielded: Some(&yielded),
                         unattended: self.unattended.as_ref(),
                         limits: JobLimits::default(),
                         main_session: spec.main_session.as_deref(),
@@ -1857,7 +1869,7 @@ impl subagents::SubagentFactory for ChildFactory {
                     manager,
                 )
                 .await?;
-            turn_result(id, &session, outcome)
+            turn_result(id, &session, outcome, &yielded)
         }
         .await;
         settle_isolated_turn(result, workspace)
@@ -1893,10 +1905,34 @@ impl subagents::SubagentFactory for ChildFactory {
 
 /// Build the turn's [`SubagentResult`] from a finished `run_depth` outcome and
 /// the session it wrote. Both the first turn and follow-up turns share this
-/// so the stop-reason contract and output extraction stay identical.
-fn turn_result(id: &str, session: &Session, outcome: RunOutcome) -> Result<SubagentResult> {
+/// so the stop-reason contract and output extraction stay identical. A result
+/// the child gave through `yield` wins over its last message; a yielded
+/// failure fails the turn with the child's reason.
+fn turn_result(
+    id: &str,
+    session: &Session,
+    outcome: RunOutcome,
+    yielded: &YieldSlot,
+) -> Result<SubagentResult> {
     if outcome.stop_reason == StopReason::Aborted {
         bail!("subagent cancelled");
+    }
+    if let Some(yielded) = yielded.lock().take() {
+        if yielded.failed {
+            bail!("subagent reported failure: {}", yielded.result);
+        }
+        let data = yielded
+            .data
+            .or_else(|| subagents::extract_json(&yielded.result));
+        return Ok(SubagentResult {
+            id: id.to_owned(),
+            output: yielded.result,
+            data,
+            usage: outcome.usage,
+            stop_reason: outcome.stop_reason,
+            session_path: session.path().to_path_buf(),
+            change_id: None,
+        });
     }
     if outcome.stop_reason != StopReason::Stop {
         bail!("subagent did not complete: {:?}", outcome.stop_reason);
@@ -1922,6 +1958,53 @@ fn turn_result(id: &str, session: &Session, outcome: RunOutcome) -> Result<Subag
         session_path: session.path().to_path_buf(),
         change_id: None,
     })
+}
+
+/// What a child handed back through `yield`, read when its turn ends.
+struct Yielded {
+    result: String,
+    data: Option<Value>,
+    failed: bool,
+}
+
+type YieldSlot = Arc<Mutex<Option<Yielded>>>;
+
+/// Lets a child hand back its result explicitly: the text main reads, optional
+/// structured data, or a failure with its reason. The turn ends with the
+/// child's next reply; the yielded result replaces that reply as the output.
+struct YieldTool {
+    slot: YieldSlot,
+}
+
+#[async_trait]
+impl Tool for YieldTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "yield".into(),
+            description: "Hand back your result for this turn. `result` is the report the agent that started you reads; `data` is optional structured output; set `failed` to true, with the reason in `result`, when you could not do the task. Call it once, when you are done, then end your turn with a one-line closing message and no more tool calls. The yielded result replaces that closing message as your output.".into(),
+            parameters: json!({"type":"object","properties":{"result":{"type":"string"},"data":{},"failed":{"type":"boolean"}},"required":["result"],"additionalProperties":false}),
+        }
+    }
+    async fn execute(&self, arguments: Value, _ctx: ToolContext) -> Result<ToolOutput, String> {
+        let result = arguments["result"]
+            .as_str()
+            .filter(|result| !result.trim().is_empty())
+            .ok_or("result required")?
+            .to_owned();
+        let failed = arguments["failed"].as_bool().unwrap_or(false);
+        let data = arguments
+            .get("data")
+            .filter(|data| !data.is_null())
+            .cloned();
+        *self.slot.lock() = Some(Yielded {
+            result,
+            data,
+            failed,
+        });
+        Ok(ToolOutput::text(
+            "Recorded. End your turn now with a one-line closing message and no more tool calls.",
+        ))
+    }
 }
 
 fn register_agent_tools(
@@ -3039,6 +3122,71 @@ mod tests {
         let path = repo.join("big.txt");
         std::fs::write(&path, "lorem ipsum dolor sit amet\n".repeat(1800)).expect("write file");
         path
+    }
+
+    /// A child that yields `args` on its first request and closes with "bye".
+    struct YieldingChild {
+        args: Value,
+    }
+
+    #[async_trait]
+    impl Provider for YieldingChild {
+        async fn stream(
+            &self,
+            _model: &Model,
+            context: &Context,
+            _options: &StreamOptions,
+            _cancel: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            let yielded = context
+                .messages
+                .iter()
+                .any(|message| matches!(message, Message::ToolResult { tool_name, .. } if tool_name == "yield"));
+            if yielded {
+                return Ok(scripted_reply(
+                    vec![ContentBlock::Text { text: "bye".into() }],
+                    StopReason::Stop,
+                ));
+            }
+            Ok(scripted_reply(
+                vec![ContentBlock::ToolCall(ToolCall {
+                    id: "call-yield".to_string(),
+                    name: "yield".to_string(),
+                    arguments: self.args.clone(),
+                    thought_signature: None,
+                })],
+                StopReason::ToolUse,
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_yielded_result_replaces_the_closing_reply_and_a_yielded_failure_fails() {
+        let root = tempdir().expect("tempdir");
+        let repo = root.path().join("repo");
+        native_repo(&repo);
+
+        let provider = Arc::new(YieldingChild {
+            args: json!({"result": "parser fixed", "data": {"files": 2}}),
+        });
+        let runtime = runtime_with(&repo, &root.path().join("ok"), mock_config(), provider);
+        let manager = runtime.subagent_manager();
+        let id = manager.spawn(TaskSpec::new("fix the parser")).unwrap();
+        let result = manager.wait(&id).await.expect("yielded success");
+        assert_eq!(result.output, "parser fixed");
+        assert_eq!(result.data, Some(json!({"files": 2})));
+
+        let provider = Arc::new(YieldingChild {
+            args: json!({"result": "the repo has no parser", "failed": true}),
+        });
+        let runtime = runtime_with(&repo, &root.path().join("fail"), mock_config(), provider);
+        let manager = runtime.subagent_manager();
+        let id = manager.spawn(TaskSpec::new("fix the parser")).unwrap();
+        let error = manager.wait(&id).await.expect_err("yielded failure");
+        assert!(
+            error.to_string().contains("the repo has no parser"),
+            "{error}"
+        );
     }
 
     /// Enables only `read`, and keeps no messages through compaction so the
@@ -5204,7 +5352,7 @@ mod tests {
         // A scout reads its peers but cannot message or spawn them.
         assert_eq!(
             provider.requests(),
-            vec![tool_set(&["read", "glob", "grep", "agent_read"])]
+            vec![tool_set(&["read", "glob", "grep", "agent_read", "yield"])]
         );
     }
 
@@ -5239,6 +5387,7 @@ mod tests {
                     tier: ExecutionTier::Attended,
                     sender: None,
                     ask: None,
+                    yielded: None,
                     main_session: None,
                     unattended: None,
                     limits: JobLimits::default(),
@@ -5292,6 +5441,7 @@ mod tests {
                         tier,
                         sender: None,
                         ask: None,
+                        yielded: None,
                         main_session: None,
                         unattended: None,
                         limits: JobLimits::default(),
