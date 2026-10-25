@@ -770,21 +770,79 @@ async fn child_report_for_a_missing_session_stays_queued() {
 }
 
 #[tokio::test]
-async fn timeline_request_answers_for_a_session() {
+async fn session_view_starts_at_the_compaction_edge_and_pages_earlier_by_turn() {
     let root = tempfile::tempdir().unwrap();
     let daemon = daemon(root.path(), ScriptedProvider::new(false));
     let view = create_session(&daemon).await;
+    let id = view.info.id.clone();
 
-    let Reply::Timeline { items } = daemon
-        .request(Request::Timeline {
-            session_id: view.info.id.clone(),
-        })
-        .await
-        .expect("timeline")
+    // Five turns of three messages: users at 0, 3, 6, 9, 12.
+    let mut journal = Session::open(&view.info.path).unwrap();
+    for turn in 0..5 {
+        journal
+            .append(EntryKind::Message {
+                message: Message::user(format!("q{turn}")),
+            })
+            .unwrap();
+        for part in ["a", "b"] {
+            let text = format!("{part}{turn}");
+            let reply = assistant(vec![ContentBlock::Text { text }], StopReason::Stop);
+            journal
+                .append(EntryKind::Message {
+                    message: Message::Assistant(reply),
+                })
+                .unwrap();
+        }
+    }
+    drop(journal);
+    let open = open_session(&daemon, &id).await;
+    assert_eq!(
+        (open.first, open.timeline.len(), open.committed),
+        (0, 15, 15)
+    );
+
+    // Memory merged messages 0..4; message 4 is mid-turn, so the view opens
+    // at that turn's user message.
+    let memory = view.info.path.with_extension("").join("memory");
+    std::fs::create_dir_all(&memory).unwrap();
+    let mut parts = vec![(2, 0)];
+    parts.extend((4..15).map(|i| (0, i)));
+    std::fs::write(
+        memory.join("view.json"),
+        serde_json::json!({ "parts": parts }).to_string(),
+    )
+    .unwrap();
+    let open = open_session(&daemon, &id).await;
+    assert_eq!(open.first, 3);
+    assert_eq!(
+        open.committed, 15,
+        "indexes still count the whole conversation"
+    );
+    assert_eq!(
+        open.timeline.first().map(Message::text).as_deref(),
+        Some("q1")
+    );
+    assert_eq!(open.timeline.len(), 12);
+
+    let page = |before, limit| Request::Timeline {
+        session_id: id.clone(),
+        before,
+        limit,
+    };
+    let Reply::Timeline { first, items } = daemon.request(page(Some(3), Some(2))).await.unwrap()
     else {
         panic!("expected a timeline reply");
     };
-    assert!(items.is_empty(), "a fresh session has no routed history");
+    let texts: Vec<String> = items.iter().map(Message::text).collect();
+    assert_eq!(
+        (first, texts),
+        (0, vec!["q0".into(), "a0".into(), "b0".into()])
+    );
+
+    let Reply::Timeline { first, items } = daemon.request(page(None, None)).await.unwrap() else {
+        panic!("expected a timeline reply");
+    };
+    assert_eq!((first, items.len()), (0, 15));
 }
 
 fn assistant(content: Vec<ContentBlock>, stop_reason: StopReason) -> AssistantMessage {
