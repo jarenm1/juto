@@ -18,6 +18,10 @@ pub(crate) async fn tick_loop(daemon: Arc<Daemon>) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
+        let _permit = daemon.admission.read().await;
+        if daemon.draining.load(std::sync::atomic::Ordering::Acquire) {
+            continue;
+        }
         if let Err(error) = daemon.runtime.tick_automations(juto_ai::timestamp_ms()) {
             eprintln!("juto-daemon: automation tick failed: {error}");
         }

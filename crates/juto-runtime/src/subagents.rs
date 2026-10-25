@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc, watch};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use uuid::Uuid;
 
 /// Model-visible description of one child run.
@@ -562,6 +563,8 @@ pub struct MainInbox {
     event_senders: Arc<Mutex<Vec<broadcast::WeakSender<SubagentEvent>>>>,
     /// Backing file, set once by `bind`.
     store: Arc<OnceLock<PathBuf>>,
+    /// Tracks execution across every nested manager sharing this run tree.
+    tasks: TaskTracker,
     /// Every child spawned anywhere in this run tree, by id, so peers can
     /// address one another and not only their own children. The inbox is the
     /// handle every manager in a tree already shares, so the directory rides on it.
@@ -784,6 +787,11 @@ impl MainInbox {
             }
             Entry::Occupied(mut lane) => lane.get_mut().push_back(pending),
         }
+    }
+
+    /// Reports whose asynchronous digest must finish before the host can exit.
+    pub fn has_pending_reports(&self) -> bool {
+        !self.lanes.lock().expect("main inbox poisoned").is_empty()
     }
 
     /// Full text of a digested or clipped report, as `wait` returns it.
@@ -1204,7 +1212,7 @@ impl SubagentManager {
 
         let inner = Arc::clone(&self.inner);
         let task_id = id.clone();
-        tokio::spawn(run_child(
+        self.inner.main_inbox.tasks.spawn(run_child(
             inner,
             child,
             task_id,
@@ -1506,7 +1514,7 @@ impl SubagentManager {
         }
         child.set_status(SubagentStatus::Running);
 
-        tokio::spawn(run_follow_up(
+        self.inner.main_inbox.tasks.spawn(run_follow_up(
             Arc::clone(&self.inner),
             child,
             self.owner.clone(),
@@ -1516,6 +1524,11 @@ impl SubagentManager {
             origin,
         ));
         Ok(())
+    }
+
+    /// Includes all nested children, operator waits, and post-turn focus summaries.
+    pub fn has_active_children(&self) -> bool {
+        !self.inner.main_inbox.tasks.is_empty()
     }
 
     /// Snapshot of every known child, newest last.
@@ -2085,7 +2098,8 @@ fn spawn_summary(inner: Arc<Inner>, child: Arc<Child>, owner: CancellationToken)
         Some(Ok(result)) => result.session_path.clone(),
         _ => return,
     };
-    tokio::spawn(async move {
+    let tasks = inner.main_inbox.tasks.clone();
+    tasks.spawn(async move {
         match inner.factory.summarize(&session_path, owner).await {
             Ok(summary) => {
                 *child.summary.lock().expect("mutex poisoned") = Some(summary.clone());
