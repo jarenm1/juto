@@ -7,7 +7,7 @@ use juto_ai::ToolDefinition;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::recall::{floor_boundary, full_body, role};
+use crate::recall::{History, floor_boundary, full_body, role};
 use crate::session::{EntryKind, Session};
 use crate::tools::OUTPUT_MAX_BYTES;
 
@@ -27,14 +27,16 @@ struct Args {
     limit: Option<usize>,
 }
 
-/// Read-only `zoom` over the main session file at `session`.
+/// Read-only `zoom` over the compactions of the session file at `session`.
+/// Indices are `recall`'s, numbered over `history`.
 pub(crate) struct ZoomTool {
     session: PathBuf,
+    history: PathBuf,
 }
 
 impl ZoomTool {
-    pub(crate) fn new(session: PathBuf) -> Self {
-        Self { session }
+    pub(crate) fn new(session: PathBuf, history: PathBuf) -> Self {
+        Self { session, history }
     }
 }
 
@@ -67,15 +69,17 @@ impl Tool for ZoomTool {
             }
         };
         let path = self.session.clone();
-        tokio::task::spawn_blocking(move || read(&path, args))
+        let history = self.history.clone();
+        tokio::task::spawn_blocking(move || read(&path, &history, args))
             .await
             .map_err(|error| error.to_string())?
     }
 }
 
-/// Answers one `zoom` call from the session at `path`. Mistakes in the call
-/// are tool errors; only a session that cannot be read is an `Err`.
-fn read(path: &Path, args: Args) -> Result<ToolOutput, String> {
+/// Answers one `zoom` call from the session at `path`, citing `recall`
+/// indices over `history`. Mistakes in the call are tool errors; only a
+/// session that cannot be read is an `Err`.
+fn read(path: &Path, history: &Path, args: Args) -> Result<ToolOutput, String> {
     if args.limit == Some(0) {
         return Ok(ToolOutput::error("`limit` must be at least 1"));
     }
@@ -112,7 +116,8 @@ fn read(path: &Path, args: Args) -> Result<ToolOutput, String> {
         Ok(span) => span,
         Err(error) => return Ok(ToolOutput::error(error.to_string())),
     };
-    let view = session.path_view().map_err(|error| error.to_string())?;
+    let history = History::open(history).map_err(|error| format!("{error:#}"))?;
+    let view = history.view().map_err(|error| format!("{error:#}"))?;
     let index_of: HashMap<&str, usize> = view
         .messages
         .iter()
@@ -126,12 +131,8 @@ fn read(path: &Path, args: Args) -> Result<ToolOutput, String> {
                 args.id
             )));
         };
-        let Some(&index) = index_of.get(entry.id.as_str()) else {
-            return Ok(ToolOutput::error(format!(
-                "span message {} is not on the main thread's path",
-                entry.id
-            )));
-        };
+        // Context the runtime seeded into a thread has no `recall` index.
+        let index = index_of.get(entry.id.as_str()).copied();
         spanned.push((index, entry.id.as_str(), message));
     }
 
@@ -151,7 +152,10 @@ fn read(path: &Path, args: Args) -> Result<ToolOutput, String> {
     let mut next = offset;
     while next < limit {
         let (index, id, message) = spanned[next];
-        let header = format!("message {index} ({}, id {id})\n", role(message));
+        let header = match index {
+            Some(index) => format!("message {index} ({}, id {id})\n", role(message)),
+            None => format!("context ({}, id {id})\n", role(message)),
+        };
         let text = full_body(message);
         if body.len() + header.len() + text.len() < PAGE_BYTES {
             body.push_str(&header);
@@ -165,10 +169,11 @@ fn read(path: &Path, args: Args) -> Result<ToolOutput, String> {
                 let cut = floor_boundary(&text, room);
                 body.push_str(&header);
                 body.push_str(&text[..cut]);
-                body.push_str(&format!(
-                    "\n[bytes 0..{cut} of {}] more: recall {{\"id\": {index}, \"at\": {cut}}}\n",
-                    text.len()
-                ));
+                body.push_str(&format!("\n[bytes 0..{cut} of {}]", text.len()));
+                if let Some(index) = index {
+                    body.push_str(&format!(" more: recall {{\"id\": {index}, \"at\": {cut}}}"));
+                }
+                body.push('\n');
                 next += 1;
             }
             break;

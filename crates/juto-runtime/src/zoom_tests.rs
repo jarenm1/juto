@@ -33,7 +33,7 @@ fn text_of(output: &ToolOutput) -> String {
 }
 
 fn zoom_call(path: &Path, args: Value) -> ToolOutput {
-    read(path, serde_json::from_value(args).unwrap()).unwrap()
+    read(path, path, serde_json::from_value(args).unwrap()).unwrap()
 }
 
 /// Expansion tokens `zz-NNN` in the order they appear in a page.
@@ -326,7 +326,10 @@ async fn zoom_json_calls_through_the_agent_return_the_exact_span() {
     });
     let mut tools = ToolRegistry::new();
     tools
-        .register(Arc::new(ZoomTool::new(session.path().to_path_buf())))
+        .register(Arc::new(ZoomTool::new(
+            session.path().to_path_buf(),
+            session.path().to_path_buf(),
+        )))
         .unwrap();
     let config = AgentConfig {
         cwd: dir.path().to_path_buf(),

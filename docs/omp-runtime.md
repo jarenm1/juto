@@ -169,9 +169,14 @@ exists.
 This is Juto behavior, not a claim about the pinned OMP implementation.
 `recall {}` lists the main session's active-path messages, including originals
 hidden by compaction; `from`/`count` page the index. `recall {"id": N}` reads one
-message, and `at` pages its body by byte offset. Responses are bounded to about
-16 KB with continuation hints; images are MIME placeholders. Indices are stable
-across compaction, but branch switches select a different path.
+message, and `at` pages its body by byte offset. When `from` or `count` is given,
+`id` and `at` are ignored and the reply says so (models that fill every optional
+field still get a listing). Responses are bounded to about 16 KB with
+continuation hints; images are MIME placeholders. Indices are stable across
+compaction, but branch switches select a different path. For a main session with
+internal threads, `recall` numbers the merged conversation of every thread in
+time order, leaving out the snapshot seeded into each new thread; `zoom` cites
+indices in that numbering.
 
 Each compaction entry records `span_start_id` and `span_end_id`: the first and last message it replaced, inclusive, on the active path. Journals written before spans omit both fields; `Session::entries_in_span` reads a span back as message entries.
 

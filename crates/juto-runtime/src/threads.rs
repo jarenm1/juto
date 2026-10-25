@@ -34,7 +34,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Runtime,
+    Runtime, recall,
     session::{EntryKind, Session},
 };
 
@@ -255,23 +255,51 @@ impl MainSession {
 
     /// Routing records and every thread's messages, merged in time order.
     /// Messages a thread copied from the main journal (an adopted transcript)
-    /// appear once.
+    /// appear once. Context the runtime seeded into a thread is left out.
     pub fn timeline(&self) -> Result<Vec<TimelineItem>> {
-        let mut items: Vec<(u64, TimelineItem)> = Vec::new();
+        Ok(self
+            .merged(true)?
+            .into_iter()
+            .map(|(_, item)| item)
+            .collect())
+    }
+
+    /// The conversation as the user sees it: every message of the timeline in
+    /// order, with its journal entry id. Threads only append, so an index into
+    /// this list keeps naming the same message as the conversation grows.
+    pub(crate) fn history(&self) -> Result<Vec<(String, Message)>> {
+        Ok(self
+            .merged(false)?
+            .into_iter()
+            .filter_map(|(id, item)| match item {
+                TimelineItem::Message { message, .. } => Some((id, message)),
+                TimelineItem::Routed { .. } => None,
+            })
+            .collect())
+    }
+
+    /// Timeline rows with their entry ids; `routes` includes routing records.
+    fn merged(&self, routes: bool) -> Result<Vec<(String, TimelineItem)>> {
+        let mut items: Vec<(u64, String, TimelineItem)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         for entry in self.journal.active_entries()? {
             seen.insert(entry.id.clone());
             match &entry.kind {
                 EntryKind::Message { message } => items.push((
                     entry.timestamp,
+                    entry.id.clone(),
                     TimelineItem::Message {
                         thread: None,
                         message: message.clone(),
                     },
                 )),
-                EntryKind::Custom { custom_type, data } if custom_type == ROUTED => {
+                EntryKind::Custom { custom_type, data } if routes && custom_type == ROUTED => {
                     let route: Route = parse_record(custom_type, data)?;
-                    items.push((entry.timestamp, TimelineItem::Routed { route }));
+                    items.push((
+                        entry.timestamp,
+                        entry.id.clone(),
+                        TimelineItem::Routed { route },
+                    ));
                 }
                 _ => {}
             }
@@ -283,21 +311,34 @@ impl MainSession {
                 if !seen.insert(entry.id.clone()) {
                     continue;
                 }
-                if let EntryKind::Message { message } = &entry.kind {
-                    items.push((
+                match &entry.kind {
+                    // A thread's only developer message is the main history
+                    // seeded at its start (see `create_thread`): context, not
+                    // conversation.
+                    EntryKind::Message {
+                        message: Message::Developer { .. },
+                    } => {}
+                    EntryKind::Message { message } => items.push((
                         entry.timestamp,
+                        entry.id.clone(),
                         TimelineItem::Message {
                             thread: Some(thread.id.clone()),
                             message: message.clone(),
                         },
-                    ));
+                    )),
+                    _ => {}
                 }
             }
         }
         // Stable: on equal timestamps a routing record precedes the request
         // it routed, because main-journal rows are collected first.
-        items.sort_by_key(|(timestamp, _)| *timestamp);
-        Ok(items.into_iter().map(|(_, item)| item).collect())
+        items.sort_by_key(|(timestamp, _, _)| *timestamp);
+        Ok(items.into_iter().map(|(_, id, item)| (id, item)).collect())
+    }
+
+    /// The routing journal, for readers that treat it as a plain session.
+    pub(crate) fn into_journal(self) -> Session {
+        self.journal
     }
 
     /// A pre-thread session: messages in the main journal and no threads.
@@ -323,7 +364,13 @@ impl MainSession {
         self.record_created(id, fork.path(), initial_label(&first_request))
     }
 
+    /// Start a thread. A thread runs with only its own history, so it begins
+    /// with a snapshot of the conversation so far: a request that refers back
+    /// to another topic, or asks about the conversation itself, still has it.
+    /// Written once at creation, the snapshot keeps the thread's prompt prefix
+    /// stable.
     fn create_thread(&mut self, label: String, model: &str) -> Result<ThreadInfo> {
+        let context = recall::thread_context(self)?;
         let parent = self.id().to_owned();
         let mut session = Session::create_child(
             &thread_dir(self.path()),
@@ -333,6 +380,11 @@ impl MainSession {
         session.append(EntryKind::ModelChange {
             model: model.to_owned(),
         })?;
+        if let Some(context) = context {
+            session.append(EntryKind::Message {
+                message: Message::developer(context),
+            })?;
+        }
         let id = session.header().id.clone();
         self.record_created(id, session.path(), label)
     }
@@ -584,7 +636,10 @@ impl Runtime {
                 let _ = forward.send(MainEvent::Agent(event));
             }
         });
-        let result = self.run(&mut session, prompt, agent_events, control).await;
+        let history = main.path().to_path_buf();
+        let result = self
+            .run_with_history(&mut session, &history, prompt, agent_events, control)
+            .await;
         // The run dropped its sender; wait so every agent event precedes the
         // label update below.
         let _ = forwarder.await;
