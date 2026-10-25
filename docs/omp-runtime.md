@@ -91,27 +91,78 @@ policy, and all extensibility. Bun-specific seams that must be replaced: `bun:sq
 (→ `rusqlite`), `Bun.spawn`/`$` (→ `tokio::process` / `std::process`), `Bun.serve`
 (→ `axum`/equivalent), `.md`-as-text imports (→ `include_str!`), `Bun.env`/`bun:ffi`.
 
-## Implemented status (first step — foundation only)
+## Implemented status (as of this revision)
 
-What exists in Juto today:
+Juto is past the foundation stage. The items below exist in source at this
+revision. This section records presence only; it does not claim that each part
+has been smoke-tested.
 
-- Nix flake + Cargo workspace skeleton with fast-build-oriented configuration.
-- `.envrc` dev environment; `jj` version control; adapted `AGENTS.md`; inherited
-  scripts/agent-scope resource wrapper.
-- A minimal **GPUI 0.2.2 application shell** targeting X11 + Wayland — a launchable
-  native window, nothing more.
+Workspace and tooling:
 
-What does **not** exist yet:
+- Nix flake and Cargo workspace, `.envrc`, jj, `AGENTS.md`, and the
+  `scripts/agent-scope.sh` resource wrapper.
 
-- **No OMP runtime behavior is ported.** There is no runtime crate yet; the module
-  layout in §"Rust module seam proposal" is a *prospective* sketch, not existing code.
-- No provider clients, no auth, no agent loop, no tools, no sessions, no extensions.
-- GPUI currently stands in for `packages/tui` only; every runtime subsystem below is
-  unimplemented in Juto.
+Provider and models (`crates/juto-ai`, `crates/juto-catalog`):
 
-Full parity with omp is a long-horizon program (§"Ordered implementation plan"), not the
-initial milestone. The first shippable slice should be judged against its own acceptance
-criteria, not against this inventory.
+- Provider dispatch and transports under `src/provider/` (`requests`, `decode`,
+  `proto`, `connect`, `devin`), SSE parsing (`sse.rs`), typed messages
+  (`types.rs`), credential store and login (`auth.rs`), and the decision judge
+  (`judge.rs`).
+- Bundled model catalog: `data/source.json` and `data/models.json.gz`.
+
+Agent loop (`crates/juto-agent`):
+
+- `Agent::run` tool-call loop, `Tool` trait, and `ToolRegistry` with
+  `retain_names` for role scoping.
+- `AgentEvent` stream, `RunControl` for cancellation, and `AgentHooks` for
+  approvals and telemetry. Hooks are a host seam, not a plugin loader.
+- `view` element trees for rendering tool results.
+
+Runtime (`crates/juto-runtime`):
+
+- Built-in tools (`tools.rs`): read, write, edit, glob, grep, bash, vcs, view,
+  desktop, desktop_artifact.
+- Session journal (`session.rs`): JSONL entries for messages, model changes,
+  branches, and compaction, with fork.
+- Subagents (`subagents.rs`): `TaskSpec` and `SubagentResult`, a status state
+  machine (Queued, Running, Blocked, terminal states), blocker reasons, a main
+  inbox, and peer messaging.
+- Todo tool (`todo.rs`): a phase and task checklist with ops `init`, `start`,
+  `done`, `drop`, `block`, `unblock`, `rm`, `append`, and `view`. A batch with
+  any error is rejected whole. Each run rebuilds its list from the newest
+  successful `todo` result on its active session path, so no separate store
+  exists. Only roles whose tool scope names `todo` get it: `builder`, `task`,
+  and `scout`. `main` and `reviewer` never do.
+- Roles (`roles.rs`, `roles/*.md`): `main`, `builder`, `browser`, `scout`, `reviewer`,
+  `task`. The `tools` frontmatter sets each role's tool scope. Project and
+  global role files override the built-ins. `scout` names its read-only tools
+  explicitly so it can include `todo`. A read-only run intersects the role scope
+  with `ToolScope::read_only_run()`, which keeps `todo`.
+- Context (`context.rs`): `AGENTS.md` discovery and `SKILL.md` skill discovery.
+- Isolation: per-subagent jj workspaces, change graph, replication, and git
+  transfer (`workspace.rs`, `change_graph.rs`, `replication.rs`,
+  `git_transfer.rs`).
+- Config layering (`config.rs`), approval handling (`approval.rs`), and desktop
+  tools backed by `juto-desktop`.
+
+Desktop and UI:
+
+- `crates/juto-desktop`: desktop supervisor, signaling, viewer, and shared-memory
+  frames.
+- `apps/juto`: GPUI app with chat, a sidebar of subagent states, subagent cards,
+  model picker, auth modal, and focus view.
+- `apps/juto-cli`: command-line client.
+
+Not implemented (checked by grep at this revision):
+
+- OMP `todo` extras not ported: op inference when `op` is missing,
+  `completedTasks` details, the `/todo` command, markdown import/export, the HUD,
+  and user-edited todo entries.
+- No MCP client and no extension or plugin loader.
+
+The capability sections below describe OMP at the pin. They do not record
+per-item Juto coverage. Check the Juto source path before assuming a feature
+exists.
 
 ## Juto extension: main-thread recall and child context
 
@@ -941,7 +992,7 @@ components implement `describe()` → semantic `NativeNode` trees → `reconcile
 for a native host; a GPUI app can consume the same describe-tree vocabulary instead of
 terminal APC bytes.
 
-## 6. Rust module seam proposal (prospective — nothing implemented)
+## 6. Rust module seam proposal (names provisional; the crates in "Implemented status" are the actual layout)
 
 Mirroring omp's layering; dependency direction only downward. All names provisional.
 
