@@ -145,6 +145,39 @@ fn the_view_and_written_lines_survive_reopening() {
 }
 
 #[test]
+fn summarized_until_is_the_end_of_the_last_merged_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = dir.path().join("main.jsonl");
+    assert_eq!(summarized_until(&main), 0, "no memory yet");
+
+    let memory = Memory::open(&memory_dir(&main)).unwrap();
+    memory.sync(&users(&["a", "b", "c"]), 100_000).unwrap();
+    assert_eq!(summarized_until(&main), 0, "every message has its own line");
+
+    let texts: Vec<String> = (0..16)
+        .map(|i| format!("{i:02}{}", "m".repeat(292)))
+        .collect();
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    memory.sync(&users(&refs), 3_000).unwrap();
+    build_all(&memory, |part| format!("summary {}", part.reference()));
+    assert!(memory.settled().unwrap());
+    let view = lines(&memory);
+    // The first single-message line after the last merged one starts the edge.
+    let edge = view
+        .iter()
+        .rev()
+        .map(|line| line.split('|').next().unwrap())
+        .find(|reference| !reference.ends_with("+1"))
+        .map(|reference| {
+            let (id, n) = reference.split_once('+').unwrap();
+            id.parse::<usize>().unwrap() + n.parse::<usize>().unwrap()
+        })
+        .expect("over budget, old lines merged");
+    assert!(edge > 0 && edge < 16, "{view:?}");
+    assert_eq!(summarized_until(&main), edge);
+}
+
+#[test]
 fn a_shorter_conversation_starts_the_view_over() {
     let dir = tempfile::tempdir().unwrap();
     let memory = Memory::open(dir.path()).unwrap();

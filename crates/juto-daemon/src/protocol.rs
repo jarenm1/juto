@@ -32,7 +32,7 @@ use juto_runtime::{Decision, RuntimeConfig, SubagentEvent, SubagentSummary, View
 use serde::{Deserialize, Serialize};
 
 /// Bumped on any incompatible change to this module.
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// One request from a client. `id` is chosen by the client and echoed back.
 #[derive(Clone, Serialize, Deserialize)]
@@ -117,9 +117,15 @@ pub enum Request {
     OpenSession {
         session_id: String,
     },
-    /// Returns a main session's conversation, oldest first.
+    /// Returns a main session's conversation, oldest first: messages
+    /// `before - limit .. before`, widened back to the start of a user turn.
+    /// `before` defaults to the conversation's length and `limit` to all of it.
     Timeline {
         session_id: String,
+        #[serde(default)]
+        before: Option<u64>,
+        #[serde(default)]
+        limit: Option<u64>,
     },
     /// Opens a session journal by path (for `--session <path>`).
     OpenSessionPath {
@@ -378,8 +384,9 @@ pub enum Reply {
     /// The outcome of one GitHub poll across every watch.
     GithubPoll(GithubPollReport),
     Transcript(Vec<Message>),
-    /// Answers [`Request::Timeline`].
+    /// Answers [`Request::Timeline`]. `first` is the index of `items[0]`.
     Timeline {
+        first: u64,
         items: Vec<Message>,
     },
     Credentials(CredentialStatus),
@@ -456,12 +463,16 @@ pub struct RunInfo {
 
 /// Full state of one session, returned by [`Request::OpenSession`].
 ///
-/// `timeline` is the committed conversation in time order. `committed` is its
-/// length; message indexes below it are already reflected. Partial stream
-/// deltas of an in-progress message are not replayed.
+/// `timeline` is the committed conversation in time order from index `first`,
+/// the start of the user turn holding the compaction edge (see
+/// `MainSession::summarized_until`); earlier messages page in through
+/// [`Request::Timeline`]. `committed` is the whole conversation's length;
+/// message indexes below it are already reflected. Partial stream deltas of an
+/// in-progress message are not replayed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionView {
     pub info: SessionInfo,
+    pub first: u64,
     pub timeline: Vec<Message>,
     pub committed: u64,
     /// Approvals waiting for an answer on this session's active run.

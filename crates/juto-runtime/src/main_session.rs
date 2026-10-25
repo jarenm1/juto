@@ -112,6 +112,13 @@ impl MainSession {
             .collect())
     }
 
+    /// Index into [`MainSession::timeline`] before which the model sees the
+    /// conversation only as merged memory lines: the conversation's
+    /// compaction edge. 0 while every message still has its own line.
+    pub fn summarized_until(&self) -> usize {
+        crate::memory::summarized_until(self.path())
+    }
+
     /// [`MainSession::timeline`] with each message's journal entry id. The
     /// conversation only grows, so an index into it keeps naming the same
     /// message: memory leaves and `recall` both count this way.

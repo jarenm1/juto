@@ -183,18 +183,7 @@ impl Memory {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("reading memory nodes"),
         }
-        let view = fs::read(dir.join(VIEW_FILE))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<ViewRecord>(&bytes).ok())
-            .map(|record| {
-                record
-                    .parts
-                    .into_iter()
-                    .map(|(l, i)| Part { l, i })
-                    .collect::<Vec<_>>()
-            })
-            .filter(|parts| contiguous(parts))
-            .unwrap_or_default();
+        let view = saved_view(dir).unwrap_or_default();
         Ok(Self {
             dir: dir.to_path_buf(),
             state: Mutex::new(State {
@@ -783,6 +772,33 @@ impl Tool for ZoomTool {
 /// Where a main session keeps its memory: beside its journal.
 fn memory_dir(main_path: &Path) -> PathBuf {
     main_path.with_extension("").join("memory")
+}
+
+/// The view saved in `dir`, if it is readable and covers messages from 0.
+fn saved_view(dir: &Path) -> Option<Vec<Part>> {
+    let bytes = fs::read(dir.join(VIEW_FILE)).ok()?;
+    let record = serde_json::from_slice::<ViewRecord>(&bytes).ok()?;
+    let parts: Vec<Part> = record
+        .parts
+        .into_iter()
+        .map(|(l, i)| Part { l, i })
+        .collect();
+    contiguous(&parts).then_some(parts)
+}
+
+/// Messages before this index reach the model only inside merged lines: the
+/// end of the saved view's last node over more than one message. 0 when the
+/// view merged nothing, or when there is no readable view yet.
+pub(crate) fn summarized_until(main_path: &Path) -> usize {
+    saved_view(&memory_dir(main_path))
+        .and_then(|parts| {
+            parts
+                .iter()
+                .rev()
+                .find(|part| part.l > 0)
+                .map(|part| part.end())
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

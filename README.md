@@ -147,6 +147,12 @@ The GUI opens the workspace's most recently active main session (`OpenLatestSess
 whose journal was written last), so the conversation continues across window launches and daemon
 restarts or upgrades. `--new` starts a new session; `--session <path>` opens a specific one.
 
+The GUI transcript starts at the conversation's compaction edge: the end of the memory view's last
+merged line (`MainSession::summarized_until`), widened back to the start of that user turn. Earlier
+messages, which the model sees only as merged lines, stay out of the transcript until **Show
+earlier** loads them 40 messages at a time (`Request::Timeline { before, limit }`, also widened to a
+turn start). A conversation whose view has merged nothing opens whole.
+
 **Native live-change DAG and Git transfer.** Juto tracks live agent edits in its own
 version control DAG rather than synthesizing premature Git commits or depending on
 jj at runtime. Edits capture immutable trees with session/thread provenance,

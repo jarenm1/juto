@@ -46,6 +46,10 @@ actions!(
     ]
 );
 
+/// Conversation messages one "Show earlier" click loads, before widening back
+/// to the start of a user turn.
+const EARLIER_PAGE: u64 = 40;
+
 pub fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("escape", CloseAttachmentMenu, Some("ChatView")),
@@ -529,6 +533,10 @@ pub struct ChatView {
     client: Client,
     session_id: String,
     committed: u64,
+    /// Conversation index of the first loaded message. Messages before it sit
+    /// past the compaction edge and load a page at a time on request.
+    first: u64,
+    loading_earlier: bool,
     streaming_row: Option<usize>,
     tokio_handle: tokio::runtime::Handle,
     is_running: bool,
@@ -713,6 +721,8 @@ impl ChatView {
             client,
             session_id,
             committed: session.committed,
+            first: session.first,
+            loading_earlier: false,
             streaming_row: None,
             tokio_handle,
             is_running: session.info.run.is_some(),
@@ -1177,6 +1187,7 @@ impl ChatView {
             self.active_model = model.into();
         }
         self.committed = view.committed;
+        self.first = view.first;
         self.messages = view_messages(&view.timeline);
         self.streaming_row = None;
         self.pending_approvals.clear();
@@ -1184,6 +1195,48 @@ impl ChatView {
             self.handle_approval_request(approval, cx);
         }
         cx.notify();
+    }
+
+    /// Prepends the page of messages before the first loaded one.
+    fn show_earlier(&mut self, cx: &mut Context<Self>) {
+        if self.loading_earlier || self.first == 0 {
+            return;
+        }
+        self.loading_earlier = true;
+        cx.notify();
+        let before = self.first;
+        let request = Request::Timeline {
+            session_id: self.session_id.clone(),
+            before: Some(before),
+            limit: Some(EARLIER_PAGE),
+        };
+        let client = self.client.clone();
+        let handle = self.tokio_handle.clone();
+        cx.spawn(async move |this, cx| {
+            let result = crate::chat_request::call(client, handle, request).await;
+            let _ = this.update(cx, |this, cx| {
+                this.loading_earlier = false;
+                match result {
+                    // A snapshot that moved the window since makes the page stale.
+                    Ok(Reply::Timeline { first, items }) if this.first == before => {
+                        let rows = view_messages(&items);
+                        let added = rows.len();
+                        this.messages.splice(0..0, rows);
+                        if let Some(row) = &mut this.streaming_row {
+                            *row += added;
+                        }
+                        this.first = first;
+                    }
+                    Ok(Reply::Timeline { .. }) => {}
+                    Ok(_) => this.report_error("Unexpected timeline reply".into(), cx),
+                    Err(error) => {
+                        this.report_error(crate::chat_request::describe_error(&error), cx)
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn reattach(&mut self, cx: &mut Context<Self>) {
@@ -1794,6 +1847,9 @@ impl ChatView {
                     .min_w_0()
                     .max_w(px(800.))
                     .mx_auto()
+                    .when(self.focus.is_none() && self.first > 0, |view| {
+                        view.child(self.earlier_row(cx))
+                    })
                     .when_some(empty_hint.filter(|_| messages.is_empty()), |view, hint| {
                         view.child(
                             div()
@@ -1899,6 +1955,44 @@ impl ChatView {
                             })
                             .into_any_element()
                     })),
+            )
+    }
+
+    /// The top of the main transcript while earlier messages are not loaded:
+    /// how many there are and a button that loads the next page.
+    fn earlier_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let count = self.first;
+        let noun = if count == 1 { "message" } else { "messages" };
+        let label = if self.loading_earlier {
+            "Loading…"
+        } else {
+            "Show earlier"
+        };
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .py_2()
+            .text_xs()
+            .text_color(rgb(theme::TEXT_FAINT))
+            .child(SharedString::from(format!(
+                "{count} earlier {noun} summarized in memory"
+            )))
+            .child(
+                div()
+                    .id("show-earlier")
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(theme::BORDER_STRONG))
+                    .bg(rgb(theme::BG_RAISED))
+                    .hover(|s| s.bg(rgb(theme::BG_HOVER)))
+                    .text_color(rgb(theme::TEXT_MUTED))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.show_earlier(cx)))
+                    .child(label),
             )
     }
 

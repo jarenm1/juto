@@ -148,6 +148,16 @@ fn message_count(main: &MainSession) -> Result<u64> {
     Ok(main.timeline()?.len() as u64)
 }
 
+/// The start of the user turn holding message `index`: the last user message
+/// at or before it, or 0 when none is. A window that begins there never shows
+/// tool results without the reply that called them.
+fn turn_start(timeline: &[juto_ai::Message], index: usize) -> usize {
+    timeline[..timeline.len().min(index + 1)]
+        .iter()
+        .rposition(|message| matches!(message, juto_ai::Message::User { .. }))
+        .unwrap_or(0)
+}
+
 /// The main session a report addressed to `origin` wakes: `origin` itself when it
 /// is a main session, else the main session one of whose legacy topic threads it
 /// is (a child spawned there before main became one conversation).
@@ -346,10 +356,14 @@ impl Daemon {
         let mut state = self.state.lock().unwrap();
         state.last_session = Some(session.header().id.clone());
         let main = MainSession::open(session.path()).map_err(failed)?;
-        let timeline = main.timeline().map_err(failed)?;
+        let mut timeline = main.timeline().map_err(failed)?;
+        let committed = timeline.len() as u64;
+        let first = turn_start(&timeline, main.summarized_until());
+        timeline.drain(..first);
         Ok(Reply::Session(SessionView {
             info: self.info(&session, &state),
-            committed: timeline.len() as u64,
+            first: first as u64,
+            committed,
             timeline,
             pending_approvals: state
                 .approvals
@@ -726,11 +740,23 @@ impl Daemon {
                 }
             },
             Request::OpenSession { session_id } => self.view(self.open(&session_id)?),
-            Request::Timeline { session_id } => {
+            Request::Timeline {
+                session_id,
+                before,
+                limit,
+            } => {
                 let session = self.open(&session_id)?;
                 let main = MainSession::open(session.path()).map_err(failed)?;
+                let mut items = main.timeline().map_err(failed)?;
+                let len = items.len() as u64;
+                let end = before.map_or(len, |before| before.min(len));
+                let start = limit.map_or(0, |limit| end.saturating_sub(limit));
+                let first = turn_start(&items, start as usize);
+                items.truncate(end as usize);
+                items.drain(..first);
                 Ok(Reply::Timeline {
-                    items: main.timeline().map_err(failed)?,
+                    first: first as u64,
+                    items,
                 })
             }
             Request::OpenSessionPath { path } => {
