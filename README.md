@@ -341,7 +341,22 @@ The viewer letterboxes the frame,
 maps pointer coordinates to desktop pixels, and reports connection state and errors
 instead of showing a stale frame as live. **Expand** moves the same viewer into a
 window-sized overlay; **Back to chat** or clicking outside returns it to its card
-without changing pause state or recreating its control lease. This also works in a
+without changing pause state or recreating its control lease. **Split right** moves
+it into the thread view's side pane: a full-height pane right of the transcript,
+which starts at half the chat area; drag the divider to resize the two, and **Close
+split** returns the viewer to its card. Each thread view, the main thread and every
+focus thread, has its own side pane and its own desktop viewers, so a desktop split
+beside a focus thread does not appear beside the main thread, and the reverse. The
+side pane (`apps/juto/src/side_pane.rs`) hosts any view implementing
+`SidePaneItem`, so other built-in apps can open there too. While the split viewer
+is live and may control the desktop, the desktop's
+resolution follows the pane: 250 ms after the pane's size settles, the viewer sends
+`ConfigureOutput` with the pane's size in logical pixels, fitted to the
+environment's admitted size and pixel rate at its current frame rate. Leaving the
+split keeps the last resolution. Every viewer connection acknowledges each new
+geometry with `GeometryReady` once it presents a frame of it, so input resumes
+after a resize; a paused viewer captures a still of the new geometry to do so.
+This also works in a
 child's focus-thread transcript. A repeated artifact mounts and renders only at
 its first occurrence in each transcript; later cards point back to that viewer.
 While live, wheel input over the desktop image is consumed by the desktop, not
@@ -835,8 +850,10 @@ frames thread still misses the 30% goal in a debug build. The earlier 129–230%
 356% figures came from different workloads and are removed. [INFERENCE] An optimised
 build should cut the frames thread well below this; not measured.
 The viewer's read
-path is 854×480 (`SHOWN_MAX_WIDTH`/`SHOWN_MAX_HEIGHT`). Environment and agent desktops
-keep 1280×720. No Wayland, hardware GPU, or provider access was exercised.
+path was 854×480 at the time of those measurements; it is now 1920×1080
+(`SHOWN_MAX_WIDTH`/`SHOWN_MAX_HEIGHT`), so a desktop sized to the split pane is
+shown without downscaling. Environment and agent desktops start at 1280×720 and
+may be resized. No Wayland, hardware GPU, or provider access was exercised.
 
 Headless `juto --desktop xeyes` under Xvfb: the inline canvas rendered xeyes after
 a click resumed it, and the Pause button showed `Paused — click to resume`, status
