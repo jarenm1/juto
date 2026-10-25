@@ -604,6 +604,12 @@ PR11 moves agent communication toward OMP's peer model (section 3.5 of `omp-runt
   so a broadcast never restarts them. A child's message is headed `[message from agent
   <id>]`. `agent_send` and `agent_read` are registered for every child, including one
   too deep to delegate.
+* **Structured yield.** Every child gets `yield {result, data?, failed?}`. The yielded
+  result replaces the child's closing reply as its output, `data` becomes its structured
+  result, and `failed: true` fails the turn with the child's reason instead of reporting
+  prose that only reads like a failure. Unlike OMP's terminal yield, the loop is not
+  stopped by the tool: the child is told to end with a one-line closing reply, which costs
+  one more model request.
 
 ---
 

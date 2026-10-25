@@ -25,8 +25,17 @@ pub(crate) const DEFAULT_ROLE: &str = "task";
 pub(crate) const MAIN_ROLE: &str = "main";
 
 /// Read-only builtin tools, by registry name. `agent_read` reads other agents'
-/// status and transcripts, so a reviewer can see how a builder got its result.
-const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", "recall", "zoom", "agent_read"];
+/// status and transcripts, so a reviewer can see how a builder got its result;
+/// `yield` only hands a child's result back.
+const READ_ONLY_TOOLS: &[&str] = &[
+    "read",
+    "glob",
+    "grep",
+    "recall",
+    "zoom",
+    "agent_read",
+    "yield",
+];
 
 const BUILTIN_ROLES: &[(&str, &str)] = &[
     ("main", include_str!("roles/main.md")),
