@@ -30,6 +30,7 @@ mod snapcompact;
 pub mod subagents;
 pub mod threads;
 pub mod tier;
+mod todo;
 pub mod tools;
 mod vcs;
 pub mod workspace;
@@ -765,7 +766,7 @@ impl Runtime {
             .clone();
         let tier = role.tier.map_or(tier, |ceiling| tier.min(ceiling));
         let scope = if read_only {
-            role.tools.intersect(&ToolScope::read_only())
+            role.tools.intersect(&ToolScope::read_only_run())
         } else {
             role.tools.clone()
         };
@@ -865,6 +866,12 @@ impl Runtime {
                 self.signaling_handle(),
                 self.inner.data_dir.clone(),
             )?;
+        }
+        if scope.allows(todo::TOOL_NAME) {
+            let entries = session.active_entries()?;
+            registry.register(Arc::new(todo::TodoTool::new(todo::phases_from_entries(
+                &entries,
+            ))))?;
         }
         scope.apply(&mut registry);
         if !settings.tools.is_empty() {
@@ -5352,7 +5359,14 @@ mod tests {
         // A scout reads its peers but cannot message or spawn them.
         assert_eq!(
             provider.requests(),
-            vec![tool_set(&["read", "glob", "grep", "agent_read", "yield"])]
+            vec![tool_set(&[
+                "read",
+                "glob",
+                "grep",
+                "agent_read",
+                "todo",
+                "yield"
+            ])]
         );
     }
 
