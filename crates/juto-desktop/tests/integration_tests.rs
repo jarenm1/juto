@@ -1280,6 +1280,11 @@ fn observe_answers_promptly_while_live_readers_hold_an_idle_desktop() {
 
     let mut seq = 0;
     for step in 0..25u32 {
+        // Input never renews the lease, and the lease lapses 5-6 s after an
+        // acquire. The loop below runs for about 4 s, so renew it each step as
+        // a real holder would.
+        env.heartbeat("lease", Some(lease.epoch))
+            .expect("renew control lease");
         for n in 0..10u32 {
             seq += 1;
             env.dispatch_input(
