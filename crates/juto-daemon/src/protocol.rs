@@ -102,6 +102,12 @@ pub enum Request {
         protocol_version: u32,
     },
 
+    /// Stops admitting independent work, then executes `binary` when existing
+    /// work has finished. The replacement stays in the same systemd service.
+    BeginUpgrade {
+        binary: PathBuf,
+    },
+
     // ---- sessions ----
     ListSessions,
     CreateSession,
@@ -285,6 +291,23 @@ pub enum Request {
     },
 }
 
+impl Request {
+    /// New independent work, unlike approvals, steering, and child continuations.
+    pub(crate) fn starts_work(&self) -> bool {
+        matches!(
+            self,
+            Self::CreateSession
+                | Self::Prompt { .. }
+                | Self::StartJob { .. }
+                | Self::RetryJob { .. }
+                | Self::RunAutomationNow { .. }
+                | Self::PollGithub
+                | Self::LoginStart { .. }
+                | Self::DesktopOpen { .. }
+        )
+    }
+}
+
 /// Actions on one subagent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -380,6 +403,9 @@ pub struct HelloInfo {
     pub desktop_socket: PathBuf,
     /// [`binary_id`] of the executable this daemon runs. Equal ids mean the same build.
     pub binary_id: String,
+    /// Older daemons omit this field and require a client-side idle check.
+    #[serde(default)]
+    pub graceful_upgrade: bool,
 }
 
 /// GNU build ID of the ELF executable at `path`, independent of its installation

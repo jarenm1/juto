@@ -1430,3 +1430,106 @@ async fn automation_requests_fail_with_typed_errors() {
 
     assert!(daemon.runtime.list_automations().unwrap().is_empty());
 }
+
+async fn begin_upgrade(daemon: &Arc<Daemon>) {
+    daemon
+        .request(Request::BeginUpgrade {
+            binary: std::env::current_exe().unwrap(),
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn upgrade_drains_a_live_run_without_interrupting_its_journal() {
+    let root = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(true);
+    let daemon = daemon(root.path(), provider.clone());
+    let view = create_session(&daemon).await;
+    let run_id = start_run(&daemon, &view.info.id, "finish before upgrading").await;
+    begin_upgrade(&daemon).await;
+    assert!(!daemon.upgrade_ready().await.unwrap());
+    let busy = daemon.request(Request::CreateSession).await.unwrap_err();
+    assert_eq!(busy.code, ErrorCode::Busy);
+    let live = open_session(&daemon, &view.info.id).await;
+    assert_eq!(live.info.run.unwrap().run_id, run_id);
+
+    provider.release();
+    until(|| daemon.state.lock().unwrap().active.is_none()).await;
+    assert!(daemon.upgrade_ready().await.unwrap());
+    let entries = journal(&view.info.path);
+    assert_eq!(
+        custom_markers(&entries, "daemon_run_finished")[0]["run_id"],
+        run_id
+    );
+    assert!(custom_markers(&entries, "run_interrupted").is_empty());
+    let main = MainSession::open(&view.info.path).unwrap();
+    assert!(main.timeline().unwrap().iter().any(|item| matches!(
+        item, TimelineItem::Message { message: Message::Assistant(message), .. }
+        if message.content.iter().any(|block| matches!(block, ContentBlock::Text { text } if text == "done"))
+    )));
+}
+
+#[tokio::test]
+async fn upgrade_waits_for_children_and_delivers_their_completion_before_exiting() {
+    let root = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(true);
+    let daemon = daemon(root.path(), provider.clone());
+    let view = create_session(&daemon).await;
+    daemon
+        .runtime
+        .subagent_manager()
+        .spawn(TaskSpec {
+            origin: Some(view.info.id.clone()),
+            ..TaskSpec::new("finish child before upgrading")
+        })
+        .unwrap();
+    begin_upgrade(&daemon).await;
+    assert!(!daemon.upgrade_ready().await.unwrap());
+    provider.release();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !daemon.upgrade_ready().await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        custom_markers(&journal(&view.info.path), "daemon_run_finished").len(),
+        1
+    );
+    assert!(
+        daemon
+            .runtime
+            .subagent_manager()
+            .list()
+            .iter()
+            .all(|child| child.status.is_terminal())
+    );
+}
+
+#[tokio::test]
+async fn upgrade_waits_for_background_jobs_including_their_final_cleanup() {
+    let root = tempfile::tempdir().unwrap();
+    let provider = ScriptedProvider::new(true);
+    let daemon = daemon_in_repo(root.path(), provider.clone());
+    let started = start_job(
+        &daemon,
+        "finish job before upgrading",
+        JobContract {
+            no_change: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    begin_upgrade(&daemon).await;
+    assert!(!daemon.upgrade_ready().await.unwrap());
+    provider.release();
+    until(|| !daemon.runtime.has_active_jobs()).await;
+    let completed = job(&daemon, &started.id).await;
+    assert_eq!(completed.status, JobStatus::Succeeded);
+    assert_eq!(completed.inbox, juto_runtime::jobs::InboxState::Archived);
+    assert_eq!(completed.result.as_deref(), Some("done"));
+    assert!(daemon.upgrade_ready().await.unwrap());
+}

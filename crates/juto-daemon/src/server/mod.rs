@@ -1,6 +1,7 @@
 //! Workspace-scoped, user-authenticated runtime host. Connections never own runs.
 
 mod services;
+mod upgrade;
 
 use crate::protocol::*;
 use anyhow::{Context, Result, bail};
@@ -18,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use tokio::{
@@ -57,6 +58,11 @@ pub(crate) struct Daemon {
     run_changed: tokio::sync::Notify,
     /// Operator notice for unattended runs blocked on a decision.
     notifier: Arc<dyn Notifier>,
+    /// Fences independent work during replacement; continuations remain usable.
+    admission: tokio::sync::RwLock<()>,
+    draining: AtomicBool,
+    replacement: Mutex<Option<PathBuf>>,
+    retiring: AtomicBool,
 }
 
 /// Best-effort operator notice that an unattended run is blocked on a decision.
@@ -217,7 +223,14 @@ const WAKE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
 /// arrivals, and an idle waiter here would take them.
 async fn wake_loop(daemon: Arc<Daemon>) {
     loop {
-        match daemon.wake_idle() {
+        let wake = {
+            let _permit = daemon.admission.read().await;
+            if daemon.retiring.load(Ordering::Acquire) {
+                return;
+            }
+            daemon.wake_idle()
+        };
+        match wake {
             Ok(Wake::Busy) => daemon.run_changed.notified().await,
             Ok(Wake::Started) => {}
             Ok(Wake::Idle) => {
@@ -253,6 +266,10 @@ impl Daemon {
             desktop_socket,
             run_changed: tokio::sync::Notify::new(),
             notifier,
+            admission: tokio::sync::RwLock::new(()),
+            draining: AtomicBool::new(false),
+            replacement: Mutex::new(None),
+            retiring: AtomicBool::new(false),
         }))
     }
 
@@ -611,7 +628,40 @@ impl Daemon {
     }
 
     async fn request(self: &Arc<Self>, request: Request) -> Result<Reply, RpcError> {
+        if let Request::BeginUpgrade { binary } = &request {
+            let _permit = self.admission.write().await;
+            if self.retiring.load(Ordering::Acquire) {
+                return Err(RpcError::new(ErrorCode::Busy, "daemon is upgrading"));
+            }
+            if !binary.is_absolute() || !binary.is_file() {
+                return Err(invalid("upgrade executable must be an absolute file path"));
+            }
+            let mut replacement = self.replacement.lock().unwrap();
+            if replacement
+                .as_ref()
+                .is_some_and(|current| current != binary)
+            {
+                return Err(RpcError::new(
+                    ErrorCode::Busy,
+                    "another upgrade is already pending",
+                ));
+            }
+            *replacement = Some(binary.clone());
+            self.draining.store(true, Ordering::Release);
+            return Ok(Reply::Ok);
+        }
+        let _permit = self.admission.read().await;
+        if self.retiring.load(Ordering::Acquire) {
+            return Err(RpcError::new(ErrorCode::Busy, "daemon is upgrading"));
+        }
+        if self.draining.load(Ordering::Acquire) && request.starts_work() {
+            return Err(RpcError::new(
+                ErrorCode::Busy,
+                "daemon is finishing existing work before an automatic upgrade",
+            ));
+        }
         match request {
+            Request::BeginUpgrade { .. } => unreachable!("handled before admission"),
             Request::Hello {
                 protocol_version, ..
             } if protocol_version == PROTOCOL_VERSION => {
@@ -625,6 +675,7 @@ impl Daemon {
                     data_dir: self.runtime.data_dir().to_owned(),
                     desktop_socket: self.desktop_socket.clone(),
                     binary_id,
+                    graceful_upgrade: true,
                 }))
             }
             Request::Hello { .. } => Err(RpcError::new(
@@ -1146,8 +1197,22 @@ pub async fn serve(workspace: PathBuf) -> Result<()> {
             }
         }
     });
+    let mut upgrade_tick = tokio::time::interval(std::time::Duration::from_millis(100));
     loop {
         tokio::select! {
+            _ = upgrade_tick.tick() => {
+                if daemon.upgrade_ready().await? {
+                    use std::os::unix::process::CommandExt;
+                    let binary = daemon.replacement.lock().unwrap().take().context("missing replacement")?;
+                    eprintln!("juto-daemon: existing work finished; upgrading");
+                    let supervisor = daemon.runtime.desktop_supervisor();
+                    tokio::task::spawn_blocking(move || supervisor.destroy_all()).await?;
+                    drop(_guard);
+                    let error = std::process::Command::new(&binary)
+                        .arg("--workspace").arg(&workspace).exec();
+                    return Err(error).with_context(|| format!("executing upgrade {}", binary.display()));
+                }
+            }
             accepted = listener.accept() => { let (stream, _) = accepted?; let daemon = daemon.clone(); tokio::spawn(async move { let _ = connection(daemon, stream).await; }); }
             accepted = desktop_listener.accept() => {
                 let (stream, _) = accepted?;

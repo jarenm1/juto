@@ -28,10 +28,27 @@ daemon executable's GNU build ID separately; the package version alone does not
 identify a build. `juto-daemon --build-id` reports the executable behind a launcher
 without starting a service. This works through Nix wrappers and accepts copied or
 debug-stripped installs of the same build, rather than comparing file metadata.
-A genuinely different running build is refused with a workspace-specific
-`systemctl --user stop ...` command; retrying then starts the installed daemon.
-After upgrading from the old metadata-based check, stop the old workspace daemon
-once using that command.
+Launching an upgraded client automatically replaces a different running build
+when their wire protocols are compatible. Existing clients retain live events,
+approvals, steering, and child-task responses while work finishes. New application
+startup and independent requests wait client-side for the replacement; direct
+requests to a draining daemon return `Busy`. Scheduled jobs pause during draining.
+
+The daemon waits without a forced timeout for foreground runs, child tasks and
+their reports/summaries, background-job cleanup, and provider logins. It then
+executes the installed replacement in the same systemd service; clients reconnect
+and reopen their persisted sessions without an application restart. Durable
+blocked-job decisions remain available after replacement. Desktop environments
+are retired after work drains; their applications do not survive replacement.
+Already-connected clients accept a compatible replacement rather than reverting
+it to their own older executable.
+
+Older daemons without cooperative draining are replaced automatically after two
+idle observations of their foreground runs, subagents, and owned background jobs.
+This legacy path cannot fence another old client or a scheduler starting work
+between the final idle check and shutdown; cooperative draining removes that
+race on subsequent upgrades. An incompatible protocol fails explicitly and
+leaves the running daemon and its tasks untouched.
 
 **Workspace isolation and resource governance.** `juto-runtime` provides `SubagentWorkspace`
 for provisioning a dedicated fork directory per subagent task: a native change-graph fork that

@@ -27,6 +27,7 @@ use juto_agent::{AgentError, AgentEvent, RunControl};
 use juto_ai::{ContentBlock, Message, StopReason, timestamp_ms};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
+use tokio_util::task::TaskTracker;
 
 use crate::broker::Priority;
 use crate::change_graph::ChangeGraph;
@@ -415,6 +416,8 @@ pub(crate) struct JobRegistry {
     /// an unattended block also cancels the run tree, and a block is not a cancel.
     cancel_requested: Mutex<HashSet<String>>,
     events: broadcast::Sender<Job>,
+    /// Includes final persistence and workspace reclamation after a terminal event.
+    tasks: TaskTracker,
 }
 
 impl JobRegistry {
@@ -426,6 +429,7 @@ impl JobRegistry {
             live: Mutex::new(HashMap::new()),
             cancel_requested: Mutex::new(HashSet::new()),
             events: broadcast::channel(EVENT_BUFFER).0,
+            tasks: TaskTracker::new(),
         }
     }
 
@@ -897,9 +901,14 @@ impl Runtime {
         Ok(interrupted)
     }
 
+    /// Whether this runtime still owns a job task, including its final cleanup.
+    pub fn has_active_jobs(&self) -> bool {
+        !self.inner.jobs.tasks.is_empty()
+    }
+
     fn spawn_job(&self, id: String, attempt: Attempt) {
         let runtime = self.clone();
-        tokio::spawn(async move {
+        self.inner.jobs.tasks.spawn(async move {
             let result = match attempt {
                 Attempt::Fresh => runtime.run_fresh(&id).await,
                 Attempt::Resume => runtime.run_resumed(&id).await,

@@ -1,9 +1,11 @@
 //! Client side of the daemon protocol. Connects to a workspace's daemon, starts
 //! it as a systemd `--user` unit when it is not running, and reconnects after loss.
 
+mod upgrade;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -75,9 +77,13 @@ impl Client {
         .await
     }
 
-    /// Sends `request` and waits for its reply. Fails with `Disconnected` while the
-    /// client is disconnected and when the connection drops before the reply arrives.
+    /// Sends `request` and waits for its reply. New independent work and startup
+    /// config wait for a pending upgrade before sending anything. Already-sent
+    /// requests are never replayed after a connection loss.
     pub async fn request(&self, request: Request) -> Result<Reply, ClientError> {
+        if request.starts_work() || matches!(request, Request::GetConfig) {
+            self.wait_for_upgrade().await?;
+        }
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let line = encode_frame(&ClientFrame { id, request })?;
         let (reply, response) = oneshot::channel();
@@ -91,6 +97,21 @@ impl Client {
         match response.await {
             Ok(result) => result.map_err(ClientError::Rpc),
             Err(_) => Err(ClientError::Disconnected),
+        }
+    }
+
+    async fn wait_for_upgrade(&self) -> Result<(), ClientError> {
+        loop {
+            let changed = self.inner.upgrade_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.inner.upgrading.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if let Some(error) = lock(&self.inner.upgrade_error).as_ref() {
+                return Err(ClientError::Start(error.clone()));
+            }
+            changed.await;
         }
     }
 
@@ -113,11 +134,15 @@ struct Inner {
     link: Mutex<Option<Link>>,
     events: broadcast::Sender<Notification>,
     next_id: AtomicU64,
+    upgrade_error: Mutex<Option<String>>,
+    upgrading: AtomicBool,
+    upgrade_changed: tokio::sync::Notify,
 }
 
 struct Link {
     hello: HelloInfo,
     outbound: mpsc::UnboundedSender<Outgoing>,
+    outdated: bool,
 }
 
 /// A request handed to the connection task, which owns the pending-reply map.
@@ -132,7 +157,7 @@ struct Target {
     cwd: PathBuf,
     socket: PathBuf,
     unit: String,
-    /// The daemon executable this client expects; a running daemon must match it.
+    /// Startup executable; an initial build mismatch initiates replacement.
     binary: PathBuf,
 }
 
@@ -140,6 +165,7 @@ struct Target {
 struct Wire {
     lines: Lines<BufReader<OwnedReadHalf>>,
     write: OwnedWriteHalf,
+    outdated: bool,
 }
 
 async fn open(target: Target) -> Result<Client, ClientError> {
@@ -147,9 +173,16 @@ async fn open(target: Target) -> Result<Client, ClientError> {
     let (outbound, rx) = mpsc::unbounded_channel();
     let (events, _) = broadcast::channel(EVENT_CAPACITY);
     let inner = Arc::new(Inner {
-        link: Mutex::new(Some(Link { hello, outbound })),
+        link: Mutex::new(Some(Link {
+            hello,
+            outdated: wire.outdated,
+            outbound,
+        })),
         events: events.clone(),
         next_id: AtomicU64::new(1),
+        upgrade_error: Mutex::new(None),
+        upgrading: AtomicBool::new(wire.outdated),
+        upgrade_changed: tokio::sync::Notify::new(),
     });
     tokio::spawn(supervise(Arc::downgrade(&inner), target, events, wire, rx));
     Ok(Client { inner })
@@ -164,20 +197,61 @@ async fn supervise(
     mut wire: Wire,
     mut outbound: mpsc::UnboundedReceiver<Outgoing>,
 ) {
+    let mut retiring_build: Option<String> = None;
     loop {
-        run_connection(wire, outbound, &events).await;
+        let Some(current) = inner.upgrade() else {
+            return;
+        };
+        let outdated = wire
+            .outdated
+            .then(|| lock(&current.link).as_ref().map(|link| link.hello.clone()))
+            .flatten();
+        if retiring_build.is_none() {
+            retiring_build = outdated.as_ref().map(|hello| hello.binary_id.clone());
+        }
+        drop(current);
+        let connection = run_connection(wire, outbound, &events);
+        tokio::pin!(connection);
+        tokio::select! {
+            _ = &mut connection => {}
+            result = async {
+                match outdated {
+                    Some(hello) => upgrade::replace(&target, hello).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Err(error) = result {
+                    eprintln!("juto: automatic daemon upgrade failed: {error}");
+                    if let Some(current) = inner.upgrade() {
+                        *lock(&current.upgrade_error) = Some(error.to_string());
+                        current.upgrade_changed.notify_waiters();
+                    }
+                }
+                connection.await;
+            }
+        }
         if !set_link(&inner, None) {
             return;
         }
         let _ = events.send(Notification::Disconnected);
-        let Some((next, hello)) = reconnect(&inner, &target).await else {
+        let Some((mut next, hello)) = reconnect(&inner, &target).await else {
             return;
         };
+        // A replacement initiated by another client must not be "upgraded" back
+        // to this already-running client's older executable.
+        next.outdated &= retiring_build.as_deref() == Some(hello.binary_id.as_str());
+        if !next.outdated {
+            retiring_build = None;
+        }
+        if let Some(current) = inner.upgrade() {
+            *lock(&current.upgrade_error) = None;
+        }
         let (tx, rx) = mpsc::unbounded_channel();
         if !set_link(
             &inner,
             Some(Link {
                 hello: hello.clone(),
+                outdated: next.outdated,
                 outbound: tx,
             }),
         ) {
@@ -245,7 +319,7 @@ async fn reconnect(inner: &Weak<Inner>, target: &Target) -> Option<(Wire, HelloI
 }
 
 /// Connects and handshakes, starting the daemon when it is not reachable, then waits
-/// up to `DAEMON_START_TIMEOUT` for its socket. A protocol answer is returned at once.
+/// up to `DAEMON_START_TIMEOUT` for its socket. Incompatible protocols fail immediately.
 async fn connect_or_start(target: &Target) -> Result<(Wire, HelloInfo), ClientError> {
     match handshake(target).await {
         Err(ClientError::Disconnected) => {}
@@ -273,13 +347,18 @@ async fn connect_or_start(target: &Target) -> Result<(Wire, HelloInfo), ClientEr
     }
 }
 
-/// Opens the socket and exchanges `Hello`. Unreachable or closed sockets yield
-/// `Disconnected`; protocol answers yield `Rpc`. A daemon started from another build
-/// than `target.binary` yields `Start`: it is refused, not reused.
+/// Opens the socket and exchanges `Hello`. An outdated compatible build stays
+/// connected while its existing work finishes; incompatible protocols fail.
 async fn handshake(target: &Target) -> Result<(Wire, HelloInfo), ClientError> {
     let stream = UnixStream::connect(&target.socket)
         .await
         .map_err(|_| ClientError::Disconnected)?;
+    let peer = stream
+        .peer_cred()
+        .map_err(|e| ClientError::Start(e.to_string()))?;
+    if peer.uid() != unsafe { libc::geteuid() } {
+        return Err(ClientError::Start("daemon belongs to another user".into()));
+    }
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     let hello = encode_frame(&ClientFrame {
@@ -310,11 +389,19 @@ async fn handshake(target: &Target) -> Result<(Wire, HelloInfo), ClientError> {
             return Err(ClientError::Rpc(RpcError::new(
                 ErrorCode::ProtocolMismatch,
                 format!(
-                    "daemon rejected protocol {PROTOCOL_VERSION} ({}); run `systemctl --user stop {}` and retry",
-                    err.message, target.unit
+                    "daemon rejected protocol {PROTOCOL_VERSION} ({}); automatic upgrade requires a compatible protocol",
+                    err.message
                 ),
             )));
         }
+        Ok(ServerFrame::Response {
+            id: HELLO_ID,
+            result:
+                Err(RpcError {
+                    code: ErrorCode::Busy,
+                    ..
+                }),
+        }) => return Err(ClientError::Disconnected),
         Ok(ServerFrame::Response {
             id: HELLO_ID,
             result: Err(err),
@@ -332,12 +419,17 @@ async fn handshake(target: &Target) -> Result<(Wire, HelloInfo), ClientError> {
             )));
         }
     };
+    if peer.pid().map(|pid| pid as u32) != Some(info.pid) || info.cwd != target.cwd {
+        return Err(ClientError::Start(
+            "daemon identity does not match its socket and workspace".into(),
+        ));
+    }
     if info.protocol_version != PROTOCOL_VERSION {
         return Err(ClientError::Rpc(RpcError::new(
             ErrorCode::ProtocolMismatch,
             format!(
-                "daemon speaks protocol {} but this client speaks {PROTOCOL_VERSION}; run `systemctl --user stop {}` and retry",
-                info.protocol_version, target.unit
+                "daemon speaks protocol {} but this client speaks {PROTOCOL_VERSION}; automatic upgrade requires a compatible protocol",
+                info.protocol_version
             ),
         )));
     }
@@ -363,15 +455,15 @@ async fn handshake(target: &Target) -> Result<(Wire, HelloInfo), ClientError> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    if info.binary_id != expected {
-        return Err(ClientError::Start(format!(
-            "juto daemon for {} was started from a different build than {}; run `systemctl --user stop {}` and retry",
-            target.cwd.display(),
-            target.binary.display(),
-            target.unit
-        )));
-    }
-    Ok((Wire { lines, write }, info))
+    let outdated = info.binary_id != expected;
+    Ok((
+        Wire {
+            lines,
+            write,
+            outdated,
+        },
+        info,
+    ))
 }
 
 /// Starts the daemon as a transient unit. Only variable names go on the command line;
@@ -433,6 +525,10 @@ fn daemon_binary() -> Result<PathBuf, ClientError> {
                 "{DAEMON_BINARY} is neither next to this executable nor on PATH"
             ))
         })
+        .and_then(|path| {
+            path.canonicalize()
+                .map_err(|e| ClientError::Start(format!("cannot resolve daemon executable: {e}")))
+        })
 }
 
 /// Names of every variable in this process's environment, except the ones systemd
@@ -471,7 +567,12 @@ fn encode_frame(frame: &ClientFrame) -> Result<String, ClientError> {
 fn set_link(inner: &Weak<Inner>, link: Option<Link>) -> bool {
     match inner.upgrade() {
         Some(inner) => {
+            let outdated = link.as_ref().map(|link| link.outdated);
             *lock(&inner.link) = link;
+            if let Some(outdated) = outdated {
+                inner.upgrading.store(outdated, Ordering::Release);
+            }
+            inner.upgrade_changed.notify_waiters();
             true
         }
         None => false,
@@ -515,6 +616,7 @@ mod tests {
                         data_dir: server_dir.join("data"),
                         desktop_socket: server_dir.join("desktop.sock"),
                         binary_id: "test-build".into(),
+                        graceful_upgrade: false,
                     })),
                 },
             )
@@ -536,28 +638,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A daemon started from another build of the binary is refused, not reused.
-    #[tokio::test]
-    async fn a_daemon_from_another_build_is_refused() {
-        let (dir, listener, target) = scratch("stale");
-        let unit = target.unit.clone();
-        let hello = hello_info(&dir, "older-build".into());
-        let server = tokio::spawn(serve_hello(listener, Ok(Reply::Hello(hello))));
-
-        let err = match open(target).await {
-            Ok(_) => panic!("a daemon started from another build was reused"),
-            Err(err) => err,
-        };
-        let message = err.to_string();
-        assert!(matches!(err, ClientError::Start(_)), "{message}");
-        assert!(
-            message.contains(&format!("systemctl --user stop {unit}")),
-            "{message}"
-        );
-        server.await.unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     /// A daemon from the same build as the client's binary is attached to.
     #[tokio::test]
     async fn a_daemon_from_the_same_build_is_reused() {
@@ -571,29 +651,21 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A daemon that rejects our protocol version gets the same restart hint.
     #[tokio::test]
-    async fn a_protocol_rejection_names_the_restart_command() {
-        let (dir, listener, target) = scratch("protocol");
-        let unit = target.unit.clone();
-        let rejection = RpcError::new(ErrorCode::ProtocolMismatch, "incompatible protocol version");
+    async fn incompatible_protocol_is_not_opened_for_upgrade() {
+        let (dir, listener, target) = scratch("incompatible");
+        let rejection = RpcError::new(ErrorCode::ProtocolMismatch, "incompatible protocol");
         let server = tokio::spawn(serve_hello(listener, Err(rejection)));
-
-        let err = match open(target).await {
-            Ok(_) => panic!("a protocol-rejecting daemon was attached"),
-            Err(err) => err,
-        };
-        let message = err.to_string();
-        assert!(
-            matches!(&err, ClientError::Rpc(rpc) if matches!(rpc.code, ErrorCode::ProtocolMismatch)),
-            "{message}"
-        );
-        assert!(
-            message.contains(&format!("systemctl --user stop {unit}")),
-            "{message}"
-        );
+        let result = open(target).await;
+        assert!(matches!(
+            result,
+            Err(ClientError::Rpc(RpcError {
+                code: ErrorCode::ProtocolMismatch,
+                ..
+            }))
+        ));
         server.await.unwrap();
-        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Scratch workspace: a bound socket, a stand-in daemon binary, and the target.
@@ -626,6 +698,7 @@ mod tests {
             data_dir: dir.join("data"),
             desktop_socket: dir.join("desktop.sock"),
             binary_id,
+            graceful_upgrade: false,
         }
     }
 

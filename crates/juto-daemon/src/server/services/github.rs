@@ -23,6 +23,10 @@ pub(crate) async fn poll_loop(daemon: Arc<Daemon>) {
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
+        let _permit = daemon.admission.read().await;
+        if daemon.draining.load(std::sync::atomic::Ordering::Acquire) {
+            continue;
+        }
         match daemon.runtime.poll_github(&api_base()).await {
             Ok(report) => {
                 for error in report.errors {
