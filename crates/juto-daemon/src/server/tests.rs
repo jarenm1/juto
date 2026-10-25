@@ -10,11 +10,11 @@ use juto_ai::{
     ProviderEvent, ProviderStream, StopReason, StreamOptions, Usage, timestamp_ms,
 };
 use juto_catalog::{Model, ModelCost};
+use juto_runtime::ViewerRoute;
 use juto_runtime::jobs::{Job, JobBudget, JobContract, JobStatus};
 use juto_runtime::subagents::{MainMessage, MainMessageKind};
 use juto_runtime::tools::{DESKTOP_SESSION_ARTIFACT_VERSION, DesktopSessionArtifact};
 use juto_runtime::{Decision, DecisionStatus, EntryKind, SessionEntry, TaskSpec};
-use juto_runtime::{Route, RouteKind, ThreadEvent, ViewerRoute};
 use serde_json::Value;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -411,66 +411,42 @@ async fn reattach_shows_the_live_run_and_then_the_committed_transcript() {
 }
 
 #[tokio::test]
-async fn prompt_routes_to_a_thread_and_subscribed_clients_see_the_route() {
+async fn prompts_continue_one_conversation_in_the_main_journal() {
     let root = tempfile::tempdir().unwrap();
     let daemon = daemon(root.path(), ScriptedProvider::new(false));
     let view = create_session(&daemon).await;
     let mut rx = attach(&daemon);
-    let run_id = start_run(&daemon, &view.info.id, "plan the release").await;
+    for text in ["plan the release", "and the changelog"] {
+        let run_id = start_run(&daemon, &view.info.id, text).await;
+        let finished =
+            next_session_event(&mut rx, |e| matches!(e, SessionEvent::RunFinished { .. })).await;
+        let SessionEvent::RunFinished {
+            run_id: finished_id,
+            error,
+            ..
+        } = finished
+        else {
+            unreachable!("filtered to RunFinished above");
+        };
+        assert_eq!(finished_id, run_id);
+        assert!(error.is_none(), "run failed: {error:?}");
+    }
 
-    let route = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            match rx.recv().await {
-                Some(ServerEvent::Thread {
-                    session_id,
-                    event: ThreadEvent::ThreadRouted { route },
-                }) => {
-                    assert_eq!(session_id, view.info.id);
-                    return route;
-                }
-                Some(_) => {}
-                None => panic!("event stream closed"),
-            }
-        }
-    })
-    .await
-    .expect("a routed thread event within 10s");
-    let finished =
-        next_session_event(&mut rx, |e| matches!(e, SessionEvent::RunFinished { .. })).await;
-    let SessionEvent::RunFinished {
-        run_id: finished_id,
-        error,
-        ..
-    } = finished
-    else {
-        unreachable!("filtered to RunFinished above");
-    };
-    assert_eq!(finished_id, run_id);
-    assert!(error.is_none(), "run failed: {error:?}");
-
-    let timeline = MainSession::open(&view.info.path)
+    // Both exchanges are in the main journal itself, in order.
+    let texts: Vec<String> = Session::open(&view.info.path)
         .unwrap()
-        .timeline()
-        .unwrap();
-    assert!(
-        timeline.iter().any(|item| matches!(
-            item,
-            TimelineItem::Routed { route: journaled } if journaled.thread == route.thread
-        )),
-        "the route is journaled on the main timeline"
-    );
-    let thread_messages = timeline
+        .messages()
+        .unwrap()
         .iter()
-        .filter(|item| {
-            matches!(item, TimelineItem::Message { thread: Some(t), .. } if *t == route.thread)
-        })
-        .count();
+        .map(Message::text)
+        .collect();
     assert_eq!(
-        thread_messages, 2,
-        "the user and assistant messages are in the routed thread"
+        texts,
+        ["plan the release", "done", "and the changelog", "done"]
     );
     let done = open_session(&daemon, &view.info.id).await;
-    assert_eq!(done.committed, 2);
+    assert_eq!(done.committed, 4);
+    assert_eq!(done.timeline.len(), 4);
 }
 
 #[test]
@@ -560,45 +536,44 @@ async fn child_completion_starts_a_run_while_no_client_is_prompting() {
     };
     assert!(error.is_none(), "wake run failed: {error:?}");
 
-    // The wake run is routed like any prompt, so the child's completion is in a
-    // thread message, not in the main journal's raw text.
+    // The wake run joins the conversation with the child's completion.
     let timeline = MainSession::open(&view.info.path)
         .unwrap()
         .timeline()
         .unwrap();
-    let thread_messages: String = timeline
-        .iter()
-        .filter(|item| {
-            matches!(
-                item,
-                TimelineItem::Message {
-                    thread: Some(_),
-                    ..
-                }
-            )
-        })
-        .map(|item| serde_json::to_string(item).unwrap())
-        .collect();
     assert!(
-        thread_messages.contains(&format!("[subagent {child} Completed]")),
+        timeline.iter().any(|message| message
+            .text()
+            .contains(&format!("[subagent {child} Completed]"))),
         "the wake run must carry the child's completion"
     );
 }
 
-/// A `task` call stamps its children with the calling thread's id, not the main
-/// session's. Their reports must still wake the main session that owns the thread.
+/// A child spawned in a legacy topic thread, before main became one
+/// conversation, reports to that thread's id. The report must still wake the
+/// main session that owns the thread.
 #[tokio::test]
-async fn a_report_addressed_to_an_internal_thread_wakes_its_main_session() {
+async fn a_report_addressed_to_a_legacy_thread_wakes_its_main_session() {
     let root = tempfile::tempdir().unwrap();
     let daemon = daemon(root.path(), ScriptedProvider::new(false));
     let view = create_session(&daemon).await;
     let mut rx = attach(&daemon);
-    start_run(&daemon, &view.info.id, "plan the release").await;
-    next_session_event(&mut rx, |e| matches!(e, SessionEvent::RunFinished { .. })).await;
-    let thread = MainSession::open(&view.info.path).unwrap().threads()[0]
-        .id
-        .clone();
-    assert_ne!(thread, view.info.id);
+    let thread_dir = view.info.path.with_extension("").join("threads");
+    let legacy = Session::create(&thread_dir, &view.info.cwd).unwrap();
+    let thread = legacy.header().id.clone();
+    let file = legacy
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    Session::open(&view.info.path)
+        .unwrap()
+        .append(EntryKind::Custom {
+            custom_type: "thread_created".into(),
+            data: serde_json::json!({"thread": thread, "file": file, "label": "old"}),
+        })
+        .unwrap();
 
     tokio::spawn(wake_loop(daemon.clone()));
     daemon.runtime.subagent_manager().main_inbox().push_from(
@@ -792,44 +767,6 @@ async fn child_report_for_a_missing_session_stays_queued() {
     assert_eq!(origin.as_deref(), Some("gone-session"));
     let bodies: Vec<&str> = orphans.iter().map(|m| m.body.as_str()).collect();
     assert_eq!(bodies, ["orphan"]);
-}
-
-#[tokio::test]
-async fn thread_events_reach_subscribed_clients() {
-    let root = tempfile::tempdir().unwrap();
-    let daemon = daemon(root.path(), ScriptedProvider::new(false));
-    let view = create_session(&daemon).await;
-    let mut rx = attach(&daemon);
-    let route = Route {
-        thread: "thread-1".into(),
-        label: "Protocol surface".into(),
-        kind: RouteKind::New,
-        confidence: None,
-        rationale: None,
-        query: None,
-        note: None,
-    };
-
-    daemon.emit(ServerEvent::Thread {
-        session_id: view.info.id.clone(),
-        event: ThreadEvent::ThreadRouted {
-            route: route.clone(),
-        },
-    });
-
-    let delivered = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-        .await
-        .expect("thread event within 10s");
-    match delivered {
-        Some(ServerEvent::Thread {
-            session_id,
-            event: ThreadEvent::ThreadRouted { route: got },
-        }) => {
-            assert_eq!(session_id, view.info.id);
-            assert_eq!(got, route);
-        }
-        other => panic!("expected a routed thread event, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -1507,8 +1444,8 @@ async fn upgrade_drains_a_live_run_without_interrupting_its_journal() {
     );
     assert!(custom_markers(&entries, "run_interrupted").is_empty());
     let main = MainSession::open(&view.info.path).unwrap();
-    assert!(main.timeline().unwrap().iter().any(|item| matches!(
-        item, TimelineItem::Message { message: Message::Assistant(message), .. }
+    assert!(main.timeline().unwrap().iter().any(|message| matches!(
+        message, Message::Assistant(message)
         if message.content.iter().any(|block| matches!(block, ContentBlock::Text { text } if text == "done"))
     )));
 }

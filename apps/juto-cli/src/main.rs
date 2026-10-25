@@ -13,10 +13,7 @@ use anyhow::{Context as _, Result, bail};
 use clap::{Parser, Subcommand};
 use juto_agent::{AgentEvent, RunControl};
 use juto_ai::{HttpProvider, ProviderEvent, StopReason};
-use juto_runtime::{
-    ApprovalMode, MainEvent, MainSession, Runtime, RuntimeConfig, Session, ThreadEvent,
-    TimelineItem, default_data_dir,
-};
+use juto_runtime::{ApprovalMode, MainSession, Runtime, RuntimeConfig, Session, default_data_dir};
 use tokio::sync::mpsc;
 
 #[derive(Parser)]
@@ -73,8 +70,8 @@ enum Command {
         #[command(subcommand)]
         command: automations::AutomationsCommand,
     },
-    /// Stream a turn in a new or existing main session. The request is routed to one of
-    /// the session's internal threads. A prompt of '-' reads stdin.
+    /// Stream a turn in a new or existing main session: one conversation, seen
+    /// through its memory view. A prompt of '-' reads stdin.
     Run {
         prompt: String,
         #[arg(long)]
@@ -95,12 +92,8 @@ enum Command {
         provider: String,
     },
     Credentials,
-    /// Print a main session's history: routing records and every thread's messages.
+    /// Print a main session's conversation, oldest first.
     History {
-        session: PathBuf,
-    },
-    /// List a main session's internal threads.
-    Threads {
         session: PathBuf,
     },
     /// Persist a model/role/thinking selector for the next turn.
@@ -117,8 +110,8 @@ enum Command {
         session: PathBuf,
         entry: Option<String>,
     },
-    /// Summarize a thread's journal with the selected provider and preserve recent
-    /// complete tool groups.
+    /// Summarize a session journal with the selected provider and preserve recent
+    /// complete tool groups. Main sessions keep a memory tree instead.
     Compact {
         session: PathBuf,
     },
@@ -239,9 +232,7 @@ async fn main() -> Result<()> {
             let signals = install_interrupt(control.clone());
             let (events, receiver) = mpsc::unbounded_channel();
             let printer = tokio::spawn(print_events(receiver, arguments.json));
-            let result = runtime
-                .send(&mut session, None, prompt, events, control)
-                .await;
+            let result = runtime.send(&mut session, prompt, events, control).await;
             signals.abort();
             printer.await??;
             let outcome = result?;
@@ -337,32 +328,11 @@ async fn main() -> Result<()> {
             );
         }
         Command::History { session } => {
-            for item in MainSession::open(&session)?.timeline()? {
+            for message in MainSession::open(&session)?.timeline()? {
                 if arguments.json {
-                    println!("{}", serde_json::to_string(&item)?);
-                    continue;
-                }
-                match item {
-                    TimelineItem::Routed { route } => {
-                        println!("[thread {:?}: {}]", route.kind, route.label)
-                    }
-                    TimelineItem::Message { message, .. } => println!("{}", message.text()),
-                }
-            }
-        }
-        Command::Threads { session } => {
-            let main = MainSession::open(&session)?;
-            for thread in main.threads() {
-                if arguments.json {
-                    println!("{}", serde_json::to_string(thread)?);
+                    println!("{}", serde_json::to_string(&message)?);
                 } else {
-                    println!(
-                        "{}  {:?}  {}  {}",
-                        thread.id,
-                        thread.status,
-                        thread.label,
-                        thread.session_path.display()
-                    );
+                    println!("{}", message.text());
                 }
             }
         }
@@ -407,7 +377,7 @@ fn install_interrupt(control: RunControl) -> tokio::task::JoinHandle<()> {
     })
 }
 
-async fn print_events(mut receiver: mpsc::UnboundedReceiver<MainEvent>, json: bool) -> Result<()> {
+async fn print_events(mut receiver: mpsc::UnboundedReceiver<AgentEvent>, json: bool) -> Result<()> {
     while let Some(event) = receiver.recv().await {
         let stdout = io::stdout();
         let mut writer = stdout.lock();
@@ -416,28 +386,16 @@ async fn print_events(mut receiver: mpsc::UnboundedReceiver<MainEvent>, json: bo
             writeln!(writer)?;
         } else {
             match event {
-                MainEvent::Agent(AgentEvent::MessageUpdate {
+                AgentEvent::MessageUpdate {
                     event: ProviderEvent::TextDelta { delta, .. },
-                }) => {
+                } => {
                     write!(writer, "{delta}")?;
                     writer.flush()?;
                 }
-                MainEvent::Agent(AgentEvent::ToolExecutionStart { call }) => {
+                AgentEvent::ToolExecutionStart { call } => {
                     eprintln!("tool: {} ({})", call.name, call.id)
                 }
-                MainEvent::Agent(AgentEvent::Error { error }) => eprintln!("error: {error}"),
-                MainEvent::Thread(ThreadEvent::ThreadRouted { route }) => {
-                    eprintln!(
-                        "thread: {} ({:?}, {})",
-                        route.label, route.kind, route.thread
-                    );
-                    if let Some(note) = route.note {
-                        eprintln!("routing note: {note}");
-                    }
-                }
-                MainEvent::Thread(ThreadEvent::ThreadLabelFailed { thread, error }) => {
-                    eprintln!("thread {thread}: label update failed: {error}")
-                }
+                AgentEvent::Error { error } => eprintln!("error: {error}"),
                 _ => {}
             }
         }

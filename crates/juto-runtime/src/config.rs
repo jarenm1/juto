@@ -118,8 +118,8 @@ fn default_compaction_threshold() -> f64 {
 fn default_keep_recent() -> usize {
     8
 }
-fn default_max_active_threads() -> usize {
-    6
+fn default_memory_view_bytes() -> usize {
+    128_000
 }
 
 /// Runtime settings. All fields carry serde defaults so partial files layer
@@ -155,7 +155,8 @@ pub struct RuntimeConfig {
     /// require explicit `auto` or `snapcompact` opt-in.
     pub compaction_method: CompactionMethod,
     /// Model selector (`provider/model[:effort]` or `@role`) that writes
-    /// compaction summaries. Unset: the session's current model compacts.
+    /// compaction summaries and the main memory's lines. Unset: the session's
+    /// current model compacts, and `@tiny` writes memory lines.
     pub compactor: Option<String>,
     /// Tool allowlist; empty means all builtin tools.
     pub tools: Vec<String>,
@@ -171,10 +172,9 @@ pub struct RuntimeConfig {
     /// with CPU and memory caps). Sandboxed tiers are always governed. Off by
     /// default because it needs `systemd-run` on the host.
     pub bash_scoped: bool,
-    /// Internal threads of a main session the router may choose among. Past
-    /// this many, the least recently routed thread goes dormant; dormant
-    /// threads are reached by history lookup.
-    pub max_active_threads: usize,
+    /// Most bytes of the main conversation's memory view. The view is also
+    /// held to half the model's context budget.
+    pub memory_view_bytes: usize,
     /// Byte budget for one child report entering the main thread. Larger
     /// reports are digested, and their full text stays one `wait` away.
     pub main_report_bytes: usize,
@@ -203,7 +203,7 @@ impl Default for RuntimeConfig {
             execution_tier: ExecutionTier::Attended,
             network: crate::network::NetworkConfig::default(),
             bash_scoped: false,
-            max_active_threads: default_max_active_threads(),
+            memory_view_bytes: default_memory_view_bytes(),
             main_report_bytes: DEFAULT_MAIN_REPORT_BYTES,
         }
     }
@@ -261,10 +261,11 @@ impl RuntimeConfig {
                 "maxConcurrency must be positive".into(),
             ));
         }
-        if self.max_active_threads == 0 {
-            return Err(ConfigError::Validation(
-                "maxActiveThreads must be positive".into(),
-            ));
+        if self.memory_view_bytes < 4 * crate::memory::NODE {
+            return Err(ConfigError::Validation(format!(
+                "memoryViewBytes must be at least {}",
+                4 * crate::memory::NODE
+            )));
         }
         if !(self.compaction_threshold > 0.0 && self.compaction_threshold <= 1.0) {
             return Err(ConfigError::Validation(format!(
