@@ -501,6 +501,9 @@ pub enum MainMessageKind {
     Cancelled,
     /// A child opened a desktop artifact that main can observe.
     Desktop,
+    /// A turn the user started with a child ended. Quiet: it never wakes an
+    /// idle main thread, and reaches main with the next report or request.
+    UserTurn,
 }
 
 impl MainMessageKind {
@@ -511,6 +514,11 @@ impl MainMessageKind {
             SubagentStatus::Cancelled => Some(Self::Cancelled),
             _ => None,
         }
+    }
+
+    /// Whether this kind may wait for main's next run instead of starting one.
+    pub fn is_quiet(self) -> bool {
+        matches!(self, Self::UserTurn)
     }
 }
 
@@ -710,8 +718,9 @@ impl MainInbox {
     }
 
     /// Remove the oldest origin group that `deliverable` accepts: every pending
-    /// message sharing its origin, in arrival order. Groups it rejects, and the
-    /// groups behind the taken one, stay queued.
+    /// message sharing its origin, in arrival order. A group is taken only for a
+    /// message that may wake main; quiet messages ride along with it. Groups it
+    /// rejects, and the groups behind the taken one, stay queued.
     pub fn take_next_group(
         &self,
         deliverable: impl Fn(Option<&str>) -> bool,
@@ -719,7 +728,9 @@ impl MainInbox {
         let mut guard = self.messages.lock().expect("main inbox poisoned");
         let origin = guard
             .iter()
-            .find(|queued| deliverable(queued.origin.as_deref()))?
+            .find(|queued| {
+                !queued.message.kind.is_quiet() && deliverable(queued.origin.as_deref())
+            })?
             .origin
             .clone();
         let (taken, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *guard)
@@ -948,6 +959,9 @@ struct Child {
     focus: AtomicBool,
     /// Latest turn summary; written only while `focus` is set.
     summary: Mutex<Option<String>>,
+    /// What the user typed for the follow-up turn in flight, quoted in the
+    /// quiet notice main gets when that turn ends.
+    user_message: Mutex<Option<String>>,
     /// Hidden from the task list by the user; the child itself is unchanged.
     archived: AtomicBool,
     workspace: Mutex<WorkspaceState>,
@@ -1146,6 +1160,7 @@ impl SubagentManager {
             spec,
             focus: AtomicBool::new(false),
             summary: Mutex::new(None),
+            user_message: Mutex::new(None),
             archived: AtomicBool::new(false),
             workspace: Mutex::new(match workspace {
                 Some(path) => WorkspaceState::Live(path),
@@ -1383,11 +1398,14 @@ impl SubagentManager {
     }
 
     /// Start a follow-up turn the user typed into any subagent. The turn gets
-    /// `USER_TURN_PREFACE` first, reports only to the user's focus thread, and makes the
-    /// child a focus thread.
+    /// `USER_TURN_PREFACE` first and makes the child a focus thread. When it
+    /// ends, main gets a quiet notice quoting the user and the outcome.
     pub fn follow_up_from_user(&self, id: &str, prompt: String) -> Result<(), SubagentError> {
-        let prompt = format!("{USER_TURN_PREFACE}\n\n{prompt}");
-        self.start_follow_up(id, prompt, TurnOrigin::User)
+        self.start_follow_up(
+            id,
+            format!("{USER_TURN_PREFACE}\n\n{prompt}"),
+            TurnOrigin::User,
+        )
     }
 
     /// Hides a finished child from the user's task list, or shows it again.
@@ -1458,6 +1476,15 @@ impl SubagentManager {
                 from: current,
                 to: SubagentStatus::Running,
             });
+        }
+        if matches!(origin, TurnOrigin::User) {
+            *child.user_message.lock().expect("mutex poisoned") = Some(
+                prompt
+                    .strip_prefix(USER_TURN_PREFACE)
+                    .and_then(|text| text.strip_prefix("\n\n"))
+                    .unwrap_or(&prompt)
+                    .to_owned(),
+            );
         }
         *control_guard = RunControl::new();
         let control = control_guard.clone();
@@ -2166,13 +2193,16 @@ async fn run_turn<F, Fut>(
 pub const USER_TURN_PREFACE: &str = "The user is chatting with you directly in your focus thread. Answer them. Your contract from main still applies, including what to report to main and when.";
 
 /// Who started a turn. Main-started turns (the first run and main's follow-ups)
-/// push a completion notice to the main inbox. User-started focus turns do not:
-/// the user reads their result in the focus thread.
+/// push a completion notice to the main inbox. User-started focus turns push a
+/// quiet notice instead: main reads it on its next run but is not woken for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnOrigin {
     Main,
     User,
 }
+
+/// Characters of the user's message quoted in a quiet user-turn notice.
+const USER_QUOTE_CHARS: usize = 500;
 
 /// Publish the terminal state for a turn — exactly once per turn. The main
 /// inbox notice is submitted before the state is published. An over-budget
@@ -2187,13 +2217,34 @@ fn finish(
     owner: &CancellationToken,
 ) {
     debug_assert!(status.is_terminal());
-    let kind = MainMessageKind::from_terminal(&status).filter(|_| origin == TurnOrigin::Main);
-    if let Some(kind) = kind {
-        let body = match &outcome {
-            Ok(result) => result.output.clone(),
-            Err(err) => err.clone(),
-        };
-        let data = outcome.as_ref().ok().and_then(|result| result.data.clone());
+    let report = match origin {
+        TurnOrigin::Main => MainMessageKind::from_terminal(&status).map(|kind| {
+            let body = match &outcome {
+                Ok(result) => result.output.clone(),
+                Err(err) => err.clone(),
+            };
+            let data = outcome.as_ref().ok().and_then(|result| result.data.clone());
+            (kind, body, data)
+        }),
+        TurnOrigin::User => {
+            let asked = child
+                .user_message
+                .lock()
+                .expect("mutex poisoned")
+                .take()
+                .unwrap_or_default();
+            let asked: String = asked.chars().take(USER_QUOTE_CHARS).collect();
+            let outcome_text = match &outcome {
+                Ok(result) => result.output.clone(),
+                Err(err) => err.clone(),
+            };
+            let body = format!(
+                "The user worked with this subagent directly.\nUser: {asked}\nOutcome ({status:?}): {outcome_text}"
+            );
+            Some((MainMessageKind::UserTurn, body, None))
+        }
+    };
+    if let Some((kind, body, data)) = report {
         inner.main_inbox.submit(
             MainReport {
                 origin: child.spec.origin.clone(),
@@ -3819,7 +3870,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn user_follow_up_skips_main_notice_and_main_follow_up_pushes_one() {
+    async fn user_follow_up_leaves_a_quiet_notice_that_never_wakes_main() {
         let (first, first_rx) = gate();
         let (second, second_rx) = gate();
         let manager = manager(
@@ -3841,30 +3892,47 @@ mod tests {
             }]
         );
 
-        // The user's follow-up runs the turn but leaves main's inbox empty.
+        // The user's follow-up leaves main a quiet notice quoting them. A
+        // waker skips it, so main is not started for the user's own turn.
         manager
             .follow_up_from_user(&id, "more".to_string())
             .expect("accepted");
+        assert!(matches!(
+            manager.follow_up_from_user(&id, "rejected duplicate".into()),
+            Err(SubagentError::InvalidTransition { .. })
+        ));
         second.send(true).unwrap();
         let result = manager.wait(&id).await.expect("user turn");
         assert!(result.output.ends_with("\n\nmore"));
-        assert!(manager.main_inbox().drain().is_empty());
+        assert!(manager.main_inbox().take_next_group(|_| true).is_none());
+        let quiet = manager.main_inbox().drain();
+        assert_eq!(quiet.len(), 1);
+        assert_eq!(quiet[0].kind, MainMessageKind::UserTurn);
+        assert!(quiet[0].body.contains("User: more"), "{}", quiet[0].body);
+        assert!(quiet[0].body.contains("again:"), "{}", quiet[0].body);
 
-        // Main's own follow-up reports to main again.
+        // A loud report takes the quiet one along when it wakes main.
+        manager
+            .follow_up_from_user(&id, "and this".to_string())
+            .expect("accepted");
+        manager.wait(&id).await.expect("user turn");
+
+        // Main's own follow-up reports to main again, and waking main for it
+        // delivers the quiet notice that was waiting in the same group.
         manager
             .follow_up(&id, "report".to_string())
             .expect("accepted");
         manager.wait(&id).await.expect("main turn");
+        let (_, group) = manager
+            .main_inbox()
+            .take_next_group(|_| true)
+            .expect("a loud report wakes main");
+        let kinds: Vec<MainMessageKind> = group.iter().map(|message| message.kind).collect();
         assert_eq!(
-            manager.main_inbox().drain(),
-            vec![MainMessage {
-                from: id,
-                kind: MainMessageKind::Completed,
-                name: None,
-                digest_of: None,
-                body: "again:report".into(),
-            }]
+            kinds,
+            [MainMessageKind::UserTurn, MainMessageKind::Completed]
         );
+        assert_eq!(group[1].body, "again:report");
     }
 
     #[test]
