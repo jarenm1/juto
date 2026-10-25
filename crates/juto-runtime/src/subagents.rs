@@ -1300,6 +1300,8 @@ impl SubagentManager {
     /// [`SubagentStatus::Running`], runs exactly one more turn in its original
     /// session and workspace under a fresh [`RunControl`], then publishes its
     /// own terminal state; `wait`/`output` then observe the new turn's result.
+    /// An archived child is unarchived, so the user's task list never hides a
+    /// child that is working again.
     ///
     /// Only `Completed` children accept a follow-up: `Failed` and `Cancelled`
     /// children never ran to a usable result, so they stay rejected with
@@ -1356,6 +1358,14 @@ impl SubagentManager {
             // the Running status publishes: that event refreshes the sidebar
             // from `list`, which must already see the flag.
             child.focus.store(true, Ordering::Release);
+        }
+        // Like the focus flag, cleared before Running publishes so the sidebar's
+        // re-sync already lists the child.
+        if child.archived.swap(false, Ordering::AcqRel) {
+            let _ = self.inner.events.send(SubagentEvent::ArchiveChanged {
+                id: id.to_string(),
+                archived: false,
+            });
         }
         child.set_status(SubagentStatus::Running);
 
@@ -4582,6 +4592,37 @@ mod tests {
             .map(Message::text)
             .collect();
         assert!(texts.iter().any(|text| text.contains("from user")));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn messaging_an_archived_child_unarchives_it() {
+        let dir = std::env::temp_dir().join(format!("juto-unarchive-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manager = manager(
+            Arc::new(TranscriptFactory { dir: dir.clone() }),
+            1,
+            CancellationToken::new(),
+        );
+        let id = manager.spawn(spec("plain task")).unwrap();
+        manager.wait(&id).await.unwrap();
+        manager.set_archived(&id, true).unwrap();
+        let mut events = manager.subscribe_events();
+
+        manager
+            .send_from_user(&id, "one more thing".into())
+            .unwrap();
+        assert!(
+            !summary_of(&manager, &id).archived,
+            "the child is listed again as soon as its turn starts"
+        );
+        let unarchived = std::iter::from_fn(|| events.try_recv().ok()).any(|event| {
+            matches!(event, SubagentEvent::ArchiveChanged { id: ref changed, archived: false } if *changed == id)
+        });
+        assert!(unarchived, "observers hear that the child is back");
+        manager.wait(&id).await.unwrap();
+        assert!(!summary_of(&manager, &id).archived);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
