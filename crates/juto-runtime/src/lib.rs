@@ -803,15 +803,22 @@ impl Runtime {
                 registry.register(Arc::new(zoom::ZoomTool::new(main_session.to_path_buf())))?;
             }
         }
-        if can_delegate {
+        // Main and every child can reach their peers, even a child too deep to
+        // delegate: it can still report to main and talk to its siblings.
+        if can_delegate || sender.is_some() {
             let peers = match sender {
                 Some(id) => PeerBus::for_child(manager.clone(), id),
                 None => PeerBus::new(manager.clone()),
             };
+            registry.register(Arc::new(SendTool {
+                peers: peers.clone(),
+            }))?;
+            registry.register(Arc::new(ReadTool { peers }))?;
+        }
+        if can_delegate {
             register_agent_tools(
                 &mut registry,
                 manager,
-                peers,
                 catalog.clone(),
                 depth == 0,
                 main_session.map(Path::to_path_buf),
@@ -1920,7 +1927,6 @@ fn turn_result(id: &str, session: &Session, outcome: RunOutcome) -> Result<Subag
 fn register_agent_tools(
     registry: &mut ToolRegistry,
     manager: Arc<SubagentManager>,
-    peers: PeerBus,
     catalog: Arc<BTreeMap<String, AgentRole>>,
     main: bool,
     main_session: Option<PathBuf>,
@@ -1936,7 +1942,6 @@ fn register_agent_tools(
     registry.register(Arc::new(WaitTool {
         manager: manager.clone(),
     }))?;
-    registry.register(Arc::new(SendTool { peers }))?;
     if main {
         registry.register(Arc::new(AgentListTool {
             manager: manager.clone(),
@@ -2267,7 +2272,7 @@ impl Tool for SendTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "agent_send".into(),
-            description: "Message child agents. `to` is one child id, a list such as `{id1, id2}`, or `agent://main` for the main agent's inbox. A queued or running child receives the message as a steer. A completed child starts a new turn with it as the prompt. Failed or cancelled children are reported as failed, and a list send still delivers to the rest.".into(),
+            description: "Message other agents in your tree: your children, your siblings, and their children. `to` is one agent id, a list such as `{id1, id2}`, `agent://all` for every working agent except you, or `agent://main` for the main agent's inbox. A queued or running agent receives the message as guidance at its next step. A completed agent starts a new turn with it as the prompt (`agent://all` skips finished agents). Failed or cancelled agents are reported as failed, and a list send still delivers to the rest. Messages from a child are headed with its id.".into(),
             parameters: json!({"type":"object","properties":{"to":{"type":"string"},"message":{"type":"string"}},"required":["to","message"],"additionalProperties":false}),
         }
     }
@@ -2301,6 +2306,98 @@ impl Tool for SendTool {
             details: value,
             is_error: !report.failed.is_empty(),
         })
+    }
+}
+
+/// Most messages `agent_read` returns from a transcript by default, and at most.
+const HISTORY_DEFAULT_MESSAGES: usize = 20;
+const HISTORY_MAX_MESSAGES: usize = 200;
+/// Characters of one transcript message or result `agent_read` returns.
+const PEER_TEXT_CHARS: usize = 4000;
+
+/// Reads another agent's status and result, or a finished agent's transcript.
+struct ReadTool {
+    peers: PeerBus,
+}
+#[async_trait]
+impl Tool for ReadTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "agent_read".into(),
+            description: "Read other agents in your tree without messaging them. `uri` is `agent://<id>`, a list `agent://{id1, id2}`, or `agent://all` for an agent's status, task, summary, and (once completed) its result; or `history://<id>` for the last `limit` messages (default 20, at most 200) of a completed agent's transcript, to see how it reached its result.".into(),
+            parameters: json!({"type":"object","properties":{"uri":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":HISTORY_MAX_MESSAGES}},"required":["uri"],"additionalProperties":false}),
+        }
+    }
+    async fn execute(&self, arguments: Value, _ctx: ToolContext) -> Result<ToolOutput, String> {
+        let uri = arguments["uri"].as_str().ok_or("uri required")?;
+        let limit = arguments["limit"]
+            .as_u64()
+            .map_or(HISTORY_DEFAULT_MESSAGES, |limit| limit as usize)
+            .clamp(1, HISTORY_MAX_MESSAGES);
+        let value = match self.peers.read(uri).map_err(|error| error.to_string())? {
+            PeerResource::Agent(snapshot) => peer_snapshot_json(&snapshot),
+            PeerResource::Agents(snapshots) => {
+                Value::Array(snapshots.iter().map(peer_snapshot_json).collect())
+            }
+            PeerResource::History {
+                agent_id, entries, ..
+            } => {
+                let messages: Vec<Value> = entries
+                    .iter()
+                    .filter_map(|entry| match &entry.kind {
+                        EntryKind::Message { message } => Some(message),
+                        _ => None,
+                    })
+                    .map(|message| {
+                        let role = match message {
+                            Message::User { .. } => "user",
+                            Message::Developer { .. } => "developer",
+                            Message::Assistant(_) => "assistant",
+                            Message::ToolResult { .. } => "tool",
+                        };
+                        json!({"role": role, "text": clip_chars(&message.text(), PEER_TEXT_CHARS)})
+                    })
+                    .collect();
+                let skipped = messages.len().saturating_sub(limit);
+                json!({
+                    "agent": agent_id,
+                    "omitted_earlier_messages": skipped,
+                    "messages": &messages[skipped..],
+                })
+            }
+        };
+        let text = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text { text }],
+            details: value,
+            is_error: false,
+        })
+    }
+}
+
+fn peer_snapshot_json(snapshot: &PeerAgentSnapshot) -> Value {
+    let summary = &snapshot.summary;
+    json!({
+        "id": summary.id,
+        "name": summary.name,
+        "status": summary.status,
+        "task": clip_chars(&summary.task, 300),
+        "focus": summary.focus,
+        "summary": summary.summary,
+        "error": summary.error,
+        "result": snapshot.result.as_ref().map(|result| json!({
+            "output": clip_chars(&result.output, PEER_TEXT_CHARS),
+            "data": result.data,
+            "change_id": result.change_id,
+        })),
+    })
+}
+
+/// At most `max` characters of `text`, marked when cut.
+fn clip_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}… [clipped]", &text[..end]),
+        None => text.to_owned(),
     }
 }
 /// Lists the subagents the user can see in their task list: every child this
@@ -4690,6 +4787,7 @@ mod tests {
                 "task",
                 "wait",
                 "agent_send",
+                "agent_read",
                 "agent_cancel",
                 "agent_list",
                 "agent_inbox",
@@ -5103,9 +5201,10 @@ mod tests {
 
         run_child(&runtime, "scout", "look around").await;
 
+        // A scout reads its peers but cannot message or spawn them.
         assert_eq!(
             provider.requests(),
-            vec![tool_set(&["read", "glob", "grep"])]
+            vec![tool_set(&["read", "glob", "grep", "agent_read"])]
         );
     }
 

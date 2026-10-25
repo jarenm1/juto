@@ -1,9 +1,11 @@
 //! In-process peer messaging and transcript lookup for subagent URIs.
 //!
-//! `agent://<id>` addresses one child, `agent://{a, b, c}` addresses a list of
-//! children, and `history://<id>` reads a completed child's active session
-//! journal. User-supplied URIs never become filesystem paths; history resolves
-//! the journal path from the manager's completed result.
+//! `agent://<id>` addresses one agent, `agent://{a, b, c}` a list, and
+//! `agent://all` every agent in the sender's tree: its own children, its
+//! siblings, and their descendants (main reaches every child of its tree).
+//! `history://<id>` reads a completed agent's active session journal.
+//! User-supplied URIs never become filesystem paths; history resolves the
+//! journal path from the manager's completed result.
 //!
 //! `agent://main` is write-only: children send messages to the main agent's
 //! inbox, and reading it is rejected so only the main agent drains it.
@@ -81,6 +83,8 @@ pub const MAIN_URI: &str = "agent://main";
 /// Sender recorded for a message to the main inbox that has no sender id.
 pub const UNKNOWN_SENDER: &str = "unknown";
 const MAIN_RECIPIENT: &str = "main";
+/// `agent://all` addresses every agent in the sender's tree.
+const ALL_RECIPIENTS: &str = "all";
 
 /// Peer URI adapter over the runtime's subagent manager and durable sessions.
 #[derive(Clone)]
@@ -107,10 +111,13 @@ impl PeerBus {
         }
     }
 
-    /// Send a message to one child, a list of children, or the main inbox. A
-    /// queued or running child receives a steer, a completed child starts a new
-    /// turn, and a failed or cancelled child is reported as failed. A list send
-    /// continues past each failure.
+    /// Send a message to one agent, a list, every working agent in the tree
+    /// (`agent://all`), or the main inbox. A queued or running agent receives a
+    /// steer, a completed agent starts a new turn, and a failed or cancelled
+    /// agent is reported as failed. `agent://all` reaches working agents only,
+    /// so a broadcast never restarts finished ones. A list send continues past
+    /// each failure. A child's message is headed with its id so the recipient
+    /// knows who wrote it.
     pub fn send(&self, uri: &str, message: impl Into<String>) -> Result<PeerSendReport, PeerError> {
         let target = parse_uri(uri)?;
         let message = message.into();
@@ -129,16 +136,30 @@ impl PeerBus {
             }
             PeerTarget::Agent(id) => vec![id],
             PeerTarget::Children(ids) => ids,
+            PeerTarget::All => self.others(true),
             PeerTarget::History(_) => return Err(PeerError::ReadOnly(uri.to_string())),
+        };
+        let message = match &self.sender {
+            Some(sender) => format!("[message from agent {sender}]\n{message}"),
+            None => message,
         };
         let mut report = PeerSendReport::default();
         for agent_id in ids {
-            match self.subagents.send(&agent_id, message.clone()) {
+            match self.subagents.send_peer(&agent_id, message.clone()) {
                 Ok(()) => report.sent.push(agent_id),
                 Err(error) => report.failed.push(PeerSendFailure { agent_id, error }),
             }
         }
         Ok(report)
+    }
+
+    /// Every agent in the sender's tree except the sender itself.
+    fn others(&self, working_only: bool) -> Vec<String> {
+        self.subagents
+            .peer_ids(working_only)
+            .into_iter()
+            .filter(|id| Some(id) != self.sender.as_ref())
+            .collect()
     }
 
     /// Read a child's current status/output, a list of child snapshots, or the
@@ -150,6 +171,14 @@ impl PeerBus {
             }
             PeerTarget::Children(ids) => {
                 let snapshots = ids
+                    .iter()
+                    .map(|id| self.snapshot(id))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(PeerResource::Agents(snapshots))
+            }
+            PeerTarget::All => {
+                let snapshots = self
+                    .others(false)
                     .iter()
                     .map(|id| self.snapshot(id))
                     .collect::<Result<Vec<_>, _>>()?;
@@ -176,12 +205,7 @@ impl PeerBus {
     }
 
     fn snapshot(&self, agent_id: &str) -> Result<PeerAgentSnapshot, PeerError> {
-        let summary = self
-            .subagents
-            .list()
-            .into_iter()
-            .find(|summary| summary.id == agent_id)
-            .ok_or_else(|| PeerError::Agent(SubagentError::Unknown(agent_id.to_string())))?;
+        let summary = self.subagents.peer_summary(agent_id)?;
         self.snapshot_from_summary(summary)
     }
 
@@ -190,7 +214,7 @@ impl PeerBus {
         summary: SubagentSummary,
     ) -> Result<PeerAgentSnapshot, PeerError> {
         let result = if summary.status == SubagentStatus::Completed {
-            self.subagents.output(&summary.id)?
+            self.subagents.peer_output(&summary.id)?
         } else {
             None
         };
@@ -200,6 +224,7 @@ impl PeerBus {
 
 enum PeerTarget {
     Main,
+    All,
     Agent(String),
     Children(Vec<String>),
     History(String),
@@ -210,6 +235,7 @@ fn parse_uri(uri: &str) -> Result<PeerTarget, PeerError> {
     let (scheme, target) = uri.split_once("://").ok_or_else(invalid)?;
     match scheme {
         "agent" if target == MAIN_RECIPIENT => Ok(PeerTarget::Main),
+        "agent" if target == ALL_RECIPIENTS => Ok(PeerTarget::All),
         "agent" if target.starts_with('{') => parse_child_list(target)
             .map(PeerTarget::Children)
             .ok_or_else(invalid),
@@ -228,7 +254,7 @@ fn parse_child_list(target: &str) -> Option<Vec<String>> {
     let mut ids: Vec<String> = Vec::new();
     for part in inner.split(',') {
         let id = parse_id(part.trim())?;
-        if id == MAIN_RECIPIENT {
+        if id == MAIN_RECIPIENT || id == ALL_RECIPIENTS {
             return None;
         }
         if !ids.contains(&id) {
@@ -557,5 +583,75 @@ mod tests {
 
         manager.cancel(&id).unwrap();
         let _ = manager.wait(&id).await;
+    }
+
+    /// Waits until `id` leaves `Queued`.
+    async fn until_started(manager: &SubagentManager, id: &str) {
+        let mut status = manager.subscribe_status(id).unwrap();
+        while *status.borrow() == SubagentStatus::Queued {
+            status.changed().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_child_reaches_siblings_in_its_tree_and_nothing_outside_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = manager(temp.path());
+        let spawn_in = |origin: &str, task: &str| {
+            let mut spec = crate::subagents::TaskSpec::new(task);
+            spec.origin = Some(origin.into());
+            root.spawn(spec).unwrap()
+        };
+        let sibling = spawn_in("thread-a", "wait");
+        let done = spawn_in("thread-a", "review parser");
+        let stranger = spawn_in("thread-b", "wait");
+        until_started(&root, &sibling).await;
+        until_started(&root, &stranger).await;
+        root.wait(&done).await.unwrap();
+
+        // The child's own tools use a manager for the children it spawns,
+        // reporting to its tree's top-level session.
+        let own = Arc::new(SubagentManager::with_origin(
+            Arc::new(TestFactory {
+                sessions: temp.path().to_path_buf(),
+            }),
+            crate::pools::Admission::unmetered(4),
+            CancellationToken::new(),
+            root.main_inbox(),
+            Some("thread-a".into()),
+        ));
+        let bus = PeerBus::for_child(own, "child-c");
+
+        let report = bus.send(&format!("agent://{sibling}"), "hi").unwrap();
+        assert_eq!(report.sent, [sibling.clone()]);
+        let report = bus.send(&format!("agent://{stranger}"), "hi").unwrap();
+        assert_eq!(
+            report.failed[0].error,
+            SubagentError::Unknown(stranger.clone()),
+            "another tree is out of reach"
+        );
+
+        let report = bus.send("agent://all", "status?").unwrap();
+        assert_eq!(
+            report.sent,
+            [sibling.clone()],
+            "a broadcast skips finished agents"
+        );
+        let PeerResource::Agents(all) = bus.read("agent://all").unwrap() else {
+            panic!("agent://all reads a list");
+        };
+        let mut read: Vec<String> = all.into_iter().map(|s| s.summary.id).collect();
+        read.sort();
+        let mut expected = vec![sibling.clone(), done.clone()];
+        expected.sort();
+        assert_eq!(read, expected, "reading all includes finished peers");
+        let PeerResource::History { agent_id, .. } =
+            bus.read(&format!("history://{done}")).unwrap()
+        else {
+            panic!("a sibling's history is readable");
+        };
+        assert_eq!(agent_id, done);
+
+        root.owner().cancel();
     }
 }
