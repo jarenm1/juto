@@ -318,6 +318,38 @@ impl Daemon {
                 .map(|r| r.info.clone()),
         }
     }
+    /// The registered session whose journal was written last. Every run
+    /// journals markers in its main session, so this is the conversation the
+    /// user last worked in. Unreadable journals are skipped.
+    fn latest_session(&self) -> Option<Session> {
+        let paths: Vec<PathBuf> = self
+            .state
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .cloned()
+            .collect();
+        paths
+            .iter()
+            .filter_map(|path| match Session::open(path) {
+                Ok(session) => Some(session),
+                Err(error) => {
+                    eprintln!(
+                        "juto-daemon: skipping session journal {}: {error:#}",
+                        path.display()
+                    );
+                    None
+                }
+            })
+            .max_by_key(|session| {
+                let written = session
+                    .active_entries()
+                    .ok()
+                    .and_then(|entries| entries.last().map(|entry| entry.timestamp));
+                written.unwrap_or(session.header().created)
+            })
+    }
     fn view(&self, session: Session) -> Result<Reply, RpcError> {
         let mut state = self.state.lock().unwrap();
         state.last_session = Some(session.header().id.clone());
@@ -712,6 +744,14 @@ impl Daemon {
                 self.register(&session)?;
                 self.view(session)
             }
+            Request::OpenLatestSession => match self.latest_session() {
+                Some(session) => self.view(session),
+                None => {
+                    let session = self.runtime.new_session().map_err(failed)?;
+                    self.register(&session)?;
+                    self.view(session)
+                }
+            },
             Request::OpenSession { session_id } => self.view(self.open(&session_id)?),
             Request::Timeline { session_id } => {
                 let session = self.open(&session_id)?;

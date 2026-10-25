@@ -18,7 +18,8 @@ Messages and turns are durably journaled to append-only JSONL sessions in the ba
 **The UI is wired into the agent runtime.** User prompts and attachments are submitted
 to the streaming agent runtime on a background Tokio thread, streaming assistant deltas
 into the native UI without blocking GPUI's foreground thread. Existing sessions can be loaded
-with `--session <path>`, and models can be selected with `--model <provider/model>`.
+with `--session <path>`, a new one started with `--new` (by default the window continues the
+workspace's most recent session), and models can be selected with `--model <provider/model>`.
 See [the full OMP runtime inventory and port plan](docs/omp-runtime.md) for the
 capabilities to preserve, primary-source references, and acceptance criteria.
 Agent contributors should read [AGENTS.md](AGENTS.md).
@@ -136,6 +137,13 @@ Routing works like this:
 - If the judge is unavailable or fails, the request continues the most recent active thread and
   the route carries a `note` saying why. Cancelling during routing records nothing.
 
+A thread runs with only its own history, but it can still see the rest of the conversation. A
+new thread starts with a developer message snapshotting the conversation so far (every thread's
+messages, newest first within about 12 KB), written once so its prompt prefix stays stable. In a
+thread, `recall` and children's snapshots read the merged conversation of every thread, not just
+the thread's own journal. The seeded snapshot is context, not conversation: the timeline and
+`recall` leave it out.
+
 The main journal records `thread_created`, `thread_routed`, `thread_labeled`, and
 `thread_status` entries; reopening it restores threads, labels, and dormancy. A session from
 before threads (messages in its own journal) is copied into a thread on its next request, and
@@ -144,7 +152,11 @@ decision (`thread_routed`), then the thread's agent events, then any `thread_upd
 `thread_label_failed` events. The GUI marks each exchange with its thread and lists threads in
 the sidebar as current, active, or dormant. `juto-cli history <session>` prints the merged
 history, and `juto-cli threads <session>` lists threads. `juto-cli compact` takes a thread's
-journal path. Threads do not yet share memory or see one another's labels.
+journal path. Threads do not yet see one another's labels.
+
+The GUI opens the workspace's most recently active main session (`OpenLatestSession`; the session
+whose journal was written last), so the conversation continues across window launches and daemon
+restarts or upgrades. `--new` starts a new session; `--session <path>` opens a specific one.
 
 **Native live-change DAG and Git transfer.** Juto tracks live agent edits in its own
 version control DAG rather than synthesizing premature Git commits or depending on

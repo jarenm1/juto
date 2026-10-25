@@ -111,6 +111,10 @@ pub enum Request {
     // ---- sessions ----
     ListSessions,
     CreateSession,
+    /// Opens the workspace's most recently active session, or creates one when
+    /// the workspace has none, so a window continues the same conversation
+    /// across launches and daemon restarts.
+    OpenLatestSession,
     /// Opens a session by id and returns its committed transcript plus live state.
     OpenSession {
         session_id: String,
