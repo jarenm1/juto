@@ -553,7 +553,9 @@ goes back to main.
   *Needs you* holds blocked subagents and jobs waiting on an operator decision. *Running*
   holds queued and working ones. *Done* holds finished ones until the user archives them;
   "Archive N done" archives every finished subagent and job. `set_archived` accepts any
-  terminal child and refuses a working one with `NotTerminal`. The header toggle reads
+  terminal child and refuses a working one with `NotTerminal`. A new turn on an archived
+  child (a user message or main's `agent_send`) unarchives it, so the list never hides
+  work in progress. The header toggle reads
   "Tasks · N need you" while anything waits on the user. The jobs strip above the
   composer and the sidebar Inbox of child notices are gone; the main inbox is the
   model's queue only.
