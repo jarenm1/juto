@@ -17,6 +17,7 @@ use juto_agent::ToolRegistry;
 use serde::Deserialize;
 
 use crate::context::{ContextError, split_frontmatter};
+use crate::todo;
 
 /// Role used by a child run whose `task` entry names none.
 pub(crate) const DEFAULT_ROLE: &str = "task";
@@ -60,6 +61,11 @@ impl ToolScope {
 
     pub(crate) fn read_only() -> Self {
         Self::named(READ_ONLY_TOOLS.iter().copied())
+    }
+
+    /// `read_only()` plus `todo`: a read-only run still keeps its own checklist.
+    pub(crate) fn read_only_run() -> Self {
+        Self::named(READ_ONLY_TOOLS.iter().copied().chain([todo::TOOL_NAME]))
     }
 
     pub(crate) fn named<S: Into<String>>(names: impl IntoIterator<Item = S>) -> Self {
@@ -337,5 +343,30 @@ mod tests {
         write_role(&agents, "blank", "---\ndescription: d\nmodel: \"\"\n---\n");
         let err = load(root.path(), &root.path().join("data")).expect_err("empty model");
         assert!(format!("{err:#}").contains("must not be empty"), "{err:#}");
+    }
+
+    #[test]
+    fn todo_is_granted_to_subagents_that_build_or_research_not_main_or_reviewer() {
+        let root = tempdir().expect("tempdir");
+        let roles = load(root.path(), &root.path().join("data")).expect("load roles");
+
+        assert!(!roles["main"].tools.allows(todo::TOOL_NAME));
+        assert!(roles["builder"].tools.allows(todo::TOOL_NAME));
+        assert!(roles["task"].tools.allows(todo::TOOL_NAME));
+        assert!(roles["scout"].tools.allows(todo::TOOL_NAME));
+        assert!(!roles["reviewer"].tools.allows(todo::TOOL_NAME));
+    }
+
+    #[test]
+    fn read_only_run_keeps_todo_only_where_the_role_grants_it() {
+        let root = tempdir().expect("tempdir");
+        let roles = load(root.path(), &root.path().join("data")).expect("load roles");
+        let run = |role: &str| roles[role].tools.intersect(&ToolScope::read_only_run());
+
+        assert!(run("scout").allows(todo::TOOL_NAME));
+        assert!(run("scout").allows("read"));
+        assert!(!run("scout").allows("write"));
+        assert!(!run("reviewer").allows(todo::TOOL_NAME));
+        assert!(!run("builder").allows("write"));
     }
 }
