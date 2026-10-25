@@ -142,6 +142,23 @@ fn message_count(main: &MainSession) -> Result<u64> {
     Ok(message_total(&main.timeline()?))
 }
 
+/// The main session a report addressed to `origin` wakes: `origin` itself when it
+/// is a main session, else the main session one of whose internal threads it is.
+/// The run is routed like any prompt, so it may land in another thread; the
+/// reports travel in its prompt either way.
+fn owning_session(sessions: &HashMap<String, PathBuf>, origin: &str) -> Option<String> {
+    if sessions.contains_key(origin) {
+        return Some(origin.to_owned());
+    }
+    sessions.iter().find_map(|(id, path)| {
+        let main = MainSession::open(path).ok()?;
+        main.threads()
+            .iter()
+            .any(|thread| thread.id == origin)
+            .then(|| id.clone())
+    })
+}
+
 fn message_total(timeline: &[TimelineItem]) -> u64 {
     timeline
         .iter()
@@ -557,26 +574,31 @@ impl Daemon {
     }
 
     /// Starts a run for the oldest child group that has a session to wake. A group
-    /// wakes the session that spawned it (its origin); a group with no origin wakes
-    /// the session last used. Other groups, including those whose session is gone,
-    /// stay queued. A group whose run cannot start returns to the front of the inbox.
+    /// wakes the session that spawned it (its origin): the main session itself, or
+    /// the main session owning the internal thread that called `task`. A group with
+    /// no origin wakes the session last used. Other groups, including those whose
+    /// session is gone, stay queued. A group whose run cannot start returns to the
+    /// front of the inbox.
     fn wake_idle(self: &Arc<Self>) -> Result<Wake> {
         let mut state = self.state.lock().unwrap();
         if state.active.is_some() {
             return Ok(Wake::Busy);
         }
         let inbox = self.runtime.subagent_manager().main_inbox();
-        // A group wakes its origin, or the session last used when it has none. A group
-        // whose session no longer exists stays queued: no run can read it, and taking it
-        // would drop its reports.
+        // A group whose session no longer exists stays queued: no run can read it,
+        // and taking it would drop its reports.
         let deliverable = |origin: Option<&str>| match origin {
-            Some(id) => state.sessions.contains_key(id),
+            Some(id) => owning_session(&state.sessions, id).is_some(),
             None => state.last_session.is_some(),
         };
         let Some((origin, messages)) = inbox.take_next_group(deliverable) else {
             return Ok(Wake::Idle);
         };
-        let Some(session_id) = origin.clone().or_else(|| state.last_session.clone()) else {
+        let session_id = match origin.as_deref() {
+            Some(id) => owning_session(&state.sessions, id),
+            None => state.last_session.clone(),
+        };
+        let Some(session_id) = session_id else {
             inbox.requeue_front(origin.as_deref(), messages);
             return Ok(Wake::Idle);
         };

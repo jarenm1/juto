@@ -89,8 +89,9 @@ child's terminal result (completed, failed, or cancelled) reaches the running ma
 steered user message headed `[subagent <id> <kind>]`. Each report is addressed to the session
 whose run spawned the child tree, so a main session's internal thread receives only its own
 children's reports; a report that lands while that thread has no active run is delivered at the
-start of its next run. Waking an idle session when a child finishes is the host's job; the GUI
-runs the report in the thread that spawned the child. Lifecycle events (`spawned`,
+start of its next run. Waking an idle session when a child finishes is the host's job: the
+workspace daemon starts a run on the main session that owns the spawning thread, with the
+reports as its prompt, and routes it like any request. Lifecycle events (`spawned`,
 `status_changed`, `finished`) are available from `SubagentManager::subscribe_events`. Child agents
 that call `task` still wait for their own children.
 

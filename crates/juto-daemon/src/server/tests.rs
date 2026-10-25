@@ -542,6 +542,51 @@ async fn child_completion_starts_a_run_while_no_client_is_prompting() {
     );
 }
 
+/// A `task` call stamps its children with the calling thread's id, not the main
+/// session's. Their reports must still wake the main session that owns the thread.
+#[tokio::test]
+async fn a_report_addressed_to_an_internal_thread_wakes_its_main_session() {
+    let root = tempfile::tempdir().unwrap();
+    let daemon = daemon(root.path(), ScriptedProvider::new(false));
+    let view = create_session(&daemon).await;
+    let mut rx = attach(&daemon);
+    start_run(&daemon, &view.info.id, "plan the release").await;
+    next_session_event(&mut rx, |e| matches!(e, SessionEvent::RunFinished { .. })).await;
+    let thread = MainSession::open(&view.info.path).unwrap().threads()[0]
+        .id
+        .clone();
+    assert_ne!(thread, view.info.id);
+
+    tokio::spawn(wake_loop(daemon.clone()));
+    daemon.runtime.subagent_manager().main_inbox().push_from(
+        Some(thread),
+        MainMessage {
+            from: "child-1".to_string(),
+            name: None,
+            kind: MainMessageKind::Completed,
+            body: "review done".to_string(),
+            digest_of: None,
+        },
+    );
+    // Fails after ten seconds when the report never wakes a run.
+    next_session_event(&mut rx, |e| matches!(e, SessionEvent::RunStarted { .. })).await;
+    let finished =
+        next_session_event(&mut rx, |e| matches!(e, SessionEvent::RunFinished { .. })).await;
+    let SessionEvent::RunFinished { error, .. } = finished else {
+        unreachable!()
+    };
+    assert!(error.is_none(), "wake run failed: {error:?}");
+    assert!(
+        daemon
+            .runtime
+            .subagent_manager()
+            .main_inbox()
+            .drain()
+            .is_empty(),
+        "the wake run took the report"
+    );
+}
+
 #[tokio::test]
 async fn queued_child_reports_survive_a_daemon_restart() {
     let root = tempfile::tempdir().unwrap();
