@@ -17,6 +17,8 @@ pub mod github;
 pub mod jobs;
 mod main_inbox_store;
 mod main_report;
+pub mod main_session;
+mod memory;
 pub mod network;
 pub mod peers;
 mod pools;
@@ -28,7 +30,6 @@ mod roles;
 pub mod session;
 mod snapcompact;
 pub mod subagents;
-pub mod threads;
 pub mod tier;
 mod todo;
 pub mod tools;
@@ -105,6 +106,7 @@ use decisions::{SharedScope, UnattendedScope};
 pub use desktop_artifact::{
     DesktopArtifactResolver, ResolveError, SESSION_VIEWER_PRINCIPAL, ViewerRoute,
 };
+pub use main_session::MainSession;
 pub use peers::{
     PeerAgentSnapshot, PeerBus, PeerError, PeerResource, PeerSendFailure, PeerSendReport,
 };
@@ -112,9 +114,6 @@ pub use session::{EntryKind, Session, SessionEntry};
 pub use subagents::{
     BlockerReason, ChildState, SchemaMode, SubagentError, SubagentEvent, SubagentManager,
     SubagentResult, SubagentStatus, SubagentSummary, TaskSpec,
-};
-pub use threads::{
-    MainEvent, MainSession, Route, RouteKind, ThreadEvent, ThreadInfo, ThreadStatus, TimelineItem,
 };
 pub use tools::{
     DESKTOP_SESSION_ARTIFACT_VERSION, DesktopArtifactTool, DesktopSessionArtifact, DesktopTool,
@@ -156,6 +155,8 @@ struct RuntimeInner {
     /// Background summaries keyed by session id; at most one per session.
     compactions:
         Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<Result<session::NewNode>>>>,
+    /// Main conversations' memories, keyed by main journal path.
+    memories: Mutex<std::collections::HashMap<PathBuf, Arc<memory::Memory>>>,
     desktop_supervisor: Mutex<Option<Arc<DesktopSupervisor>>>,
     signaling: Mutex<Option<Arc<SignalingHandle>>>,
     /// Browser processes and named tabs shared across runs.
@@ -319,6 +320,7 @@ impl Runtime {
                 approval,
                 subagent_manager: Mutex::new(None),
                 compactions: Mutex::new(std::collections::HashMap::new()),
+                memories: Mutex::new(std::collections::HashMap::new()),
                 desktop_supervisor: Mutex::new(None),
                 signaling: Mutex::new(None),
                 jobs,
@@ -603,22 +605,21 @@ impl Runtime {
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
     ) -> Result<RunOutcome> {
-        let history = session.path().to_path_buf();
-        self.run_with_history(session, &history, prompt.into(), events, control)
+        self.run_with_memory(session, None, prompt.into(), events, control)
             .await
     }
 
-    /// [`Runtime::run`], with `recall` and children's snapshots reading
-    /// `history` instead of `session`: a main session's thread reads the whole
-    /// main conversation.
-    pub(crate) async fn run_with_history(
+    /// [`Runtime::run`]; with `memory`, the run is the main conversation's: it
+    /// sees the memory view instead of the journal's raw history.
+    pub(crate) async fn run_with_memory(
         &self,
         session: &mut Session,
-        history: &Path,
+        memory: Option<&Arc<memory::Memory>>,
         prompt: String,
         events: mpsc::UnboundedSender<AgentEvent>,
         control: RunControl,
     ) -> Result<RunOutcome> {
+        let history = session.path().to_path_buf();
         let placement = RunPlacement {
             depth: 0,
             role: roles::MAIN_ROLE,
@@ -627,9 +628,10 @@ impl Runtime {
             sender: None,
             ask: None,
             yielded: None,
-            main_session: Some(history),
+            main_session: Some(&history),
             unattended: None,
             limits: JobLimits::default(),
+            memory,
         };
         // Children this run starts are owned by a token of their own. Stopping
         // the run cancels them; ending it normally leaves them running.
@@ -698,6 +700,7 @@ impl Runtime {
             main_session: Some(&main_session),
             unattended: Some(&scope),
             limits,
+            memory: None,
         };
         // Children of this run are owned by a token of their own, as in `run`.
         let run_children = CancellationToken::new();
@@ -768,6 +771,7 @@ impl Runtime {
             main_session,
             unattended,
             limits: job_limits,
+            memory,
         } = placement;
         if session.header().cwd != self.inner.cwd {
             bail!("session belongs to a different working directory");
@@ -794,6 +798,7 @@ impl Runtime {
         // One budget gates the run-start compaction and the agent's per-request guard.
         let window_budget =
             (model.context_window.unwrap_or(128_000) as f64 * settings.compaction_threshold) as u64;
+        let memory_high = self.memory_high(&model);
         // Depth 0's children belong to the run's scope, which only a stop cancels (see `run`).
         // Nested runs own the children they spawn and stop them when they end.
         let _children = (depth > 0).then(|| ChildCancellation(manager.owner()));
@@ -818,8 +823,14 @@ impl Runtime {
                 main_session.to_path_buf(),
             )))?;
             // Only the main thread zooms: `all`-scoped child roles would inherit it.
-            // Zoom expands this session's own compactions.
-            if depth == 0 {
+            // The main conversation zooms into its memory tree; any other run
+            // expands its own session's compactions.
+            if let Some(memory) = memory {
+                registry.register(Arc::new(memory::ZoomTool::new(
+                    memory.clone(),
+                    session.path().to_path_buf(),
+                )))?;
+            } else if depth == 0 {
                 registry.register(Arc::new(zoom::ZoomTool::new(
                     session.path().to_path_buf(),
                     main_session.to_path_buf(),
@@ -903,6 +914,9 @@ impl Runtime {
         if !role.instructions.is_empty() {
             system_prompt.push(role.instructions.clone());
         }
+        if memory.is_some() {
+            system_prompt.push(memory::GUIDE.to_owned());
+        }
         if can_delegate {
             let delegates: Vec<&AgentRole> = catalog
                 .values()
@@ -938,11 +952,15 @@ impl Runtime {
             }
             system_prompt.push(descriptions);
         }
-        // A finished background summary joins the view at the run start only.
-        self.apply_background_compaction(session).await;
+        // The main conversation's memory replaces compaction: its view is
+        // built and within budget before the run starts.
+        if memory.is_none() {
+            // A finished background summary joins the view at the run start only.
+            self.apply_background_compaction(session).await;
+        }
         // The estimate covers the first request: system prompt, advertised tools,
         // and the history plus the new prompt.
-        if settings.auto_compact {
+        if settings.auto_compact && memory.is_none() {
             let history = session.messages()?;
             let estimated =
                 estimate_request_tokens(&system_prompt, &registry.definitions(), &history)
@@ -954,9 +972,17 @@ impl Runtime {
                 compaction_usage = self.compact(session, &control).await?;
             }
         }
+        let messages = match memory {
+            Some(memory) => memory
+                .view_text()
+                .map(Message::developer)
+                .into_iter()
+                .collect(),
+            None => session.messages()?,
+        };
         let context = Context {
             system_prompt,
-            messages: session.messages()?,
+            messages,
             tools: Vec::new(),
         };
         // The job's per-attempt turn budget and the runtime's own limit both
@@ -974,7 +1000,7 @@ impl Runtime {
             max_cost: job_limits.spend,
             max_retries: 2,
             retry_delay: Duration::from_millis(500),
-            context_limit: settings.auto_compact.then_some(window_budget),
+            context_limit: (settings.auto_compact || memory.is_some()).then_some(window_budget),
         };
         let mut agent = Agent::new(config, self.inner.provider.clone(), registry, context);
         let mode = if read_only {
@@ -1021,6 +1047,15 @@ impl Runtime {
                         Err(CompactError::Failed(
                             "session persistence failed; run cancelled".to_owned(),
                         ))
+                    } else if let Some(memory) = memory {
+                        let condensed = self
+                            .condensed_view(memory, session.path(), memory_high, &control.token())
+                            .await;
+                        if control.token().is_cancelled() {
+                            Err(CompactError::Cancelled)
+                        } else {
+                            condensed.map_err(|error| CompactError::Failed(format!("{error:#}")))
+                        }
                     } else {
                         let compacted = self.compact(session, &control).await;
                         if control.token().is_cancelled() {
@@ -1054,6 +1089,7 @@ impl Runtime {
             return Err(error.context("session persistence failed; run cancelled"));
         }
         if settings.auto_compact
+            && memory.is_none()
             && let Err(error) = self.schedule_background_compaction(
                 session,
                 window_budget,
@@ -1390,6 +1426,9 @@ struct RunPlacement<'a> {
     /// Caps the job that started this run places on its main run. Children
     /// never inherit them.
     limits: JobLimits,
+    /// Set for main-conversation runs: the request sees the memory view
+    /// instead of the journal's raw history.
+    memory: Option<&'a Arc<memory::Memory>>,
 }
 
 struct ChildFactory {
@@ -1825,6 +1864,7 @@ impl subagents::SubagentFactory for ChildFactory {
                         yielded: Some(&yielded),
                         unattended: self.unattended.as_ref(),
                         limits: JobLimits::default(),
+                        memory: None,
                         main_session: spec.main_session.as_deref(),
                     },
                     manager,
@@ -1890,6 +1930,7 @@ impl subagents::SubagentFactory for ChildFactory {
                         yielded: Some(&yielded),
                         unattended: self.unattended.as_ref(),
                         limits: JobLimits::default(),
+                        memory: None,
                         main_session: spec.main_session.as_deref(),
                     },
                     manager,
@@ -5424,6 +5465,7 @@ mod tests {
                     main_session: None,
                     unattended: None,
                     limits: JobLimits::default(),
+                    memory: None,
                 },
                 runtime.subagent_manager(),
             )
@@ -5478,6 +5520,7 @@ mod tests {
                         main_session: None,
                         unattended: None,
                         limits: JobLimits::default(),
+                        memory: None,
                     },
                     runtime.subagent_manager(),
                 )

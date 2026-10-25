@@ -33,7 +33,7 @@ use juto_daemon::protocol::{
 };
 use juto_runtime::jobs::Job;
 use juto_runtime::subagents::SubagentEvent;
-use juto_runtime::{DesktopSessionArtifact, SubagentSummary, TimelineItem};
+use juto_runtime::{DesktopSessionArtifact, SubagentSummary};
 use tokio::sync::broadcast::{self, error::RecvError};
 
 actions!(
@@ -152,15 +152,6 @@ pub fn extract_desktop_artifacts(message: &AiMessage) -> Vec<DesktopSessionArtif
         _ => {}
     }
     artifacts
-}
-
-/// Transcript rows for a session's timeline: messages from the main journal and
-/// from every routed thread, in timeline order. Routing records are not rows.
-pub fn load_messages(timeline: &[TimelineItem]) -> Vec<Message> {
-    view_messages(timeline.iter().filter_map(|item| match item {
-        TimelineItem::Message { message, .. } => Some(message),
-        TimelineItem::Routed { .. } => None,
-    }))
 }
 
 /// Converts agent messages into transcript rows, for the main thread and focus
@@ -633,7 +624,7 @@ impl ChatView {
             SidebarEvent::ArchiveFinished => this.archive_finished(cx),
         });
 
-        let messages = load_messages(&session.timeline);
+        let messages = view_messages(&session.timeline);
         let event_client = client.clone();
         let event_handle = tokio_handle.clone();
         let session_id = session.info.id.clone();
@@ -1186,7 +1177,7 @@ impl ChatView {
             self.active_model = model.into();
         }
         self.committed = view.committed;
-        self.messages = load_messages(&view.timeline);
+        self.messages = view_messages(&view.timeline);
         self.streaming_row = None;
         self.pending_approvals.clear();
         for approval in view.pending_approvals {
@@ -2742,7 +2733,7 @@ impl Render for ChatView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use juto_runtime::{EntryKind, MainSession, Route, RouteKind, Session};
+    use juto_runtime::{EntryKind, MainSession, Session};
     #[test]
     fn repeated_desktop_descriptors_keep_the_first_identity_and_order() {
         let artifact = |id: &str, grant: &str| DesktopSessionArtifact {
@@ -2843,7 +2834,7 @@ mod tests {
     }
 
     #[test]
-    fn load_messages_extracts_user_and_assistant_history() {
+    fn view_messages_extracts_user_and_assistant_history() {
         let temp_dir = tempfile::tempdir().unwrap();
         let cwd = std::env::current_dir().unwrap();
         let mut session = Session::create(temp_dir.path(), &cwd).unwrap();
@@ -2875,7 +2866,7 @@ mod tests {
             .unwrap()
             .timeline()
             .unwrap();
-        let messages = load_messages(&timeline);
+        let messages = view_messages(&timeline);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].role, MessageRole::User);
         assert_eq!(messages[0].text.as_ref(), "Hello from user");
@@ -2884,7 +2875,7 @@ mod tests {
     }
 
     #[test]
-    fn load_messages_extracts_and_mounts_desktop_artifacts_from_tool_results() {
+    fn view_messages_extracts_and_mounts_desktop_artifacts_from_tool_results() {
         let temp_dir = tempfile::tempdir().unwrap();
         let cwd = std::env::current_dir().unwrap();
         let mut session = Session::create(temp_dir.path(), &cwd).unwrap();
@@ -2922,7 +2913,7 @@ mod tests {
             .unwrap()
             .timeline()
             .unwrap();
-        let messages = load_messages(&timeline);
+        let messages = view_messages(&timeline);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, MessageRole::Assistant);
         assert_eq!(messages[0].desktop_artifacts.len(), 1);
@@ -2930,7 +2921,7 @@ mod tests {
     }
 
     #[test]
-    fn load_messages_places_view_result_in_its_own_row_after_text() {
+    fn view_messages_places_view_result_in_its_own_row_after_text() {
         let temp_dir = tempfile::tempdir().unwrap();
         let cwd = std::env::current_dir().unwrap();
         let mut session = Session::create(temp_dir.path(), &cwd).unwrap();
@@ -2980,37 +2971,12 @@ mod tests {
             .unwrap()
             .timeline()
             .unwrap();
-        let messages = load_messages(&timeline);
+        let messages = view_messages(&timeline);
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].text.as_ref(), "Spawned a worker");
         assert!(messages[0].views.is_empty());
         assert!(messages[1].text.is_empty());
         assert_eq!(messages[1].views, vec![view]);
-    }
-
-    #[test]
-    fn load_messages_reads_routed_thread_messages_and_skips_routing_records() {
-        let timeline = vec![
-            TimelineItem::Routed {
-                route: Route {
-                    thread: "thread-1".into(),
-                    label: "Release".into(),
-                    kind: RouteKind::New,
-                    confidence: None,
-                    rationale: None,
-                    query: None,
-                    note: None,
-                },
-            },
-            TimelineItem::Message {
-                thread: Some("thread-1".into()),
-                message: AiMessage::user("Plan the release"),
-            },
-        ];
-        let messages = load_messages(&timeline);
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, MessageRole::User);
-        assert_eq!(messages[0].text.as_ref(), "Plan the release");
     }
 
     #[test]
