@@ -93,8 +93,13 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   from one producer per environment that blocks on the compositor's publish signal;
   every mounted canvas of that environment shares its output.
   Expand/Back-to-chat moves the same viewer between its inline card and a
-  window-sized overlay, preserving pause/control state. Within a transcript,
-  repeated artifact identifiers mount and render only at their first occurrence.
+  window-sized overlay, preserving pause/control state. Split right docks it in
+  the shown thread view's side pane (one per thread view, with a draggable
+  divider); while that
+  viewer is live and may control the desktop, it resizes the desktop's output to
+  the pane (debounced, fitted to the admitted profile at the current fps).
+  Within a transcript, repeated artifact identifiers mount and render only at
+  their first occurrence.
   Wheel input over a live image does not also scroll the surrounding chat;
   paused canvases leave transcript scrolling enabled.
 - Remote presentation: a GStreamer `webrtcbin` sender (VP8 default, H.264
@@ -152,7 +157,13 @@ juto-runtime`, the daemon smoke, and the Xvfb viewer smoke):
   `Unavailable`.
 - Resize gating: a new geometry generation clears viewer acknowledgements and
   input is rejected until every active viewer reports `GeometryReady` for the
-  new generation, over the connection that owns the viewer.
+  new generation, over the connection that owns the viewer. The harness's frame
+  producer and each embedded viewer acknowledge when they present a frame of a
+  new generation; a paused viewer captures a still of it on `OutputChanged`.
+- Output modes: creation and `ConfigureOutput` reject zero sides or fps, sides
+  past the profile's maximum, and pixel rates past its limit. The frame pool is
+  sized for the profile's maximum (3840×2160), so any admitted resize fits the
+  mapping viewers already hold; unwritten pool pages are never touched.
 
 Not implemented: the local PCM path to a viewer, DMA-BUF export/import, and
 deployment provisioning (TLS termination, public reachability). Sections
