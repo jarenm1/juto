@@ -12,9 +12,9 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, AnyView, App, Bounds, Corners, Div, FontWeight, Hsla, PathBuilder, Pixels, Point,
-    SharedString, StatefulInteractiveElement, Window, canvas, div, fill, point, prelude::*, px,
-    relative, rgb, size,
+    AnyElement, AnyView, App, Bounds, Corners, Div, ElementId, FontWeight, Hsla, PathBuilder,
+    Pixels, Point, SharedString, StatefulInteractiveElement, Window, canvas, div, fill, point,
+    prelude::*, px, relative, rgb, size,
 };
 use juto_agent::{MAX_TIMELINE_TICKS, ViewChild, ViewNode, parse_chart_labels, parse_chart_values};
 
@@ -73,14 +73,20 @@ impl ViewActions {
     }
 }
 
-/// Renders one element and its subtree.
-pub fn render_view(node: &ViewNode, actions: &ViewActions) -> AnyElement {
+/// Renders one element and its subtree. `window` and `cx` supply keyed state for
+/// stateful elements such as `Quiz`, so they must come from the frame being built.
+pub fn render_view(
+    node: &ViewNode,
+    actions: &ViewActions,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     match node.tag.as_str() {
         "Column" => div()
             .flex()
             .flex_col()
             .gap_3()
-            .children(column_children(node, actions))
+            .children(column_children(node, actions, window, cx))
             .into_any_element(),
         "Row" => div()
             .flex()
@@ -88,16 +94,17 @@ pub fn render_view(node: &ViewNode, actions: &ViewActions) -> AnyElement {
             .flex_wrap()
             .items_center()
             .gap_2()
-            .children(render_children(node, actions))
+            .children(render_children(node, actions, window, cx))
             .into_any_element(),
         "Text" => div()
             .text_sm()
             .text_color(rgb(theme::TEXT))
-            .children(render_children(node, actions))
+            .children(render_children(node, actions, window, cx))
             .into_any_element(),
         "Badge" => badge(prop(node, "label"), prop(node, "tone")),
         "Button" => button(node, actions),
-        "Stats" => stats(node, actions),
+        "Quiz" => quiz(node, actions, window, cx),
+        "Stats" => stats(node, actions, window, cx),
         "Stat" => stat(prop(node, "label"), prop(node, "value")),
         "Timeline" => timeline(node),
         "Chart" => chart(node),
@@ -106,17 +113,27 @@ pub fn render_view(node: &ViewNode, actions: &ViewActions) -> AnyElement {
     }
 }
 
-fn render_children(node: &ViewNode, actions: &ViewActions) -> Vec<AnyElement> {
+fn render_children(
+    node: &ViewNode,
+    actions: &ViewActions,
+    window: &mut Window,
+    cx: &mut App,
+) -> Vec<AnyElement> {
     node.children
         .iter()
-        .map(|child| render_child(child, actions))
+        .map(|child| render_child(child, actions, window, cx))
         .collect()
 }
 
-fn render_child(child: &ViewChild, actions: &ViewActions) -> AnyElement {
+fn render_child(
+    child: &ViewChild,
+    actions: &ViewActions,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     match child {
         ViewChild::Text(text) => SharedString::from(text.clone()).into_any_element(),
-        ViewChild::Node(node) => render_view(node, actions),
+        ViewChild::Node(node) => render_view(node, actions, window, cx),
     }
 }
 
@@ -261,9 +278,141 @@ fn button(node: &ViewNode, actions: &ViewActions) -> AnyElement {
         .into_any_element()
 }
 
+/// Answer state of one `Quiz`, kept across frames under the quiz's view key.
+#[derive(Default)]
+struct QuizState {
+    /// Index of the option answered correctly. The quiz is locked after that.
+    solved: Option<usize>,
+    /// Indices of wrong options picked so far. Each one may not be picked again.
+    missed: Vec<usize>,
+}
+
+impl QuizState {
+    /// Whether a click on option `index` should be judged.
+    fn accepts(&self, index: usize) -> bool {
+        self.solved.is_none() && !self.missed.contains(&index)
+    }
+}
+
+/// A `Quiz`: a question with `Choice` options. A click judges that option at once.
+/// A wrong pick is marked and may be retried; a correct pick locks the quiz. Each
+/// pick submits the quiz's `prompt` with the chosen text, so the agent can guide
+/// the next step. Without a submit action the quiz still gives local feedback.
+fn quiz(node: &ViewNode, actions: &ViewActions, window: &mut Window, cx: &mut App) -> AnyElement {
+    let key = view_key(node);
+    let state = window.use_keyed_state(ElementId::Name(key.clone().into()), cx, |_, _| {
+        QuizState::default()
+    });
+    let (solved, missed) = {
+        let state = state.read(cx);
+        (state.solved, state.missed.clone())
+    };
+    let on_submit = actions.on_submit.clone();
+    let prompt = prop(node, "prompt").to_owned();
+
+    let mut options = div().flex().flex_col().gap_1p5();
+    for (index, choice) in node.children.iter().filter_map(node_child).enumerate() {
+        let label = choice_label(choice);
+        let correct = prop(choice, "correct") == "true";
+        let (border, text) = if solved == Some(index) {
+            (theme::DIFF_ADD, theme::DIFF_ADD)
+        } else if missed.contains(&index) {
+            (theme::DANGER, theme::DANGER)
+        } else {
+            (theme::BORDER_STRONG, theme::TEXT)
+        };
+        let mut option = div()
+            .id(SharedString::from(format!("{key}-option-{index}")))
+            .px_3()
+            .py_2()
+            .rounded_sm()
+            .border_1()
+            .text_sm()
+            .border_color(rgb(border))
+            .text_color(rgb(text));
+        if solved.is_none() && !missed.contains(&index) {
+            let state = state.clone();
+            let on_submit = on_submit.clone();
+            let prompt = prompt.clone();
+            let chosen = label.clone();
+            option = option
+                .cursor_pointer()
+                .hover(|style| style.bg(rgb(theme::BG_HOVER)))
+                .on_click(move |_, window, cx| {
+                    if !state.read(cx).accepts(index) {
+                        return;
+                    }
+                    state.update(cx, |answer, cx| {
+                        if correct {
+                            answer.solved = Some(index);
+                        } else {
+                            answer.missed.push(index);
+                        }
+                        cx.notify();
+                    });
+                    if let Some(on_submit) = &on_submit {
+                        on_submit(format!("{prompt}\nChosen answer: {chosen}"), window, cx);
+                    }
+                });
+        }
+        options = options.child(option.child(SharedString::from(label)));
+    }
+
+    let feedback = if solved.is_some() {
+        Some(("Correct.", theme::DIFF_ADD))
+    } else if !missed.is_empty() {
+        Some(("Not quite. Try another option.", theme::WARNING))
+    } else {
+        None
+    };
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .px_3()
+        .py_2p5()
+        .border_1()
+        .rounded_sm()
+        .border_color(rgb(theme::BORDER))
+        .child(
+            div()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(theme::TEXT))
+                .child(SharedString::from(prop(node, "question").to_owned())),
+        )
+        .child(options);
+    if let Some((message, color)) = feedback {
+        card = card.child(
+            div()
+                .text_xs()
+                .text_color(rgb(color))
+                .child(SharedString::from(message)),
+        );
+    }
+    card.into_any_element()
+}
+
+/// The text of a `Choice`: its text children, which the validator limits to one.
+fn choice_label(choice: &ViewNode) -> String {
+    choice
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            ViewChild::Text(text) => Some(text.as_str()),
+            ViewChild::Node(_) => None,
+        })
+        .collect()
+}
+
 /// Column children. Each run of adjacent `Subagent` nodes becomes one list, so
 /// the rows sit flush with hairline dividers instead of gapped cards.
-fn column_children(node: &ViewNode, actions: &ViewActions) -> Vec<AnyElement> {
+fn column_children(
+    node: &ViewNode,
+    actions: &ViewActions,
+    window: &mut Window,
+    cx: &mut App,
+) -> Vec<AnyElement> {
     let mut out = Vec::new();
     let mut run: Vec<&ViewNode> = Vec::new();
     for child in &node.children {
@@ -273,7 +422,7 @@ fn column_children(node: &ViewNode, actions: &ViewActions) -> Vec<AnyElement> {
                 if !run.is_empty() {
                     out.push(subagent_list(std::mem::take(&mut run)));
                 }
-                out.push(render_child(child, actions));
+                out.push(render_child(child, actions, window, cx));
             }
         }
     }
@@ -322,7 +471,7 @@ fn subagent_row(node: &ViewNode) -> AnyElement {
 }
 
 /// Horizontal strip of `Stat` cells split by hairline dividers, closed by a rule.
-fn stats(node: &ViewNode, actions: &ViewActions) -> AnyElement {
+fn stats(node: &ViewNode, actions: &ViewActions, window: &mut Window, cx: &mut App) -> AnyElement {
     let mut strip = div()
         .flex()
         .flex_row()
@@ -333,7 +482,12 @@ fn stats(node: &ViewNode, actions: &ViewActions) -> AnyElement {
         if index > 0 {
             strip = strip.child(div().w(px(1.0)).my_3().bg(rgb(theme::BORDER)));
         }
-        strip = strip.child(div().flex_1().min_w_0().child(render_view(cell, actions)));
+        strip = strip.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(render_view(cell, actions, window, cx)),
+        );
     }
     strip.into_any_element()
 }

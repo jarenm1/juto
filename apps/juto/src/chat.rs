@@ -375,9 +375,14 @@ pub fn desktop_row(artifact: DesktopSessionArtifact) -> Message {
 }
 
 /// Renders a view. A subagent card is clickable and opens it in focus mode.
-fn card_element(view: &ViewNode, actions: &ViewActions, cx: &Context<ChatView>) -> AnyElement {
+fn card_element(
+    view: &ViewNode,
+    actions: &ViewActions,
+    window: &mut Window,
+    cx: &mut Context<ChatView>,
+) -> AnyElement {
     let Some(id) = subagent_card::card_id(view) else {
-        return render_view(view, actions);
+        return render_view(view, actions, window, cx);
     };
     let id = id.to_owned();
     div()
@@ -386,7 +391,7 @@ fn card_element(view: &ViewNode, actions: &ViewActions, cx: &Context<ChatView>) 
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
             this.enter_focus(&id, cx);
         }))
-        .child(render_view(view, actions))
+        .child(render_view(view, actions, window, cx))
         .into_any_element()
 }
 
@@ -1881,7 +1886,7 @@ impl ChatView {
     fn thread_body(
         &self,
         messages: Vec<Message>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         div()
@@ -1898,7 +1903,7 @@ impl ChatView {
     fn message_list(
         &self,
         messages: Vec<Message>,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let actions = self.view_actions(cx);
@@ -2044,9 +2049,13 @@ impl ChatView {
                                 ))
                             })
                             .when(!views.is_empty(), |row| {
-                                row.child(div().mt_2().flex().flex_col().gap_2().children(
-                                    views.iter().map(|view| card_element(view, &actions, cx)),
-                                ))
+                                row.child(
+                                    div().mt_2().flex().flex_col().gap_2().children(
+                                        views
+                                            .iter()
+                                            .map(|view| card_element(view, &actions, window, cx)),
+                                    ),
+                                )
                             })
                             .into_any_element()
                     })),
