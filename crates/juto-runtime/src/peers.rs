@@ -623,7 +623,7 @@ mod tests {
         let bus = PeerBus::for_child(own, "child-c");
 
         let report = bus.send(&format!("agent://{sibling}"), "hi").unwrap();
-        assert_eq!(report.sent, [sibling.clone()]);
+        assert_eq!(report.sent, std::slice::from_ref(&sibling));
         let report = bus.send(&format!("agent://{stranger}"), "hi").unwrap();
         assert_eq!(
             report.failed[0].error,
@@ -634,7 +634,7 @@ mod tests {
         let report = bus.send("agent://all", "status?").unwrap();
         assert_eq!(
             report.sent,
-            [sibling.clone()],
+            std::slice::from_ref(&sibling),
             "a broadcast skips finished agents"
         );
         let PeerResource::Agents(all) = bus.read("agent://all").unwrap() else {

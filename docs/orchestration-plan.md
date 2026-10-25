@@ -469,8 +469,8 @@ undrained message keeps its `origin`, the top-level session it is addressed to, 
 drains only its own. Reports still waiting for a digest are not persisted; a restart before the
 digest finishes drops them. A file that cannot be read fails the bind instead of being replaced.
 Main-started turns (the first run and an `agent_send` to a completed child) push a notice on every terminal publication. A
-turn the user types in any subagent pushes none; its result reaches the user through
-the focus view.
+turn the user types in any subagent pushes a quiet `user_turn` notice instead (PR11); the
+user reads the result in the focus view.
 
 Run ownership: the registry, concurrency limit, and inbox are shared by the process, but
 `Runtime::subagent_manager(&control)` returns a handle that owns only the children it spawns, scoped
@@ -610,6 +610,11 @@ PR11 moves agent communication toward OMP's peer model (section 3.5 of `omp-runt
   prose that only reads like a failure. Unlike OMP's terminal yield, the loop is not
   stopped by the tool: the child is told to end with a one-line closing reply, which costs
   one more model request.
+* **User turns reach main.** A follow-up turn the user starts with a child used to report
+  only to its focus view. It now leaves main a `user_turn` notice quoting the user (up to
+  500 characters) and the turn's outcome. The notice is quiet: the daemon's waker takes an
+  inbox group only for a loud message, so main is never started for the user's own turn,
+  and quiet notices ride along with the next report or reach the next run main starts.
 
 ---
 
