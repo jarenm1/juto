@@ -21,11 +21,12 @@ use juto_desktop::shm::FrameWait;
 use juto_desktop::viewer::{EventStream, ViewerClient};
 use tokio::sync::watch;
 
-/// Longest shown edges are 854x480 (480p, 16:9). Larger frames are shrunk
-/// before upload; the environment keeps its resolution and input is still
-/// mapped to environment pixels.
-const SHOWN_MAX_WIDTH: u32 = 854;
-const SHOWN_MAX_HEIGHT: u32 = 480;
+/// Longest shown edges are 1920x1080, the largest mode the software profile
+/// admits at 30 fps, so a desktop sized to its pane is shown pixel for pixel.
+/// Larger frames are shrunk before upload; the environment keeps its
+/// resolution and input is still mapped to environment pixels.
+const SHOWN_MAX_WIDTH: u32 = 1920;
+const SHOWN_MAX_HEIGHT: u32 = 1080;
 /// Longest a producer blocks before rechecking liveness and subscribers.
 const WAIT_SLICE: Duration = Duration::from_millis(100);
 /// Pause after a failed wait before the producer tries again.
@@ -137,7 +138,7 @@ fn stream_for(socket: &Path, env_id: &str) -> Arc<Stream> {
 /// the environment awake while this runs; a lifecycle watcher ends the stream
 /// when the environment stops or fails.
 fn run_producer(socket: PathBuf, env_id: String, stream: Arc<Stream>) {
-    let (viewer, lifecycle) = match (
+    let (mut viewer, lifecycle) = match (
         ViewerClient::attach(&socket, &env_id),
         EventStream::subscribe(&socket, &env_id),
     ) {
@@ -162,6 +163,9 @@ fn run_producer(socket: PathBuf, env_id: String, stream: Arc<Stream>) {
     // subscriber joining an idle environment still sees its current frame.
     let mut seen_publish = 0;
     let mut last_frame_id = None;
+    // This connection is an admitted viewer, so input after a resize waits on
+    // its acknowledgement too. Publishing a frame of a generation presents it.
+    let mut acknowledged_generation = None;
     loop {
         if matches!(*stream.feed.borrow(), Feed::Ended) {
             stopping.store(true, Ordering::Release);
@@ -191,7 +195,15 @@ fn run_producer(socket: PathBuf, env_id: String, stream: Arc<Stream>) {
                         generation: decoded.generation,
                         image,
                     };
+                    let generation = frame.generation;
                     stream.feed.send_replace(Feed::Frame(Arc::new(frame)));
+                    // A failed acknowledgement (a newer resize already landed)
+                    // is retried with the next frame.
+                    if acknowledged_generation != Some(generation)
+                        && viewer.geometry_ready(generation).is_ok()
+                    {
+                        acknowledged_generation = Some(generation);
+                    }
                 }
             }
             Ok(FrameWait::TimedOut) => {}
@@ -411,11 +423,11 @@ mod tests {
 
     #[test]
     fn downscale_averages_fine_detail_instead_of_sampling_it() {
-        // 1708x960 maps onto 854x480 at exactly 1/2, so each destination pixel
-        // covers a 2x2 block holding two black and two white pixels.
-        let pixels = checkerboard_bgra(1708, 960);
-        let (width, height, out) = fit_shown(&pixels, 1708, 960).unwrap();
-        assert_eq!((width, height), (854, 480));
+        // 3840x2160 maps onto 1920x1080 at exactly 1/2, so each destination
+        // pixel covers a 2x2 block holding two black and two white pixels.
+        let pixels = checkerboard_bgra(3840, 2160);
+        let (width, height, out) = fit_shown(&pixels, 3840, 2160).unwrap();
+        assert_eq!((width, height), (1920, 1080));
         assert!(out.chunks_exact(4).all(|px| px == [128, 128, 128, 255]));
     }
 
@@ -471,15 +483,14 @@ mod tests {
     #[test]
     fn separable_downscale_matches_direct_footprint_average() {
         let sizes = [
-            (1280, 720),
-            (1920, 1080),
+            (2560, 1440),
             (1000, 3000),
             (4000, 600),
-            (855, 481),
+            (1921, 1081),
             (3000, 1001),
-            (1708, 960),
-            (1000, 1),
-            (1, 1000),
+            (3416, 1920),
+            (4000, 1),
+            (1, 3000),
         ];
         for (width, height) in sizes {
             let seed = u64::from(width) * 7919 + u64::from(height);

@@ -21,6 +21,7 @@ use gpui::{
 };
 use juto_daemon::client::Client;
 use juto_desktop::protocol::{DesktopEvent, GrantRole, InputEvent};
+use juto_desktop::supervisor::OutputConfig;
 use juto_desktop::{DesktopError, ViewerClient, viewer::EventStream};
 
 use crate::desktop_stream;
@@ -32,6 +33,11 @@ const LEASE_HEARTBEAT: Duration = Duration::from_secs(2);
 const AWAKE_DEADLINE_SECS: u64 = 6;
 /// How often the viewer drains cursor events from the listener thread.
 const CURSOR_POLL: Duration = Duration::from_millis(33);
+/// How long the split pane's size must hold before the desktop is resized to
+/// it, so dragging the divider or the window does not reconfigure every frame.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(250);
+/// Height of the canvas row while the viewer sits inline in a chat card.
+const INLINE_HEIGHT: f32 = 405.;
 /// Evdev codes for the modifier keys forwarded to the seat.
 const KEY_LEFTSHIFT: u32 = 42;
 const KEY_LEFTCTRL: u32 = 29;
@@ -122,6 +128,19 @@ fn lock_client(client: &SharedClient) -> MutexGuard<'_, ViewerClient> {
     client.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Where the viewer is shown. Moving between placements keeps the frame feed,
+/// pause state and control lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    /// In its chat card, at a fixed height.
+    Inline,
+    /// In the window-sized overlay.
+    Expanded,
+    /// In the pane right of the chat. The desktop's resolution follows the
+    /// pane while the viewer is live and may control the desktop.
+    Split,
+}
+
 /// Client cursor bitmap drawn over the canvas at the local pointer.
 struct CursorOverlay {
     image: Arc<RenderImage>,
@@ -158,7 +177,12 @@ pub struct DesktopViewer {
     /// fixed for a resolved grant, None when view-only.
     grant_expires_at: Option<u64>,
     paused: bool,
-    expanded: bool,
+    placement: Placement,
+    /// Newest geometry generation this viewer's connection acknowledged. After
+    /// a resize the desktop gates input until every viewer acknowledges.
+    acknowledged_generation: Option<u64>,
+    /// Debounced resize to the split pane's size.
+    resize_task: Option<Task<()>>,
     frame_task: Option<Task<()>>,
     heartbeat_task: Option<Task<()>>,
     snapshot_task: Option<Task<()>>,
@@ -242,7 +266,9 @@ impl DesktopViewer {
             access,
             grant_expires_at: None,
             paused: true,
-            expanded: false,
+            placement: Placement::Inline,
+            acknowledged_generation: None,
+            resize_task: None,
             frame_task: None,
             snapshot_task: None,
             press_started_paused: false,
@@ -281,19 +307,103 @@ impl DesktopViewer {
         if viewer.client.is_some() {
             viewer.start_heartbeat(cx);
             viewer.start_cursor_listener(window, cx);
-            viewer.capture_snapshot(window, cx);
+            viewer.capture_snapshot(0, window, cx);
         }
         viewer
     }
 
-    pub fn is_expanded(&self) -> bool {
-        self.expanded
+    pub fn placement(&self) -> Placement {
+        self.placement
     }
 
-    /// Presentation changes keep the same frame feed, pause state and lease.
-    pub fn set_expanded(&mut self, expanded: bool, cx: &mut Context<Self>) {
-        self.expanded = expanded;
+    /// Moves the viewer; the frame feed, pause state and lease are kept. The
+    /// split pane resizes the desktop to fit it; leaving it keeps the size.
+    pub fn set_placement(&mut self, placement: Placement, cx: &mut Context<Self>) {
+        self.placement = placement;
+        self.schedule_resize(cx);
         cx.notify();
+    }
+
+    /// Whether the desktop's resolution should follow the canvas now: in the
+    /// split pane, live, attached, and allowed to control the desktop.
+    fn follows_canvas(&self) -> bool {
+        self.placement == Placement::Split
+            && !self.paused
+            && self.can_control
+            && self.client.is_some()
+    }
+
+    /// Resizes the desktop to the canvas once its size has held for
+    /// [`RESIZE_DEBOUNCE`]. A newer call restarts the wait.
+    fn schedule_resize(&mut self, cx: &mut Context<Self>) {
+        if !self.follows_canvas() {
+            self.resize_task = None;
+            return;
+        }
+        self.resize_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RESIZE_DEBOUNCE).await;
+            let _ = this.update(cx, |this, cx| this.resize_to_canvas(cx));
+        }));
+    }
+
+    /// Reconfigures the desktop to the canvas size in logical pixels, fitted to
+    /// what the environment admits at its current frame rate.
+    fn resize_to_canvas(&mut self, cx: &mut Context<Self>) {
+        self.resize_task = None;
+        if !self.follows_canvas() {
+            return;
+        }
+        let size = self.surface_bounds.get().size;
+        let (width, height) = (f32::from(size.width), f32::from(size.height));
+        if width < 1.0 || height < 1.0 {
+            return;
+        }
+        let status = match self.with_client(|client| client.describe()) {
+            Ok(status) => status,
+            Err(err) => {
+                self.error = Some(format!("resize failed: {err}"));
+                cx.notify();
+                return;
+            }
+        };
+        let current = status.output;
+        let (width, height) = status
+            .output_profile
+            .fit(width as u32, height as u32, current.fps);
+        if (width, height) == (current.width, current.height) {
+            return;
+        }
+        // Keys held across a geometry change would be released against a
+        // different layout; release them first.
+        self.release_held_input(cx);
+        let mode = OutputConfig {
+            width,
+            height,
+            ..current
+        };
+        match self.with_client(|client| client.configure_output(status.generation, mode)) {
+            Ok((generation, output)) => {
+                self.generation = generation;
+                self.error = None;
+                self.status = format!("resized to {}x{}", output.width, output.height);
+            }
+            Err(err) => self.error = Some(format!("resize failed: {err}")),
+        }
+        cx.notify();
+    }
+
+    /// Reports a presented frame's generation over this viewer's connection,
+    /// once per generation. Input after a resize waits for it.
+    fn acknowledge_geometry(&mut self, generation: u64) {
+        if self.client.is_none() || self.acknowledged_generation == Some(generation) {
+            return;
+        }
+        match self.with_client(|client| client.geometry_ready(generation)) {
+            Ok(()) => self.acknowledged_generation = Some(generation),
+            // A newer resize already landed; its frame acknowledges instead.
+            Err(DesktopError::Rejected { code, .. }) if code == "StaleGeneration" => {}
+            Err(err) => self.error = Some(format!("geometry acknowledgement failed: {err}")),
+        }
     }
 
     /// Runs `f` on the control connection. Fails when the environment was never
@@ -382,9 +492,9 @@ impl DesktopViewer {
                     }
                 }
                 if !pending.is_empty() {
-                    let update = this.update_in(cx, |this, _window, cx| {
+                    let update = this.update_in(cx, |this, window, cx| {
                         for event in pending {
-                            this.apply_cursor_event(event, cx);
+                            this.apply_desktop_event(event, window, cx);
                         }
                     });
                     if update.is_err() {
@@ -398,7 +508,12 @@ impl DesktopViewer {
         }));
     }
 
-    fn apply_cursor_event(&mut self, event: DesktopEvent, cx: &mut Context<Self>) {
+    fn apply_desktop_event(
+        &mut self,
+        event: DesktopEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match event {
             DesktopEvent::CursorShapeChanged { shape, .. } => self.set_cursor_shape(&shape, cx),
             DesktopEvent::CursorImageChanged {
@@ -421,6 +536,11 @@ impl DesktopViewer {
                     pixels,
                 );
                 self.set_cursor_overlay(overlay, cx);
+            }
+            // A paused canvas receives no frames, yet input after a resize waits
+            // until it presents the new geometry. Capture a still of it.
+            DesktopEvent::OutputChanged { generation, .. } if self.paused => {
+                self.capture_snapshot(generation, window, cx);
             }
             // Missed shape changes leave the last known shape in place: the
             // compositor cannot re-send it, and guessing a default would be wrong too.
@@ -475,16 +595,27 @@ impl DesktopViewer {
         )
     }
 
-    /// Captures one still of the newest frame without starting the live feed.
-    pub fn capture_snapshot(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Captures one still of the newest frame of at least `min_generation`
+    /// without starting the live feed.
+    pub fn capture_snapshot(
+        &mut self,
+        min_generation: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let mut feed = desktop_stream::subscribe(&self.socket, &self.env_id);
         self.snapshot_task = Some(cx.spawn_in(window, async move |this, cx| {
-            // The worker may not have composed its first frame yet; the feed waits
-            // for one and ends only when the environment does.
-            if let Some(frame) = feed.next().await {
+            // The worker may not have composed its first frame, or its first
+            // frame after a resize, yet; the feed waits for one and ends only
+            // when the environment does.
+            while let Some(frame) = feed.next().await {
+                if frame.generation < min_generation {
+                    continue;
+                }
                 let _ = this.update_in(cx, |this, window, cx| {
                     this.set_frame(frame, window, cx);
                 });
+                return;
             }
         }));
     }
@@ -502,6 +633,7 @@ impl DesktopViewer {
         // Input is mapped in environment pixels, not the downscaled image.
         let (width, height) = frame.source;
         self.generation = frame.generation;
+        self.acknowledge_geometry(frame.generation);
         self.frame_size = (width, height);
         if self.error.is_none() {
             self.status = if self.paused {
@@ -522,13 +654,14 @@ impl DesktopViewer {
         self.release_held_input(cx);
         self.paused = true;
         self.frame_task = None;
+        self.resize_task = None;
         // A paused canvas no longer keeps the desktop awake; the idle clock starts.
         self.awake = false;
         if self.has_control {
             self.release_control(cx);
         }
         self.status = "paused".to_string();
-        self.capture_snapshot(window, cx);
+        self.capture_snapshot(0, window, cx);
         cx.notify();
     }
 
@@ -556,6 +689,7 @@ impl DesktopViewer {
         // A pending still must not overwrite live frames.
         self.snapshot_task = None;
         self.start_frames(window, cx);
+        self.schedule_resize(cx);
         cx.notify();
     }
 
@@ -853,6 +987,7 @@ impl Render for DesktopViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl gpui::IntoElement {
         let frame = self.frame.clone();
         let bounds_cell = self.surface_bounds.clone();
+        let this = cx.weak_entity();
         let status = self.status.clone();
         let error = self.error.clone();
         let has_control = self.has_control;
@@ -1009,10 +1144,10 @@ impl Render for DesktopViewer {
             }))
             .w_full()
             .map(|view| {
-                if self.expanded {
-                    view.h_full()
+                if self.placement == Placement::Inline {
+                    view.h(px(INLINE_HEIGHT))
                 } else {
-                    view.h(px(405.))
+                    view.h_full()
                 }
             })
             .flex()
@@ -1115,8 +1250,16 @@ impl Render for DesktopViewer {
                     }))
                     .child(
                         canvas(
-                            move |bounds, _window, _cx| {
-                                bounds_cell.set(bounds);
+                            move |bounds, _window, cx| {
+                                // Layout runs after render, so a new size is
+                                // only known here; resize once it settles.
+                                if bounds_cell.replace(bounds).size != bounds.size {
+                                    let this = this.clone();
+                                    cx.defer(move |cx| {
+                                        let _ =
+                                            this.update(cx, |this, cx| this.schedule_resize(cx));
+                                    });
+                                }
                             },
                             move |_bounds, _state, _window, _cx| {},
                         )
