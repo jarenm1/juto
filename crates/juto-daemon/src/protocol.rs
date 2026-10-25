@@ -28,7 +28,6 @@ use juto_catalog::Model;
 use juto_runtime::automations::{Automation, AutomationHistory, AutomationSpec};
 use juto_runtime::github::{GithubEventRecord, GithubPollReport, GithubWatch, GithubWatchSpec};
 use juto_runtime::jobs::{InboxState, Job, JobBudget, JobContract};
-use juto_runtime::subagents::MainMessage;
 use juto_runtime::{
     Decision, RuntimeConfig, SubagentEvent, SubagentSummary, ThreadEvent, TimelineItem, ViewerRoute,
 };
@@ -284,14 +283,6 @@ pub enum Request {
     ResolveDesktopArtifact {
         artifact: serde_json::Value,
     },
-
-    // ---- inbox ----
-    /// Lists the notices waiting in the main inbox for the user.
-    InboxMessages,
-    /// Dismisses one notice from the user's inbox. The agent keeps its copy.
-    InboxDismiss {
-        message: MainMessage,
-    },
 }
 
 /// Actions on one subagent.
@@ -307,12 +298,13 @@ pub enum SubagentCommand {
     },
     Release,
     /// Sends a message from the user to the child. A queued or running child
-    /// takes it as a steer and becomes a focus thread; a completed child starts
-    /// a user follow-up.
+    /// takes it as a steer, a blocked child takes it as the answer to its
+    /// question, and a completed child starts a user follow-up. Each makes the
+    /// child a focus thread.
     Send {
         text: String,
     },
-    /// Hides a focus thread from the inbox (`true`) or shows it again.
+    /// Hides a finished task from the sidebar (`true`) or shows it again.
     SetArchived {
         archived: bool,
     },
@@ -370,9 +362,6 @@ pub enum Reply {
         login_id: u64,
     },
     DesktopEnvironment(DesktopEnvironmentInfo),
-    InboxMessages {
-        messages: Vec<MainMessage>,
-    },
     /// `None` when the artifact is not a desktop artifact this daemon can route.
     Route(Option<ViewerRoute>),
     /// Used by requests that succeed without data.
@@ -501,8 +490,6 @@ pub enum ServerEvent {
     Config {
         config: RuntimeConfig,
     },
-    /// The user's inbox changed; fetch it with `Request::InboxMessages`.
-    Inbox,
     /// A job changed: queued, running, blocked, finished, or its inbox state moved.
     Job {
         /// Boxed: a job is large, and every event is passed by value.

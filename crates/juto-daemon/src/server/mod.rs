@@ -141,6 +141,7 @@ fn session_event(state: &mut State, session_id: &str, event: SessionEvent) {
 fn message_count(main: &MainSession) -> Result<u64> {
     Ok(message_total(&main.timeline()?))
 }
+
 fn message_total(timeline: &[TimelineItem]) -> u64 {
     timeline
         .iter()
@@ -214,16 +215,6 @@ async fn wake_loop(daemon: Arc<Daemon>) {
                 tokio::time::sleep(WAKE_RETRY).await;
             }
         }
-    }
-}
-
-/// Tells the connected clients whenever the user's inbox changes; they fetch the notices
-/// with `Request::InboxMessages`.
-async fn inbox_loop(daemon: Arc<Daemon>) {
-    let inbox = daemon.runtime.subagent_manager().main_inbox();
-    loop {
-        inbox.user_changed().await;
-        daemon.emit(ServerEvent::Inbox);
     }
 }
 
@@ -843,18 +834,6 @@ impl Daemon {
                     Err(e) => Err(failed(e)),
                 }
             }
-            Request::InboxMessages => {
-                let inbox = self.runtime.subagent_manager().main_inbox();
-                Ok(Reply::InboxMessages {
-                    messages: inbox.user_messages(),
-                })
-            }
-            Request::InboxDismiss { message } => {
-                let inbox = self.runtime.subagent_manager().main_inbox();
-                inbox.dismiss_user_message(&message).map_err(failed)?;
-                self.emit(ServerEvent::Inbox);
-                Ok(Reply::Ok)
-            }
         }
     }
 
@@ -1090,7 +1069,6 @@ pub async fn serve(workspace: PathBuf) -> Result<()> {
     tokio::spawn(wake_loop(daemon.clone()));
     tokio::spawn(services::automations::tick_loop(daemon.clone()));
     tokio::spawn(services::github::poll_loop(daemon.clone()));
-    tokio::spawn(inbox_loop(daemon.clone()));
     forward_job_events(&daemon);
     let approval_daemon = daemon.clone();
     tokio::spawn(async move {

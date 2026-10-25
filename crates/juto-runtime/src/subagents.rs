@@ -15,7 +15,7 @@ use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::main_inbox_store;
 use crate::main_report::{self, DEFAULT_MAIN_REPORT_BYTES};
@@ -83,6 +83,54 @@ pub struct TaskSpec {
     /// default, `workspace`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<ExecutionTier>,
+    /// Lets this turn ask the user a question and wait for the answer. The
+    /// manager sets it on the spec it hands the factory for each turn; it is
+    /// never stored with the child and never model-supplied.
+    #[serde(skip)]
+    pub ask: Option<UserAsk>,
+}
+
+/// A running child's line to the user. [`UserAsk::ask`] marks the child
+/// [`SubagentStatus::Blocked`] on [`BlockerReason::UserInput`] with the
+/// question as its prompt, and resolves with the user's answer once
+/// [`SubagentManager::unblock`] (or a user message) delivers it.
+#[derive(Clone)]
+pub struct UserAsk {
+    inner: Weak<Inner>,
+    owner: CancellationToken,
+    id: String,
+}
+
+impl fmt::Debug for UserAsk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserAsk").field("id", &self.id).finish()
+    }
+}
+
+impl UserAsk {
+    fn new(inner: &Arc<Inner>, owner: &CancellationToken, id: &str) -> Self {
+        Self {
+            inner: Arc::downgrade(inner),
+            owner: owner.clone(),
+            id: id.to_owned(),
+        }
+    }
+
+    /// Block on the user's answer to `question`. Cancelling the child or its
+    /// owner ends the wait with [`SubagentError::Cancelled`].
+    pub async fn ask(&self, question: String) -> Result<String, SubagentError> {
+        let inner = self
+            .inner
+            .upgrade()
+            .ok_or_else(|| SubagentError::Unknown(self.id.clone()))?;
+        let manager = SubagentManager {
+            inner,
+            owner: self.owner.clone(),
+        };
+        manager
+            .block_and_wait(&self.id, BlockerReason::UserInput, question)
+            .await
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -117,6 +165,7 @@ impl TaskSpec {
             main_session: None,
             main_snapshot: None,
             tier: None,
+            ask: None,
         }
     }
 }
@@ -218,8 +267,8 @@ pub struct SubagentSummary {
     pub workspace: Option<PathBuf>,
     /// `true` once the main agent released this focus thread's workspace.
     pub released: bool,
-    /// `true` once the user archived this focus thread: it leaves the inbox,
-    /// but its workspace and transcript are kept.
+    /// `true` once the user archived this finished child: it leaves the task
+    /// list, but its workspace and transcript are kept.
     pub archived: bool,
 }
 
@@ -268,14 +317,12 @@ pub enum SubagentError {
     NoTranscript(String),
     /// Reading the child's session file failed.
     Transcript(String),
-    /// `release` targeted a child that has not reached a terminal state.
+    /// `release` or `set_archived` targeted a child that has not reached a terminal state.
     NotTerminal(String),
     /// The child's workspace was released; follow-ups and transcripts are refused.
     WorkspaceReleased(String),
     /// Removing the child's workspace failed; the workspace stays recorded.
     WorkspaceRelease(String),
-    /// The child is not a focus thread; only focus threads can be archived.
-    NotFocus(String),
 }
 
 impl fmt::Display for SubagentError {
@@ -296,16 +343,12 @@ impl fmt::Display for SubagentError {
             Self::NoTranscript(id) => write!(f, "subagent {id} has no completed transcript"),
             Self::Transcript(err) => write!(f, "failed to read subagent transcript: {err}"),
             Self::NotTerminal(id) => {
-                write!(
-                    f,
-                    "subagent {id} is not terminal; release it after it finishes"
-                )
+                write!(f, "subagent {id} is still working; wait until it finishes")
             }
             Self::WorkspaceReleased(id) => write!(f, "subagent {id} workspace was released"),
             Self::WorkspaceRelease(err) => {
                 write!(f, "failed to release subagent workspace: {err}")
             }
-            Self::NotFocus(id) => write!(f, "subagent {id} is not a focus thread"),
         }
     }
 }
@@ -484,12 +527,10 @@ pub struct MainMessage {
 /// main session with several internal threads delivers a report to the thread
 /// that asked for it.
 ///
-/// Once [`MainInbox::bind`] attaches a file, every change to the queue, to the
-/// user's notices, or to the digest archive is written to it. Reports still waiting in a sender's
+/// Once [`MainInbox::bind`] attaches a file, every change to the queue or to
+/// the digest archive is written to it. Reports still waiting in a sender's
 /// lane for their digest are not persisted: the digest needs the live model,
 /// so a restart before it finishes drops them.
-///
-/// The user's copy of each notice is separate: dismissing it never acknowledges the message for the model.
 #[derive(Clone, Default)]
 pub struct MainInbox {
     messages: Arc<Mutex<Vec<Queued>>>,
@@ -503,10 +544,6 @@ pub struct MainInbox {
     event_senders: Arc<Mutex<Vec<broadcast::WeakSender<SubagentEvent>>>>,
     /// Backing file, set once by `bind`.
     store: Arc<OnceLock<PathBuf>>,
-    /// Notices the user sees, in arrival order. Reading never drains; dismissing removes only this copy.
-    user: Arc<Mutex<Vec<MainMessage>>>,
-    /// Woken when a notice is pushed to `user`.
-    user_changed: Arc<Notify>,
 }
 
 /// One queued message and the top-level session it is addressed to.
@@ -533,17 +570,14 @@ impl MainInbox {
             return Ok(());
         }
         let loaded = main_inbox_store::load(&path)?;
-        let restored = !loaded.queued.is_empty() || !loaded.user.is_empty();
-        let mut user = self.user.lock().expect("main inbox poisoned");
+        let restored = !loaded.queued.is_empty();
         let mut archive = self.archive.lock().expect("main inbox poisoned");
         archive.extend(loaded.archive);
-        user.splice(0..0, loaded.user);
         messages.splice(0..0, loaded.queued);
         // Checked above under the `messages` lock, so no other bind can have set it.
         let _ = self.store.set(path);
-        self.persist_with(&messages, &user, &archive);
+        self.persist_with(&messages, &archive);
         drop(archive);
-        drop(user);
         drop(messages);
         if restored {
             self.announce();
@@ -556,16 +590,13 @@ impl MainInbox {
         self.push_from(None, message);
     }
 
-    /// Queue a message addressed to the top-level session `origin`. The user's
-    /// copy is queued with it.
+    /// Queue a message addressed to the top-level session `origin`.
     pub fn push_from(&self, origin: Option<String>, message: MainMessage) {
         {
             let mut messages = self.messages.lock().expect("main inbox poisoned");
-            let mut user = self.user.lock().expect("main inbox poisoned");
-            user.push(message.clone());
             messages.push(Queued { origin, message });
             let archive = self.archive.lock().expect("main inbox poisoned");
-            self.persist_with(&messages, &user, &archive);
+            self.persist_with(&messages, &archive);
         }
         self.announce();
     }
@@ -586,30 +617,23 @@ impl MainInbox {
         // Stores a permit when no waiter is parked, so a push racing a drain
         // is not missed by the next `arrived` wait.
         self.arrived.notify_one();
-        self.user_changed.notify_one();
     }
 
-    /// Write the queue, the user's notices and the archive to the bound file,
-    /// if any. Lock order is `messages`, then `user`, then `archive`. A failed
-    /// write is reported on stderr and the state stays in memory; the next
-    /// successful write stores all of it again.
+    /// Write the queue and the archive to the bound file, if any. Lock order
+    /// is `messages`, then `archive`. A failed write is reported on stderr and
+    /// the state stays in memory; the next successful write stores all of it
+    /// again.
     fn persist(&self, messages: &[Queued]) {
-        let user = self.user.lock().expect("main inbox poisoned");
         let archive = self.archive.lock().expect("main inbox poisoned");
-        self.persist_with(messages, &user, &archive);
+        self.persist_with(messages, &archive);
     }
 
-    /// As [`Self::persist`], for callers that already hold `messages` and `user`.
-    fn persist_with(
-        &self,
-        messages: &[Queued],
-        user: &[MainMessage],
-        archive: &HashMap<String, ArchivedReport>,
-    ) {
+    /// As [`Self::persist`], for callers that already hold `messages` and `archive`.
+    fn persist_with(&self, messages: &[Queued], archive: &HashMap<String, ArchivedReport>) {
         let Some(path) = self.store.get() else {
             return;
         };
-        if let Err(error) = main_inbox_store::save(path, messages, archive, user) {
+        if let Err(error) = main_inbox_store::save(path, messages, archive) {
             eprintln!("juto: {error:#}");
         }
     }
@@ -617,35 +641,6 @@ impl MainInbox {
     /// Resolves once a message is pushed. Pending messages are read with `drain`.
     pub async fn arrived(&self) {
         self.arrived.notified().await;
-    }
-
-    /// Resolves once a notice is pushed for the user. Read them with `user_messages`.
-    pub async fn user_changed(&self) {
-        self.user_changed.notified().await;
-    }
-
-    /// The notices the user has not dismissed, oldest first. Reading never drains.
-    pub fn user_messages(&self) -> Vec<MainMessage> {
-        self.user.lock().expect("main inbox poisoned").clone()
-    }
-
-    /// Dismiss one notice for the user, leaving the model's copy queued. A
-    /// failed write keeps the notice visible so the dismissal can be retried.
-    pub fn dismiss_user_message(&self, message: &MainMessage) -> anyhow::Result<()> {
-        let messages = self.messages.lock().expect("main inbox poisoned");
-        let mut user = self.user.lock().expect("main inbox poisoned");
-        let Some(index) = user.iter().position(|entry| entry == message) else {
-            return Ok(());
-        };
-        let removed = user.remove(index);
-        if let Some(path) = self.store.get() {
-            let archive = self.archive.lock().expect("main inbox poisoned");
-            if let Err(error) = main_inbox_store::save(path, &messages, &archive, &user) {
-                user.insert(index, removed);
-                return Err(error);
-            }
-        }
-        Ok(())
     }
 
     /// Put undelivered messages for `origin` back at the front, preserving
@@ -870,10 +865,9 @@ async fn bound_pending(inbox: &MainInbox, pending: PendingReport) -> MainMessage
             };
             {
                 let messages = inbox.messages.lock().expect("main inbox poisoned");
-                let user = inbox.user.lock().expect("main inbox poisoned");
                 let mut archive = inbox.archive.lock().expect("main inbox poisoned");
                 archive.insert(key, archived);
-                inbox.persist_with(&messages, &user, &archive);
+                inbox.persist_with(&messages, &archive);
             }
             MainMessage {
                 from,
@@ -1241,8 +1235,9 @@ impl SubagentManager {
     }
 
     /// Message a child from its focus thread. A queued or running child takes it
-    /// as a user steer and becomes a focus thread, so the thread stays in the
-    /// inbox. A completed child starts a user follow-up instead.
+    /// as a user steer, a blocked child takes it as the answer to its question,
+    /// and a completed child starts a user follow-up. Each makes the child a
+    /// focus thread.
     pub fn send_from_user(&self, id: &str, message: String) -> Result<(), SubagentError> {
         let child = self.child(id)?;
         let status = child.state.borrow().status.clone();
@@ -1252,17 +1247,21 @@ impl SubagentManager {
         if status.is_terminal() {
             return Err(SubagentError::Terminal(status));
         }
+        if status.is_blocked() {
+            self.unblock(id, message)?;
+        } else {
+            child
+                .control
+                .lock()
+                .expect("mutex poisoned")
+                .steer(Message::user(format!("{USER_TURN_PREFACE}\n\n{message}")));
+        }
         if !child.focus.swap(true, Ordering::AcqRel) {
             let _ = self
                 .inner
                 .events
                 .send(SubagentEvent::Promoted { id: id.to_string() });
         }
-        child
-            .control
-            .lock()
-            .expect("mutex poisoned")
-            .steer(Message::user(format!("{USER_TURN_PREFACE}\n\n{message}")));
         Ok(())
     }
 
@@ -1281,12 +1280,13 @@ impl SubagentManager {
         self.start_follow_up(id, prompt, TurnOrigin::User)
     }
 
-    /// Hides a focus thread from the inbox, or shows it again. Only the
-    /// listing changes: the workspace, transcript, and follow-up state stay.
+    /// Hides a finished child from the user's task list, or shows it again.
+    /// Only the listing changes: the workspace, transcript, and follow-up state
+    /// stay. A child still at work cannot be hidden.
     pub fn set_archived(&self, id: &str, archived: bool) -> Result<(), SubagentError> {
         let child = self.child(id)?;
-        if !child.focus.load(Ordering::Acquire) {
-            return Err(SubagentError::NotFocus(id.to_string()));
+        if !child.state.borrow().status.is_terminal() {
+            return Err(SubagentError::NotTerminal(id.to_string()));
         }
         child.archived.store(archived, Ordering::Release);
         let _ = self.inner.events.send(SubagentEvent::ArchiveChanged {
@@ -1550,6 +1550,9 @@ impl SubagentManager {
     ///
     /// Suspends child progress via [`RunControl::pause`], sets status to
     /// [`SubagentStatus::Blocked`], and prepares an unblock signaling channel.
+    /// The resolution reaches the child only through
+    /// [`SubagentManager::wait_for_resolution`], so pair every block with one
+    /// (or use [`SubagentManager::block_and_wait`]).
     pub fn block(
         &self,
         id: &str,
@@ -1655,8 +1658,10 @@ impl SubagentManager {
 
     /// Provide a resolution to a blocked child, transitioning it back to Running.
     ///
-    /// Resumes the child's [`RunControl`], steers the child with the resolution
-    /// message, and delivers the resolution string to the waiter.
+    /// Resumes the child's [`RunControl`] and delivers the resolution string to
+    /// the waiter, which hands it to the child (for `ask_user`, as the tool
+    /// result). It is never steered into the transcript as well, so the child
+    /// reads the answer once and a credential never enters its history.
     pub fn unblock(&self, id: &str, resolution: impl Into<String>) -> Result<(), SubagentError> {
         let child = self.child(id)?;
         let resolution = resolution.into();
@@ -1671,24 +1676,12 @@ impl SubagentManager {
             .expect("mutex poisoned")
             .take()
             .ok_or_else(|| SubagentError::NotBlocked(id.to_string()))?;
-        let is_credential = matches!(
-            current,
-            SubagentStatus::Blocked {
-                reason: BlockerReason::Credential,
-                ..
-            }
-        );
 
         child.state.send_modify(|state| {
             state.status = SubagentStatus::Running;
         });
         child.set_status(SubagentStatus::Running);
-
-        let control = child.control.lock().expect("mutex poisoned");
-        control.resume();
-        if !is_credential {
-            control.steer(Message::user(resolution.clone()));
-        }
+        child.control.lock().expect("mutex poisoned").resume();
 
         let _ = tx.send(resolution);
         Ok(())
@@ -1858,7 +1851,10 @@ async fn run_child(
     child.set_status(SubagentStatus::Running);
 
     let factory = inner.factory.clone();
-    let spec = child.spec.clone();
+    let spec = TaskSpec {
+        ask: Some(UserAsk::new(&inner, &owner, &id)),
+        ..child.spec.clone()
+    };
     let task_id = id.clone();
     let task_control = control.clone();
     seats
@@ -1899,7 +1895,10 @@ async fn run_follow_up(
         .and_then(|schema| jsonschema::validator_for(schema).ok());
     let id = child.id.clone();
     let factory = inner.factory.clone();
-    let spec = child.spec.clone();
+    let spec = TaskSpec {
+        ask: Some(UserAsk::new(&inner, &owner, &id)),
+        ..child.spec.clone()
+    };
     let task_control = control.clone();
     seats
         .desk
@@ -2213,6 +2212,7 @@ mod tests {
             main_session: None,
             main_snapshot: None,
             tier: None,
+            ask: None,
         }
     }
 
@@ -3007,6 +3007,73 @@ mod tests {
             .expect("wait failed");
         assert_eq!(result.output, "setup-db:postgres");
         assert_eq!(manager.status(&id), Some(SubagentStatus::Completed));
+    }
+
+    /// Asks through the `UserAsk` handle the manager attaches to the spec, and
+    /// finishes with the answer it got back.
+    struct AskingFactory;
+
+    #[async_trait]
+    impl SubagentFactory for AskingFactory {
+        async fn run(
+            &self,
+            id: &str,
+            spec: TaskSpec,
+            control: RunControl,
+            _events: mpsc::UnboundedSender<AgentEvent>,
+        ) -> Result<SubagentResult, String> {
+            let ask = spec.ask.expect("the manager attaches a user line");
+            let answer = ask
+                .ask("Merge now or verify first?".into())
+                .await
+                .map_err(|e| e.to_string())?;
+            // The answer releases the pause the block engaged.
+            if control.is_paused() {
+                return Err("the run stayed paused after the answer".into());
+            }
+            Ok(SubagentResult {
+                id: id.to_string(),
+                output: format!("answer:{answer}"),
+                data: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                session_path: PathBuf::from("/tmp/test"),
+                change_id: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_user_message_answers_a_child_asking_the_user() {
+        let manager = manager(Arc::new(AskingFactory), 1, CancellationToken::new());
+        let id = manager.spawn(spec("review the PR")).unwrap();
+        let mut status_rx = manager.subscribe_status(&id).unwrap();
+        status_rx
+            .wait_for(|s| s.is_blocked())
+            .await
+            .expect("child blocks on its question");
+        assert_eq!(
+            summary_of(&manager, &id).status,
+            SubagentStatus::Blocked {
+                reason: BlockerReason::UserInput,
+                prompt: "Merge now or verify first?".into(),
+            }
+        );
+        assert!(!summary_of(&manager, &id).focus);
+
+        manager
+            .send_from_user(&id, "verify first".into())
+            .expect("the answer is accepted");
+        assert!(
+            summary_of(&manager, &id).focus,
+            "answering promotes the child"
+        );
+
+        let result = timeout(WAIT_TIMEOUT, manager.wait(&id))
+            .await
+            .expect("wait timed out")
+            .expect("child completes");
+        assert_eq!(result.output, "answer:verify first");
     }
 
     #[tokio::test]
@@ -3834,24 +3901,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archiving_hides_focus_threads_and_refuses_workers() {
-        let manager = manager(Arc::new(StreamingFactory), 2, CancellationToken::new());
+    async fn archiving_hides_finished_children_and_refuses_working_ones() {
+        let (gate, gate_rx) = gate();
+        let running = Arc::new(AtomicUsize::new(0));
+        let manager = manager(
+            gate_factory(
+                gate_rx,
+                running.clone(),
+                Arc::new(AtomicUsize::new(0)),
+                false,
+                None,
+            ),
+            2,
+            CancellationToken::new(),
+        );
         let mut events = manager.subscribe_events();
-        let focus = manager.spawn(focus_spec("build")).unwrap();
         let worker = manager.spawn(spec("scan")).unwrap();
-        manager.wait(&focus).await.expect("focus run");
-        manager.wait(&worker).await.expect("worker run");
+        until_running(&running, 1).await;
 
-        manager.set_archived(&focus, true).unwrap();
-        assert!(summary_of(&manager, &focus).archived);
         assert_eq!(
             manager.set_archived(&worker, true),
-            Err(SubagentError::NotFocus(worker.clone()))
+            Err(SubagentError::NotTerminal(worker.clone()))
         );
         assert!(!summary_of(&manager, &worker).archived);
 
-        manager.set_archived(&focus, false).unwrap();
-        assert!(!summary_of(&manager, &focus).archived);
+        gate.send(true).unwrap();
+        manager.wait(&worker).await.expect("worker run");
+        manager.set_archived(&worker, true).unwrap();
+        assert!(summary_of(&manager, &worker).archived);
+        manager.set_archived(&worker, false).unwrap();
+        assert!(!summary_of(&manager, &worker).archived);
 
         let archive_events: Vec<(String, bool)> = std::iter::from_fn(|| events.try_recv().ok())
             .filter_map(|event| match event {
@@ -3859,7 +3938,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(archive_events, vec![(focus.clone(), true), (focus, false)]);
+        assert_eq!(
+            archive_events,
+            vec![(worker.clone(), true), (worker, false)]
+        );
     }
 
     #[test]
@@ -4893,55 +4975,5 @@ mod tests {
                 .unwrap()
                 .starts_with("first report ")
         );
-    }
-
-    fn inbox_note(from: &str, body: &str) -> MainMessage {
-        MainMessage {
-            from: from.into(),
-            name: None,
-            kind: MainMessageKind::Message,
-            digest_of: None,
-            body: body.into(),
-        }
-    }
-
-    /// The user's copy of a notice is independent of the model's: dismissing it
-    /// leaves the message queued for `drain`, and both outcomes survive a restart.
-    #[test]
-    fn user_dismiss_and_model_drain_are_independent_across_restart() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let path = root.path().join("session.json");
-        let inbox = MainInbox::default();
-        inbox.bind(path.clone()).expect("bind");
-        let first = inbox_note("child", "completed");
-        let second = inbox_note("child", "failed");
-        inbox.push(first.clone());
-        inbox.push(second.clone());
-        inbox.dismiss_user_message(&first).expect("dismiss first");
-        assert_eq!(inbox.drain(), vec![first.clone(), second.clone()]);
-        drop(inbox);
-
-        let inbox = MainInbox::default();
-        inbox.bind(path.clone()).expect("rebind");
-        assert!(inbox.drain().is_empty());
-        assert_eq!(inbox.user_messages(), vec![second.clone()]);
-        inbox.dismiss_user_message(&second).expect("dismiss second");
-        drop(inbox);
-
-        let inbox = MainInbox::default();
-        inbox.bind(path).expect("third bind");
-        assert!(inbox.user_messages().is_empty());
-    }
-
-    #[tokio::test]
-    async fn push_wakes_user_watchers() {
-        let inbox = MainInbox::default();
-        let watcher = inbox.clone();
-        let waiting = tokio::spawn(async move { watcher.user_changed().await });
-        inbox.push(inbox_note("child-1", "blocked on a decision"));
-        timeout(WAIT_TIMEOUT, waiting)
-            .await
-            .expect("watcher woke after push")
-            .expect("watcher task");
     }
 }

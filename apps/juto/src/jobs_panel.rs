@@ -1,10 +1,10 @@
-//! Background jobs in the chat view: the strip that lists them, the actions offered on each,
+//! Background jobs in the task sidebar: the row that shows one, the actions offered on each,
 //! and the daemon request each action sends. Job state lives in the daemon; this module only
 //! presents it and turns clicks into requests.
 
 use std::rc::Rc;
 
-use gpui::{App, ClickEvent, Div, SharedString, Window, div, prelude::*, px, rgb};
+use gpui::{App, ClickEvent, SharedString, Window, div, prelude::*, rgb};
 use juto_daemon::protocol::Request;
 use juto_runtime::jobs::{InboxState, Job, JobBudget, JobContract, JobStatus};
 
@@ -47,7 +47,7 @@ pub fn background_request(prompt: String) -> Request {
     }
 }
 
-/// Jobs the strip shows: every job the user has not archived, newest first.
+/// Jobs the sidebar shows: every job the user has not archived, newest first.
 pub fn visible(jobs: &[Job]) -> Vec<&Job> {
     let mut shown: Vec<&Job> = jobs
         .iter()
@@ -164,7 +164,8 @@ fn action_button(job: &Job, action: JobAction, handler: &JobActionHandler) -> im
         .child(action_label(action))
 }
 
-fn job_row(job: &Job, handler: &JobActionHandler) -> impl IntoElement {
+/// One job: status, prompt, result or error, and its actions.
+pub fn job_row(job: &Job, handler: &JobActionHandler) -> impl IntoElement {
     let mut row = div()
         .flex()
         .flex_col()
@@ -223,72 +224,54 @@ fn job_row(job: &Job, handler: &JobActionHandler) -> impl IntoElement {
     row
 }
 
-/// The strip above the composer. Empty (and taking no space) when nothing is shown.
-pub fn render_strip(jobs: &[Job], handler: &JobActionHandler) -> Div {
-    let shown = visible(jobs);
-    if shown.is_empty() {
-        return div();
+#[cfg(test)]
+pub(crate) fn test_job(id: &str, status: JobStatus, inbox: InboxState) -> Job {
+    Job {
+        id: id.into(),
+        prompt: "summarize the repo".into(),
+        budget: JobBudget {
+            wall_secs: 60,
+            max_attempts: 1,
+            max_turns: None,
+            max_spend: None,
+        },
+        contract: JobContract {
+            no_change: true,
+            ..Default::default()
+        },
+        status,
+        inbox,
+        drained: false,
+        attempts: 1,
+        run_ms: 0,
+        turns: 0,
+        spend_usd: 0.0,
+        session_id: None,
+        session_path: None,
+        tier: None,
+        permission: None,
+        forks: Vec::new(),
+        decision_id: None,
+        result: None,
+        error: None,
+        owner_pid: None,
+        created_ms: 0,
+        started_ms: None,
+        finished_ms: None,
+        origin: None,
+        priority: None,
+        model: None,
     }
-    div()
-        .flex()
-        .flex_col()
-        .gap_2()
-        .flex_none()
-        .px_6()
-        .pb_2()
-        .w_full()
-        .max_w(px(800.))
-        .mx_auto()
-        .children(shown.into_iter().map(|job| job_row(job, handler)))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
 
-    fn job(id: &str, status: JobStatus, inbox: InboxState) -> Job {
-        Job {
-            id: id.into(),
-            prompt: "summarize the repo".into(),
-            budget: JobBudget {
-                wall_secs: 60,
-                max_attempts: 1,
-                max_turns: None,
-                max_spend: None,
-            },
-            contract: JobContract {
-                no_change: true,
-                ..Default::default()
-            },
-            status,
-            inbox,
-            drained: false,
-            attempts: 1,
-            run_ms: 0,
-            turns: 0,
-            spend_usd: 0.0,
-            session_id: None,
-            session_path: None::<PathBuf>,
-            tier: None,
-            permission: None,
-            forks: Vec::new(),
-            decision_id: None,
-            result: None,
-            error: None,
-            owner_pid: None,
-            created_ms: 0,
-            started_ms: None,
-            finished_ms: None,
-            origin: None,
-            priority: None,
-            model: None,
-        }
-    }
+    use super::test_job as job;
 
     #[test]
-    fn archived_jobs_leave_the_strip_and_the_rest_are_newest_first() {
+    fn archived_jobs_are_hidden_and_the_rest_are_newest_first() {
         let mut old = job("old", JobStatus::Succeeded, InboxState::Unread);
         old.created_ms = 1;
         let mut new = job("new", JobStatus::Running, InboxState::Read);

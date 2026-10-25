@@ -609,6 +609,7 @@ impl Runtime {
             read_only: false,
             tier: self.config().execution_tier,
             sender: None,
+            ask: None,
             main_session: Some(&main_session),
             unattended: None,
             limits: JobLimits::default(),
@@ -675,6 +676,7 @@ impl Runtime {
             read_only: limits.permission == PermissionProfile::ReadOnly,
             tier: job_run_tier(limits.tier, self.config().execution_tier),
             sender: None,
+            ask: None,
             main_session: Some(&main_session),
             unattended: Some(&scope),
             limits,
@@ -743,6 +745,7 @@ impl Runtime {
             read_only,
             tier,
             sender,
+            ask,
             main_session,
             unattended,
             limits: job_limits,
@@ -814,6 +817,11 @@ impl Runtime {
                 main_session.map(Path::to_path_buf),
                 tier,
             )?;
+        }
+        // Only a run with a person behind it may wait on one: an unattended
+        // tree stops for operator decisions instead.
+        if let Some(ask) = ask.filter(|_| unattended.is_none()) {
+            registry.register(Arc::new(AskUserTool { ask: ask.clone() }))?;
         }
         // The browser launches host processes and reads and writes host files
         // outside the bash sandbox, so sandboxed tiers do not get it.
@@ -1331,6 +1339,8 @@ struct RunPlacement<'a> {
     /// Id of the child running here, if any. Its messages to `agent://main`
     /// carry this id as `from`; `None` for the main thread.
     sender: Option<&'a str>,
+    /// The child's line to the user, for `ask_user`. `None` for the main thread.
+    ask: Option<&'a subagents::UserAsk>,
     /// The main thread's session file, which `recall` reads. Children carry
     /// it from the `task` call that spawned them.
     main_session: Option<&'a Path>,
@@ -1757,6 +1767,7 @@ impl subagents::SubagentFactory for ChildFactory {
                         // falls back to the sandboxed default.
                         tier: spec.tier.unwrap_or(ExecutionTier::Workspace),
                         sender: Some(id),
+                        ask: spec.ask.as_ref(),
                         unattended: self.unattended.as_ref(),
                         limits: JobLimits::default(),
                         main_session: spec.main_session.as_deref(),
@@ -1819,6 +1830,7 @@ impl subagents::SubagentFactory for ChildFactory {
                         // falls back to the sandboxed default.
                         tier: spec.tier.unwrap_or(ExecutionTier::Workspace),
                         sender: Some(id),
+                        ask: spec.ask.as_ref(),
                         unattended: self.unattended.as_ref(),
                         limits: JobLimits::default(),
                         main_session: spec.main_session.as_deref(),
@@ -2099,7 +2111,42 @@ impl TaskTool {
             focus,
             tier: Some(tier),
             origin: None,
+            ask: None,
         })
+    }
+}
+
+/// Lets a child stop and ask the user, for the decisions only a person can
+/// make. The child shows as needing the user until they answer.
+struct AskUserTool {
+    ask: subagents::UserAsk,
+}
+
+#[async_trait]
+impl Tool for AskUserTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "ask_user".into(),
+            description: "Ask the user a question and wait for their answer. Use it only when you need a decision or a verification from the user that you cannot make yourself, for example whether to merge, or whether a manual check passed. Your task shows as needing the user until they reply, which can take a long time. Do not use it for progress updates or for questions main or the code can answer.".into(),
+            parameters: json!({"type":"object","properties":{"question":{"type":"string","description":"The question, with the context the user needs to answer it."}},"required":["question"],"additionalProperties":false}),
+        }
+    }
+    fn tier(&self) -> ToolTier {
+        ToolTier::Read
+    }
+    async fn execute(&self, arguments: Value, ctx: ToolContext) -> Result<ToolOutput, String> {
+        let question = arguments["question"]
+            .as_str()
+            .map(str::trim)
+            .filter(|question| !question.is_empty())
+            .ok_or("question required")?
+            .to_owned();
+        // The wait gives the turn's desk back: the user may take hours.
+        let answer = pools::release_while(&ctx.cancel, self.ask.ask(question))
+            .await
+            .map_err(|_| "cancelled while waiting for the user".to_string())?
+            .map_err(|error| error.to_string())?;
+        Ok(ToolOutput::text(format!("The user answered: {answer}")))
     }
 }
 struct WaitTool {
@@ -5061,6 +5108,7 @@ mod tests {
                     read_only: false,
                     tier: ExecutionTier::Attended,
                     sender: None,
+                    ask: None,
                     main_session: None,
                     unattended: None,
                     limits: JobLimits::default(),
@@ -5113,6 +5161,7 @@ mod tests {
                         read_only: false,
                         tier,
                         sender: None,
+                        ask: None,
                         main_session: None,
                         unattended: None,
                         limits: JobLimits::default(),

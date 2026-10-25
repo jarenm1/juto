@@ -543,45 +543,7 @@ async fn child_completion_starts_a_run_while_no_client_is_prompting() {
 }
 
 #[tokio::test]
-async fn inbox_notices_are_announced_listed_and_dismissed() {
-    let root = tempfile::tempdir().unwrap();
-    let daemon = daemon(root.path(), ScriptedProvider::new(false));
-    let mut rx = attach(&daemon);
-    tokio::spawn(inbox_loop(daemon.clone()));
-
-    let inbox = daemon.runtime.subagent_manager().main_inbox();
-    inbox.push(MainMessage {
-        from: "child-1".to_string(),
-        name: None,
-        kind: MainMessageKind::Completed,
-        body: "done".to_string(),
-        digest_of: None,
-    });
-    assert!(matches!(rx.recv().await, Some(ServerEvent::Inbox)));
-
-    let Reply::InboxMessages { messages } = daemon.request(Request::InboxMessages).await.unwrap()
-    else {
-        panic!("expected the inbox");
-    };
-    assert_eq!(messages.len(), 1);
-    assert_eq!(messages[0].body, "done");
-
-    daemon
-        .request(Request::InboxDismiss {
-            message: messages[0].clone(),
-        })
-        .await
-        .unwrap();
-    assert!(matches!(rx.recv().await, Some(ServerEvent::Inbox)));
-    let Reply::InboxMessages { messages } = daemon.request(Request::InboxMessages).await.unwrap()
-    else {
-        panic!("expected the inbox");
-    };
-    assert!(messages.is_empty(), "a dismissed notice must not be listed");
-}
-
-#[tokio::test]
-async fn inbox_notices_survive_a_daemon_restart() {
+async fn queued_child_reports_survive_a_daemon_restart() {
     let root = tempfile::tempdir().unwrap();
     let first = daemon(root.path(), ScriptedProvider::new(false));
     first.runtime.subagent_manager().main_inbox().push_from(
@@ -597,11 +559,8 @@ async fn inbox_notices_survive_a_daemon_restart() {
     drop(first);
 
     let daemon = daemon(root.path(), ScriptedProvider::new(false));
-    let Reply::InboxMessages { messages } = daemon.request(Request::InboxMessages).await.unwrap()
-    else {
-        panic!("expected the inbox");
-    };
-    assert_eq!(messages.len(), 1, "the notice must survive the restart");
+    let messages = daemon.runtime.subagent_manager().main_inbox().drain();
+    assert_eq!(messages.len(), 1, "the report must survive the restart");
     assert_eq!(messages[0].body, "done before restart");
 }
 

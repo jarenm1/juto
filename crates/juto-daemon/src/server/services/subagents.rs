@@ -17,8 +17,9 @@ pub(crate) async fn subagent_transcript(d: &Daemon, id: String) -> Result<Reply,
         .map_err(subagent_error)
 }
 
-/// `Send` is a user-typed message: it steers a live child and promotes it to a
-/// focus thread, or starts a user follow-up on a completed one.
+/// `Send` is a user-typed message: it steers a live child, answers a blocked
+/// one, or starts a user follow-up on a completed one. Each promotes the child
+/// to a focus thread.
 pub(crate) async fn subagent_command(
     d: &Daemon,
     id: String,

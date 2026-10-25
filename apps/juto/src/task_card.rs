@@ -38,7 +38,7 @@ pub fn status_label(status: &SubagentStatus) -> &'static str {
     match status {
         SubagentStatus::Queued => "Queued",
         SubagentStatus::Running => "Running",
-        SubagentStatus::Blocked { .. } => "Blocked",
+        SubagentStatus::Blocked { .. } => "Needs you",
         SubagentStatus::Verifying => "Verifying",
         SubagentStatus::Reviewing => "Reviewing",
         SubagentStatus::Completed => "Completed",
@@ -290,7 +290,7 @@ impl TaskCard {
     pub fn new(model: TaskCardModel, is_selected: bool, cx: &mut Context<Self>) -> Self {
         let resolution_input = cx.new(|cx| {
             let mut input = TextInput::new(cx);
-            input.set_placeholder("Reply to resume…", cx);
+            input.set_placeholder("Type your answer…", cx);
             if !model.resolution_input.is_empty() {
                 input.set_text(&model.resolution_input, cx);
             }
@@ -460,7 +460,7 @@ impl TaskCard {
             return div();
         };
         let reason_label = match reason {
-            BlockerReason::UserInput => "Input needed".to_string(),
+            BlockerReason::UserInput => "Question for you".to_string(),
             BlockerReason::Credential => "Provider credential missing".to_string(),
             BlockerReason::Environment => "Environment dependency blocked".to_string(),
             BlockerReason::Approval => "Approval needed".to_string(),
@@ -521,7 +521,7 @@ impl TaskCard {
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.resume(cx);
                         }))
-                        .child("Resume"),
+                        .child("Answer"),
                 ),
             )
     }

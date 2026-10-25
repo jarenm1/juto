@@ -14,17 +14,16 @@ use crate::chat::{Message, MessageRole, apply_stream_event, view_messages};
 use crate::vcs_sidebar::VcsSidebar;
 
 /// Why the composer is disabled for `status`, or `None` when a message can be
-/// sent. A message to a working thread steers it and makes it a focus thread.
+/// sent. A message to a working thread steers it, a message to a blocked
+/// thread answers its question, and either makes it a focus thread.
 pub fn message_unavailable_reason(status: &SubagentStatus) -> Option<&'static str> {
     match status {
         SubagentStatus::Completed
         | SubagentStatus::Queued
         | SubagentStatus::Running
+        | SubagentStatus::Blocked { .. }
         | SubagentStatus::Verifying
         | SubagentStatus::Reviewing => None,
-        SubagentStatus::Blocked { .. } => {
-            Some("The thread is blocked. Answer its request before messaging it.")
-        }
         SubagentStatus::Failed => Some("The thread failed, so it cannot take messages."),
         SubagentStatus::Cancelled => Some("The thread was cancelled, so it cannot take messages."),
     }
@@ -201,7 +200,7 @@ pub fn strip_user_preface(messages: &mut [Message]) {
 
 /// Emitted when the thread should leave focus.
 pub enum FocusEvent {
-    /// The daemon archived the thread, so it left the inbox.
+    /// The daemon archived the thread, so it left the task list.
     Archived,
 }
 
@@ -322,6 +321,14 @@ impl FocusThread {
         self.state.can_message()
     }
 
+    /// The question a blocked thread is waiting on the user to answer.
+    pub fn question(&self) -> Option<SharedString> {
+        match self.state.status() {
+            SubagentStatus::Blocked { prompt, .. } => Some(prompt.clone().into()),
+            _ => None,
+        }
+    }
+
     /// What to show above the composer: a rejected command, a failed
     /// transcript read, or why the thread cannot take messages.
     pub fn notice(&self) -> Option<SharedString> {
@@ -397,8 +404,8 @@ impl FocusThread {
         .detach();
     }
 
-    /// Sends `text` to the thread: a running thread is steered and promoted to
-    /// focus, a completed one takes a follow-up turn.
+    /// Sends `text` to the thread: a running thread is steered, a blocked one
+    /// takes it as its answer, and a completed one takes a follow-up turn.
     pub fn send(&mut self, text: String, cx: &mut Context<Self>) {
         if !self.state.can_message() {
             return;
@@ -425,8 +432,8 @@ impl FocusThread {
         cx.notify();
     }
 
-    /// Hides this thread from the inbox. The daemon keeps its workspace and
-    /// transcript, and focus closes once the archive is confirmed.
+    /// Hides this finished thread from the task list. The daemon keeps its
+    /// workspace and transcript, and focus closes once the archive is confirmed.
     pub fn archive(&mut self, cx: &mut Context<Self>) {
         let client = self.client.clone();
         let handle = self.tokio_handle.clone();
@@ -472,12 +479,9 @@ mod tests {
     }
 
     #[test]
-    fn messaging_is_enabled_unless_blocked_or_terminal() {
+    fn messaging_is_enabled_unless_terminal_without_a_result() {
         for status in all_statuses() {
-            let enabled = !matches!(
-                status,
-                SubagentStatus::Blocked { .. } | SubagentStatus::Failed | SubagentStatus::Cancelled
-            );
+            let enabled = !matches!(status, SubagentStatus::Failed | SubagentStatus::Cancelled);
             let state: FocusState<()> = FocusState::enter("t".into(), status.clone(), None, false);
             assert_eq!(state.can_message(), enabled, "status {status:?}");
         }
