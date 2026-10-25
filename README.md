@@ -59,7 +59,7 @@ with its exit status, wall time, and cgroup peak memory, CPU, OOM kills, and IO.
 resources` summarizes measured use per command class. See [docs/resources.md](docs/resources.md).
 
 **Delegating role model.** The top-level `main` role has `read`, `glob`, `grep`, `task`, `wait`,
-`agent_send`, `agent_cancel`, `agent_inbox`, `subagent_release`, `subagent_join`, `subagent_drop`, and `view`; it cannot edit files. Work runs in child agents defined as
+`agent_send`, `agent_cancel`, `agent_list`, `agent_inbox`, `subagent_release`, `subagent_join`, `subagent_drop`, and `view`; it cannot edit files. `agent_list` shows the children that own tasks (everything the user has not archived), and main's prompt tells it to `agent_send` the owner for updates and follow-ups instead of starting a new child. Work runs in child agents defined as
 markdown roles in `crates/juto-runtime/src/roles/`: `builder` (all tools), `scout` and `reviewer`
 (read-only), `task` (all tools, the default), and `browser` (only the `browser` tool, on
 `@smol`). A role's `tools` frontmatter takes `all`,

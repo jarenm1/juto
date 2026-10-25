@@ -1938,6 +1938,9 @@ fn register_agent_tools(
     }))?;
     registry.register(Arc::new(SendTool { peers }))?;
     if main {
+        registry.register(Arc::new(AgentListTool {
+            manager: manager.clone(),
+        }))?;
         registry.register(Arc::new(InboxTool {
             inbox: manager.main_inbox(),
         }))?;
@@ -1972,7 +1975,7 @@ impl Tool for TaskTool {
             description: format!(
                 "Run child agents concurrently. Each child gets an independent durable transcript; optional output_schema validates its JSON result. Set schema_mode to strict (default) to fail on missing or invalid data, or permissive to preserve the result. {} Set agent to a role from the available agents list; omit it for the default task role. A role's tools bound what its child may use, and read_only further restricts a child to read, glob, and grep. Set tier to untrusted, workspace, or attended to confine a child's shell commands; omit it for the default (isolated children get workspace, others attended). A child never gets a tier above this run's.",
                 if self.async_results {
-                    "This call returns once the children are queued, with their ids. Each child's terminal result arrives later as a message in the main thread; use `wait` to read one now."
+                    "This call returns once the children are queued, with their ids. Each child's terminal result arrives later as a message in the main thread; use `wait` to read one now. Start a child only for work no existing child owns: check `agent_list` first, and continue a listed child's work with `agent_send`."
                 } else {
                     "This call waits for all children."
                 }
@@ -2297,6 +2300,47 @@ impl Tool for SendTool {
             content: vec![ContentBlock::Text { text }],
             details: value,
             is_error: !report.failed.is_empty(),
+        })
+    }
+}
+/// Lists the subagents the user can see in their task list: every child this
+/// process started that has not been archived.
+struct AgentListTool {
+    manager: Arc<SubagentManager>,
+}
+#[async_trait]
+impl Tool for AgentListTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "agent_list".into(),
+            description: "List the subagents that own tasks: every child not archived by the user, oldest first, with its id, name, status, the start of its task, whether the user has messaged it (focus), and its latest summary. Check it before `task`: work a listed child owns, including updates, fixes, and follow-ups, goes to that child with `agent_send`.".into(),
+            parameters: json!({"type":"object","properties":{},"additionalProperties":false}),
+        }
+    }
+    async fn execute(&self, _arguments: Value, _ctx: ToolContext) -> Result<ToolOutput, String> {
+        let entries: Vec<Value> = self
+            .manager
+            .list()
+            .into_iter()
+            .filter(|child| !child.archived)
+            .map(|child| {
+                let task: String = child.task.chars().take(200).collect();
+                json!({
+                    "id": child.id,
+                    "name": child.name,
+                    "status": child.status,
+                    "task": task,
+                    "focus": child.focus,
+                    "summary": child.summary,
+                })
+            })
+            .collect();
+        let value = Value::Array(entries);
+        let text = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+        Ok(ToolOutput {
+            content: vec![ContentBlock::Text { text }],
+            details: value,
+            is_error: false,
         })
     }
 }
@@ -4647,6 +4691,7 @@ mod tests {
                 "wait",
                 "agent_send",
                 "agent_cancel",
+                "agent_list",
                 "agent_inbox",
                 "desktop_observe",
                 "subagent_release",
@@ -5324,6 +5369,69 @@ mod tests {
             .expect(
                 "parents and their children all finish: waiting parents must not hold every desk",
             );
+    }
+
+    #[tokio::test]
+    async fn agent_list_shows_owned_tasks_and_hides_archived_ones() {
+        struct InstantFactory;
+
+        #[async_trait]
+        impl subagents::SubagentFactory for InstantFactory {
+            async fn run(
+                &self,
+                id: &str,
+                _spec: TaskSpec,
+                _control: RunControl,
+                _events: mpsc::UnboundedSender<AgentEvent>,
+            ) -> Result<SubagentResult, String> {
+                Ok(SubagentResult {
+                    id: id.to_string(),
+                    output: "done".to_string(),
+                    data: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    session_path: PathBuf::from("/tmp/child.jsonl"),
+                    change_id: None,
+                })
+            }
+        }
+
+        let manager = Arc::new(SubagentManager::new(
+            Arc::new(InstantFactory),
+            pools::Admission::unmetered(1),
+            CancellationToken::new(),
+            subagents::MainInbox::default(),
+        ));
+        let mut review = TaskSpec::new("review PR #7");
+        review.name = Some("Review PR #7".into());
+        let review = manager.spawn(review).unwrap();
+        let scan = manager.spawn(TaskSpec::new("scan TODOs")).unwrap();
+        manager.wait(&review).await.unwrap();
+        manager.wait(&scan).await.unwrap();
+        manager.set_archived(&scan, true).unwrap();
+
+        let tool = AgentListTool { manager };
+        let output = tool
+            .execute(
+                json!({}),
+                ToolContext {
+                    cwd: PathBuf::from("/repo"),
+                    session_id: "main".to_string(),
+                    cancel: CancellationToken::new(),
+                },
+            )
+            .await
+            .unwrap();
+        let listed = output.details.as_array().unwrap();
+        assert_eq!(listed.len(), 1, "an archived task is no longer owned work");
+        assert_eq!(listed[0]["id"], review.as_str());
+        assert_eq!(listed[0]["name"], "Review PR #7");
+        assert_eq!(listed[0]["status"], "completed");
+        // The model reads `content`, so the id it must message is there.
+        let ContentBlock::Text { text } = &output.content[0] else {
+            panic!("text output");
+        };
+        assert!(text.contains(&review));
     }
 
     #[tokio::test]
