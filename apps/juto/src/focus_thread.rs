@@ -7,10 +7,13 @@ use gpui::{AppContext, Context, Entity, EventEmitter, ScrollHandle, SharedString
 use juto_agent::AgentEvent;
 use juto_daemon::client::{Client, Notification};
 use juto_daemon::protocol::{Reply, Request, ServerEvent, SubagentCommand};
-use juto_runtime::subagents::{SubagentEvent, SubagentStatus, SubagentSummary, USER_TURN_PREFACE};
+use juto_runtime::subagents::{
+    SubagentEvent, SubagentStatus, SubagentSummary, USER_TURN_PREFACE, strip_main_turn_header,
+};
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::chat::{Message, MessageRole, apply_stream_event, view_messages};
+use crate::subagent_card::fallback_name;
 use crate::vcs_sidebar::VcsSidebar;
 
 /// Why the composer is disabled for `status`, or `None` when a message can be
@@ -33,6 +36,8 @@ pub fn message_unavailable_reason(status: &SubagentStatus) -> Option<&'static st
 /// transitions can be tested without GPUI.
 pub struct FocusState<V> {
     thread_id: String,
+    /// The child's name, shown on its replies.
+    label: SharedString,
     status: SubagentStatus,
     vcs: Option<V>,
     /// The main agent released this thread's workspace, so its fork is gone.
@@ -50,12 +55,14 @@ pub struct FocusState<V> {
 impl<V> FocusState<V> {
     pub fn enter(
         thread_id: String,
+        label: SharedString,
         status: SubagentStatus,
         vcs: Option<V>,
         released: bool,
     ) -> Self {
         Self {
             thread_id,
+            label,
             status,
             vcs,
             released,
@@ -144,7 +151,10 @@ impl<V> FocusState<V> {
         }
         self.pending_load = None;
         self.transcript_fresh = true;
-        self.transcript = transcript;
+        self.transcript = transcript.map(|mut rows| {
+            label_replies(&mut rows, &self.label);
+            rows
+        });
         // A reply still streaming is not on disk yet, so it stays on screen.
         let in_flight = if self.streaming {
             self.tail.pop()
@@ -168,6 +178,7 @@ impl<V> FocusState<V> {
                 }
                 let mut committed = view_messages(std::iter::once(message));
                 strip_user_preface(&mut committed);
+                label_replies(&mut committed, &self.label);
                 self.tail.extend(committed);
                 true
             }
@@ -175,14 +186,17 @@ impl<V> FocusState<V> {
                 if matches!(event, AgentEvent::MessageStart) {
                     self.streaming = true;
                 }
-                apply_stream_event(&mut self.tail, event)
+                let changed = apply_stream_event(&mut self.tail, event);
+                label_replies(&mut self.tail, &self.label);
+                changed
             }
         }
     }
 }
 
 /// Shows user turns as typed. The runtime frames each message the user sends
-/// a thread with `USER_TURN_PREFACE` for the model; the row omits it.
+/// a thread with `USER_TURN_PREFACE` for the model; the row omits it. Main's
+/// messages carry `MAIN_TURN_HEADER` instead; the row omits it and reads "Main".
 pub fn strip_user_preface(messages: &mut [Message]) {
     for message in messages {
         if message.role != MessageRole::User {
@@ -194,6 +208,22 @@ pub fn strip_user_preface(messages: &mut [Message]) {
             .and_then(|rest| rest.strip_prefix("\n\n"))
         {
             message.text = typed.to_owned().into();
+        } else if let Some(sent) = strip_main_turn_header(&message.text) {
+            message.text = sent.to_owned().into();
+            message.author = Some(MAIN_LABEL.into());
+        }
+    }
+}
+
+/// The author shown on turns main sent a child.
+const MAIN_LABEL: &str = "Main";
+
+/// Labels a child's replies with its name. A row that already has an author
+/// keeps it.
+fn label_replies(messages: &mut [Message], label: &SharedString) {
+    for message in messages {
+        if message.role == MessageRole::Assistant && message.author.is_none() {
+            message.author = Some(label.clone());
         }
     }
 }
@@ -226,6 +256,11 @@ impl FocusThread {
         cx: &mut Context<Self>,
     ) -> Self {
         let status = summary.status.clone();
+        let label: SharedString = summary
+            .name
+            .clone()
+            .unwrap_or_else(|| fallback_name(&summary.id))
+            .into();
         let vcs = summary
             .workspace
             .clone()
@@ -285,7 +320,7 @@ impl FocusThread {
             }
         });
         Self {
-            state: FocusState::enter(summary.id, status, vcs, summary.released),
+            state: FocusState::enter(summary.id, label, status, vcs, summary.released),
             title: summary.name.unwrap_or(summary.task).into(),
             client,
             tokio_handle,
@@ -486,23 +521,34 @@ mod tests {
     fn messaging_is_enabled_unless_terminal_without_a_result() {
         for status in all_statuses() {
             let enabled = !matches!(status, SubagentStatus::Failed | SubagentStatus::Cancelled);
-            let state: FocusState<()> = FocusState::enter("t".into(), status.clone(), None, false);
+            let state: FocusState<()> =
+                FocusState::enter("t".into(), "Builder".into(), status.clone(), None, false);
             assert_eq!(state.can_message(), enabled, "status {status:?}");
         }
     }
 
     #[test]
     fn released_thread_refuses_messages() {
-        let state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None, true);
+        let state: FocusState<()> = FocusState::enter(
+            "t".into(),
+            "Builder".into(),
+            SubagentStatus::Completed,
+            None,
+            true,
+        );
         assert!(!state.can_message());
         assert!(state.message_unavailable().is_some());
     }
 
     #[test]
     fn transcript_loads_once_per_terminal_state() {
-        let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
+        let mut state: FocusState<()> = FocusState::enter(
+            "t".into(),
+            "Builder".into(),
+            SubagentStatus::Completed,
+            None,
+            false,
+        );
         let token = state
             .begin_transcript_load()
             .expect("terminal thread loads");
@@ -519,8 +565,13 @@ mod tests {
 
     #[test]
     fn working_thread_keeps_its_history_until_it_settles() {
-        let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
+        let mut state: FocusState<()> = FocusState::enter(
+            "t".into(),
+            "Builder".into(),
+            SubagentStatus::Completed,
+            None,
+            false,
+        );
         let first = state.begin_transcript_load().expect("settled thread loads");
         let history = view_messages(&[juto_ai::Message::user("task")]);
         assert!(state.apply_transcript(first, Ok(history)));
@@ -539,8 +590,13 @@ mod tests {
 
     #[test]
     fn stale_transcript_read_is_ignored() {
-        let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
+        let mut state: FocusState<()> = FocusState::enter(
+            "t".into(),
+            "Builder".into(),
+            SubagentStatus::Completed,
+            None,
+            false,
+        );
         let stale = state.begin_transcript_load().expect("first load");
         state.set_status(SubagentStatus::Running);
         state.set_status(SubagentStatus::Completed);
@@ -577,8 +633,13 @@ mod tests {
 
     #[test]
     fn live_deltas_stream_and_message_end_replaces_the_reply() {
-        let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Running, None, false);
+        let mut state: FocusState<()> = FocusState::enter(
+            "t".into(),
+            "Builder".into(),
+            SubagentStatus::Running,
+            None,
+            false,
+        );
         assert!(state.apply_live(&AgentEvent::MessageStart));
         assert!(state.apply_live(&delta("Hel")));
         assert!(state.apply_live(&delta("lo")));
@@ -599,8 +660,13 @@ mod tests {
     fn transcript_read_keeps_the_reply_in_flight() {
         // A send can start a turn before the summary reports it, so a read begun
         // while the thread looked settled lands mid-stream.
-        let mut state: FocusState<()> =
-            FocusState::enter("t".into(), SubagentStatus::Completed, None, false);
+        let mut state: FocusState<()> = FocusState::enter(
+            "t".into(),
+            "Builder".into(),
+            SubagentStatus::Completed,
+            None,
+            false,
+        );
         let token = state.begin_transcript_load().expect("settled thread loads");
         state.apply_live(&AgentEvent::MessageStart);
         state.apply_live(&delta("Hi"));
@@ -620,5 +686,32 @@ mod tests {
         strip_user_preface(&mut rows);
         let texts: Vec<String> = rows.iter().map(|row| row.text.to_string()).collect();
         assert_eq!(texts, ["hello thread", "plain", framed.as_str()]);
+    }
+
+    #[test]
+    fn a_main_turn_reads_as_main_without_its_header() {
+        let mut rows = view_messages(&[juto_ai::Message::user(
+            juto_runtime::subagents::main_turn_text("look at the parser"),
+        )]);
+        strip_user_preface(&mut rows);
+        assert_eq!(rows[0].text.as_ref(), "look at the parser");
+        assert_eq!(rows[0].author, Some("Main".into()));
+    }
+
+    #[test]
+    fn a_child_reply_reads_as_the_child() {
+        let mut state: FocusState<()> = FocusState::enter(
+            "t".into(),
+            "Builder".into(),
+            SubagentStatus::Running,
+            None,
+            false,
+        );
+        assert!(state.apply_live(&AgentEvent::MessageStart));
+        assert!(state.apply_live(&delta("Hi")));
+        assert_eq!(
+            state.tail().last().and_then(|row| row.author.clone()),
+            Some("Builder".into())
+        );
     }
 }
