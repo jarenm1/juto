@@ -954,18 +954,22 @@ pub fn completion_prompt(messages: &[MainMessage]) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MainMessageHeader {
     pub from: String,
+    /// The child's configured name, when `main_message_text` wrote one.
+    pub name: Option<String>,
     pub kind: MainMessageKind,
 }
 
 /// Parses the first line `main_message_text` writes for a framed main message.
-/// `None` for any other line. The name and digest fields are display-only, so
-/// they are not returned.
+/// `None` for any other line. The digest is display-only, so it is not returned.
 pub fn parse_main_message_header(line: &str) -> Option<MainMessageHeader> {
     let inner = line.strip_prefix("[subagent ")?.strip_suffix(']')?;
     let (from, rest) = inner.split_once(' ')?;
-    let rest = match rest.strip_prefix("name=") {
-        Some(named) => skip_debug_string(named)?.strip_prefix(' ')?,
-        None => rest,
+    let (name, rest) = match rest.strip_prefix("name=") {
+        Some(named) => {
+            let (name, after) = parse_debug_string(named)?;
+            (Some(name), after.strip_prefix(' ')?)
+        }
+        None => (None, rest),
     };
     let kind = match rest.split(' ').next()? {
         "Message" => MainMessageKind::Message,
@@ -978,23 +982,53 @@ pub fn parse_main_message_header(line: &str) -> Option<MainMessageHeader> {
     };
     Some(MainMessageHeader {
         from: from.to_owned(),
+        name,
         kind,
     })
 }
 
-/// The text after the Debug-quoted string that opens `text`, or `None`.
-fn skip_debug_string(text: &str) -> Option<&str> {
+/// Decodes the Debug-quoted string that opens `text`. Returns the decoded value
+/// and the text after its closing quote.
+fn parse_debug_string(text: &str) -> Option<(String, &str)> {
     let body = text.strip_prefix('"')?;
-    let mut escaped = false;
-    for (at, c) in body.char_indices() {
+    let mut chars = body.char_indices();
+    let mut out = String::new();
+    while let Some((at, c)) = chars.next() {
         match c {
-            _ if escaped => escaped = false,
-            '\\' => escaped = true,
-            '"' => return Some(&body[at + 1..]),
-            _ => {}
+            '"' => return Some((out, &body[at + 1..])),
+            '\\' => out.push(unescape(&mut chars)?),
+            _ => out.push(c),
         }
     }
     None
+}
+
+/// Decodes the character after a backslash in a Debug-escaped string.
+fn unescape(chars: &mut std::str::CharIndices<'_>) -> Option<char> {
+    let (_, escape) = chars.next()?;
+    Some(match escape {
+        '"' | '\\' | '\'' => escape,
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        '0' => '\0',
+        'u' => {
+            let (_, open) = chars.next()?;
+            if open != '{' {
+                return None;
+            }
+            let mut hex = String::new();
+            loop {
+                let (_, digit) = chars.next()?;
+                if digit == '}' {
+                    break;
+                }
+                hex.push(digit);
+            }
+            char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?
+        }
+        _ => return None,
+    })
 }
 
 /// Where a child's isolated workspace stands. `Releasing` covers the cleanup
@@ -4032,8 +4066,11 @@ mod tests {
             MainMessageKind::UserTurn,
         ];
         for kind in kinds {
-            for (name, digest_of) in [(None, None), (Some("builder \"two\" ] Failed"), Some(1812))]
-            {
+            for (name, digest_of) in [
+                (None, None),
+                (Some("builder \"two\" ] Failed"), Some(1812)),
+                (Some("tab\tback\\slash\nnewline"), None),
+            ] {
                 let message = MainMessage {
                     from: "w1".into(),
                     kind,
@@ -4047,6 +4084,7 @@ mod tests {
                     header,
                     Some(MainMessageHeader {
                         from: "w1".into(),
+                        name: name.map(str::to_owned),
                         kind,
                     }),
                     "{text}"

@@ -179,15 +179,11 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
     for message in source {
         match message {
             AiMessage::User { .. } => {
-                messages.push(Message {
-                    role: MessageRole::User,
-                    text: message.text().into(),
-                    thinking: SharedString::default(),
-                    attachments: Vec::new(),
-                    desktop_artifacts: Vec::new(),
-                    approval: None,
-                    views: Vec::new(),
-                });
+                let text = message.text();
+                match subagent_card::report_rows(&text) {
+                    Some(rows) => messages.extend(rows),
+                    None => messages.push(user_row(text)),
+                }
             }
             AiMessage::Assistant(assistant) => {
                 let text = assistant.text();
@@ -196,6 +192,7 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
                 if !text.is_empty() || !thinking.is_empty() || !desktop_artifacts.is_empty() {
                     messages.push(Message {
                         role: MessageRole::Assistant,
+                        author: None,
                         text: text.into(),
                         thinking: thinking.into(),
                         attachments: Vec::new(),
@@ -215,6 +212,7 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
                     } else {
                         messages.push(Message {
                             role: MessageRole::Assistant,
+                            author: None,
                             text: MessageText::default(),
                             thinking: SharedString::default(),
                             attachments: Vec::new(),
@@ -232,6 +230,20 @@ pub fn view_messages<'a>(source: impl IntoIterator<Item = &'a AiMessage>) -> Vec
         }
     }
     messages
+}
+
+/// A transcript row for a message the user sent.
+pub fn user_row(text: String) -> Message {
+    Message {
+        role: MessageRole::User,
+        author: None,
+        text: text.into(),
+        thinking: SharedString::default(),
+        attachments: Vec::new(),
+        desktop_artifacts: Vec::new(),
+        approval: None,
+        views: Vec::new(),
+    }
 }
 
 /// The message's reasoning blocks, trimmed and separated by blank lines.
@@ -313,6 +325,7 @@ pub fn apply_stream_event(messages: &mut Vec<Message>, event: &AgentEvent) -> bo
 fn assistant_message(text: MessageText) -> Message {
     Message {
         role: MessageRole::Assistant,
+        author: None,
         text,
         thinking: SharedString::default(),
         attachments: Vec::new(),
@@ -352,6 +365,7 @@ fn thinking_block(thinking: SharedString) -> impl IntoElement {
 pub fn view_row(view: ViewNode) -> Message {
     Message {
         role: MessageRole::Assistant,
+        author: None,
         text: MessageText::default(),
         thinking: SharedString::default(),
         attachments: Vec::new(),
@@ -365,6 +379,7 @@ pub fn view_row(view: ViewNode) -> Message {
 pub fn desktop_row(artifact: DesktopSessionArtifact) -> Message {
     Message {
         role: MessageRole::Assistant,
+        author: None,
         text: MessageText::default(),
         thinking: SharedString::default(),
         attachments: Vec::new(),
@@ -398,6 +413,9 @@ fn card_element(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub role: MessageRole,
+    /// Who the row is attributed to when it is not the role's default. A
+    /// subagent's report names the child; `None` keeps "You" or "Assistant".
+    pub author: Option<SharedString>,
     pub text: MessageText,
     /// Model reasoning shown above `text`, muted. Empty for most rows.
     pub thinking: SharedString,
@@ -890,6 +908,7 @@ impl ChatView {
                             .insert(artifact.artifact_id.clone(), DesktopCanvas::Live(viewer));
                         this.messages.push(Message {
                             role: MessageRole::Assistant,
+                            author: None,
                             text: MessageText::default(),
                             thinking: SharedString::default(),
                             attachments: Vec::new(),
@@ -1275,7 +1294,7 @@ impl ChatView {
         }
         self.committed = view.committed;
         self.first = view.first;
-        self.messages = view_messages(&view.timeline);
+        self.messages = subagent_card::without_repeated_cards(&[], view_messages(&view.timeline));
         self.streaming_row = None;
         self.pending_approvals.clear();
         for approval in view.pending_approvals {
@@ -1306,7 +1325,10 @@ impl ChatView {
                 match result {
                     // A snapshot that moved the window since makes the page stale.
                     Ok(Reply::Timeline { first, items }) if this.first == before => {
-                        let rows = view_messages(&items);
+                        let rows = subagent_card::without_repeated_cards(
+                            &this.messages,
+                            view_messages(&items),
+                        );
                         let added = rows.len();
                         this.messages.splice(0..0, rows);
                         if let Some(row) = &mut this.streaming_row {
@@ -1371,8 +1393,11 @@ impl ChatView {
                         {
                             self.messages.remove(row);
                         }
-                        self.messages
-                            .extend(view_messages(std::iter::once(&message)));
+                        let rows = subagent_card::without_repeated_cards(
+                            &self.messages,
+                            view_messages(std::iter::once(&message)),
+                        );
+                        self.messages.extend(rows);
                         self.sync_subagents(cx);
                     }
                     SessionEvent::ApprovalRequested { approval } => {
@@ -1627,6 +1652,7 @@ impl ChatView {
         self.pending_approvals.insert(id, request);
         self.messages.push(Message {
             role: MessageRole::Assistant,
+            author: None,
             text: MessageText::default(),
             thinking: SharedString::default(),
             attachments: Vec::new(),
@@ -1977,10 +2003,12 @@ impl ChatView {
                         )
                     })
                     .children(messages.iter().enumerate().map(|(index, message)| {
-                        let author = match message.role {
-                            MessageRole::User => "You",
-                            MessageRole::Assistant => "Assistant",
-                        };
+                        let author = message.author.clone().unwrap_or_else(|| {
+                            SharedString::from(match message.role {
+                                MessageRole::User => "You",
+                                MessageRole::Assistant => "Assistant",
+                            })
+                        });
                         let artifacts = message.desktop_artifacts.clone();
                         let views = message.views.clone();
                         div()
@@ -3102,6 +3130,20 @@ mod tests {
         assert_eq!(messages[0].text.as_ref(), "Hello from user");
         assert_eq!(messages[1].role, MessageRole::Assistant);
         assert_eq!(messages[1].text.as_ref(), "Hello from assistant");
+    }
+
+    #[test]
+    fn a_framed_completion_is_a_card_row_not_a_user_row() {
+        let messages = view_messages(&[
+            AiMessage::user("[subagent w1 Completed]\nfull report"),
+            AiMessage::user("typed by the user"),
+        ]);
+
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].text.as_ref().is_empty());
+        assert_eq!(subagent_card::card_id(&messages[0].views[0]), Some("w1"));
+        assert_eq!(messages[1].role, MessageRole::User);
+        assert_eq!(messages[1].text.as_ref(), "typed by the user");
     }
 
     #[test]
