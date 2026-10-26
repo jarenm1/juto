@@ -950,6 +950,53 @@ pub fn completion_prompt(messages: &[MainMessage]) -> String {
         .join("\n\n")
 }
 
+/// The header a framed main message opens with, as `main_message_text` writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MainMessageHeader {
+    pub from: String,
+    pub kind: MainMessageKind,
+}
+
+/// Parses the first line `main_message_text` writes for a framed main message.
+/// `None` for any other line. The name and digest fields are display-only, so
+/// they are not returned.
+pub fn parse_main_message_header(line: &str) -> Option<MainMessageHeader> {
+    let inner = line.strip_prefix("[subagent ")?.strip_suffix(']')?;
+    let (from, rest) = inner.split_once(' ')?;
+    let rest = match rest.strip_prefix("name=") {
+        Some(named) => skip_debug_string(named)?.strip_prefix(' ')?,
+        None => rest,
+    };
+    let kind = match rest.split(' ').next()? {
+        "Message" => MainMessageKind::Message,
+        "Completed" => MainMessageKind::Completed,
+        "Failed" => MainMessageKind::Failed,
+        "Cancelled" => MainMessageKind::Cancelled,
+        "Desktop" => MainMessageKind::Desktop,
+        "UserTurn" => MainMessageKind::UserTurn,
+        _ => return None,
+    };
+    Some(MainMessageHeader {
+        from: from.to_owned(),
+        kind,
+    })
+}
+
+/// The text after the Debug-quoted string that opens `text`, or `None`.
+fn skip_debug_string(text: &str) -> Option<&str> {
+    let body = text.strip_prefix('"')?;
+    let mut escaped = false;
+    for (at, c) in body.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return Some(&body[at + 1..]),
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Where a child's isolated workspace stands. `Releasing` covers the cleanup
 /// window so no follow-up or transcript read can race the directory removal.
 enum WorkspaceState {
@@ -3972,6 +4019,54 @@ mod tests {
             completion_prompt(&arrivals),
             "[subagent w1 Completed]\ntests pass\n\n[subagent w2 Failed]\nbuild error"
         );
+    }
+
+    #[test]
+    fn main_message_header_parses_what_main_message_text_writes() {
+        let kinds = [
+            MainMessageKind::Message,
+            MainMessageKind::Completed,
+            MainMessageKind::Failed,
+            MainMessageKind::Cancelled,
+            MainMessageKind::Desktop,
+            MainMessageKind::UserTurn,
+        ];
+        for kind in kinds {
+            for (name, digest_of) in [(None, None), (Some("builder \"two\" ] Failed"), Some(1812))]
+            {
+                let message = MainMessage {
+                    from: "w1".into(),
+                    kind,
+                    name: name.map(Into::into),
+                    digest_of,
+                    body: "line one\nline two".into(),
+                };
+                let text = main_message_text(&message);
+                let header = parse_main_message_header(text.lines().next().unwrap());
+                assert_eq!(
+                    header,
+                    Some(MainMessageHeader {
+                        from: "w1".into(),
+                        kind,
+                    }),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn main_message_header_rejects_other_lines() {
+        assert_eq!(
+            parse_main_message_header("hello [subagent w1 Completed]"),
+            None
+        );
+        assert_eq!(
+            parse_main_message_header("[subagent w1 Completed] tail"),
+            None
+        );
+        assert_eq!(parse_main_message_header("[subagent w1 Bogus]"), None);
+        assert_eq!(parse_main_message_header("[subagent w1]"), None);
     }
 
     #[test]
