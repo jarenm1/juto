@@ -3,10 +3,12 @@
 
 use juto_agent::ViewNode;
 use juto_runtime::DesktopSessionArtifact;
-use juto_runtime::subagents::SubagentStatus;
+use juto_runtime::subagents::{
+    MainMessageHeader, MainMessageKind, SubagentStatus, parse_main_message_header,
+};
 use serde_json::{Map, json};
 
-use crate::chat::{Message, MessageRole, desktop_row, view_row};
+use crate::chat::{Message, MessageRole, desktop_row, user_row, view_row};
 use crate::task_card::status_label;
 
 /// Element tag that `view_element` renders as a subagent card. Host-built, so it
@@ -44,6 +46,18 @@ fn set_card_status(card: &mut ViewNode, name: Option<&str>, status: &SubagentSta
         .insert("tone".to_owned(), json!(status_tone(status)));
 }
 
+/// A `Subagent` card for child `id`, labeled `name` and showing `status`.
+fn new_card(id: &str, name: &str, status: &SubagentStatus) -> ViewNode {
+    let mut card = ViewNode {
+        tag: SUBAGENT_TAG.to_owned(),
+        props: Map::new(),
+        children: Vec::new(),
+    };
+    card.props.insert("id".to_owned(), json!(id));
+    set_card_status(&mut card, Some(name), status);
+    card
+}
+
 /// Name for a card whose child has no configured name. Ids are UUIDv7 strings:
 /// their head is a timestamp, identical for siblings spawned together, so the
 /// tail is what tells them apart.
@@ -75,14 +89,8 @@ pub fn upsert_subagent_card(
         return;
     }
 
-    let mut card = ViewNode {
-        tag: SUBAGENT_TAG.to_owned(),
-        props: Map::new(),
-        children: Vec::new(),
-    };
-    card.props.insert("id".to_owned(), json!(id));
     let fallback = fallback_name(id);
-    set_card_status(&mut card, Some(name.unwrap_or(&fallback)), status);
+    let card = new_card(id, name.unwrap_or(&fallback), status);
 
     let streaming_assistant = streaming
         && messages
@@ -122,6 +130,82 @@ pub fn attach_desktop_artifact(
     }
 }
 
+/// Transcript rows for a user message the runtime framed for main. Each framed
+/// report opens with the header `main_message_text` writes. A terminal report
+/// becomes a card without its body: the card carries the status, and the child's
+/// focus thread keeps the report. Any other report keeps its text as a row
+/// attributed to the child, except a user turn, which stays "You".
+/// `None` unless the text opens with a framed header, so typed text is unchanged.
+pub fn report_rows(text: &str) -> Option<Vec<Message>> {
+    let mut segments: Vec<(MainMessageHeader, String)> = Vec::new();
+    for line in text.lines() {
+        match parse_main_message_header(line) {
+            Some(header) => segments.push((header, line.to_owned())),
+            None => {
+                let (_, raw) = segments.last_mut()?;
+                raw.push('\n');
+                raw.push_str(line);
+            }
+        }
+    }
+    if segments.is_empty() {
+        return None;
+    }
+    let rows = segments
+        .into_iter()
+        .map(|(header, raw)| {
+            let name = header
+                .name
+                .clone()
+                .unwrap_or_else(|| fallback_name(&header.from));
+            match terminal_status(header.kind) {
+                Some(status) => view_row(new_card(&header.from, &name, &status)),
+                None => {
+                    let mut row = user_row(raw.trim_end().to_owned());
+                    if header.kind != MainMessageKind::UserTurn {
+                        row.author = Some(name.into());
+                    }
+                    row
+                }
+            }
+        })
+        .collect();
+    Some(rows)
+}
+
+/// Drops the card rows in `rows` whose child already has a card in `shown`, or an
+/// earlier row in `rows`. A child has one card, updated in place as its status
+/// changes, so a report for a child that already has one adds no second card.
+pub fn without_repeated_cards(shown: &[Message], rows: Vec<Message>) -> Vec<Message> {
+    let mut known: Vec<String> = shown
+        .iter()
+        .flat_map(|message| message.views.iter())
+        .filter_map(card_id)
+        .map(str::to_owned)
+        .collect();
+    rows.into_iter()
+        .filter(|row| match row.views.first().and_then(card_id) {
+            Some(id) if known.iter().any(|seen| seen == id) => false,
+            Some(id) => {
+                known.push(id.to_owned());
+                true
+            }
+            None => true,
+        })
+        .collect()
+}
+
+/// The status a terminal report leaves its child in. Other kinds say nothing
+/// final about the child, so they have none.
+fn terminal_status(kind: MainMessageKind) -> Option<SubagentStatus> {
+    match kind {
+        MainMessageKind::Completed => Some(SubagentStatus::Completed),
+        MainMessageKind::Failed => Some(SubagentStatus::Failed),
+        MainMessageKind::Cancelled => Some(SubagentStatus::Cancelled),
+        MainMessageKind::Message | MainMessageKind::Desktop | MainMessageKind::UserTurn => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +213,7 @@ mod tests {
     fn assistant(text: &str) -> Message {
         Message {
             role: MessageRole::Assistant,
+            author: None,
             text: text.to_owned().into(),
             thinking: Default::default(),
             attachments: Vec::new(),
@@ -230,5 +315,104 @@ mod tests {
             vec![desktop("desk-1-artifact")]
         );
         assert!(messages[2].desktop_artifacts.is_empty());
+    }
+
+    #[test]
+    fn terminal_reports_render_as_cards_without_their_bodies() {
+        let text =
+            "[subagent w1 Completed]\nsecret full report\n\n[subagent w2 Failed]\nbuild error";
+        let rows = report_rows(text).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(card_count(&rows), 2);
+        assert_eq!(rows[0].role, MessageRole::Assistant);
+        assert!(rows[0].text.as_ref().is_empty());
+        let card = &rows[0].views[0];
+        assert_eq!(card_id(card), Some("w1"));
+        assert_eq!(card.props.get("name"), Some(&json!(fallback_name("w1"))));
+        assert_eq!(
+            card.props.get("status"),
+            Some(&json!(status_label(&SubagentStatus::Completed)))
+        );
+        assert!(
+            !serde_json::to_string(&card.props)
+                .unwrap()
+                .contains("secret")
+        );
+    }
+
+    #[test]
+    fn framed_header_with_name_and_digest_still_makes_a_card() {
+        let text = r#"[subagent w3 name="api \"v2\"" Cancelled (digest of 9 bytes)]
+clipped"#;
+        let rows = report_rows(text).unwrap();
+
+        assert_eq!(card_count(&rows), 1);
+        let card = &rows[0].views[0];
+        assert_eq!(card_id(card), Some("w3"));
+        assert_eq!(
+            card.props.get("status"),
+            Some(&json!(status_label(&SubagentStatus::Cancelled)))
+        );
+    }
+
+    #[test]
+    fn non_terminal_reports_keep_their_text_as_a_user_row() {
+        let rows =
+            report_rows("[subagent w1 Completed]\ndone\n\n[subagent w2 Message]\nneed input")
+                .unwrap();
+
+        assert_eq!(card_count(&rows), 1);
+        assert_eq!(rows[1].role, MessageRole::User);
+        assert_eq!(rows[1].text.as_ref(), "[subagent w2 Message]\nneed input");
+    }
+
+    #[test]
+    fn text_not_opening_with_a_framed_header_is_not_a_report() {
+        assert!(report_rows("hello").is_none());
+        assert!(report_rows("").is_none());
+        assert!(report_rows("note\n[subagent w1 Completed]\ndone").is_none());
+    }
+
+    #[test]
+    fn a_report_adds_no_card_for_a_child_already_shown() {
+        let mut shown = Vec::new();
+        upsert_subagent_card(
+            &mut shown,
+            "w1",
+            Some("builder"),
+            &SubagentStatus::Running,
+            false,
+        );
+        let rows =
+            report_rows("[subagent w1 Completed]\ndone\n\n[subagent w2 Failed]\nbad").unwrap();
+
+        let kept = without_repeated_cards(&shown, rows);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(card_id(&kept[0].views[0]), Some("w2"));
+    }
+
+    #[test]
+    fn one_card_per_child_within_a_batch() {
+        let rows = report_rows("[subagent w1 Completed]\na\n\n[subagent w1 Failed]\nb").unwrap();
+
+        let kept = without_repeated_cards(&[], rows);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            kept[0].views[0].props.get("status"),
+            Some(&json!(status_label(&SubagentStatus::Completed)))
+        );
+    }
+
+    #[test]
+    fn a_child_report_is_attributed_to_the_child_and_a_user_turn_is_not() {
+        let rows = report_rows(
+            "[subagent w2 name=\"builder\" Message]\nneed input\n[subagent w3 Message]\nhi\n[subagent w4 UserTurn]\nthanks",
+        )
+        .unwrap();
+
+        assert_eq!(rows[0].author, Some("builder".into()));
+        assert_eq!(rows[1].author, Some("Subagent w3".into()));
+        assert_eq!(rows[2].author, None);
     }
 }
