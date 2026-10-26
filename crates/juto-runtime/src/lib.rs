@@ -1840,7 +1840,7 @@ impl subagents::SubagentFactory for ChildFactory {
                 }
             }
             runtime.switch_model(&mut session, &selector)?;
-            let mut prompt = spec.task;
+            let mut prompt = subagents::main_turn_text(&spec.task);
             if let Some(schema) = spec.output_schema {
                 prompt.push_str("\n\nReturn a single JSON value validating against this JSON Schema, without surrounding prose:\n");
                 prompt.push_str(&serde_json::to_string(&schema)?);
@@ -4680,7 +4680,7 @@ mod tests {
                     self.release_digest.acquire().await.unwrap().forget();
                     "completed; cargo test passed; changed src/example.rs".to_string()
                 } else if context.messages.iter().any(|m| {
-                    matches!(m, Message::User { content, .. } if content.iter().any(|b| matches!(b, ContentBlock::Text { text } if text == "large-report-child")))
+                    matches!(m, Message::User { content, .. } if content.iter().any(|b| matches!(b, ContentBlock::Text { text } if crate::subagents::strip_main_turn_header(text).unwrap_or(text) == "large-report-child")))
                 }) {
                     "verified output é\n".repeat(1200)
                 } else {
@@ -4849,7 +4849,10 @@ mod tests {
         assert!(workspace_dir.exists(), "the fork must still exist");
         let prompts = provider.prompts.lock();
         assert_eq!(prompts.len(), 3, "task plus both committed prompts");
-        assert_eq!(prompts[2], "continue the thread");
+        assert_eq!(
+            prompts[2],
+            crate::subagents::main_turn_text("continue the thread")
+        );
     }
 
     #[tokio::test]
@@ -5873,6 +5876,7 @@ mod tests {
                     _ => None,
                 })
                 .unwrap_or_default();
+            let prompt = crate::subagents::strip_main_turn_header(prompt).unwrap_or(prompt);
             let answered_by_tool = context
                 .messages
                 .iter()

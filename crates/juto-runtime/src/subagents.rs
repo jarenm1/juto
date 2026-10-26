@@ -1444,7 +1444,7 @@ impl SubagentManager {
             .control
             .lock()
             .expect("mutex poisoned")
-            .steer(Message::user(message));
+            .steer(Message::user(main_turn_text(&message)));
         Ok(())
     }
 
@@ -1483,7 +1483,7 @@ impl SubagentManager {
     /// `agent_send`. Its terminal state also pushes a completion notice to the
     /// main inbox.
     pub fn follow_up(&self, id: &str, prompt: String) -> Result<(), SubagentError> {
-        self.start_follow_up(id, prompt, TurnOrigin::Main)
+        self.start_follow_up(id, main_turn_text(&prompt), TurnOrigin::Main)
     }
 
     /// Start a follow-up turn the user typed into any subagent. The turn gets
@@ -2287,6 +2287,20 @@ async fn run_turn<F, Fut>(
 /// gave at spawn stays in the session history, so the thread keeps it.
 pub const USER_TURN_PREFACE: &str = "The user is chatting with you directly in your focus thread. Answer them. Your contract from main still applies, including what to report to main and when.";
 
+/// Prepended to what main sends a child: a steer, a follow-up, or the first
+/// prompt. A focus thread labels such turns "Main" and omits the header.
+pub const MAIN_TURN_HEADER: &str = "[from main]";
+
+/// `text` framed as a turn main started: the header, a blank line, then `text`.
+pub fn main_turn_text(text: &str) -> String {
+    format!("{MAIN_TURN_HEADER}\n\n{text}")
+}
+
+/// The message inside a turn main started, or `None` when `text` has no header.
+pub fn strip_main_turn_header(text: &str) -> Option<&str> {
+    text.strip_prefix(MAIN_TURN_HEADER)?.strip_prefix("\n\n")
+}
+
 /// Who started a turn. Main-started turns (the first run and main's follow-ups)
 /// push a completion notice to the main inbox. User-started focus turns push a
 /// quiet notice instead: main reads it on its next run but is not woken for it.
@@ -2878,7 +2892,7 @@ mod tests {
         assert_eq!(manager.status(&id), Some(SubagentStatus::Running));
         second.send(true).unwrap();
         let result = manager.wait(&id).await.expect("follow-up turn");
-        assert_eq!(result.output, "again:more");
+        assert_eq!(result.output, format!("again:{}", main_turn_text("more")));
     }
 
     #[tokio::test]
@@ -3957,9 +3971,12 @@ mod tests {
 
         second.send(true).unwrap();
         let result = manager.wait(&id).await.expect("follow-up turn");
-        assert_eq!(result.output, "again:more");
+        assert_eq!(result.output, format!("again:{}", main_turn_text("more")));
         assert_eq!(manager.status(&id), Some(SubagentStatus::Completed));
-        assert_eq!(manager.output(&id).unwrap().unwrap().output, "again:more");
+        assert_eq!(
+            manager.output(&id).unwrap().unwrap().output,
+            format!("again:{}", main_turn_text("more"))
+        );
         // The workspace lookup ran once at spawn and never again.
         assert_eq!(workspace_calls.load(Ordering::SeqCst), 1);
     }
@@ -4027,7 +4044,7 @@ mod tests {
             kinds,
             [MainMessageKind::UserTurn, MainMessageKind::Completed]
         );
-        assert_eq!(group[1].body, "again:report");
+        assert_eq!(group[1].body, format!("again:{}", main_turn_text("report")));
     }
 
     #[test]
@@ -4105,6 +4122,17 @@ mod tests {
         );
         assert_eq!(parse_main_message_header("[subagent w1 Bogus]"), None);
         assert_eq!(parse_main_message_header("[subagent w1]"), None);
+    }
+
+    #[test]
+    fn main_turn_header_frames_and_strips_back() {
+        let framed = main_turn_text("look at the parser");
+        assert_eq!(strip_main_turn_header(&framed), Some("look at the parser"));
+        assert_eq!(strip_main_turn_header("look at the parser"), None);
+        assert_eq!(
+            strip_main_turn_header(&format!("{USER_TURN_PREFACE}\n\nhi")),
+            None
+        );
     }
 
     #[test]
@@ -4492,7 +4520,7 @@ mod tests {
             .expect("accepted");
         second.send(true).unwrap();
         let result = manager.wait(&id).await.expect("follow-up turn");
-        assert_eq!(result.output, "again:next");
+        assert_eq!(result.output, format!("again:{}", main_turn_text("next")));
 
         let summary = manager
             .list()
@@ -4582,7 +4610,7 @@ mod tests {
             .expect("accepted");
         second.send(true).unwrap();
         let result = manager.wait(&id).await.expect("follow-up turn");
-        assert_eq!(result.output, "again:more");
+        assert_eq!(result.output, format!("again:{}", main_turn_text("more")));
         assert_eq!(manager.status(&id), Some(SubagentStatus::Completed));
     }
 
@@ -4890,14 +4918,16 @@ mod tests {
             .unwrap();
         assert!(next_summary(&mut events, &id).await.ends_with("first ask"));
         manager.follow_up(&id, "from main again".into()).unwrap();
-        assert_eq!(
-            next_summary(&mut events, &id).await,
-            "summary:from main again",
+        assert!(
+            next_summary(&mut events, &id)
+                .await
+                .ends_with("from main again"),
             "a focus thread is summarized after main's turns too"
         );
-        assert_eq!(
-            summary_of(&manager, &id).summary.as_deref(),
-            Some("summary:from main again")
+        assert!(
+            summary_of(&manager, &id)
+                .summary
+                .is_some_and(|summary| summary.ends_with("from main again"))
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
