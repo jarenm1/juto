@@ -50,7 +50,7 @@ fn mock_config() -> crate::RuntimeConfig {
             reasoning: false,
             input: vec!["text".to_string()],
             cost: ModelCost::default(),
-            context_window: Some(8192),
+            context_window: Some(16_384),
             max_tokens: Some(1024),
             kind: "chat".to_string(),
             supports_tools: true,
